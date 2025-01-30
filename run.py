@@ -165,9 +165,7 @@ class RepoProcessor:
             "gitingest",
             repo_url,
             "--output",
-            output_path,
-            "--exclude-patterns",
-            "AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,GITHUB_TOKEN,BITBUCKET_TOKEN"
+            output_path
         ], check=True)
 
     def _process_github_repositories(self) -> str:
