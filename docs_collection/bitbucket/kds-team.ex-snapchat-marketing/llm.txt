@@ -1,0 +1,1516 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-snapchat-marketing/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── snapchat/
+    │   │   ├── component.py
+    │   │   ├── client.py
+    │   │   └── result.py
+    │   └── main.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       └── out/
+    │           └── tables/
+    │               ├── creatives.csv
+    │               ├── adsquads.csv.manifest
+    │               ├── ads.csv.manifest
+    │               ├── organizations.csv.manifest
+    │               ├── statistics.csv.manifest
+    │               ├── ads.csv
+    │               ├── campaigns.csv
+    │               ├── organizations.csv
+    │               ├── creatives.csv.manifest
+    │               ├── campaigns.csv.manifest
+    │               ├── adsquads.csv
+    │               ├── adaccounts.csv
+    │               ├── statistics.csv
+    │               └── adaccounts.csv.manifest
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.0**
+Added check for duplicate metrics which could cause table with duplicate columns to be outputted.
+Added documentation.
+
+**0.0.1**
+First version of the extractor.
+
+================================================
+File: /src/snapchat/component.py
+================================================
+import dateparser
+import datetime
+import json
+import logging
+import pytz
+import sys
+from kbc.env_handler import KBCEnvHandler
+from snapchat.client import SnapchatClient
+from snapchat.result import SnapchatWriter, SnapchatStatisticsWriter
+
+
+KEY_DOWNLOAD_OBJECTS = 'statisticsObjects'
+KEY_DATES_ATTR = 'dateSettings'
+KEY_ATTRIBUTION_ATTR = 'attributionSettings'
+KEY_QUERY = 'query'
+
+KEY_DATES_START = 'startDate'
+KEY_DATES_END = 'endDate'
+
+KEY_ATTRIBUTION_GRANULARITY = 'granularity'
+KEY_ATTRIBUTION_SWIPE = 'windowSwipe'
+KEY_ATTRIBUTION_VIEW = 'windowView'
+
+MANDATORY_PARAMS = []
+
+AUTH_APPKEY = 'appKey'
+AUTH_APPSECRET = '#appSecret'
+AUTH_APPDATA = '#data'
+AUTH_APPDATA_REFRESHTOKEN = 'refresh_token'
+
+SUPPORTED_OBJECTS = ['campaigns', 'adsquads', 'ads']
+SUPPORTED_GRANULARITY = ['HOUR', 'DAY']
+SUPPORTED_WINDOW_VIEW = ["1_HOUR", "3_HOUR", "6_HOUR", "1_DAY", "7_DAY", "28_DAY"]
+SUPPORTED_WINDOW_SWIPE = ["1_DAY", "7_DAY", "28_DAY"]
+
+DATE_CHUNK_FORMAT = '%Y-%m-%d'
+
+
+class SnapchatComponent(KBCEnvHandler):
+
+    def __init__(self):
+
+        super().__init__(mandatory_params=MANDATORY_PARAMS)
+        self.parseAuthorization()
+        self.client = SnapchatClient(self.varRefreshToken, self.varAppKey, self.varAppSecret)
+
+        self.writerOrganizations = SnapchatWriter(self.data_path, 'organizations')
+        self.writerAdaccounts = SnapchatWriter(self.data_path, 'adaccounts')
+        self.writerCampaigns = SnapchatWriter(self.data_path, 'campaigns')
+        self.writerAdsquads = SnapchatWriter(self.data_path, 'adsquads')
+        self.writerCreatives = SnapchatWriter(self.data_path, 'creatives')
+        self.writerAds = SnapchatWriter(self.data_path, 'ads')
+
+        self.checkParameters()
+
+        if self.paramObjects != []:
+            self.writerStatistics = SnapchatStatisticsWriter(self.data_path, metricFields=self.paramQuery)
+
+        self.paramDateChunks = self.split_dates_to_chunks(self.paramStartDate, self.paramEndDate,
+                                                          28 if self.paramGranularity == 'DAY' else 6,
+                                                          strformat=DATE_CHUNK_FORMAT)
+
+        logging.debug(self.paramDateChunks)
+
+    def checkParameters(self):
+
+        _objects = self.cfg_params.get(KEY_DOWNLOAD_OBJECTS, [])
+        logging.debug(_objects)
+        _diff = set(_objects) - set(SUPPORTED_OBJECTS)
+
+        if len(_diff) > 0:
+            logging.error(f"Unsupported objects {_diff} in parameter \"downloadForObjects\".")
+            sys.exit(1)
+
+        else:
+            self.paramObjects = _objects
+
+        _dates = self.cfg_params.get(KEY_DATES_ATTR, {})
+        _startDate = dateparser.parse(_dates.get(KEY_DATES_START, '30 days ago'))
+        _endDate = dateparser.parse(_dates.get(KEY_DATES_END, 'yesterday'))
+
+        if _startDate is None or _endDate is None:
+
+            logging.error(' '.join(["Invalid start date or end date. Read the \"dateparser\"",
+                                    "documentation for correct usage and formats. The documentations is",
+                                    "available at: https://dateparser.readthedocs.io/en/latest/."]))
+            sys.exit(1)
+
+        else:
+
+            self.paramStartDate = _startDate
+            self.paramEndDate = _endDate
+
+            logging.debug(f"start: {_startDate}, end: {_endDate}.")
+
+        _query = self.cfg_params.get(KEY_QUERY, '')
+        _queryClean = list(set([m.strip() for m in _query.replace('\n', ',').split(',') if m.strip() != '']))
+
+        if _queryClean == []:
+            self.paramQuery = ['impressions', 'spend']
+
+        else:
+            self.paramQuery = _queryClean
+
+        logging.debug(f"Query: {self.paramQuery}.")
+
+        _attribution = self.cfg_params.get(KEY_ATTRIBUTION_ATTR, {})
+        _granularity = _attribution.get(KEY_ATTRIBUTION_GRANULARITY, 'DAY')
+
+        if _granularity not in SUPPORTED_GRANULARITY:
+            logging.error(f"Unsupported granularity setting {_granularity}.")
+            sys.exit(1)
+
+        else:
+            self.paramGranularity = _granularity
+
+        _swipe = _attribution.get(KEY_ATTRIBUTION_SWIPE, '28_DAY')
+
+        if _swipe not in SUPPORTED_WINDOW_SWIPE:
+            logging.error(f"Unsupported swipe window setting {_swipe}.")
+            sys.exit(1)
+
+        else:
+            self.paramWindowSwipe = _swipe
+
+        _view = _attribution.get(KEY_ATTRIBUTION_VIEW, '1_DAY')
+
+        if _view not in SUPPORTED_WINDOW_VIEW:
+            logging.error(f"Unsupported swipe window setting {_view}.")
+            sys.exit(1)
+
+        else:
+            self.paramWindowView = _view
+
+    def getAuthorization(self):
+
+        try:
+            return self.configuration.config_data["authorization"]["oauth_api"]["credentials"]
+
+        except KeyError:
+            logging.error("Authorization is missing.")
+            sys.exit(1)
+
+    def parseAuthorization(self):
+
+        authDict = self.getAuthorization()
+
+        try:
+            self.varAppKey = authDict[AUTH_APPKEY]
+            self.varAppSecret = authDict[AUTH_APPSECRET]
+            self.varRefreshToken = json.loads(authDict[AUTH_APPDATA])[AUTH_APPDATA_REFRESHTOKEN]
+
+        except KeyError as e:
+            logging.error("Key %s missing in authorization." % e)
+            sys.exit(1)
+
+    def normalizeTime(self, timezone):
+
+        tz = pytz.timezone(timezone)
+        chunks = []
+
+        for chunk in self.paramDateChunks:
+
+            _start = tz.localize(datetime.datetime.strptime(chunk['start_date'],
+                                                            DATE_CHUNK_FORMAT)).replace(hour=0).isoformat()
+            _end = tz.localize(datetime.datetime.strptime(chunk['end_date'],
+                                                          DATE_CHUNK_FORMAT)).replace(hour=0).isoformat()
+
+            chunks += [{'start_date': _start, 'end_date': _end}]
+
+        return chunks
+
+    def getAndWriteOrganizations(self):
+
+        allOrgs = self.client.getOrganizations()
+        self.writerOrganizations.writerow(allOrgs)
+        self.varOrganizations = [org['id'] for org in allOrgs]
+
+    def getAndWriteAdAccounts(self):
+
+        allAdAccs = []
+
+        for orgId in self.varOrganizations:
+            allAdAccs += self.client.getAdAccounts(orgId)
+
+        self.writerAdaccounts.writerow(allAdAccs)
+        self.varAdAccs = {acc['id']: {"timezone": acc['timezone']} for acc in allAdAccs}
+
+    def getAndWriteCampaigns(self, adAccountId):
+
+        allCampaigns = self.client.getCampaignsForAdAccount(adAccountId)
+        self.writerCampaigns.writerow(allCampaigns)
+
+        if 'campaigns' in self.paramObjects:
+            return [(c['id'], 'campaigns') for c in allCampaigns]
+
+        else:
+            return []
+
+    def getAndWriteAdSquads(self, adAccountId):
+
+        allAdSquads = self.client.getAdSquadsForAdAccount(adAccountId)
+        self.writerAdsquads.writerow(allAdSquads)
+
+        if 'adsquads' in self.paramObjects:
+            return [(a['id'], 'adsquads') for a in allAdSquads]
+
+        else:
+            return []
+
+    def getAndWriteCreatives(self, adAccountId):
+
+        allCreatives = self.client.getCreativesForAdAccount(adAccountId)
+        self.writerCreatives.writerow(allCreatives)
+
+    def getAndWriteAds(self, adAccountId):
+
+        allAds = self.client.getAdsForAdAccount(adAccountId)
+        self.writerAds.writerow(allAds)
+
+        if 'ads' in self.paramObjects:
+            return [(a['id'], 'ads') for a in allAds]
+
+        else:
+            return []
+
+    def run(self):
+
+        self.getAndWriteOrganizations()
+        logging.info("Organizations obtained.")
+
+        self.getAndWriteAdAccounts()
+        logging.info("Ad accounts obtained.")
+
+        for adAccId, adAccIdSet in self.varAdAccs.items():
+
+            logging.info(f"Starting download for ad account {adAccId}.")
+
+            allStatObjects = []
+            dates = self.normalizeTime(adAccIdSet['timezone'])
+
+            logging.debug(dates)
+
+            allStatObjects += self.getAndWriteCampaigns(adAccId)
+            allStatObjects += self.getAndWriteAdSquads(adAccId)
+            allStatObjects += self.getAndWriteAds(adAccId)
+            self.getAndWriteCreatives(adAccId)
+
+            for obj, end in allStatObjects:
+
+                for dr in dates:
+
+                    _measures = self.client.getStatistics(end, obj, ','.join(self.paramQuery), self.paramGranularity,
+                                                          dr['start_date'], dr['end_date'], self.paramWindowSwipe,
+                                                          self.paramWindowView)
+
+                    self.writerStatistics.writerow(_measures)
+
+            logging.info(f"Finished download for ad account {adAccId}.")
+
+
+================================================
+File: /src/snapchat/client.py
+================================================
+import logging
+import os
+import sys
+import time
+from kbc.client_base import HttpClientBase
+from urllib.parse import urlparse, parse_qs
+from json.decoder import JSONDecodeError
+
+BASE_URL = 'https://adsapi.snapchat.com/v1/'
+ACCESS_TOKEN_EXPIRATION = 1700
+PAGINATION_LIMIT = 500
+
+
+class SnapchatClientException(Exception):
+    pass
+
+
+class SnapchatClient(HttpClientBase):
+
+    def __init__(self, refreshToken, clientId, clientSecret):
+
+        self.paramRefreshToken = refreshToken
+        self.paramClientId = clientId
+        self.paramClientSecret = clientSecret
+
+        super().__init__(base_url=BASE_URL, status_forcelist=(429, 500, 502, 503, 504))
+        self.refreshAccessToken()
+
+    def refreshAccessToken(self):
+
+        urlRefresh = 'https://accounts.snapchat.com/login/oauth2/access_token'
+        paramsRefresh = {
+            'code': self.paramRefreshToken,
+            'client_id': self.paramClientId,
+            'client_secret': self.paramClientSecret,
+            'grant_type': 'refresh_token'
+        }
+
+        reqRefresh = self.post_raw(urlRefresh, params=paramsRefresh)
+        scRefresh, jsRefresh = reqRefresh.status_code, reqRefresh.json()
+
+        if scRefresh == 200:
+
+            self.varAccessToken = jsRefresh['access_token']
+            logging.info("Access token refreshed.")
+
+            self._auth_header = {'Authorization': f'Bearer {self.varAccessToken}'}
+            self.varAccessTokenCreated = time.time()
+
+        else:
+
+            logging.info("Access token could not be refreshed. Received: %s - %s" % (scRefresh, jsRefresh))
+            sys.exit(1)
+
+    def _checkAndRefreshAccessToken(self):
+
+        currentTime = time.time()
+        timeDiff = int(currentTime - self.varAccessTokenCreated)
+
+        if timeDiff >= ACCESS_TOKEN_EXPIRATION:
+            self.refreshAccessToken()
+        else:
+            pass
+
+    def getOrganizations(self):
+
+        self._checkAndRefreshAccessToken()
+
+        urlOrgs = os.path.join(self.base_url, 'me/organizations')
+
+        reqOrgs = self.get_raw(urlOrgs)
+        scOrgs, jsOrgs = reqOrgs.status_code, reqOrgs.json()
+
+        if scOrgs == 200:
+
+            logging.info("Organizations obtained successfully.")
+            return [obj['organization'] for obj in jsOrgs['organizations']]
+
+        else:
+
+            logging.error("Could not obtain organizations. Received: %s - %s." % (scOrgs, jsOrgs))
+            sys.exit(1)
+
+    def _npGetAdAccounts(self, organizationId, cursor=None):
+
+        self._checkAndRefreshAccessToken()
+
+        urlAdAccs = os.path.join(self.base_url, f'organizations/{organizationId}/adaccounts')
+        paramsAdAccs = {
+            'limit': PAGINATION_LIMIT,
+            'cursor': cursor
+        }
+        reqAdAccs = self.get_raw(urlAdAccs, params=paramsAdAccs)
+
+        return reqAdAccs
+
+    @staticmethod
+    def _parseCursorParameter(urlToParse):
+
+        if urlToParse is None:
+            return None
+        else:
+            parsedUrl = urlparse(urlToParse)
+            cursor = parse_qs(parsedUrl.query).get('cursor', [None])[0]
+            return cursor
+
+    def _npGetAdsForAdAccount(self, adAccountId, cursor=None):
+
+        self._checkAndRefreshAccessToken()
+
+        urlAds = os.path.join(self.base_url, f'adaccounts/{adAccountId}/ads')
+        paramsAds = {
+            'limit': PAGINATION_LIMIT,
+            'cursor': cursor
+        }
+        reqAds = self.get_raw(urlAds, params=paramsAds)
+
+        return reqAds
+
+    def _npGetCampaignsForAdAccount(self, adAccountId, cursor=None):
+
+        self._checkAndRefreshAccessToken()
+
+        urlCampaigns = os.path.join(self.base_url, f'adaccounts/{adAccountId}/campaigns')
+        paramsCampaigns = {
+            'limit': PAGINATION_LIMIT,
+            'cursor': cursor
+        }
+
+        reqCampaigns = self.get_raw(urlCampaigns, params=paramsCampaigns)
+
+        return reqCampaigns
+
+    def _npGetAdSquadsForAdAccount(self, adAccountId, cursor=None):
+
+        self._checkAndRefreshAccessToken()
+
+        urlAdSquads = os.path.join(self.base_url, f'adaccounts/{adAccountId}/adsquads')
+        paramsAdSquads = {
+            'limit': PAGINATION_LIMIT,
+            'cursor': cursor
+        }
+
+        reqAdSquads = self.get_raw(urlAdSquads, params=paramsAdSquads)
+
+        return reqAdSquads
+
+    def _npGetCreativesForAdAccount(self, adAccountId, cursor=None):
+
+        self._checkAndRefreshAccessToken()
+
+        urlCreatives = os.path.join(self.base_url, f'adaccounts/{adAccountId}/creatives')
+        paramsCreatives = {
+            'limit': PAGINATION_LIMIT,
+            'cursor': cursor
+        }
+
+        reqCreatives = self.get_raw(urlCreatives, params=paramsCreatives)
+
+        return reqCreatives
+
+    def _getPaginatedRequest(self, evalExpression, mappingObj, returnKey):
+
+        if 'cursor' not in mappingObj:
+            mappingObj['cursor'] = None
+
+        moreRecords = True
+        results = []
+        while moreRecords is True:
+
+            reqPagination = eval(evalExpression, None, mappingObj)
+            try:
+                scPagination, jsPagination = reqPagination.status_code, reqPagination.json()
+            except JSONDecodeError as json_err:
+                raise SnapchatClientException(f" Failed to parse json from : {reqPagination}") from json_err
+
+            if scPagination == 200:
+
+                results += [obj[returnKey] for obj in jsPagination[returnKey + 's']]
+                nextPageUrl = jsPagination.get('paging', {}).get('next_link', None)
+                nextPageCursor = self._parseCursorParameter(nextPageUrl)
+
+                if nextPageCursor is None:
+                    moreRecords = False
+                else:
+                    mappingObj['cursor'] = nextPageCursor
+
+            else:
+
+                logging.error("Could not obtain %s. Request to %s failed." % (returnKey, reqPagination.url))
+                logging.error("Received: %s - %s." % (scPagination, jsPagination))
+                sys.exit(1)
+
+        return results
+
+    def getAdsForAdAccount(self, adAccountId):
+
+        evalAds = 'func(adAccId, cursor)'
+        mapAds = {
+            'adAccId': adAccountId,
+            'func': self._npGetAdsForAdAccount
+        }
+        keyAds = 'ad'
+
+        return self._getPaginatedRequest(evalAds, mapAds, keyAds)
+
+    def getAdAccounts(self, organizationId):
+
+        evalAdAccs = 'func(orgId, cursor)'
+        mapAdAccs = {
+            'func': self._npGetAdAccounts,
+            'orgId': organizationId
+        }
+        keyAdAccs = 'adaccount'
+
+        return self._getPaginatedRequest(evalAdAccs, mapAdAccs, keyAdAccs)
+
+    def getCampaignsForAdAccount(self, adAccountId):
+
+        evalCampaigns = 'func(adAccId, cursor)'
+        mapCampaigns = {
+            'adAccId': adAccountId,
+            'func': self._npGetCampaignsForAdAccount
+        }
+        keyCampaigns = 'campaign'
+
+        return self._getPaginatedRequest(evalCampaigns, mapCampaigns, keyCampaigns)
+
+    def getAdSquadsForAdAccount(self, adAccountId):
+
+        evalAdSquads = 'func(adAccId, cursor)'
+        mapAdSquads = {
+            'adAccId': adAccountId,
+            'func': self._npGetAdSquadsForAdAccount
+        }
+        keyAdSquads = 'adsquad'
+
+        return self._getPaginatedRequest(evalAdSquads, mapAdSquads, keyAdSquads)
+
+    def getCreativesForAdAccount(self, adAccountId):
+
+        evalCreatives = 'func(adAccId, cursor)'
+        mapCreatives = {
+            'adAccId': adAccountId,
+            'func': self._npGetCreativesForAdAccount
+        }
+        keyCreatives = 'creative'
+
+        return self._getPaginatedRequest(evalCreatives, mapCreatives, keyCreatives)
+
+    def getStatistics(self, endpoint, endpointId, fields, granularity, startTime, endTime, windowSwipe, windowView):
+
+        self._checkAndRefreshAccessToken()
+
+        urlStatistics = os.path.join(self.base_url, endpoint, endpointId, 'stats')
+        paramsStatistics = {
+            'fields': fields,
+            'granularity': granularity,
+            'start_time': startTime,
+            'end_time': endTime,
+            'swipe_up_attribution_window': windowSwipe,
+            'view_attribution_window': windowView
+        }
+
+        try:
+            reqStatistics = self.get_raw(urlStatistics, params=paramsStatistics)
+        except JSONDecodeError as json_error:
+            logging.error("Failed to get statistics for account")
+            raise SnapchatClientException(json_error) from JSONDecodeError
+
+        try:
+            scStatistics, jsStatistics = reqStatistics.status_code, reqStatistics.json()
+        except JSONDecodeError as json_error:
+            logging.error(f"Failed to parse statistics for account. Only got response : {reqStatistics}")
+            raise SnapchatClientException(json_error) from JSONDecodeError
+
+        if scStatistics == 200:
+
+            return [x['timeseries_stat'] for x in jsStatistics['timeseries_stats']]
+
+        else:
+
+            logging.error(f"Could not obtain statistics for {endpoint}, id: {endpointId}.")
+            logging.error(f"Received: {scStatistics} - {jsStatistics}.")
+            sys.exit(1)
+
+
+================================================
+File: /src/snapchat/result.py
+================================================
+import csv
+import json
+import os
+
+FIELDS_ORGANIZATIONS = ['id', 'updated_at', 'created_at', 'name', 'country', 'postal_code', 'locality', 'contact_name',
+                        'contact_email', 'tax_id', 'address_line_1', 'administrative_district_level_1',
+                        'accepted_term_version', 'configuration_settings', 'type', 'state', 'roles', 'my_display_name',
+                        'my_invited_email', 'my_member_id']
+JSON_FIELDS_ORGANIZATIONS = ['configuration_settings', 'roles']
+PK_ORGANIZATIONS = ['id']
+
+FIELDS_ADACCOUNTS = ['id', 'updated_at', 'created_at', 'name', 'type', 'status', 'organization_id',
+                     'funding_source_ids', 'currency', 'timezone', 'advertiser_organization_id', 'billing_center_id',
+                     'billing_type', 'agency_representing_client', 'client_paying_invoices', 'regulations']
+JSON_FIELDS_ADACCOUNTS = ['funding_source_ids', 'regulations']
+PK_ADACCOUNTS = ['id']
+
+FIELDS_CAMPAIGNS = ['id', 'name', 'ad_account_id', 'status', 'objective', 'updated_at', 'created_at',
+                    'start_time', 'end_time', 'lifetime_spend_cap_micro', 'daily_budget_micro', 'buy_model',
+                    'regulations', 'measurement_spec']
+JSON_FIELDS_CAMPAIGNS = ['regulations', 'measurement_spec']
+PK_CAMPAIGNS = ['id']
+
+FIELDS_ADSQUADS = ['id', 'name', 'campaign_id', 'status', 'updated_at', 'created_at', 'type', 'targeting',
+                   'targeting_reach_status', 'placement', 'billing_event', 'bid_micro', 'auto_bid', 'target_bid',
+                   'lifetime_budget_micro', 'start_time', 'end_time', 'optimization_goal', 'delivery_constraint',
+                   'pacing_type']
+JSON_FIELDS_ADSQUADS = ['targeting']
+PK_ADSQUADS = ['id']
+
+FIELDS_CREATIVES = ['id', 'updated_at', 'created_at', 'name', 'ad_account_id', 'type', 'packaging_status',
+                    'review_status', 'review_status_details', 'shareable', 'forced_view_eligibility', 'headline',
+                    'brand_name', 'call_to_action', 'render_type', 'top_snap_media_id', 'top_snap_crop_position',
+                    'ad_product', 'app_install_properties', 'longform_video_properties', 'web_view_properties']
+JSON_FIELDS_CREATIVES = ['app_install_properties', 'longform_video_properties', 'web_view_properties']
+PK_CREATIVES = ['id']
+
+FIELDS_ADS = ['id', 'name', 'ad_squad_id', 'creative_id', 'status', 'type', 'render_type', 'updated_at',
+              'created_at', 'review_status']
+JSON_FIELDS_ADS = []
+PK_ADS = ['id']
+
+FIELDS_STATISTICS = ['id', 'type', 'granularity', 'swipe_up_attribution_window', 'view_attribution_window',
+                     'start_time', 'end_time']
+PK_STATISTICS = ['id', 'type', 'granularity', 'swipe_up_attribution_window', 'view_attribution_window',
+                 'start_time', 'end_time']
+
+
+class SnapchatStatisticsWriter:
+
+    def __init__(self, dataPath, tableName='statistics', metricFields=[]):
+
+        self.paramPath = dataPath
+        self.paramTable = 'statistics.csv'
+        self.paramTablePath = os.path.join(self.paramPath, 'out/tables', self.paramTable)
+        self.paramFields = FIELDS_STATISTICS + metricFields
+        self.paramPrimaryKey = PK_STATISTICS
+
+        self.createManifest()
+        self.createWriter()
+
+    def createManifest(self):
+
+        template = {
+            'incremental': True,
+            'primary_key': self.paramPrimaryKey
+        }
+
+        path = self.paramTablePath + '.manifest'
+
+        with open(path, 'w') as manifest:
+
+            json.dump(template, manifest)
+
+    def createWriter(self):
+
+        self.writer = csv.DictWriter(open(self.paramTablePath, 'w'), fieldnames=self.paramFields,
+                                     restval='', extrasaction='ignore', quotechar='\"', quoting=csv.QUOTE_ALL)
+        self.writer.writeheader()
+
+    def writerow(self, listToWrite):
+
+        for stat in listToWrite:
+
+            headerDict = {
+                'id': stat['id'],
+                'type': stat['type'],
+                'granularity': stat['granularity'],
+                'swipe_up_attribution_window': stat['swipe_up_attribution_window'],
+                'view_attribution_window': stat['view_attribution_window']
+            }
+
+            for timeseries in stat['timeseries']:
+
+                metricDict = timeseries['stats']
+                metricDict['start_time'] = timeseries['start_time']
+                metricDict['end_time'] = timeseries['end_time']
+
+                self.writer.writerow({**headerDict, **metricDict})
+
+
+class SnapchatWriter:
+
+    def __init__(self, dataPath, tableName):
+
+        self.paramPath = dataPath
+        self.paramTableName = tableName
+        self.paramTable = tableName + '.csv'
+        self.paramTablePath = os.path.join(self.paramPath, 'out/tables', self.paramTable)
+        self.paramFields = eval(f'FIELDS_{tableName.upper()}')
+        self.paramJsonFields = eval(f'JSON_FIELDS_{tableName.upper()}')
+        self.paramPrimaryKey = eval(f'PK_{tableName.upper()}')
+
+        self.createManifest()
+        self.createWriter()
+
+    def createManifest(self):
+
+        template = {
+            'incremental': True,
+            'primary_key': self.paramPrimaryKey
+        }
+
+        path = self.paramTablePath + '.manifest'
+
+        with open(path, 'w') as manifest:
+
+            json.dump(template, manifest)
+
+    def createWriter(self):
+
+        self.writer = csv.DictWriter(open(self.paramTablePath, 'w'), fieldnames=self.paramFields,
+                                     restval='', extrasaction='ignore', quotechar='\"', quoting=csv.QUOTE_ALL)
+        self.writer.writeheader()
+
+    def writerow(self, listToWrite):
+
+        for row in listToWrite:
+
+            _dictToWrite = {}
+
+            for key, value in row.items():
+
+                if key in self.paramJsonFields:
+                    _dictToWrite[key] = json.dumps(value)
+
+                else:
+                    _dictToWrite[key] = value
+
+            self.writer.writerow(_dictToWrite)
+
+
+================================================
+File: /src/main.py
+================================================
+import logging
+import os
+import sys
+import logging_gelf.handlers
+import logging_gelf.formatters
+from snapchat.component import SnapchatComponent
+
+# Environment setup
+sys.tracebacklimit = 0
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)-8s : [line:%(lineno)3s] %(message)s',
+    datefmt="%Y-%m-%d %H:%M:%S")
+
+if 'KBC_LOGGER_ADDR' in os.environ and 'KBC_LOGGER_PORT' in os.environ:
+
+    logger = logging.getLogger()
+    logging_gelf_handler = logging_gelf.handlers.GELFTCPSocketHandler(
+        host=os.getenv('KBC_LOGGER_ADDR'),
+        port=int(os.getenv('KBC_LOGGER_PORT'))
+    )
+    logging_gelf_handler.setFormatter(
+        logging_gelf.formatters.GELFFormatter(null_character=True))
+    logger.addHandler(logging_gelf_handler)
+
+    # removes the initial stdout logging
+    logger.removeHandler(logger.handlers[0])
+
+APP_VERSION = '1.0.0'
+
+if __name__ == '__main__':
+
+    logging.info("Running component version %s..." % APP_VERSION)
+
+    v = SnapchatComponent()
+    v.run()
+
+    logging.info("Extraction finished.")
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# Snapchat Marketing Extractor
+
+A Snapchat marketing extractor allows users to download data about marketing campaigns and statistics via Snapchat Marketing API. To successfully download data, following prerequisities are required to be met:
+
+- Snapchat account (create one at https://ads.snapchat.com/)
+- access to Snapchat Matketing API (apply at https://developers.snapchat.com/apply/)
+
+The extractor allows to download statistics for campaigns, adsquads and ads with all supported metrics from Snapchat with either hourly or daily granularity.
+
+## Configuration
+
+The full configuration of the Snapchat extractor can be found in the [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.ex-snapchat-marketing/src/master/component_config/sample-config/).
+
+The component needs to be authorized with valid Snapchat Marketing account via OAuth. Configuration parameters will be discussed in upcoming sections.
+
+### Objects to download (`statisticsObjects`)
+
+An array of objects, for which the statistics should be downloaded. One or multiple objects can be specified.
+Allowed values are:
+
+- campaigns,
+- adsquads,
+- ads.
+
+Based on amount of data available for each endpoint, it might take a while to download all of the data. It is therefore recommended to only download data in the lowest accuracy needed. If nothing's specified, no statistics are downloaded and only campaigns, ad squads and ads are returned - without statistics.
+
+### Start date and end date (`dateSettings.startDate` and `dateSettings.endDate`)
+
+A date range, which defines the upper and lower boundary of downloaded statistics. Any supported format by [`dateparser` library](https://pypi.org/project/dateparser/) can be used, but it's recommended to stick by `YYYY-MM-DD` or `YYYY-MM-DD HH:MI:SS` format; or in case of relative date specification, use one of the following options: `2 months ago`, `10 days ago`, `2 hours ago`, `today`, `in 3 days`.
+
+### Granularity (`attributionSettings.granularity`)
+
+Defines a granularity by which the data should be download. Either `HOUR` - hourly data, or `DAY` - daily data is supported. `HOUR` granularity supports much smaller date window and will therefore require more calls to retrieve the data, consequently taking longer time to finish.
+
+### Swipe-up and View attribution windows (`attributionSettings.windowSwipe` and `attributionSettings.windowView`)
+
+Attributes of Snapchat Marketing API which define which attribution window to use for metric values returned. Useful if [variants of metrics](https://developers.snapchat.com/api/docs/#attribution-windows) are to be used.
+
+### Metrics (`query`)
+
+A comma-separated or new-line separated list of metrics, which will be downloaded for each object. For full list of metrics and their variations, please visit [Snapchat documentation](https://developers.snapchat.com/api/docs/#core-metrics).
+
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+### Objects to download (`statisticsObjects`)
+
+An array of objects, for which the statistics should be downloaded. One or multiple objects can be specified.
+Allowed values are:
+
+- campaigns,
+- adsquads,
+- ads.
+
+Based on amount of data available for each endpoint, it might take a while to download all of the data. It is therefore recommended to only download data in the lowest accuracy needed. If nothing's specified, no statistics are downloaded and only campaigns, ad squads and ads are returned - without statistics.
+
+### Start date and end date (`dateSettings.startDate` and `dateSettings.endDate`)
+
+A date range, which defines the upper and lower boundary of downloaded statistics. Any supported format by [`dateparser` library](https://pypi.org/project/dateparser/) can be used, but it's recommended to stick by `YYYY-MM-DD` or `YYYY-MM-DD HH:MI:SS` format; or in case of relative date specification, use one of the following options: `2 months ago`, `10 days ago`, `2 hours ago`, `today`, `in 3 days`.
+
+### Granularity (`attributionSettings.granularity`)
+
+Defines a granularity by which the data should be download. Either `HOUR` - hourly data, or `DAY` - daily data is supported. `HOUR` granularity supports much smaller date window and will therefore require more calls to retrieve the data, consequently taking longer time to finish.
+
+### Swipe-up and View attribution windows (`attributionSettings.windowSwipe` and `attributionSettings.windowView`)
+
+Attributes of Snapchat Marketing API which define which attribution window to use for metric values returned. Useful if [variants of metrics](https://developers.snapchat.com/api/docs/#attribution-windows) are to be used.
+
+### Metrics (`query`)
+
+A comma-separated or new-line separated list of metrics, which will be downloaded for each object. For full list of metrics and their variations, please visit [Snapchat documentation](https://developers.snapchat.com/api/docs/#core-metrics).
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Snapchat Marketing API allows to download statistics for objects ran on Snapchat, a multimedia messaging app used globally.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+    "title": "Parameters",
+    "type": "object",
+    "required": [
+        "statisticsObjects",
+        "dateSettings",
+        "attributionSettings",
+        "query"
+    ],
+    "properties": {
+        "statisticsObjects": {
+            "title": "Objects to download",
+            "description": "A list of objects for which statistics will be downloaded. One or multiple objects can be specified.",
+            "type": "array",
+            "format": "select",
+            "uniqueItems": true,
+            "items": {
+                "enum": [
+                    "campaigns",
+                    "adsquads",
+                    "ads"
+                ],
+                "type": "string"
+            },
+            "default": [
+                "campaigns",
+                "adsquads",
+                "ads"
+            ],
+            "propertyOrder": 100
+        },
+        "dateSettings": {
+            "type": "object",
+            "title": "Date settings",
+            "description": "Setting date range for which the statistics will be downloaded.",
+            "format": "grid",
+            "required": [
+                "startDate",
+                "endDate"
+            ],
+            "properties": {
+                "startDate": {
+                    "type": "string",
+                    "title": "Start Date",
+                    "default": "30 days ago",
+                    "propertyOrder": 100,
+                    "description": "Start date, from which the extractor will download data. Can be specified absolutely in format YYYY-MM-DD or relatively like 4 hours ago, 10 days ago, 3 months ago, etc."
+                },
+                "endDate": {
+                    "type": "string",
+                    "title": "End Date",
+                    "default": "today",
+                    "propertyOrder": 200,
+                    "description": "End date, to which the extractor will download data. Can be specified absolutely in format YYYY-MM-DD or relatively like 4 hours ago, 10 days ago, 3 months ago, etc."
+                }
+            },
+            "propertyOrder": 200
+        },
+        "attributionSettings": {
+            "type": "object",
+            "title": "Result settings",
+            "description": "Snapchat API result settings.",
+            "format": "grid",
+            "required": [
+                "windowSwipe",
+                "windowView",
+                "granularity"
+            ],
+            "propertyOrder": 300,
+            "properties": {
+                "windowView": {
+                    "type": "string",
+                    "title": "View Window",
+                    "enum": [
+                        "1_HOUR",
+                        "3_HOUR",
+                        "6_HOUR",
+                        "1_DAY",
+                        "7_DAY",
+                        "28_DAY"
+                    ],
+                    "description": "A post-view attribution window within which conversions will be attributed to responsible ad.",
+                    "default": "1_DAY",
+                    "propertyOrder": 100
+                },
+                "windowSwipe": {
+                    "type": "string",
+                    "title": "Swipe Up Window",
+                    "enum": [
+                        "1_DAY",
+                        "7_DAY",
+                        "28_DAY"
+                    ],
+                    "description": "A post-swipe-up attribution window within which conversions will be attributed to responsible ad.",
+                    "default": "28_DAY",
+                    "propertyOrder": 200
+                },
+                "granularity": {
+                    "type": "string",
+                    "enum": [
+                        "HOUR",
+                        "DAY"
+                    ],
+                    "default": "DAY",
+                    "title": "Granularity",
+                    "description": "Select if the statistics should be downloaded on daily or hourly basis.",
+                    "uniqueItems": true,
+                    "propertyOrder": 300
+                }
+            }
+        },
+        "query": {
+            "type": "string",
+            "title": "Metrics",
+            "format": "textarea",
+            "default": "impressions, spend",
+            "options": {
+                "input_height": "100px"
+            },
+            "description": "A comma separated list of metrics to be downloaded. See <a href='https://developers.snapchat.com/api/docs/#measurement' target='_blank'>documentation</a> for a complete list of available metrics.",
+            "uniqueItems": true,
+            "propertyOrder": 150
+        }
+    }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/out/tables/creatives.csv
+================================================
+"id","updated_at","created_at","name","ad_account_id","type","packaging_status","review_status","review_status_details","shareable","forced_view_eligibility","headline","brand_name","call_to_action","render_type","top_snap_media_id","top_snap_crop_position","ad_product","app_install_properties","longform_video_properties","web_view_properties"
+"10ccca1c-3681-4976-9ff6-c6ac415c6c23","2019-11-21T14:14:07.701Z","2019-11-20T15:33:57.502Z","test-24","11998ab7-5aa2-4bba-875a-70511a352a7d","APP_INSTALL","SUCCESS","PENDING_REVIEW","","True","NONE","Wed en kijk de Pro League live!","testBrand","INSTALL_NOW","STATIC","970c5a0a-719d-4d64-80de-2925e1e4b929","MIDDLE","SNAP_AD","{""app_name"": ""Testing App"", ""ios_app_id"": ""1234566764"", ""icon_media_id"": ""9ee9030f-f9b7-44b6-8727-99c8ed5e6019""}","",""
+
+
+================================================
+File: /component_config/sample-config/out/tables/adsquads.csv.manifest
+================================================
+{"incremental": true, "primary_key": ["id"]}
+
+================================================
+File: /component_config/sample-config/out/tables/ads.csv.manifest
+================================================
+{"incremental": true, "primary_key": ["id"]}
+
+================================================
+File: /component_config/sample-config/out/tables/organizations.csv.manifest
+================================================
+{"incremental": true, "primary_key": ["id"]}
+
+================================================
+File: /component_config/sample-config/out/tables/statistics.csv.manifest
+================================================
+{"incremental": true, "primary_key": ["id", "type", "granularity", "swipe_up_attribution_window", "view_attribution_window", "start_time", "end_time"]}
+
+================================================
+File: /component_config/sample-config/out/tables/ads.csv
+================================================
+"id","name","ad_squad_id","creative_id","status","type","render_type","updated_at","created_at","review_status"
+"130701c6-b252-4232-8da4-c0a97953a5ac","ad-24","8f11f2c0-f71e-4bd1-9cc5-dea7af1c6093","93622368-e30c-44ee-8974-5a5c9fb7deba","ACTIVE","APP_INSTALL","STATIC","2019-11-25T20:13:48.395Z","2019-11-25T08:34:24.052Z","APPROVED"
+
+
+================================================
+File: /component_config/sample-config/out/tables/campaigns.csv
+================================================
+"id","name","ad_account_id","status","objective","updated_at","created_at","start_time","end_time","lifetime_spend_cap_micro","daily_budget_micro","buy_model","regulations","measurement_spec"
+"bb38952c-8b18-4915-b0a2-aea8c24df0af","TEST_CAMPAIGN","11998ab7-5aa2-4bba-875a-70511a352a7d","PAUSED","APP_INSTALL","2019-11-25T18:43:54.838Z","2019-11-25T08:34:17.650Z","2019-11-22T09:15:31.000Z","2019-12-01T22:59:59.000Z","5000000000","","AUCTION","","{""ios_app_id"": ""463335337""}"
+
+
+================================================
+File: /component_config/sample-config/out/tables/organizations.csv
+================================================
+"id","updated_at","created_at","name","country","postal_code","locality","contact_name","contact_email","tax_id","address_line_1","administrative_district_level_1","accepted_term_version","configuration_settings","type","state","roles","my_display_name","my_invited_email","my_member_id"
+"96c9d770-faf7-4aeb-a545-79864497a30c","2019-10-14T11:04:28.013Z","2018-08-31T09:22:08.141Z","Testst","GB","E14 7UF","London ","Testy McTestFace","testy@mctestface.com","","","GB-MRT","8","{""notifications_enabled"": true}","ENTERPRISE","ACTIVE","[""admin""]","Testy","me@keboola.com","f8414fbf-b610-4fa1-8c18-8222e65ffde7"
+
+
+================================================
+File: /component_config/sample-config/out/tables/creatives.csv.manifest
+================================================
+{"incremental": true, "primary_key": ["id"]}
+
+================================================
+File: /component_config/sample-config/out/tables/campaigns.csv.manifest
+================================================
+{"incremental": true, "primary_key": ["id"]}
+
+================================================
+File: /component_config/sample-config/out/tables/adsquads.csv
+================================================
+"id","name","campaign_id","status","updated_at","created_at","type","targeting","targeting_reach_status","placement","billing_event","bid_micro","auto_bid","target_bid","lifetime_budget_micro","start_time","end_time","optimization_goal","delivery_constraint","pacing_type"
+"3b5b9067-22a7-461e-8806-97bda5f943e1","adsquad_123","bb38952c-8b18-4915-b0a2-aea8c24df0af","ACTIVE","2019-11-25T20:14:12.898Z","2019-11-25T08:34:20.620Z","SNAP_ADS","{""regulated_content"": true, ""demographics"": [{""min_age"": ""25"", ""gender"": ""MALE"", ""languages"": [""fr""]}], ""interests"": [{""category_id"": [""SLC_100"", ""SLC_34"", ""SLC_67"", ""SLC_84""]}], ""geos"": [{""country_code"": ""be"", ""operation"": ""INCLUDE""}], ""devices"": [{""os_type"": ""iOS"", ""os_version_min"": ""11.0""}], ""enable_targeting_expansion"": true}","","UNSUPPORTED","IMPRESSION","20000000","False","True","1250000000","2019-11-22T09:15:31.000Z","2019-12-01T22:59:59.000Z","APP_INSTALLS","LIFETIME_BUDGET","STANDARD"
+
+
+================================================
+File: /component_config/sample-config/out/tables/adaccounts.csv
+================================================
+"id","updated_at","created_at","name","type","status","organization_id","funding_source_ids","currency","timezone","advertiser_organization_id","billing_center_id","billing_type","agency_representing_client","client_paying_invoices","regulations"
+"11998ab7-5tr3-32fs-12gs-70501a323f7d","2019-11-18T11:11:04.718Z","2019-11-18T11:10:25.008Z","SNAP_ACCOUNT_1","PARTNER","ACTIVE","daf00-231-r123-421f-23dsa-132r0fo0asf","[""321ras-312rfas-4b50-312ds-32134213rffd""]","GBP","Europe/Brussels","fasdsd-312ds-dsad-312sda-1231rfsa","dfasfasd-fasfas-123r-213r-321r","REVOLVING","False","False","{""restricted_delivery_signals"": false}"
+
+================================================
+File: /component_config/sample-config/out/tables/statistics.csv
+================================================
+"id","type","granularity","swipe_up_attribution_window","view_attribution_window","start_time","end_time","spend","impressions"
+"bb38952c-8b18-4915-b0a2-aea8c24df0af","CAMPAIGN","HOUR","28_DAY","1_DAY","2019-11-07T00:00:00.000+01:00","2019-11-07T01:00:00.000+01:00","0","0"
+
+
+================================================
+File: /component_config/sample-config/out/tables/adaccounts.csv.manifest
+================================================
+{"incremental": true, "primary_key": ["id"]}
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.4.zip#egg=kbc
+logging_gelf==0.0.18
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.0-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+CMD ["python", "-u", "/code/src/main.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Snapchat Marketing Extractor
+
+A Snapchat marketing extractor allows users to download data about marketing campaigns and statistics via Snapchat Marketing API. To successfully download data, following prerequisities are required to be met:
+
+- Snapchat account (create one at https://ads.snapchat.com/)
+- access to Snapchat Matketing API (apply at https://developers.snapchat.com/apply/)
+
+The extractor allows to download statistics for campaigns, adsquads and ads with all supported metrics from Snapchat with either hourly or daily granularity.
+
+## Configuration
+
+The full configuration of the Snapchat extractor can be found in the [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.ex-snapchat-marketing/src/master/component_config/sample-config/).
+
+The component needs to be authorized with valid Snapchat Marketing account via OAuth. Configuration parameters will be discussed in upcoming sections.
+
+### Objects to download (`statisticsObjects`)
+
+An array of objects, for which the statistics should be downloaded. One or multiple objects can be specified.
+Allowed values are:
+
+- campaigns,
+- adsquads,
+- ads.
+
+Based on amount of data available for each endpoint, it might take a while to download all of the data. It is therefore recommended to only download data in the lowest accuracy needed. If nothing's specified, no statistics are downloaded and only campaigns, ad squads and ads are returned - without statistics.
+
+### Start date and end date (`dateSettings.startDate` and `dateSettings.endDate`)
+
+A date range, which defines the upper and lower boundary of downloaded statistics. Any supported format by [`dateparser` library](https://pypi.org/project/dateparser/) can be used, but it's recommended to stick by `YYYY-MM-DD` or `YYYY-MM-DD HH:MI:SS` format; or in case of relative date specification, use one of the following options: `2 months ago`, `10 days ago`, `2 hours ago`, `today`, `in 3 days`.
+
+### Granularity (`attributionSettings.granularity`)
+
+Defines a granularity by which the data should be download. Either `HOUR` - hourly data, or `DAY` - daily data is supported. `HOUR` granularity supports much smaller date window and will therefore require more calls to retrieve the data, consequently taking longer time to finish.
+
+### Swipe-up and View attribution windows (`attributionSettings.windowSwipe` and `attributionSettings.windowView`)
+
+Attributes of Snapchat Marketing API which define which attribution window to use for metric values returned. Useful if [variants of metrics](https://developers.snapchat.com/api/docs/#attribution-windows) are to be used.
+
+### Metrics (`query`)
+
+A comma-separated or new-line separated list of metrics, which will be downloaded for each object. For full list of metrics and their variations, please visit [Snapchat documentation](https://developers.snapchat.com/api/docs/#core-metrics).
+
+## Output
+
+The output of the extractor is a list of campaigns, ad squads, ads and creatives plus a table containing all statistics defined in `query` section.
+
+## Development
+
+For local testing and development, use following commands to build and run docker image:
+
+```
+docker-compose build dev
+docker-compose run --rm dev
+```
+

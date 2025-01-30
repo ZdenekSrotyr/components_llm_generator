@@ -1,0 +1,2272 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-salesforce-commerce-cloud/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── src/
+    │   ├── component.py
+    │   ├── json_parser/
+    │   │   ├── table_key.py
+    │   │   ├── endpoint_definition.py
+    │   │   ├── json_parser.py
+    │   │   └── __init__.py
+    │   ├── client/
+    │   │   ├── endpoint_def.py
+    │   │   ├── __init__.py
+    │   │   └── client.py
+    │   └── helpers/
+    │       ├── date_tools.py
+    │       └── __init__.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── logger
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── loggerConfiguration.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── TEMPLATE_README.md
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    example
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/component.py
+================================================
+import logging
+import tempfile
+import time
+import warnings
+from collections import OrderedDict
+
+from keboola.component.base import ComponentBase
+from keboola.component.exceptions import UserException
+from keboola.csvwriter import ElasticDictWriter
+
+from client import SalesforceClient, ENDPOINT_DEF, SalesforceClientException
+from helpers import get_date_intervals, DateParseException
+from json_parser import JSONParser, EndpointDefinition
+
+warnings.filterwarnings(
+    "ignore",
+    message="The localize method is no longer necessary, as this time zone supports the fold attribute",
+)
+
+ENDPOINT_DEFINITION_PATH = "endpoint_definitions/endpoint_def.py"
+
+KEY_CLIENT_ID = 'client_id'
+KEY_CLIENT_SECRET = '#client_secret'
+KEY_ORGANIZATION_ID = "organization_id"
+KEY_TENANT_ID = "tenant_id"
+KEY_SITE_ID = "site_id"
+KEY_ENDPOINT = "endpoint"
+KEY_BACKFILL_MODE = "backfill_mode"
+KEY_SHORT_CODE = "short_code"
+
+KEY_ENCODED_AUTH_STR = "#encoded_auth_string"
+
+KEY_DATE_FROM = 'date_from'
+KEY_DATE_TO = 'date_to'
+KEY_USE_CREATED_DATE = 'use_created_date'
+
+KEY_STATE_ENDPOINT_COLUMNS = "endpoint_columns"
+KEY_STATE_FETCHED_INTERVALS = "fetched_intervals"
+KEY_STATE_ENDPOINT = "endpoint"
+
+REQUIRED_PARAMETERS = [KEY_CLIENT_ID, KEY_CLIENT_SECRET, KEY_ORGANIZATION_ID, KEY_TENANT_ID, KEY_SHORT_CODE]
+REQUIRED_IMAGE_PARS = []
+
+ENDPOINTS = ["promotions", "orders", "source_code_groups", "catalogs"]
+ENDPOINTS_WITH_DATE_PARAMS = ["orders"]
+ENDPOINTS_WITH_SITE_ID = ["promotions", "orders", "source_code_groups"]
+DATE_INTERVAL = 5
+COMPONENT_RUNTIME = 3600
+
+# TODO: In general do typehints and docstrings straight away. It also helps to think about the design.
+#  At least public methods. Most of the time I have no idea what happens here.
+
+
+class Component(ComponentBase):
+    def __init__(self):
+        self.tables = {}
+        self.new_state = {}
+        self._writer_cache = dict()
+        self.client = None
+        self.fetched_intervals = []
+        super().__init__()
+
+    def run(self):
+        self.validate_configuration_parameters(REQUIRED_PARAMETERS)
+        self.validate_image_parameters(REQUIRED_IMAGE_PARS)
+        params = self.configuration.parameters
+        state = self.get_state_file()
+
+        client_id = params.get(KEY_CLIENT_ID)
+        client_secret = params.get(KEY_CLIENT_SECRET)
+        organization_id = params.get(KEY_ORGANIZATION_ID)
+        short_code = params.get(KEY_SHORT_CODE)
+        site_id = params.get(KEY_SITE_ID)
+        endpoint = params.get(KEY_ENDPOINT)
+        backfill_mode = params.get(KEY_BACKFILL_MODE, False)
+        use_created_date = params.get(KEY_USE_CREATED_DATE, False)
+
+        encoded_auth_string = params.get(KEY_ENCODED_AUTH_STR)
+
+        self.validate_config(endpoint, state)
+
+        date_intervals = self.get_date_intervals(backfill_mode, state) if endpoint in ENDPOINTS_WITH_DATE_PARAMS else []
+
+        try:
+            self.client = SalesforceClient(client_id, client_secret, organization_id, short_code,
+                                           encoded_auth_string)
+        except SalesforceClientException as sfcc_exc:
+            raise UserException(sfcc_exc) from sfcc_exc
+
+        endpoint_columns = state.get(KEY_STATE_ENDPOINT_COLUMNS) if state.get(KEY_STATE_ENDPOINT_COLUMNS) else {}
+
+        self.fetch_and_save_endpoint_data(endpoint, site_id, endpoint_columns, date_intervals, use_created_date)
+
+        new_state = self.update_state(endpoint, backfill_mode)
+        self.write_state_file(new_state)
+
+        self._close_writers()
+        self.write_table_manifests()
+
+    def write_table_manifests(self):
+        for table in self.tables:
+            self.write_manifest(self.tables[table])
+
+    def get_date_intervals(self, backfill_mode, state):
+        params = self.configuration.parameters
+        fetched_intervals = state.get("fetched_intervals")
+
+        if backfill_mode:
+            logging.info(f"Fetching with backfill mode. Already fetched data for intervals {fetched_intervals}")
+        try:
+            intervals_to_fetch, fetched_intervals = get_date_intervals(fetched_intervals,
+                                                                       params.get(KEY_DATE_FROM),
+                                                                       params.get(KEY_DATE_TO),
+                                                                       DATE_INTERVAL,
+                                                                       backfill_mode)
+            self.fetched_intervals = fetched_intervals
+            return intervals_to_fetch
+        except DateParseException as date_err:
+            raise UserException(date_err) from date_err
+
+    @staticmethod
+    def validate_config(endpoint, state):
+        if endpoint not in ENDPOINTS:
+            raise UserException(f"Selected endpoint '{endpoint}' is not in : {ENDPOINTS}")
+        if state.get(KEY_STATE_ENDPOINT):
+            if state.get(KEY_STATE_ENDPOINT) != endpoint:
+                raise UserException("When running the configuration with a new endpoint, you must reset the state "
+                                    f"of the component. {endpoint} dos not match "
+                                    f"the last run endpoint : {state.get(KEY_STATE_ENDPOINT)}")
+
+    def fetch_and_save_endpoint_data(self, endpoint_name, site_id, endpoint_columns, date_intervals, use_created_date):
+        fieldnames = endpoint_columns if endpoint_columns else {}
+        endpoint_definition = EndpointDefinition(ENDPOINT_DEF, endpoint_name)
+        self.create_tables_from_endpoint_definition(endpoint_definition, endpoint_columns)
+
+        endpoint_getter = self._get_endpoint_getter(self.client, endpoint_name)
+
+        logging.info(f"Fetching data for endpoint : {endpoint_name}")
+
+        json_parser = JSONParser(endpoint_definition)
+        if endpoint_name in ENDPOINTS_WITH_DATE_PARAMS:
+            self.fetch_and_process_endpoint_with_date(endpoint_name, endpoint_getter, site_id, json_parser, fieldnames,
+                                                      date_intervals, use_created_date)
+        elif endpoint_name in ENDPOINTS_WITH_SITE_ID:
+            self.fetch_and_process_endpoint_with_site_id(endpoint_getter, site_id, json_parser, fieldnames)
+        else:
+            self.fetch_and_process_endpoint(endpoint_getter, json_parser, fieldnames)
+
+    def fetch_and_process_endpoint(self, endpoint_getter, json_parser, fieldnames):
+        start_time = time.time()
+        for data in endpoint_getter():
+            if (time.time() - start_time) > 900:
+                self.client.login()
+                logging.info("Re-authenticating the client")
+                start_time = time.time()
+            if data and json_parser.endpoint_definition.root_node in data:
+                parsed_data = json_parser.parse_data(data)
+                self.save_parsed_data(parsed_data, fieldnames)
+
+    def fetch_and_process_endpoint_with_site_id(self, endpoint_getter, site_id, json_parser, fieldnames):
+        start_time = time.time()
+        for data in endpoint_getter(site_id):
+            if (time.time() - start_time) > 900:
+                self.client.login()
+                logging.info("Re-authenticating the client")
+                start_time = time.time()
+            if data:
+                parsed_data = json_parser.parse_data(data)
+                self.save_parsed_data(parsed_data, fieldnames)
+
+    def fetch_and_process_endpoint_with_date(self, endpoint_name, endpoint_getter, site_id, json_parser, fieldnames,
+                                             date_intervals, use_created_date):
+        token_start_time = time.time()
+        extraction_start_time = time.time()
+
+        for interval in date_intervals:
+            logging.info(
+                f"Fetching {endpoint_name} data for interval {interval['start_date']} to {interval['end_date']}")
+            for data in endpoint_getter(site_id, interval["start_date"], interval["end_date"], use_created_date):
+                # TODO: this should be handled by the client. Not here, it leads to duplicated code.
+                # It can be a wrapper function/annotation on each client method.
+                if (time.time() - token_start_time) > 900:
+                    self.client.login()
+                    logging.info("Re-authenticating the client")
+                    token_start_time = time.time()
+                if data:
+                    parsed_data = json_parser.parse_data(data)
+                    self.save_parsed_data(parsed_data, fieldnames)
+            self.fetched_intervals.append(interval)
+
+            # Stop fetching and save results after 75% of run time has passed
+            if (time.time() - extraction_start_time) > COMPONENT_RUNTIME * 0.75:
+                logging.warning("Maximum run time of the component has almost passed, "
+                                "must save results and end fetching. If backfill mode is enabled, "
+                                "then rerun the component and fetching will continue. If backfill mode is not enabled,"
+                                " you should enable it to fetch the data in the specified date range")
+                break
+
+    def update_table_definitions(self):
+        for wr in self._writer_cache.values():
+            table_name = wr.table_name
+            columns = wr.fieldnames
+            self.update_table_columns(table_name, columns)
+
+    def update_table_columns(self, table_name, columns):
+        for table in self.tables:
+            if table_name == table:
+                self.tables[table].columns = columns
+
+    @staticmethod
+    def _get_endpoint_getter(client, endpoint_name):
+        func_name = f"get_{endpoint_name}"
+        try:
+            return getattr(client, func_name)
+        except AttributeError as attr_err:
+            raise UserException(f"Function to fetch endpoint data of '{endpoint_name}' : '{func_name}' "
+                                f"is not implemented") from attr_err
+
+    def create_tables_from_endpoint_definition(self, endpoint_definition, endpoint_columns):
+        for table in endpoint_definition.all_tables:
+            table_name = endpoint_definition.all_tables[table]
+            primary_keys = endpoint_definition.get_table_primary_key_names(table)
+            table_columns = primary_keys.copy()
+            object_name = table_name.replace(".csv", "")
+            columns_from_state = endpoint_columns.get(object_name) if endpoint_columns.get(object_name) else []
+            table_columns.extend(columns_from_state)
+            table_columns = self.get_no_duplicate_list(table_columns)
+            self.tables[table_name] = self.create_out_table_definition(table_name, primary_key=primary_keys,
+                                                                       incremental=True, columns=table_columns)
+            self._get_writer_from_cache(self.tables[table_name], self.tables[table_name].columns)
+
+    @staticmethod
+    def get_no_duplicate_list(list_):
+        # list(set()) rearranges the list
+        return list(OrderedDict.fromkeys(list_))
+
+    def save_parsed_data(self, parsed_data, fieldnames):
+        for data_name in parsed_data:
+            table_fieldnames = fieldnames.get(data_name) if fieldnames.get(data_name) else []
+            table_fieldnames.extend(self.tables[data_name].columns)
+            table_fieldnames = self.get_no_duplicate_list(table_fieldnames)
+            writer = self._get_writer_from_cache(self.tables[data_name], table_fieldnames)
+            writer.writerows(parsed_data[data_name])
+
+    def _get_writer_from_cache(self, out_table, fieldnames):
+        if not self._writer_cache.get(out_table.name):
+            # init writer if not in cache
+            self._writer_cache[out_table.name] = ElasticDictWriter(out_table.full_path,
+                                                                   fieldnames,
+                                                                   temp_directory=tempfile.mkdtemp())
+
+        return self._writer_cache[out_table.name]
+
+    def _close_writers(self):
+        for wr in self._writer_cache.values():
+            wr.close()
+
+    def update_state(self, endpoint, backfill_mode):
+        new_state_column = {}
+        for table in self.tables:
+            table_name = self.tables[table].name.replace(".csv", "")
+            new_state_column[table_name] = self.tables[table].columns
+        new_state = {KEY_STATE_ENDPOINT_COLUMNS: new_state_column,
+                     KEY_STATE_ENDPOINT: endpoint,
+                     KEY_STATE_FETCHED_INTERVALS: []}
+        if backfill_mode:
+            new_state[KEY_STATE_FETCHED_INTERVALS] = self.fetched_intervals
+        return new_state
+
+
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /src/json_parser/table_key.py
+================================================
+class Key:
+    def __init__(self, object_name, name, value):
+        self.object_name = object_name
+        self.name = name
+        self.value = value
+
+
+================================================
+File: /src/json_parser/endpoint_definition.py
+================================================
+from typing import Dict
+
+
+class EndpointDefinitionError(Exception):
+    pass
+
+
+class EndpointDefinition:
+    def __init__(self, endpoint_definitions=None, endpoint_name=""):
+        endpoint_definitions = endpoint_definitions
+        endpoint_definition = endpoint_definitions.get(endpoint_name)
+        if not endpoint_definition:
+            valid_endpoint_definitions = list(endpoint_definitions.keys())
+            raise EndpointDefinitionError(
+                f"Endpoint '{endpoint_name}' not found, only found definitions for {valid_endpoint_definitions}")
+        self.parent_table = endpoint_definition.get("parent_table")
+        self.child_table_definitions = endpoint_definition.get("child_table_definitions")
+        self.table_primary_keys = endpoint_definition.get("table_primary_keys")
+        self.root_node = endpoint_definition.get("root_node")
+        # TODO: this could be a property as it's derived from other
+        self.all_tables = self._get_all_table_definitions()
+
+    def _get_all_table_definitions(self) -> Dict:
+        all_tables = self.parent_table
+        if self.child_table_definitions:
+            all_tables = {**self.parent_table, **self.child_table_definitions}
+        return all_tables
+
+    @property
+    def parent_table_name(self):
+        return list(self.parent_table.keys())[0]
+
+    @property
+    def all_table_names(self):
+        return list(self.all_tables.keys())
+
+    @property
+    def child_table_names(self):
+        return list(self.child_table_definitions.keys())
+
+    def is_child_table(self, table_name) -> bool:
+        if table_name in self.child_table_names:
+            return True
+        return False
+
+    def get_table_primary_key_objects(self, table_name):
+        table_dict = self.table_primary_keys.get(table_name)
+        if not table_dict:
+            raise EndpointDefinitionError(f"Table {table_name} has no defined primary keys")
+        return list(table_dict.keys())
+
+    def get_table_primary_key_names(self, table_name):
+        table_primary_key_names = []
+        for primary_key_object in self.table_primary_keys[table_name]:
+            table_primary_key_names.append(self.get_table_primary_key_name(table_name, primary_key_object))
+        return table_primary_key_names
+
+    def get_table_primary_key_name(self, table_name, object_name):
+        return self.table_primary_keys.get(table_name).get(object_name)
+
+
+================================================
+File: /src/json_parser/json_parser.py
+================================================
+import logging
+from typing import List, Dict
+from typing import Optional
+
+from .table_key import Key
+from .endpoint_definition import EndpointDefinition
+
+
+class JSONParserError(Exception):
+    pass
+
+
+class JSONParser:
+    def __init__(self, endpoint_definition: EndpointDefinition) -> None:
+
+        """
+        Class for parsing JSON data. An input JSON is transformed into 1 or multiple lists of dictionaries of depth 1.
+
+        Args:
+            parent_table:
+                Dict : Parent table definition e.g. {"parent_element": "parent_table_name.csv"}
+            child_table_definitions:
+                Optional[dict]: Child table definitions containing the key value pairs of child tables.
+                Keys being the object name (with all parent objects separated by periods),
+                and the value being the name of the output table. e.g. {"order.order-items": "order_items.csv"}
+            table_primary_keys:
+                Optional[dict]: definition of all primary keys of all tables. Key value pairs where
+                Keys being the object name (with all parent objects separated by periods) and values being
+                key value pairs of objects that should be primary keys of the table and values being the resulting
+                names of the columns in the CSV
+                e.g. {"order.order-item" : {"order.id" : "order_id", "order.order-items.item_id" : "item_id"}}
+            root_node:
+                Optional[str] : name of any root nodes of the data e.g. if data is:
+                {"root_el": {"orders": {"order": [{}]}}}, then root_node should be root_el.orders.order
+        Raises:
+            JSONParserError - on parsing errors.
+        """
+        self.endpoint_definition = endpoint_definition
+
+    def parse_data(self, data: Dict) -> Dict:
+        """
+
+        Args:
+            data (Dict): A dictionary containing the data to be parsed. If the root node is root_el.orders.order,
+            then the data should be {"root_el": {"orders": {"order": [{**ORDER_DATA**},{**ORDER_DATA**}]}}}
+
+        Returns:
+            parsed_data (Dict) : dictionary of parsed data with key value pairs, where keys are names of csv files, and
+            values are lists of flat dictionaries.
+
+        """
+        data_to_parse = self._get_data_to_parse(data, self.endpoint_definition.root_node)
+        parsed_data = {}
+        for row in data_to_parse:
+            parsed_row = self._parse_row_to_tables(row)
+            for table_name in parsed_row:
+                if table_name not in parsed_data:
+                    parsed_data[table_name] = []
+                parsed_data[table_name].extend(parsed_row[table_name])
+        return parsed_data
+
+    def _initialize_tables(self) -> Dict[str, List]:
+        table_data = {}
+        for table in self.endpoint_definition.parent_table:
+            table_data[self.endpoint_definition.parent_table[table]] = []
+        for table in self.endpoint_definition.child_table_definitions:
+            table_data[self.endpoint_definition.child_table_definitions[table]] = []
+        return table_data
+
+    def _parse_row_to_tables(self, data_object: Dict) -> Dict:
+        table_data = self._initialize_tables()
+        warnings = {}
+
+        def _parse_list_of_dicts(data: List[Dict], primary_keys: List[Key], object_name: str) -> None:
+            for index, datum in enumerate(data):
+                _parse_nested_dict(datum, object_name, foreign_keys=primary_keys, table_index=index)
+
+        def _parse_nested_dict(data: Dict,
+                               parent_object: str = "",
+                               table_index: int = 0,
+                               foreign_keys: Optional[List[Key]] = None,
+                               parent_prefix: str = "") -> None:
+
+            if not foreign_keys:
+                foreign_keys = []
+
+            for index, column in enumerate(data):
+                _parse_column(data, parent_object, table_index, foreign_keys, parent_prefix, column)
+
+        def _parse_column(data: Dict,
+                          parent_object: str,
+                          table_index: int,
+                          foreign_keys: Optional[List[Key]],
+                          parent_prefix: str,
+                          column: str) -> None:
+            if self._is_object_child_table(parent_object, column):
+                _process_child_table(data, parent_object, foreign_keys, column)
+            elif self._is_object_dict(data[column]):
+                new_parent_prefix = self.get_joined_name(parent_prefix, column)
+                primary_keys = self._get_primary_keys(data, parent_object, parent_object)
+                _parse_nested_dict(data[column],
+                                   parent_object,
+                                   table_index,
+                                   foreign_keys=primary_keys,
+                                   parent_prefix=new_parent_prefix)
+            elif self._is_list_of_dicts(data[column]):
+                warnings[column] = f'Warning : Possible table "{column}" will be ignored as it is not specified ' \
+                                   f"in the configuration of the parser. Table parent object : '{parent_object}'" \
+                                   f"Sample data : {data[column]}"
+            else:
+                _parse_object(parent_object, parent_prefix, column, data, table_index, foreign_keys)
+
+        def _process_child_table(data: Dict,
+                                 parent_object: str,
+                                 foreign_keys: Optional[List[Key]],
+                                 column: str) -> None:
+            object_name = self.get_joined_name(parent_object, column, ".")
+            if not isinstance(data[column], List):
+                data[column] = [data[column]]
+            for foreign_key in foreign_keys:
+                foreign_key.name = self.endpoint_definition.get_table_primary_key_name(object_name,
+                                                                                       foreign_key.object_name)
+            primary_keys = self._get_primary_keys(data, parent_object, object_name)
+            primary_keys.extend(foreign_keys)
+            _parse_list_of_dicts(data[column], primary_keys, object_name)
+
+        def _parse_object(parent_object: str,
+                          parent_prefix: str,
+                          column: str,
+                          data: Dict,
+                          table_index: int,
+                          foreign_keys: List[Key]) -> None:
+
+            table_name = self.endpoint_definition.all_tables[parent_object]
+
+            if len(table_data[table_name]) <= table_index:
+                table_data[table_name].append({})
+
+            _add_foreign_keys_to_table(table_name, foreign_keys)
+            column_name = self.get_joined_name(parent_prefix, column, "_")
+            table_data[table_name][table_index][column_name] = data[column]
+
+        def _add_foreign_keys_to_table(table_name: str, foreign_keys: List[Key]):
+            table_size = len(table_data[table_name])
+            for foreign_key in foreign_keys:
+                table_data[table_name][table_size - 1][foreign_key.name] = foreign_key.value
+
+        parent_table = self.endpoint_definition.parent_table_name
+        _parse_nested_dict(data_object, parent_table)
+        self._log_warnings(warnings)
+        return table_data
+
+    @staticmethod
+    def _log_warnings(warnings: Dict):
+        for warning in warnings:
+            logging.warning(warnings[warning])
+
+    def _is_object_child_table(self, parent_object: str, object_name: str) -> bool:
+        object_name = self.get_joined_name(parent_object, object_name, ".")
+        return self.endpoint_definition.is_child_table(object_name)
+
+    @staticmethod
+    def _is_object_dict(object_):
+        return isinstance(object_, Dict)
+
+    @staticmethod
+    def _is_list_of_dicts(object_) -> bool:
+        if not isinstance(object_, List):
+            return False
+        _is_list_of_dicts = all(isinstance(i, dict) for i in object_)
+        return _is_list_of_dicts
+
+    @staticmethod
+    def _get_data_to_parse(data: Dict, root_node: str) -> List[Dict]:
+        root_nodes = root_node.split(".")
+        if len(root_nodes) == 1 and not root_nodes[0]:
+            raise JSONParserError("Invalid root node, could not parse JSON file")
+        try:
+            for root_node in root_nodes:
+                data = data.get(root_node)
+        except AttributeError as attr_err:
+            raise JSONParserError("Invalid root node, could not parse JSON file") from attr_err
+
+        if not data:
+            raise JSONParserError("Invalid root node or empty JSON. Could not find data based on root node")
+
+        if not isinstance(data, List):
+            raise JSONParserError(
+                "Invalid root node. Data extracted from JSON using the root node should be a list of dictionaries.")
+        return data
+
+    @staticmethod
+    def get_joined_name(parent: str, child: str, delimiter="_") -> str:
+        joined_name = child
+        if parent:
+            joined_name = delimiter.join([parent, child])
+        return joined_name
+
+    def _get_primary_keys(self, data: Dict, parent_object: str, table_object) -> List[Key]:
+        primary_keys = []
+        primary_key_objects = self.endpoint_definition.get_table_primary_key_objects(parent_object)
+        key_prefix = "".join([parent_object, "."])
+        for object_name in primary_key_objects:
+            child_object = object_name.replace(key_prefix, "")
+            if child_object in data:
+                value = data[child_object]
+                name = self.endpoint_definition.get_table_primary_key_name(table_object, object_name)
+                new_key = Key(object_name, name, value)
+                primary_keys.append(new_key)
+        return primary_keys
+
+
+================================================
+File: /src/json_parser/__init__.py
+================================================
+from .endpoint_definition import EndpointDefinition  # noqa
+from .json_parser import JSONParser  # noqa
+
+
+================================================
+File: /src/client/endpoint_def.py
+================================================
+ENDPOINT_DEF = {
+    "orders": {
+        "parent_table": {
+            "orders": "orders.csv"
+        },
+        "child_table_definitions": {
+            "orders.notes": "order_notes.csv",
+            "orders.paymentInstruments": "order_payment_instruments.csv",
+            "orders.productItems": "order_product_items.csv",
+            "orders.shipments": "order_shipments.csv",
+            "orders.shippingItems": "order_shipping_items.csv",
+            "orders.shippingItems.priceAdjustments": "order_shipping_items_price_adjustments.csv",
+            "orders.productItems.priceAdjustments": "order_payment_items_price_adjustments.csv",
+            "orders.orderPriceAdjustments": "order_price_adjustments.csv",
+            "orders.couponItems": "order_coupon_items.csv"
+        },
+        "table_primary_keys": {
+            "orders": {
+                "orders.orderNo": "orderNo"
+            },
+            "orders.notes": {
+                "orders.orderNo": "orderNo",
+                "orders.notes.subject": "note_subject",
+                "orders.notes.creationDate": "note_creationDate"
+            },
+            "orders.paymentInstruments": {
+                "orders.orderNo": "orderNo",
+                "orders.paymentInstruments.paymentInstrumentId": "paymentInstrumentId"
+            },
+            "orders.productItems": {
+                "orders.orderNo": "orderNo",
+                "orders.productItems.itemId": "itemId",
+                "orders.productItems.productId": "productId"
+            },
+            "orders.shipments": {
+                "orders.orderNo": "orderNo",
+                "orders.shipments.shipmentId": "shipmentId"
+            },
+            "orders.shippingItems": {
+                "orders.orderNo": "orderNo",
+                "orders.shippingItems.shipmentId": "shipmentId"
+            },
+            "orders.shippingItems.priceAdjustments": {
+                "orders.orderNo": "orderNo",
+                "orders.shippingItems.shipmentId": "shipmentId",
+                "orders.shippingItems.priceAdjustments.priceAdjustmentId": "priceAdjustmentId",
+                "orders.shippingItems.priceAdjustments.promotionId": "promotionId"
+            },
+            "orders.productItems.priceAdjustments": {
+                "orders.orderNo": "orderNo",
+                "orders.productItems.itemId": "itemId",
+                "orders.productItems.productId": "productId",
+                "orders.productItems.priceAdjustments.campaignId": "campaignId",
+                "orders.productItems.priceAdjustments.priceAdjustmentId": "priceAdjustmentId",
+                "orders.productItems.priceAdjustments.promotionId": "promotionId"
+            },
+            "orders.orderPriceAdjustments": {
+                "orders.orderNo": "orderNo",
+                "orders.orderPriceAdjustments.campaignId": "campaignId",
+                "orders.orderPriceAdjustments.priceAdjustmentId": "priceAdjustmentId",
+                "orders.orderPriceAdjustments.promotionId": "promotionId"
+            },
+            "orders.couponItems": {
+                "orders.orderNo": "orderNo",
+                "orders.couponItems.couponItemId": "couponItemId"
+            }
+        },
+        "root_node": "data"
+    },
+    "promotions": {
+        "parent_table": {
+            "promotions": "promotions.csv"
+        },
+        "child_table_definitions": {
+            "promotions.activeCampaignAssignments": "promotions_active_campaign_assignments.csv",
+            "promotions.tags": "promotions_tags.csv"
+        },
+        "table_primary_keys": {
+            "promotions": {
+                "promotions.id": "id"
+            },
+            "promotions.activeCampaignAssignments": {
+                "promotions.id": "promotionId",
+                "promotions.campaignId": "campaignId"
+            },
+            "promotions.tags": {
+                "promotions.id": "promotionId",
+                "promotions.tagId": "tagId"
+            }
+        },
+        "root_node": "hits"
+    },
+    "source_code_groups": {
+        "parent_table": {
+            "source_code_groups": "source_code_groups.csv"
+        },
+        "child_table_definitions": {
+            "source_code_groups.specifications": "source_code_groups_specification.csv"
+        },
+        "table_primary_keys": {
+            "source_code_groups": {
+                "source_code_groups.id": "id"
+            },
+            "source_code_groups.specifications": {
+                "source_code_groups.id": "groupId",
+                "source_code_groups.specifications.expression": "expression"
+            }
+        },
+        "root_node": "hits"
+    },
+    "catalogs": {
+        "parent_table": {
+            "catalogs": "catalogs.csv"
+        },
+        "child_table_definitions": {
+            "catalogs.assignedSites": "catalogs_assignedSites.csv"
+        },
+        "table_primary_keys": {
+            "catalogs": {
+                "catalogs.id": "id"
+            },
+            "catalogs.assignedSites": {
+                "catalogs.id": "catalog_id",
+                "catalogs.assignedSites.id": "id"
+            }
+        },
+        "root_node": "data"
+    }
+}
+
+
+================================================
+File: /src/client/__init__.py
+================================================
+from .client import SalesforceClient, SalesforceClientException  # noqa
+from .endpoint_def import ENDPOINT_DEF # noqa
+
+
+================================================
+File: /src/client/client.py
+================================================
+from keboola.http_client import HttpClient
+from requests.exceptions import HTTPError
+
+import base64
+
+AUTH_URL = "https://account.demandware.com/dwsso/oauth2/access_token"
+BASE_URL = "https://{SHORTCODE}.api.commercecloud.salesforce.com/"
+VALID_ENDPOINTS = []
+
+
+class SalesforceClientException(Exception):
+    pass
+
+
+class SalesforceClient(HttpClient):
+    def __init__(self, client_id, client_secret, organization_id, short_code, encoded_auth_string=None):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.organization_id = organization_id
+        self.tenant_id = organization_id.split("_", 2)[2]
+        self.auth_token = None
+        super().__init__(BASE_URL.replace("{SHORTCODE}", short_code), status_forcelist=(500, 502, 504, 409))
+        self.login(encoded_auth_string=encoded_auth_string)
+
+    def login(self, encoded_auth_string=None):
+        params = {
+            "grant_type": "client_credentials",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "scope": f"SALESFORCE_COMMERCE_API:{self.tenant_id} "
+                     f"sfcc.promotions sfcc.orders sfcc.source-codes sfcc.catalogs sfcc.customerlists"
+        }
+
+        base64_auth_string = self.base64_encode_auth(self.client_id, self.client_secret)
+
+        header = {
+            "Authorization": f"Basic {base64_auth_string}"
+        }
+
+        if encoded_auth_string:
+            header = {
+                "Authorization": f"Basic {encoded_auth_string}"
+            }
+
+        self.update_auth_header(header, overwrite=True)
+        try:
+            auth_response = self.post(AUTH_URL, data=params, headers=header)
+        except HTTPError as http_err:
+            raise SalesforceClientException("Failed to authenticate client. Make sure you username, password, "
+                                            "and organization id are correct. More info from SF : "
+                                            f"{http_err.response.text}") from http_err
+        self.auth_token = auth_response.get("access_token")
+        auth_header = {'Authorization': f'Bearer {self.auth_token}'}
+        self.update_auth_header(auth_header, overwrite=True)
+
+    @staticmethod
+    def base64_encode_auth(client_id, client_secret):
+        auth_string = f"{client_id}:{client_secret}"
+        auth_string_bytes = auth_string.encode("ascii")
+
+        base64_bytes = base64.b64encode(auth_string_bytes)
+        return base64_bytes.decode("ascii")
+
+    def get_orders(self, site_id, start_date, end_date, use_created_date):
+        params = {
+            "siteId": site_id,
+            "limit": 200
+        }
+
+        if use_created_date:
+            params["creationDateFrom"] = start_date
+            params["creationDateTo"] = end_date
+        else:
+            params["lastModifiedDateFrom"] = start_date
+            params["lastModifiedDateTo"] = end_date
+
+        endpoint_path = f"/checkout/orders/v1/organizations/{self.organization_id}/orders"
+        all_orders_fetched = False
+        offset = 0
+        while not all_orders_fetched:
+            page = self._get_page(endpoint_path, params, offset)
+            yield page
+            if not page.get("data"):
+                all_orders_fetched = True
+            offset += 1
+
+    def _get_page(self, endpoint, params, offset):
+        if offset > 0:
+            params["offset"] = offset
+        response = self.get(endpoint_path=endpoint, params=params)
+        return response
+
+    def search_post_endpoint(self, site_id, endpoint_path):
+        all_data_fetched = False
+        params = {
+            "siteId": site_id
+        }
+        body = {
+            "limit": 150,
+            "query": {
+                "textQuery": {
+                    "fields": ['id'],
+                    "searchPhrase": "*"
+                }
+            },
+            "offset": 1
+        }
+        while not all_data_fetched:
+            response = self.post(endpoint_path=endpoint_path,
+                                 params=params,
+                                 json=body,
+                                 headers={'Content-Type': 'application/json'})
+            yield response
+            if len(response.get("hits")) < 150:
+                all_data_fetched = True
+            body["offset"] += 1
+
+    def get_promotions(self, site_id):
+        endpoint_path = f"pricing/promotions/v1/organizations/{self.organization_id}/promotions"
+        return self.search_post_endpoint(site_id, endpoint_path)
+
+    def get_source_code_groups(self, site_id):
+        endpoint_path = f"pricing/source-code-groups/v1/organizations/{self.organization_id}/source-code-groups"
+        return self.search_post_endpoint(site_id, endpoint_path)
+
+    def get_catalogs(self):
+        params = {
+            "limit": 50
+        }
+        endpoint_path = f"/product/catalogs/v1/organizations/{self.organization_id}/catalogs"
+        all_orders_fetched = False
+        offset = 1
+        while not all_orders_fetched:
+            page = self._get_page(endpoint_path, params, offset)
+            if "data" in page:
+                all_orders_fetched = True
+            yield page
+            offset += 1
+
+
+================================================
+File: /src/helpers/date_tools.py
+================================================
+import datetime
+import keboola.utils.date as dutils
+from typing import List, Dict
+
+
+class DateParseException(Exception):
+    pass
+
+
+def get_date_intervals(fetched_intervals, date_from, date_to, date_interval, backfill_mode):
+    fetched_intervals = fetched_intervals if fetched_intervals and backfill_mode else []
+    fetched_intervals = merge_intervals(fetched_intervals)
+    start_date, end_date = parse_datetime_interval(date_from, date_to)
+    missing_dates = get_missing_dates(start_date, end_date, fetched_intervals)
+
+    missing_date_intervals = get_intervals_from_dates(missing_dates)
+
+    intervals_to_fetch = []
+
+    for missing_date_interval in missing_date_intervals:
+        intervals_to_fetch.extend(
+            dutils.split_dates_to_chunks(missing_date_interval["start_date"], missing_date_interval["end_date"],
+                                         intv=date_interval, strformat='%Y-%m-%d'))
+    return intervals_to_fetch, fetched_intervals
+
+
+def get_intervals_from_dates(list_of_dates):
+    if not list_of_dates:
+        return []
+    intervals = []
+    current_interval_start = None
+    current_interval_end = None
+    for date in list_of_dates:
+        date = str_to_date(date)
+        if not current_interval_start:
+            current_interval_start = date
+            current_interval_end = date
+        elif (date - current_interval_end).days != 1:
+            intervals.append(
+                {"start_date": current_interval_start - datetime.timedelta(days=1),
+                 "end_date": current_interval_end + datetime.timedelta(days=1)})
+            current_interval_start = date
+            current_interval_end = date
+        else:
+            current_interval_end = date
+    intervals.append(
+        {"start_date": current_interval_start - datetime.timedelta(days=1),
+         "end_date": current_interval_end + datetime.timedelta(days=1)})
+
+    return intervals
+
+
+def get_missing_dates(start_date, end_date, fetched_intervals):
+    fetched_dates = get_dates_from_intervals(fetched_intervals)
+    dates_to_fetch = get_dates_from_interval(start_date, end_date)
+
+    missing_dates = []
+    for date in dates_to_fetch:
+        if date not in fetched_dates:
+            missing_dates.append(date)
+
+    return missing_dates
+
+
+def get_dates_from_intervals(intervals):
+    dates = []
+    for interval in intervals:
+        dates.extend(get_dates_from_interval(interval["start_date"], interval["end_date"]))
+    return dates
+
+
+def get_dates_from_interval(start_date, end_date):
+    dates = []
+    start = datetime.datetime.strptime(start_date, '%Y-%m-%d')
+    end = datetime.datetime.strptime(end_date, '%Y-%m-%d')
+    date_generated = [start + datetime.timedelta(days=x) for x in range(0, (end - start).days + 1)]
+
+    for date in date_generated:
+        dates.append(date.strftime('%Y-%m-%d'))
+    return dates
+
+
+def str_to_date(date_str):
+    return datetime.datetime.strptime(date_str, '%Y-%m-%d')
+
+
+def parse_datetime_interval(date_from, date_to):
+    try:
+        start_date, end_date = dutils.parse_datetime_interval(date_from, date_to, strformat='%Y-%m-%d')
+        return start_date, end_date
+    except TypeError:
+        raise DateParseException(f"Failed to parse dates, please check if {date_from} and {date_to} are valid inputs")
+
+
+def merge_intervals(intervals: List[Dict]) -> List[Dict]:
+    intervals.sort(key=lambda x: x["start_date"])
+    merged = []
+    for interval in intervals:
+        # if the list of merged intervals is empty or if the current
+        # interval does not overlap with the previous, simply append it.
+        if not merged or merged[-1]["end_date"] < interval["start_date"]:
+            merged.append(interval)
+        else:
+            # otherwise, there is overlap, so we merge the current and previous
+            # intervals.
+            merged[-1]["end_date"] = max(merged[-1]["end_date"], interval["end_date"])
+
+    return merged
+
+
+================================================
+File: /src/helpers/__init__.py
+================================================
+from .date_tools import get_date_intervals, DateParseException  # noqa
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - echo 'Pushing test image to repo. [tag=test]'
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/logger
+================================================
+gelf
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+This component enables you to extract objects from Salesforce Commerce Cloud.
+
+The following endpoints are currently supported:
+* [Orders](https://developer.salesforce.com/docs/commerce/commerce-api/references/orders?meta=getOrders)
+* [Promotions](https://developer.salesforce.com/docs/commerce/commerce-api/references/promotions?meta=getPromotion)
+* [Catalogs](https://developer.salesforce.com/docs/commerce/commerce-api/references/catalogs?meta=getCatalogs)
+* [Source Code Groups](https://developer.salesforce.com/docs/commerce/commerce-api/references/source-code-groups?meta=getSourceCodeGroup)
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Commerce Cloud is a multi-tenant, cloud-based commerce platform by Salesforce
+
+================================================
+File: /component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "title": "Salesforce Commerce Cloud Authentication",
+  "type": "object",
+  "required": [
+    "client_id",
+    "#client_secret",
+    "tenant_id",
+    "organization_id",
+    "short_code"
+  ],
+  "properties": {
+    "client_id": {
+      "title": "Client ID",
+      "type": "string",
+      "description": "Client ID granted by the Salesforce Commerce Cloud Account Manager",
+      "propertyOrder": 10
+    },
+    "#client_secret": {
+      "title": "Client Secret",
+      "type": "string",
+      "description": "Client Secret granted by the Salesforce Commerce Cloud Account Manager",
+      "format": "password",
+      "propertyOrder": 20
+    },
+    "organization_id": {
+      "title": "Organization Id",
+      "type": "string",
+      "description": "Get Organization Id from SFCC Business Manager by going to Administration > Site Development > Salesforce Commerce API Settings",
+      "propertyOrder": 30
+    },
+    "short_code": {
+      "title": "Short code",
+      "type": "string",
+      "description": "Get Short code from SFCC Business Manager by going to Administration > Site Development > Salesforce Commerce API Settings",
+      "propertyOrder": 50
+    }
+  }
+}
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{
+  "title": "Salesforce Commerce Cloud Authentication",
+  "type": "object",
+  "required": [
+    "endpoint"
+  ],
+  "properties": {
+    "endpoint": {
+      "title": "Endpoint",
+      "type": "string",
+      "enum": [
+        "promotions",
+        "orders",
+        "source_code_groups",
+        "catalogs"
+      ],
+      "options": {
+        "enum_titles": [
+          "Promotions",
+          "Orders",
+          "Source Code Groups",
+          "Catalogs"
+        ]
+      },
+      "default": "Search analytics",
+      "propertyOrder": 10
+    },
+    "site_id": {
+      "title": "Site ID",
+      "type": "string",
+      "options": {
+        "dependencies": {
+          "endpoint": [
+            "orders",
+            "promotions",
+            "source_code_groups"
+          ]
+        }
+      },
+      "description": "Site ID is the name of the site for which you want to access data, for example RefArch or SiteGenesis. To see a list of sites in Business Manager, go to Administration > Sites > Manage Sites",
+      "propertyOrder": 20
+    },
+    "date_from": {
+      "title": "Last modified date from",
+      "type": "string",
+      "options": {
+        "dependencies": {
+          "endpoint": [
+            "orders"
+          ]
+        }
+      },
+      "description": "Data that has been modified since this date will be fetched. Either a relative date can be set eg. 3 days ago, or an exact date eg. 2022-01-01",
+      "propertyOrder": 30
+    },
+    "date_to": {
+      "title": "Last modified date to",
+      "type": "string",
+      "options": {
+        "dependencies": {
+          "endpoint": [
+            "orders"
+          ]
+        }
+      },
+      "description": "Data that has been modified until this date will be fetched. Either a relative date can be set eg. 'now', or an exact date eg. 2022-01-01",
+      "propertyOrder": 40
+    },
+    "use_created_date": {
+      "title": "Filter orders by created date instead of last modified date",
+      "type": "boolean",
+      "default": false,
+      "format": "checkbox",
+      "options": {
+        "dependencies": {
+          "endpoint": [
+            "orders"
+          ]
+        }
+      },
+      "propertyOrder": 50
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+fi
+
+echo "Updating logger settings"
+
+value=`cat component_config/logger`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} logger --value="$value"
+else
+    echo "logger type is empty!"
+fi
+
+echo "Updating logger configuration"
+value=`cat component_config/loggerConfiguration.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} loggerConfiguration --value="$value"
+else
+    echo "loggerConfiguration is empty!"
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.component==1.3.7
+keboola.utils==1.1.0
+keboola.http-client==1.0.0
+mock~=4.0.3
+freezegun~=1.1.0
+requests~=2.27.1
+keboola.csvwriter==1.0.1
+
+
+================================================
+File: /TEMPLATE_README.md
+================================================
+# KBC Component Python template
+
+Python template for KBC Component creation. Defines the default structure and all Bitbucket pipeline CI scripts for automatic deployment.
+
+Use as a starting point when creating a new component.
+
+Example uses [keboola.component](https://pypi.org/project/keboola.component) library providing useful methods for KBC related tasks 
+and boilerplate methods often needed by components, for more details see [documentation](https://github.com/keboola/python-component/blob/main/README.md)
+
+*NOTE: Previously the template was based on top of the deprecated [keboola-python-util-lib library](https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/src/master/)*
+
+**Table of contents:**  
+  
+[TOC]
+
+# Recommended component architecture
+It is recommended to use the [keboola.component library](https://pypi.org/project/keboola.component), 
+for each component. Major advantage is that it reduces the boilerplate code replication, the developer can focus on core component logic 
+and not on boilerplate tasks. If anything is missing in the library, please fork and create a pull request with additional changes, 
+so we can all benefit from it
+
+**Base components on [CommonInterface](https://htmlpreview.github.io/?https://raw.githubusercontent.com/keboola/python-component/main/docs/api-html/component/interface.html#keboola.component.interface.CommonInterface)**
+
+- No need to write configuration processing and validation code each time
+- No need to setup logging environment manually
+- No need to write code to store manifests, write statefile, retrieve dates based on relative period, and many more.
+- The main focus can be the core component logic, which increases the code readability for new comers.
+
+**Base Client on [HtttpClient](https://pypi.org/project/keboola.http-client/)**
+
+- No need to write HTTP request handling over and over again
+- Covers basic authentication, retry strategy, headers, default parameters
+
+
+## Architecture using the template
+
+![picture](docs/imgs/architecture.png)
+
+## Example component
+This template contains functional example of an [hello-world component](https://bitbucket.org/kds_consulting_team/kbc-python-template/src/master/src/component.py), 
+it can be run with [sample configuration](https://bitbucket.org/kds_consulting_team/kbc-python-template/src/master/data/) and it produces valid results. 
+It is advisable to use this structure as a base for new components. Especially the `component.py` module, which should only 
+contain the base logic necessary for communication with KBC interface, processing parameters, collecting results
+ and calling targeted API service methods. 
+
+
+# Creating a new component
+Clone this repository into new folder and remove git history
+```bash
+git clone https://bitbucket.org/kds_consulting_team/kbc-python-template.git my-new-component
+cd my-new-component
+rm -rf .git
+git init
+git remote add origin PATH_TO_YOUR_BB_REPO
+git add .
+git commit -m 'initial'
+git push -u origin master
+```
+
+**Method #2:**
+
+Copy the contents of the template folder into your clone empty repository
+
+```bash
+git clone PATH_TO_YOUR_BB_REPO my-new-component
+# now copy the contents of the template into the my-new-component dir
+cd my-new-component
+git add .
+git commit -m 'initial'
+git push -u origin master
+```
+
+# Setting up the CI
+ - Bitbucket: Enable [pipelines](https://confluence.atlassian.com/bitbucket/get-started-with-bitbucket-pipelines-792298921.html) in the repository.
+    - For Github: Check that the [workflows are enabled](https://docs.github.com/en/actions/managing-workflow-runs/disabling-and-enabling-a-workflow).
+    The actions are present in `.github/workflows/` folder. 
+ - Set `KBC_DEVELOPERPORTAL_APP` env variable (dev portal app id)
+ 
+ In case it is not set on the account level, set also other required dev portal env variables:
+ 
+ - `KBC_DEVELOPERPORTAL_PASSWORD` - service account password
+ - `KBC_DEVELOPERPORTAL_USERNAME` - service account username
+ - `KBC_DEVELOPERPORTAL_VENDOR` - dev portal vendor
+ - `KBC_STORAGE_TOKEN` - (optional) in case you wish to run KBC automated tests
+  
+ 
+ ![picture](docs/imgs/ci_variable.png)
+ 
+The script execution is defined in three stages:
+
+## Default stage
+This script is executed on push to any branch except the master branch. It executes basic build and code quality steps. Following steps are performed:
+Build docker image
+Execute flake8 lint tests
+Execute python unittest
+(Optional) Push image with tag :test into the AWS repository for manual testing in KBC
+If any of the above steps results in non 0 status, the build will fail. It is impossible to merge branches that fail to build into the master branch.
+
+## Master stage
+This script is executed on any push or change in the master branch. It performs every step as the default stage. Additionally, 
+the `./scripts/update_dev_portal_properties.sh` script is executed. 
+This script propagates all changes in the Component configuration files (component_config folder) to the Developer portal.
+Currently these Dev Portal configuration parameters are supported:
+
+ - `configSchema.json`
+ - `configRowSchema.json`
+ - `component_short_description.md`
+ - `component_long_description.md`    
+
+The choice to include this script directly in the master branch was made to simplify ad-hoc changes of the component configuration parameters. For instance if you wish to slightly modify the configuration schema without affecting the code itself, it is possible to simply push the changes directly into the master and these will be automatically propagated to the production without rebuilding the image itself. Solely Developer Portal configuration metadata is deployed at this stage.
+
+## Tagged commit stage
+Whenever a tagged commit is added, or tag created this script gets executed. This is a deployment phase, so a successful build results in new code being deployed in KBC production.
+At this stage all steps present in the default and master stage are executed. Additionally, 
+`deploy.sh` script that pushes the newly built image / tag into the ECR repository and KBC production is executed.
+The deploy script is executed only after all tests and proper build steps passed. 
+Moreover, the `deploy.sh` script will be executed **only in the master branch**. In other words if you create a tagged commit in another branch, the pipeline gets triggered but deployment script will fail, because it is not triggered within a master branch. This is to prevent accidental deployment from a feature branch.
+
+ 
+# GELF logging
+
+The template automatically chooses between STDOUT and GELF logger based on the Developer Portal configuration.
+
+To fully leverage the benefits such as outputting the `Stack Trace` into the log event detail (available by clicking on the log event) 
+log exceptions using `logger.exception(ex)`.
+
+**TIP:** When the logger verbosity is set to `verbose` you may leverage `extra` fields to log the detailed message in the detail of the log event by adding extra fields to you messages:
+
+```python
+logging.error(f'{error}. See log detail for full query. ',
+                         extra={"failed_query": json.dumps(query)})
+```
+
+Recommended [GELF logger setup](https://developers.keboola.com/extend/common-interface/logging/#setting-up) (Developer Portal) to allow debug mode logging:
+
+```json
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+``` 
+ 
+# Development
+ 
+This example contains runnable container with simple unittest. For local testing it is useful to include `data` folder in the root
+and use docker-compose commands to run the container or execute tests. 
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path:
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone https://bitbucket.org:kds_consulting_team/kbc-python-template.git my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+## Testing
+
+The preset pipeline scripts contain sections allowing pushing testing image into the ECR repository and automatic 
+testing in a dedicated project. These sections are by default commented out. 
+
+**Running KBC tests on deploy step, before deployment**
+
+Uncomment following section in the deployment step in `bitbucket-pipelines.yml` file:
+
+```yaml
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+```
+
+Make sure that you have `KBC_STORAGE_TOKEN` env. variable set, containing appropriate storage token with access 
+to your KBC project. Also make sure to create a functional testing configuration and replace the `BASE_KBC_CONFIG` placeholder with its id.
+
+**Pushing testing image for manual KBC tests**
+
+In some cases you may wish to execute a testing version of your component manually prior to publishing. For instance to test various
+configurations on it. For that it may be convenient to push the `test` image on every push either to master, or any branch.
+
+To achieve that simply uncomment appropriate sections in `bitbucket-pipelines.yml` file, either in master branch step or in `default` step.
+
+```yaml
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+```
+ 
+ Once the build is finished, you may run such configuration in any KBC project as many times as you want by using [run-job](https://kebooladocker.docs.apiary.io/#reference/run/create-a-job-with-image/run-job) API call, using the `test` image tag.
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.6-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Salesforce Commerce Cloud Extractor
+
+Commerce Cloud is a multi-tenant, cloud-based commerce platform by Salesforce
+
+This component enables you to extract objects from Salesforce Commerce Cloud
+
+
+# Supported endpoints
+
+- Orders - [Salesforce Documentation](https://developer.salesforce.com/docs/commerce/commerce-api/references/orders?meta=Summary)
+- Promotions - [Salesforce Documentation](https://developer.salesforce.com/docs/commerce/commerce-api/references/promotions?meta=Summary)
+- Catalogs - [Salesforce Documentation](https://developer.salesforce.com/docs/commerce/commerce-api/references/catalogs?meta=Summary)
+- Source Code Groups - [Salesforce Documentation](https://developer.salesforce.com/docs/commerce/commerce-api/references/source-code-groups?meta=getSourceCodeGroup)
+
+
+# Prerequisites
+
+- In the Commerce Cloud Account Manager add an API Client. For details, refer to: [help.salesforce.com](https://help.salesforce.com/s/articleView?id=cc.b2c_account_manager_add_api_client_id.htm&type=5) 
+- Enable API  Client ID. For details, refer to: [help.salesforce.com](https://help.salesforce.com/s/articleView?id=cc.b2c_account_manager_enable_disable_client_id.htm&type=5)
+
+# Configuration
+
+
+## Salesforce Commerce Cloud Authentication
+ - Client ID (client_id) - [REQ] Client ID granted by the Salesforce Commerce Cloud Account Manager
+ - Client Secret (#client_secret) - [REQ] Client Secret granted by the Salesforce Commerce Cloud Account Manager
+ - Organization Id (organization_id) - [REQ] Get Organization Id from SFCC Business Manager by going to Administration > Site Development > Salesforce Commerce API Settings
+ - Tenant Id (tenant_id) - [REQ] The tenant ID should be part of your organization ID f_ecom_{{tenant_id}}. Example: for organization ID f_ecom_zzzz_001, the tenant ID is zzzz_001.
+ - Short code (short_code) - [REQ] Get Short code from SFCC Business Manager by going to Administration > Site Development > Salesforce Commerce API Settings
+
+## Row Configuration
+ - Endpoint (endpoint) - [REQ] description
+ - Site ID (site_id) - [OPT] Site ID is the name of the site for which you want to access data, for example RefArch or SiteGenesis. To see a list of sites in Business Manager, go to Administration > Sites > Manage Sites
+ - Last modified date from (date_from) - [OPT] Data that has been modified since this date will be fetched. Either a relative date can be set eg. 3 days ago, or an exact date eg. 2022-01-01
+ - Last modified date to (date_to) - [OPT] Data that has been modified until this date will be fetched. Either a relative date can be set eg. 'now', or an exact date eg. 2022-01-01
+ - Backfill (backfill_mode) - [OPT] If set to true, data will be fetched during multiple runs. 
+
+
+# Sample Configuration
+
+```json
+{
+    "parameters": {
+        "client_id": "CLIENT_ID",
+        "#client_secret": "SECRET_VALUE",
+        "organization_id": "org_id",
+        "tenant_id": "tenant_id",
+        "short_code": "short_code",
+        "site_id": "site_id",
+        "date_from": "30 days ago",
+        "date_to": "now",
+        "endpoint": "orders",
+        "backfill_mode": true
+    },
+    "action": "run"
+}
+```
+
+Output
+======
+
+List of tables, foreign keys, schema.
+
+Development
+-----------
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path in
+the `docker-compose.yml` file:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clone this repository, init the workspace and run the component with following command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose build
+docker-compose run --rm dev
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run the test suite and lint check using this command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose run --rm test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Integration
+===========
+
+For information about deployment and integration with KBC, please refer to the
+[deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/)
+

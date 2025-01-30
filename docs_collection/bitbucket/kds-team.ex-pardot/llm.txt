@@ -1,0 +1,2117 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-pardot/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   └── mapping.json
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── data/
+    │   ├── config.json
+    │   ├── in/
+    │   │   ├── state.json
+    │   │   ├── tables/
+    │   │   │   ├── test.csv
+    │   │   │   └── test.csv.manifest
+    │   │   └── files/
+    │   │       └── order1.xml
+    │   └── out/
+    │       ├── tables/
+    │       │   └── test.csv
+    │       └── files/
+    │           └── order1.xml
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── configSchema_test.json
+    │   ├── component_short_description.md
+    │   └── configSchema.json
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.1**
+
+- fix requirements
+- add src folder to path for tests
+
+**0.1.0**
+
+- src folder structure
+- remove dependency on handler lib - import the code directly to enable modifications until its released
+
+**0.0.2**
+
+- add dependency to base lib
+- basic tests
+
+**0.0.1**
+
+- add utils scripts
+- move kbc tests directly to pipelines file
+- use uptodate base docker image
+- add changelog
+
+
+================================================
+File: /src/component.py
+================================================
+'''
+Template Component main class.
+
+'''
+
+import logging
+import logging_gelf.handlers
+import logging_gelf.formatters  # noqa
+import sys
+import os  # noqa
+import datetime  # noqa
+import dateparser
+import pandas as pd
+import json
+
+from kbc.env_handler import KBCEnvHandler
+from kbc.result import KBCTableDef  # noqa
+from kbc.result import ResultWriter  # noqa
+from pypardot.client import PardotAPI
+
+
+# configuration variables
+KEY_EMAIL = 'email'
+KEY_PASSWORD = '#password'
+KEY_USERKEY = '#userkey'
+
+MANDATORY_PARS = [
+    KEY_EMAIL,
+    KEY_PASSWORD,
+    KEY_USERKEY
+]
+MANDATORY_IMAGE_PARS = []
+
+# Default Table Output Destination
+DEFAULT_TABLE_SOURCE = "/data/in/tables/"
+DEFAULT_TABLE_DESTINATION = "/data/out/tables/"
+DEFAULT_FILE_DESTINATION = "/data/out/files/"
+DEFAULT_FILE_SOURCE = "/data/in/files/"
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)-8s : [line:%(lineno)3s] %(message)s',
+    datefmt="%Y-%m-%d %H:%M:%S")
+
+if 'KBC_LOGGER_ADDR' in os.environ and 'KBC_LOGGER_PORT' in os.environ:
+
+    logger = logging.getLogger()
+    logging_gelf_handler = logging_gelf.handlers.GELFTCPSocketHandler(
+        host=os.getenv('KBC_LOGGER_ADDR'), port=int(os.getenv('KBC_LOGGER_PORT')))
+    logging_gelf_handler.setFormatter(
+        logging_gelf.formatters.GELFFormatter(null_character=True))
+    logger.addHandler(logging_gelf_handler)
+
+    # remove default logging to stdout
+    logger.removeHandler(logger.handlers[0])
+
+APP_VERSION = '0.0.7'
+
+# Loading mapping table for special parsing
+with open('src/mapping.json', 'r') as f:
+    mapping = json.load(f)
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, debug=False):
+        KBCEnvHandler.__init__(self, MANDATORY_PARS)
+        logging.info('Running version %s', APP_VERSION)
+        logging.info('Loading configuration...')
+
+        try:
+            self.validate_config()
+            self.validate_image_parameters(MANDATORY_IMAGE_PARS)
+        except ValueError as e:
+            logging.error(e)
+            exit(1)
+
+    # backfill_mode, start_date, end_date):
+    def config_date_range(self, backfill_obj):
+        '''
+        Setting up request date range
+        '''
+
+        # if backfill == 'enable':
+        if backfill_obj['backfill'] == 'enable':
+            logging.info('Backfill mode: Enabled')
+            # self.start_date = params['backfill_mode']['start_date']
+            # self.end_date = params['backfill_mode']['end_date']
+            self.start_date = backfill_obj['start_date']
+            self.end_date = backfill_obj['end_date']
+            logging.info('Backfill Start Date: {}'.format(self.start_date))
+            logging.info('Backfill End Date: {}'.format(self.end_date))
+            # Error control in case user did not input date
+            if self.start_date == '' or self.end_date == '':
+                logging.error(
+                    'Start date or end date cannot be empty with backfill mode enabled.' +
+                    'Please enter start date and end date.'
+                )
+                sys.exit(1)
+
+            # Validate if the input date range is valid
+            start_date_temp = dateparser.parse(self.start_date)
+            end_date_temp = dateparser.parse(self.end_date)
+            if (end_date_temp-start_date_temp).days < 0:
+                logging.error('Start date cannot be later than end date.')
+                sys.exit(1)
+        else:
+            self.start_date = 'last_7_days'
+            self.end_date = 'today'
+
+    def produce_manifest(self, file_name, primary_key):
+        '''
+        function for producting manifest
+        '''
+
+        file = DEFAULT_TABLE_DESTINATION+'{}.manifest'.format(file_name)
+        manifest = {
+            "incremental": True,
+            "primary_key": primary_key
+        }
+
+        try:
+            with open(file, 'w') as file_out:
+                json.dump(manifest, file_out)
+                logging.info("Output manifest file produced.")
+        except Exception as e:
+            logging.error("Could not produce output file manifest.")
+            logging.error(e)
+
+    def special_parsing(self, tablename, data_in):
+        '''
+        Special treatment for some table
+        '''
+
+        data_out = []
+
+        if tablename in mapping:
+            table_mapping = mapping[tablename]
+            for row in data_in:
+                temp_data = {}
+                for col in table_mapping:
+                    col_delim = col.split('.')
+                    col_value = row
+                    try:
+                        for delim in col_delim:
+                            col_value = col_value[delim]
+                    except Exception:
+                        col_value = ''
+
+                    temp_data[table_mapping[col]['col_name']] = col_value
+                data_out.append(temp_data)
+
+        else:
+            data_out = data_in
+
+        return data_out
+
+    def output_file(self, data, file_name, column_headers):
+        '''
+        Output dataframe intput to destination file
+        Appending to file if file exist
+        '''
+
+        if not os.path.isfile(file_name):
+            with open(file_name, 'a') as b:
+                data.to_csv(b, index=False, columns=column_headers)
+            b.close()
+        else:
+            with open(file_name, 'a') as b:
+                data.to_csv(b, index=False, header=False,
+                            columns=column_headers)
+            b.close()
+
+        return
+
+    def execute_pardot(self, pardot, endpoint):
+        '''
+        Calling defined pardot functions
+        '''
+
+        # data_out = []
+        empty = False
+        count = 200
+        offset = 0
+        column_headers = []
+        # Parameters to check if last value of the array is same as last itr
+        same_last_value = False
+        last_array_value = ''
+        bulk_bool = False
+        # Importing retry method
+        retry_bool = True
+        retry_n = 0
+
+        while count == 200 and not same_last_value and retry_bool:
+            try:
+                if endpoint == 'campaigns':
+                    data_in = pardot.campaigns.query(
+                        # output='bulk',
+                        format='json',
+                        # created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['campaign']
+                elif endpoint == 'customfields':
+                    data_in = pardot.customfields.query(
+                        # output='bulk',
+                        format='json',
+                        # created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['customField']
+                elif endpoint == 'customredirects':
+                    data_in = pardot.customredirects.query(
+                        # output='bulk',
+                        format='json',
+                        # created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['customRedirect']
+                elif endpoint == 'dynamiccontent':
+                    data_in = pardot.dynamiccontent.query(
+                        # output='bulk',
+                        format='json',
+                        # created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['dynamicContent']
+                elif endpoint == 'emailclicks':
+                    bulk_bool = True
+                    data_in = pardot.emailclicks.query(
+                        output='bulk',
+                        format='json',
+                        created_after=self.start_date,
+                        created_before=self.end_date,
+                        # offset=offset)
+                        id_greater_than=last_array_value)
+                    data_temp = data_in['emailClick']
+
+                elif endpoint == 'forms':
+                    data_in = pardot.forms.query(
+                        # output='bulk',
+                        format='json',
+                        # created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['form']
+                elif endpoint == 'lifecyclehistories':
+                    data_in = pardot.lifecyclehistories.query(
+                        # output='bulk',
+                        format='json',
+                        created_after=self.start_date,
+                        created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['lifecycleHistory']
+                elif endpoint == 'lifecyclestages':
+                    data_in = pardot.lifecyclestages.query(
+                        # output='bulk',
+                        format='json',
+                        # created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['lifecycleStage']
+                elif endpoint == 'lists':
+                    data_in = pardot.lists.query(
+                        # output='bulk',
+                        format='json',
+                        # created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['list']
+                elif endpoint == 'listmemberships':
+                    data_in = pardot.listmemberships.query(
+                        # output='bulk',
+                        format='json',
+                        created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['list_membership']
+
+                elif endpoint == 'opportunities':
+                    data_in = pardot.opportunities.query(
+                        # output='bulk',
+                        format='json',
+                        created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['opportunity']
+                    # data_temp = self.special_parsing(endpoint, data_in['opportunity'])
+                elif endpoint == 'prospects':
+                    bulk_bool = True
+                    data_in = pardot.prospects.query(
+                        output='bulk',
+                        format='json',
+                        created_after=self.start_date,
+                        created_before=self.end_date,
+                        offset=offset)
+                    # id_greater_than=last_array_value)
+                    data_temp = data_in['prospect']
+                elif endpoint == 'prospectaccounts':
+                    data_in = pardot.prospectaccounts.query(
+                        # output='bulk',
+                        format='json',
+                        created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['prospectAccount']
+                elif endpoint == 'tags':
+                    data_in = pardot.tags.query(
+                        # output='bulk',
+                        format='json',
+                        # created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['tag']
+                elif endpoint == 'tagobjects':
+                    data_in = pardot.tagobjects.query(
+                        # output='bulk',
+                        format='json',
+                        created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['tagObject']
+
+                elif endpoint == 'users':
+                    data_in = pardot.users.query(
+                        # output='bulk',
+                        format='json',
+                        # created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    data_temp = data_in['user']
+                elif endpoint == 'visitors':
+                    bulk_bool = True
+                    data_in = pardot.visitors.query(
+                        output='bulk',
+                        format='json',
+                        created_after=self.start_date, created_before=self.end_date,
+                        offset=offset)
+                    # id_greater_than=last_array_value)
+                    data_temp = data_in['visitor']
+                elif endpoint == 'visitoractivities':
+                    bulk_bool = True
+                    data_in = pardot.visitoractivities.query(
+                        output='bulk',
+                        format='json',
+                        created_after=self.start_date,
+                        created_before=self.end_date,
+                        offset=offset)
+                    # id_greater_than=last_array_value)
+                    data_temp = data_in['visitor_activity']
+                elif endpoint == 'visits':
+                    data_in = pardot.visits.query_by_visitor_ids(
+                        visitor_ids=self.visit_id)
+                    data_temp = data_in['visit']
+                elif endpoint == 'emails':
+                    data_temp = []
+                    for email_id in self.email_id:
+                        data_in = pardot.emails.stats(
+                            list_email_id=email_id
+                        )
+                        data_to_insert = data_in['stats']
+                        data_to_insert['id'] = email_id
+                        data_temp.append(data_to_insert)
+                else:
+                    logging.error(
+                        'Endpoint [{}] does not exist. Please contact support'.format(endpoint))
+                    sys.exit(1)
+
+                # Special parsing on endpoints if needed
+                data_temp_parsed = self.special_parsing(endpoint, data_temp)
+                data_out = pd.DataFrame(data_temp_parsed)
+
+                # Pagination parameters settings
+                count = len(data_temp)
+                # if last value of the array is same as last itr
+                if count == 200:
+                    array_last_value = data_temp[199]
+                    if bulk_bool:
+                        last_array_value = array_last_value['id']
+                    else:
+                        if array_last_value == last_array_value:
+                            same_last_value = True
+                        else:
+                            last_array_value = array_last_value
+
+                if offset == 0:
+                    column_headers = list(data_out.columns)
+                offset = offset + 200
+
+                # Adding temp data into the big queue
+                # data_out = data_out + data_temp_parsed
+                if count == 0:
+                    empty = True
+                else:
+                    self.output_file(data_out, DEFAULT_TABLE_DESTINATION +
+                                     '{}.csv'.format(endpoint), column_headers)
+                    logging.info(
+                        "[{0}] pagination - count:{1}, offset: {2}".format(endpoint, count, offset))
+
+            # except Exception as e:
+            #     if offset == 0:
+            #         empty = True
+            #         count = 0
+            #     logging.error(
+            #         "There is an issue with the request. Please check error message: {}".format(e))
+            #     sys.exit(1)
+
+            # Query retry
+            except Exception as e:
+                logging.error(
+                    "There is an issue with the request. Please check error message: {}".format(e))
+                if retry_n < 5:
+                    logging.info("Retrying...{}".format(retry_n))
+                    retry_n += 1
+                else:
+                    retry_bool = False
+                    sys.exit(1)
+
+        return empty, data_out
+
+    def run(self):
+        '''
+        Main execution code
+        '''
+
+        params = self.cfg_params  # noqa
+        # Validating input parameters
+        if params == {}:
+            logging.error(
+                'Please input required parameters: Email, Password, UserKey, Endpoint.')
+            sys.exit(1)
+        input_email = params['email']
+        input_password = params['#password']
+        input_userkey = params['#userkey']
+        if input_email == '' or input_password == '' or input_userkey == '':
+            logging.error('Please enter required information: Email, Password, UserKey'
+                          )
+            sys.exit(1)
+
+        endpoints_unparsed = params['endpoint']
+        # Converting endpoint objects to endpoint list
+        endpoints = []
+        for i in endpoints_unparsed:
+            endpoints.append(i['endpoint'])
+
+        # Validating if the custom ids are entered for special endpoints
+        if 'visits' in endpoints:
+            self.visit_id = params['visit_id']
+            if self.visit_id == '':
+                logging.error(
+                    '[Visits] endpoint is selected. However, <visitor ids> are missing in the configuration. '
+                    'Please enter <visitor ids>.')
+                sys.exit(1)
+        if 'emails' in endpoints:
+            tmp_email_id = params['email_id'].replace(' ', '')
+            self.email_id = tmp_email_id.split(',')
+            if len(self.email_id) == 0:
+                logging.error(
+                    '[Emails] endpoint is selected. However, <email ids> are missing in the configuration. '
+                    'Please enter <email ids>')
+                sys.exit(1)
+
+        # Configuring date range
+        self.config_date_range(
+            backfill_obj=params['backfill_mode']
+        )
+
+        # Pardot Integration
+        pardot = PardotAPI(
+            email=input_email,
+            password=input_password,
+            user_key=input_userkey
+        )
+        pardot.authenticate()
+
+        # Looping through all the input in the configuration
+        for endpoint in endpoints:
+            logging.info('Extracting [{}]...'.format(endpoint))
+            empty, endpoint_data = self.execute_pardot(
+                pardot, endpoint)
+            if empty:
+                logging.info(
+                    'Endpoint [{}] contains no data.'.format(endpoint))
+            else:
+                logging.info('Outputting [{}]'.format(endpoint))
+                self.produce_manifest('{}.csv'.format(
+                    endpoint), ['id'])
+
+        logging.info("Extraction finished")
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        debug = sys.argv[1]
+    else:
+        debug = True
+    comp = Component(debug)
+    comp.run()
+
+
+================================================
+File: /src/mapping.json
+================================================
+{
+    "opportunities": {
+        "id": {
+            "col_name": "id"
+        },
+        "name": {
+            "col_name": "name"
+        },
+        "value": {
+            "col_name": "value"
+        },
+        "probability": {
+            "col_name": "probability"
+        },
+        "type": {
+            "col_name": "type"
+        },
+        "stage": {
+            "col_name": "stage"
+        },
+        "status": {
+            "col_name": "status"
+        },
+        "created_at": {
+            "col_name": "created_at"
+        },
+        "updated_at": {
+            "col_name": "updated_at"
+        },
+        "campaign.id": {
+            "col_name": "campaign_id"
+        },
+        "prospects.prospect.id": {
+            "col_name": "prospect_id"
+        }
+    },
+    "customredirects": {
+        "id": {
+            "col_name": "id"
+        },
+        "name": {
+            "col_name": "name"
+        },
+        "url": {
+            "col_name": "url"
+        },
+        "destination_url": {
+            "col_name": "destination_url"
+        },
+        "campaign.id": {
+            "col_name": "campaign_id"
+        },
+        "created_at": {
+            "col_name": "created_at"
+        },
+        "updated_at": {
+            "col_name": "updated_at"
+        }
+    },
+    "forms": {
+        "id": {
+            "col_name": "id"
+        },
+        "name": {
+            "col_name": "name"
+        },
+        "campaign.id": {
+            "col_name": "campaign_id"
+        },
+        "embedCode": {
+            "col_name": "embedCode"
+        },
+        "created_at": {
+            "col_name": "created_at"
+        },
+        "updated_at": {
+            "col_name": "updated_at"
+        }
+    },
+    "prospectaccounts": {
+        "id": {
+            "col_name": "id"
+        },
+        "created_at": {
+            "col_name": "created_at"
+        },
+        "updated_at": {
+            "col_name": "updated_at"
+        },
+        "assigned_to.user.id": {
+            "col_name": "userid_assigned_to"
+        },
+        "Account_Created_Date_Lead_Converted_Date.value": {
+            "col_name": "Account_Created_Date_Lead_Converted_Date"
+        },
+        "Account_Email.value": {
+            "col_name": "Account_Email"
+        },
+        "annual_revenue.value": {
+            "col_name": "annual_revenue"
+        },
+        "Best_Contact_Method.value": {
+            "col_name": "Best_Contact_Method"
+        },
+        "billing_address_one.value": {
+            "col_name": "billing_address_one"
+        },
+        "billing_address_two.value": {
+            "col_name": "billing_address_two"
+        },
+        "billing_city.value": {
+            "col_name": "billing_city"
+        },
+        "billing_country.value": {
+            "col_name": "billing_country"
+        },
+        "billing_state.value": {
+            "col_name": "billing_state"
+        },
+        "billing_zip.value": {
+            "col_name": "billing_zip"
+        },
+        "ConAb_Status.value": {
+            "col_name": "ConAb_Status"
+        },
+        "Consult_Date.value": {
+            "col_name": "Consult_Date"
+        },
+        "Date_Status_Basic_Access.value": {
+            "col_name": "Date_Status_Basic_Access"
+        },
+        "Date_Status_Full_Access.value": {
+            "col_name": "Date_Status_Full_Access"
+        },
+        "Date_Status_GC_Only.value": {
+            "col_name": "Date_Status_GC_Only"
+        },
+        "description.value": {
+            "col_name": "description"
+        },
+        "Do_Not_Mail.value": {
+            "col_name": "Do_Not_Mail"
+        },
+        "employees.value": {
+            "col_name": "employees"
+        },
+        "fax.value": {
+            "col_name": "fax"
+        },
+        "First_Name.value": {
+            "col_name": "First_Name"
+        },
+        "How_did_you_hear_about_us_.value": {
+            "col_name": "How_did_you_hear_about_us"
+        },
+        "industry.value": {
+            "col_name": "industry"
+        },
+        "Integration_Compound_ID.value": {
+            "col_name": "Integration_Compound_ID"
+        },
+        "Integration_ID.value": {
+            "col_name": "Integration_ID"
+        },
+        "Interest.value": {
+            "col_name": "Interest"
+        },
+        "Last_Login_Date.value": {
+            "col_name": "Last_Login_Date"
+        },
+        "Last_Name.value": {
+            "col_name": "Last_Name"
+        },
+        "Lead_Created_Date.value": {
+            "col_name": "Lead_Created_Date"
+        },
+        "name.value": {
+            "col_name": "name"
+        },
+        "number.value": {
+            "col_name": "number"
+        },
+        "ownership.value": {
+            "col_name": "ownership"
+        },
+        "Pardot_Record_Type.value": {
+            "col_name": "Pardot_Record_Type"
+        },
+        "Partner_Name.value": {
+            "col_name": "Partner_Name"
+        },
+        "phone.value": {
+            "col_name": "phone"
+        },
+        "Primary_Contact_Name.value": {
+            "col_name": "Primary_Contact_Name"
+        },
+        "rating.value": {
+            "col_name": "rating"
+        },
+        "shipping_address_one.value": {
+            "col_name": "shipping_address_one"
+        },
+        "shipping_address_two.value": {
+            "col_name": "shipping_address_two"
+        },
+        "shipping_city.value": {
+            "col_name": "shipping_city"
+        },
+        "shipping_country.value": {
+            "col_name": "shipping_country"
+        },
+        "shipping_state.value": {
+            "col_name": "shipping_state"
+        },
+        "shipping_zip.value": {
+            "col_name": "shipping_zip"
+        },
+        "sic.value": {
+            "col_name": "sic"
+        },
+        "site.value": {
+            "col_name": "site"
+        },
+        "Status.value": {
+            "col_name": "Status"
+        },
+        "ticker_symbol.value": {
+            "col_name": "ticker_symbol"
+        },
+        "type.value": {
+            "col_name": "type"
+        },
+        "website.value": {
+            "col_name": "website"
+        }
+    },
+    "prospects": {
+        "id": {
+            "col_name": "id"
+        },
+        "campaign_id": {
+            "col_name": "campaign_id"
+        },
+        "user_id": {
+            "col_name": "user_id"
+        },
+        "salutation": {
+            "col_name": "salutation"
+        },
+        "first_name": {
+            "col_name": "first_name"
+        },
+        "last_name": {
+            "col_name": "last_name"
+        },
+        "email": {
+            "col_name": "email"
+        },
+        "company": {
+            "col_name": "company"
+        },
+        "website": {
+            "col_name": "website"
+        },
+        "job_title": {
+            "col_name": "job_title"
+        },
+        "department": {
+            "col_name": "department"
+        },
+        "country": {
+            "col_name": "country"
+        },
+        "address_one": {
+            "col_name": "address_one"
+        },
+        "address_two": {
+            "col_name": "address_two"
+        },
+        "city": {
+            "col_name": "city"
+        },
+        "state": {
+            "col_name": "state"
+        },
+        "territory": {
+            "col_name": "territory"
+        },
+        "zip": {
+            "col_name": "zip"
+        },
+        "phone": {
+            "col_name": "phone"
+        },
+        "source": {
+            "col_name": "source"
+        },
+        "annual_revenue": {
+            "col_name": "annual_revenue"
+        },
+        "employees": {
+            "col_name": "employees"
+        },
+        "industry": {
+            "col_name": "industry"
+        },
+        "years_in_business": {
+            "col_name": "years_in_business"
+        },
+        "score": {
+            "col_name": "score"
+        },
+        "grade": {
+            "col_name": "grade"
+        },
+        "crm_lead_fid": {
+            "col_name": "crm_lead_fid"
+        },
+        "crm_contact_fid": {
+            "col_name": "crm_contact_fid"
+        },
+        "crm_owner_fid": {
+            "col_name": "crm_owner_fid"
+        },
+        "last_activity_at": {
+            "col_name": "last_activity_at"
+        },
+        "is_do_not_email": {
+            "col_name": "is_do_not_email"
+        },
+        "is_do_not_call": {
+            "col_name": "is_do_not_call"
+        },
+        "opted_out": {
+            "col_name": "opted_out"
+        },
+        "is_reviewed": {
+            "col_name": "is_reviewed"
+        },
+        "created_at": {
+            "col_name": "created_at"
+        },
+        "updated_at": {
+            "col_name": "updated_at"
+        },
+        "prospect_account_id": {
+            "col_name": "prospect_account_id"
+        }
+    },
+    "visitoractivities": {
+        "id": {
+            "col_name": "id"
+        },
+        "prospect_id": {
+            "col_name": "prospect_id"
+        },
+        "type": {
+            "col_name": "type"
+        },
+        "type_name": {
+            "col_name": "type_name"
+        },
+        "opportunity_id": {
+            "col_name": "opportunity_id"
+        },
+        "campaign_id": {
+            "col_name": "campaign_id"
+        },
+        "created_at": {
+            "col_name": "created_at"
+        },
+        "details": {
+            "col_name": "details"
+        },
+        "email_id": {
+            "col_name": "email_id"
+        },
+        "list_email_id": {
+            "col_name": "list_email_id"
+        },
+        "email_template_id": {
+            "col_name": "email_template_id"
+        },
+        "custom_redirect_id": {
+            "col_name": "custom_redirect_id"
+        }
+    }
+}
+
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+#          - echo 'Pushing test image to repo. [tag=test]'
+#          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /data/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /data/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /data/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /data/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /data/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /data/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /data/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+Pardot is a B2B Marketing Automation platform offering solutions to organize/gather marketing data. The purpose of Pardot Extractor is to allow users to retrieve the marketing related data resources out of Pardot.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+1. Email
+    - User login to Pardot platform
+2. Password
+    - Password used to login to Pardot platform
+3. UserKey
+    - To acquire this, instruction is described in the `Authentication` Section
+4. Endpoints
+    - List of endpoints supported for this extractor
+5. Backfill mode
+    - If disabled, the component will run the date range to last 7 days by default
+    - Please ensure to input start date and end date when backfill mode is enabled
+    - Please avoid running backfill mode on multiple endpoints at the same time as there will be a possibility that it will flood the component's memory capacity
+6. Visitor IDs
+    - This configuration is required when `Visits` endpoint is selected
+    - Note: The component will only accept `visitor_id`, NOT `visit_id`
+7. Email IDs
+    - This configuration is required when `Emails` endpoint is selected
+
+## Authentication ##
+Required Information
+
+1. Email    
+2. Password 
+3. UserKey 
+    - Available in Pardot under ``{your email address}`` > Settings in the API User Key row
+
+***Note: For user accounts that have `Salesforce User Sync` enabled, user must authenticate with a  `Pardot-only` user.***
+
+## Rate Limits ##
+1. Daily Requests
+    - Pardot Pro useres are allocated 25,000 API requests per day
+    - Pardot Ultimate users can make up to 100,000 API requests per day
+2. Concurrent Requests
+    - Can have up to 5 concurrent API requests
+
+
+================================================
+File: /component_config/configSchema_test.json
+================================================
+{
+    "type": "object",
+    "title": "Configuration",
+    "required": [
+        "email",
+        "#password",
+        "#userkey",
+        "backfill_mode",
+        "endpoint",
+        "visit_id",
+        "email_id"
+    ],
+    "default": {
+        "backfill_mode": "#/definitions/disable"
+    },
+    "properties": {
+        "email": {
+            "type": "string",
+            "title": "Email",
+            "minLength": 1,
+            "propertyOrder": 100
+        },
+        "#password": {
+            "type": "string",
+            "title": "Password",
+            "minLength": 1,
+            "propertyOrder": 200
+        },
+        "#userkey": {
+            "type": "string",
+            "title": "UserKey",
+            "propertyOrder": 300,
+            "minLength": 1,
+            "description": "API user keys are available in Pardot under {your email address} > Settings in the API User Key row"
+        },
+        "endpoint": {
+            "type": "array",
+            "title": "Endpoints",
+            "uniqueItems": true,
+            "format": "table",
+            "items": {
+                "type": "object",
+                "title": "endpoint",
+                "properties": {
+                    "endpoint": {
+                        "enum": [
+                            "campaigns",
+                            "customfields",
+                            "customredirects",
+                            "dynamiccontent",
+                            "emailclicks",
+                            "forms",
+                            "lifecyclehistories",
+                            "lifecyclestages",
+                            "lists",
+                            "listmemberships",
+                            "opportunities",
+                            "prospects",
+                            "prospectaccounts",
+                            "tags",
+                            "tagobjects",
+                            "users",
+                            "visitors",
+                            "visitoractivities",
+                            "visits",
+                            "emails"
+                        ],
+                        "type": "string",
+                        "options": {
+                            "enum_titles": [
+                                "Campaigns",
+                                "Custom Fields",
+                                "Custom Redirects",
+                                "Dynamic Content",
+                                "Email Clicks",
+                                "Forms",
+                                "Lifecycle Histories",
+                                "Lifecycle Stages",
+                                "Lists",
+                                "List Memberships",
+                                "Opportunities",
+                                "Prospects",
+                                "Prospect Accounts",
+                                "Tags",
+                                "TagObjects",
+                                "Users",
+                                "Visitors",
+                                "Visitor Activities",
+                                "Visits",
+                                "Emails"
+                            ]
+                        }
+                    }
+                }
+            },
+            "minItems": 1,
+            "propertyOrder": 400
+        },
+        "backfill_mode": {
+            "title": "Backfill",
+            "propertyOrder": 500,
+            "type": "object",
+            "oneOf": [
+                {
+                    "$ref": "#/definitions/disable"
+                },
+                {
+                    "$ref": "#/definitions/enable"
+                }
+            ],
+            "description": "Please enter Start and End date if Backfill mode is enabled. If not, extractor will automatically define date range to last 7 days. On the other hand, please avoid running backfill on multiple endpoints as there will be a possibility that it will flood the component's memory capacity. Please run 1 or 2 endpoint only when backfill mode is enabled.",
+            "additionalProperties": false
+        },
+        "email_id": {
+            "type": "string",
+            "title": "Email IDs",
+            "propoertyOrder": 600,
+            "default": "",
+            "description": "This configuration is required when 'Email' endpoint is selected. The [email ids] should be comma separated integers (no spaces)."
+        },
+        "visit_id": {
+            "type": "string",
+            "title": "Visitor IDs",
+            "propertyOrder": 700,
+            "default": "",
+            "description": "This configuration is required when 'Visit' endpoint is selected. The [visitor ids] should be comma separated integers (no spaces)."
+        }
+
+    },
+    "definitions": {
+        "disable": {
+            "title": "Disable",
+            "type": "object",
+            "required": [
+                "backfill"
+            ],
+            "properties": {
+                "backfill": {
+                    "enum": [
+                        "disable"
+                    ],
+                    "type": "string",
+                    "title": "Backfill Mode",
+                    "default": "disable",
+                    "readOnly": true,
+                    "options": {
+                        "enum_titles": [
+                            "Disable"
+                        ]
+                    }
+                }
+            }
+        },
+        "enable": {
+            "title": "Enable",
+            "type": "object",
+            "required": [
+                "backfill",
+                "start_date",
+                "end_date"
+            ],
+            "properties": {
+                "backfill": {
+                    "enum": [
+                        "enable"
+                    ],
+                    "type": "string",
+                    "title": "Backfill Mode",
+                    "default": "enable",
+                    "readOnly": true,
+                    "propertyOrder": 100,
+                    "options": {
+                        "enum_titles": [
+                            "Enable"
+                        ]
+                    }
+                },
+                "start_date": {
+                    "type": "string",
+                    "title": "Start Date",
+                    "default": "2019-01-01",
+                    "description": "Input Format: YYYY-MM-DD",
+                    "propertyOrder": 200,
+                    "minLength": 1
+                },
+                "end_date": {
+                    "type": "string",
+                    "title": "End Date",
+                    "default": "2019-01-01",
+                    "description": "Input Format: YYYY-MM-DD",
+                    "propertyOrder": 300,
+                    "minLength": 1
+                }
+            }
+        }
+    }
+}
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Provides a B2B Marketing Automation solution
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+    "type": "object",
+    "title": "Configuration",
+    "required": [
+        "email",
+        "#password",
+        "#userkey",
+        "backfill_mode",
+        "endpoint",
+        "visit_id",
+        "email_id"
+    ],
+    "default": {
+        "backfill_mode": "#/definitions/disable"
+    },
+    "properties": {
+        "email": {
+            "type": "string",
+            "title": "Email",
+            "minLength": 1,
+            "propertyOrder": 100
+        },
+        "#password": {
+            "type": "string",
+            "title": "Password",
+            "minLength": 1,
+            "propertyOrder": 200
+        },
+        "#userkey": {
+            "type": "string",
+            "title": "UserKey",
+            "propertyOrder": 300,
+            "minLength": 1,
+            "description": "API user keys are available in Pardot under {your email address} > Settings in the API User Key row"
+        },
+        "endpoint": {
+            "type": "array",
+            "title": "Endpoints",
+            "uniqueItems": true,
+            "format": "table",
+            "items": {
+                "type": "object",
+                "title": "endpoint",
+                "properties": {
+                    "endpoint": {
+                        "enum": [
+                            "campaigns",
+                            "customfields",
+                            "customredirects",
+                            "dynamiccontent",
+                            "emailclicks",
+                            "forms",
+                            "lifecyclehistories",
+                            "lifecyclestages",
+                            "lists",
+                            "listmemberships",
+                            "opportunities",
+                            "prospects",
+                            "prospectaccounts",
+                            "tags",
+                            "tagobjects",
+                            "users",
+                            "visitors",
+                            "visitoractivities",
+                            "visits",
+                            "emails"
+                        ],
+                        "type": "string",
+                        "options": {
+                            "enum_titles": [
+                                "Campaigns",
+                                "Custom Fields",
+                                "Custom Redirects",
+                                "Dynamic Content",
+                                "Email Clicks",
+                                "Forms",
+                                "Lifecycle Histories",
+                                "Lifecycle Stages",
+                                "Lists",
+                                "List Memberships",
+                                "Opportunities",
+                                "Prospects",
+                                "Prospect Accounts",
+                                "Tags",
+                                "TagObjects",
+                                "Users",
+                                "Visitors",
+                                "Visitor Activities",
+                                "Visits",
+                                "Emails"
+                            ]
+                        }
+                    }
+                }
+            },
+            "minItems": 1,
+            "propertyOrder": 400
+        },
+        "backfill_mode": {
+            "title": "Backfill",
+            "propertyOrder": 500,
+            "type": "object",
+            "oneOf": [
+                {
+                    "$ref": "#/definitions/disable"
+                },
+                {
+                    "$ref": "#/definitions/enable"
+                }
+            ],
+            "description": "Please enter Start and End date if Backfill mode is enabled. If not, extractor will automatically define date range to last 7 days. On the other hand, please avoid running backfill on multiple endpoints as there will be a possibility that it will flood the component's memory capacity. Please run 1 or 2 endpoint only when backfill mode is enabled.",
+            "additionalProperties": false
+        },
+        "email_id": {
+            "type": "string",
+            "title": "Email IDs",
+            "propoertyOrder": 600,
+            "default": "",
+            "description": "Please enter 'Email IDs' when 'Email' endpoint is selected. The 'Email IDs' should be comma separated integers."
+        },
+        "visit_id": {
+            "type": "string",
+            "title": "Visitor IDs",
+            "propertyOrder": 700,
+            "default": "",
+            "description": "Please enter 'Visitor IDs' when 'Visits' endpoint is selected. The 'Visitor IDs' should be comma separated integers."
+        }
+
+    },
+    "definitions": {
+        "disable": {
+            "title": "Disable",
+            "type": "object",
+            "required": [
+                "backfill"
+            ],
+            "properties": {
+                "backfill": {
+                    "enum": [
+                        "disable"
+                    ],
+                    "type": "string",
+                    "title": "Backfill Mode",
+                    "default": "disable",
+                    "readOnly": true,
+                    "options": {
+                        "enum_titles": [
+                            "Disable"
+                        ]
+                    }
+                }
+            }
+        },
+        "enable": {
+            "title": "Enable",
+            "type": "object",
+            "required": [
+                "backfill",
+                "start_date",
+                "end_date"
+            ],
+            "properties": {
+                "backfill": {
+                    "enum": [
+                        "enable"
+                    ],
+                    "type": "string",
+                    "title": "Backfill Mode",
+                    "default": "enable",
+                    "readOnly": true,
+                    "propertyOrder": 100,
+                    "options": {
+                        "enum_titles": [
+                            "Enable"
+                        ]
+                    }
+                },
+                "start_date": {
+                    "type": "string",
+                    "title": "Start Date",
+                    "default": "2019-01-01",
+                    "description": "Input Format: YYYY-MM-DD",
+                    "propertyOrder": 200,
+                    "minLength": 1
+                },
+                "end_date": {
+                    "type": "string",
+                    "title": "End Date",
+                    "default": "2019-01-01",
+                    "description": "Input Format: YYYY-MM-DD",
+                    "propertyOrder": 300,
+                    "minLength": 1
+                }
+            }
+        }
+    }
+}
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.0.zip#egg=kbc
+logging_gelf==0.0.18
+mock
+freezegun
+pandas
+pypardot4
+dateparser
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.7.2-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install --upgrade pip
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+Copyright (c) 2018 Keboola DS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Pardot Extractor #
+
+## Overview ##
+Pardot is a B2B Marketing Automation platform offering solutions to organize/gather marketing data. The purpose of Pardot Extractor is to allow users to retrieve the marketing related data resources out of Pardot.
+
+## Pardot API Documentations ##
+[Pardot API](http://developer.pardot.com/)
+
+## Authentication ##
+Required Information
+
+1. Email    
+2. Password 
+3. UserKey 
+    - Available in Pardot under ``{your email address}`` > Settings in the API User Key row
+
+***Note: For user accounts that have `Salesforce User Sync` enabled, user must authenticate with a  `Pardot-only` user.***
+
+## Rate Limits ##
+1. Daily Requests
+    - Pardot Pro useres are allocated 25,000 API requests per day
+    - Pardot Ultimate users can make up to 100,000 API requests per day
+2. Concurrent Requests
+    - Can have up to 5 concurrent API requests
+
+## Configuration ##
+1. Email
+    - User login to Pardot platform
+2. Password
+    - Password used to login to Pardot platform
+3. UserKey
+    - To acquire this, instruction is described in the `Authentication` Section
+4. Endpoints
+    - List of endpoints supported for this extractor
+5. Backfill mode
+    - If disabled, the component will run the date range to last 7 days by default
+    - Please ensure to input start date and end date when backfill mode is enabled
+    - Please avoid running backfill mode on multiple endpoints at the same time as there will be a possibility that it will flood the component's memory capacity
+6. Visitor IDs
+    - This configuration is required when `Visits` endpoint is selected
+    - Note: The component will only accept `visitor_id`, NOT `visit_id`
+7. Email IDs
+    - This configuration is required when `Emails` endpoint is selected
+
+## Python Wrapper Used ##
+[PyPardot4](https://github.com/mneedham91/PyPardot4)
+

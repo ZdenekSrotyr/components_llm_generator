@@ -1,0 +1,1580 @@
+Directory structure:
+└── kds_consulting_team-kds_team.ex-mixpanel/
+    ├── .python-version
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   └── client/
+    │       ├── __init__.py
+    │       └── client.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── logger
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── loggerConfiguration.json
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       └── out/
+    │           └── tables/
+    │               └── output.csv
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /.python-version
+================================================
+3.8.11/envs/ex-mixpanel
+
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command: 
+      - /bin/sh
+      - /code/scripts/run.sh
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.2.0**
+Rewrote source code to utilize KBCEnvHandler library.
+Fixed error on separating json files, now they are read from source file line-by-line without separation.
+
+**0.1.2**
+Fixed badly ended json files from the API call.
+
+**0.1.1**
+Added printing of wrong rows for debugging purposes.
+
+**0.1.0**
+Added relative data extraction. Tweaked configuration schema. Added README, descriptions.
+
+**0.0.6**
+Added descriptions.
+
+**0.0.5**
+Executables fix #2.
+
+**0.0.4**
+Fixed executables.
+
+**0.0.3**
+Pipeline fixes.
+
+**0.0.2**
+Logging_gelf fixes.
+
+**0.0.1**
+The beta version of the component. So far, only __to_date__ and __from_date__ parameters are supported.
+
+================================================
+File: /src/component.py
+================================================
+import logging
+import datetime
+import pytz
+import urllib
+import json
+import csv
+import tempfile
+from hashlib import md5
+from typing import Tuple, List, Dict, Literal
+from keboola.component.base import ComponentBase
+from keboola.component.exceptions import UserException
+from keboola.component.dao import TableDefinition
+from client import MixPanelClient, MixPanelClientException
+
+KEY_API_SECRET = '#api_secret'
+KEY_FROM_DATE = 'from_date'
+KEY_TO_DATE = 'to_date'
+KEY_TIMEZONE = 'timezone'
+KEY_THROWBACK = 'throwback'
+KEY_INCREMENTAL = 'incremental'
+KEY_SERVER = 'residency_server'
+KEY_RAW_EXTRACT = 'raw_extract'
+KEY_EVENTS = 'events'
+KEY_WHERE = 'where'
+KEY_DEBUG = 'debug'
+
+OUTPUT_FIELDS = ['id', 'parameter', 'value']
+OUTPUT_PK = ['id', 'parameter']
+
+OUTPUT_FIELDS_RAW = ['id', 'raw']
+OUTPUT_PK_RAW = ['id']
+
+REQUIRED_PARAMETERS = [KEY_API_SECRET, KEY_TIMEZONE, [KEY_THROWBACK, [KEY_TO_DATE, KEY_FROM_DATE]]]
+REQUIRED_IMAGE_PARS = []
+
+
+class Component(ComponentBase):
+    def __init__(self) -> None:
+        super().__init__(required_parameters=REQUIRED_PARAMETERS, required_image_parameters=REQUIRED_IMAGE_PARS)
+
+    def run(self) -> None:
+        params = self.configuration.parameters
+        api_token = params.get(KEY_API_SECRET)
+
+        if params.get(KEY_DEBUG):
+            logging.getLogger().setLevel(logging.DEBUG)
+
+        server = params.get(KEY_SERVER, 'US')
+        export_server = self.get_export_server_url(server)
+
+        date_from = params.get(KEY_FROM_DATE)
+        date_to = params.get(KEY_TO_DATE)
+        timezone = params.get(KEY_TIMEZONE)
+        throwback = params.get(KEY_THROWBACK)
+        requests_date_from, requests_date_to = self.determine_date(date_from, date_to, timezone, throwback)
+
+        events = params.get(KEY_EVENTS)
+        encoded_events = self.encode_events(events)
+        where = params.get(KEY_WHERE, "")
+        encoded_where = urllib.parse.quote_plus(where)
+
+        client = MixPanelClient(api_token, export_server=export_server)
+        result_tmp_file = tempfile.NamedTemporaryFile()
+        result_headers_tmp_file = tempfile.NamedTemporaryFile()
+        try:
+            client.export_events(date_from=requests_date_from, date_to=requests_date_to,
+                                 destination=result_tmp_file.name, events=encoded_events, where=encoded_where,
+                                 header_destination=result_headers_tmp_file.name)
+        except MixPanelClientException as mixpanel_exception:
+            raise UserException("Failed to process query, make sure the dates, events, and where filters are all set "
+                                "correctly") from mixpanel_exception
+
+        incremental = params.get(KEY_INCREMENTAL, True)
+        output_table = self.create_out_table_definition("output.csv", incremental=incremental)
+        raw_extract = params.get(KEY_RAW_EXTRACT)
+
+        if raw_extract:
+            output_table.primary_key = OUTPUT_PK_RAW
+            output_table.columns = OUTPUT_FIELDS_RAW
+        else:
+            output_table.primary_key = OUTPUT_PK
+            output_table.columns = OUTPUT_FIELDS
+
+        self.process_output(result_tmp_file.name, output_table, raw_extract)
+        self.write_manifest(output_table)
+
+    @staticmethod
+    def determine_date(date_from: str, date_to: str, timezone: str, throwback: int) -> Tuple[str, str]:
+        if not date_from or not date_to:
+            logging.info("Relative data extraction will be used.")
+            dt_utc = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
+            dt_local = dt_utc.astimezone(pytz.timezone(timezone)) - datetime.timedelta(days=1)
+            requests_date_to = dt_local.strftime("%Y-%m-%d")
+            requests_date_from = (dt_local + datetime.timedelta(days=int(throwback) + 1)).strftime("%Y-%m-%d")
+            logging.info(f"Data will be exported from {requests_date_from} to {requests_date_to}.")
+        else:
+            requests_date_from = date_from
+            requests_date_to = date_to
+            logging.info(f"Using absolute date export from {requests_date_from} to {requests_date_to}.")
+        return requests_date_from, requests_date_to
+
+    @staticmethod
+    def encode_events(events: List) -> str:
+        if not events:
+            return ''
+        else:
+            return urllib.parse.quote_plus(json.dumps([ev for ev in events if ev.strip() != '']))
+
+    @staticmethod
+    def get_export_server_url(server: str) -> Literal['data', 'data-eu']:
+        if server == 'US':
+            return 'data'
+        elif server == 'EU':
+            return 'data-eu'
+        else:
+            raise UserException(f"Unsupported residency server selected: {server}.")
+
+    def process_output(self, input_table: str, output_table: TableDefinition, raw: bool) -> None:
+        writer = csv.writer(open(output_table.full_path, 'w'), quotechar='"', quoting=csv.QUOTE_ALL)
+
+        logging.info("Processing output...")
+        i = 0
+
+        with open(input_table, 'r') as raw_data:
+            for line in raw_data:
+                i += 1
+
+                if i % 200000 == 0:
+                    logging.info("Processed %s rows so far..." % i)
+
+                try:
+                    _line_js = json.loads(line)
+                    _line_id = md5(line.encode()).hexdigest()
+                except ValueError as e:
+                    raise UserException("Error occured while processing the file.") from e
+                if raw is True:
+                    writer.writerow([_line_id, json.dumps(line)])
+                else:
+                    _line_flattened = self._json_flatten(_line_js)
+                    for param in _line_flattened:
+                        writer.writerow([_line_id, param, _line_flattened[param]])
+        logging.info("Processed %s rows in total." % i)
+
+    def _json_flatten(self, raw_json: Dict, delimiter: str = '__') -> Dict:
+
+        result_dict = {}
+        for key in raw_json:
+            if isinstance(raw_json[key], dict):
+                get = self._json_flatten(raw_json[key], delimiter)
+                for nested_key in get:
+                    result_dict[key.replace(' ', '_') + delimiter + nested_key.replace(' ', '_')] = get[nested_key]
+            else:
+                result_dict[key.replace(' ', '_')] = raw_json[key]
+
+        return result_dict
+
+
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        comp.run()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /src/client/__init__.py
+================================================
+from .client import MixPanelClient, MixPanelClientException  # noqa
+
+================================================
+File: /src/client/client.py
+================================================
+import logging
+import subprocess
+
+
+class MixPanelClientException(Exception):
+    pass
+
+
+class MixPanelClient():
+    def __init__(self, token, export_server):
+        self.token = token
+        self.export_server = export_server
+
+    def export_events(self, date_from: str, date_to: str, destination: str, events: str = '', where: str = '',
+                      header_destination: str = "response-headers.txt") -> None:
+
+        _callCURL = f"""curl -s https://{self.export_server}.mixpanel.com/api/2.0/export/ \
+                        -u {self.token}: \
+                        -d from_date={date_from} \
+                        -d to_date={date_to} \
+                        -d event={events} \
+                        -d where={where} \
+                        -D {header_destination}"""
+
+        logging.debug("cURL call:")
+        logging.debug(_callCURL)
+        logging.info("Downloading data...")
+
+        with open(destination, 'w') as response:
+            subprocess.call(_callCURL.split(), stdout=response)
+
+        with open(header_destination, 'r') as response_headers:
+
+            headers = [h.strip() for h in response_headers.readlines()]
+
+            if '200' not in headers[0]:
+                with open(destination, 'r') as response:
+                    file = [f.strip() for f in response.readlines()]
+                err = headers[0]
+                raise MixPanelClientException(
+                    f"There was an issue downloading the data. The response received was {err} . Message : {str(file)}")
+
+            else:
+                logging.info("Download was successful.")
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP 516588087 test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/logger
+================================================
+gelf
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# MixPanel
+
+## Overview
+
+The MixPanel is a service analyzing user behavior across sites and apps. The extractor uses the [MixPanel API](https://developer.mixpanel.com/docs/exporting-raw-data) to export raw data about user behavior and allows to analyze data further. All of the data is returned in `json` format, delimited by new line between records. However, not all records consist of same parameter keys, hence the extractor processes the output into name-value pair (NVP) format.
+
+The output is a table of 3 columns, which is **not** loaded incrementally.
+
+#### Note on the exports
+Due to vast amount of data, the extractor may run for hours, hence it is recommended to split the data into parts, if a full download is required. You can do so, by correctly specifying `From date` and `To date` parameters.
+In case that full download of the data is not required (i.e. extractor is ran every night in the orchestration), it's best to use `Throwback` parameter, which automatically downloads the specified number of full days of data. Specifying `Throwback=-1` downloads 1 last day full of data, i.e. date prior to day; `Throwback=-2` downloads data for 2 full days prior to today, etc.
+
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+### Input
+
+The extractor accepts 5 parameters, of which 2 are required and the rest requires to have a combination present. The parameters are:
+
+  - `API Secret` (required) - API secret for the project from which the data should be downloaded. [Click here](https://help.mixpanel.com/hc/en-us/articles/115004490503-Project-Token-API-Key-API-Secret) for information on how to retrieve the API secret.
+  - `Residency Server Region` (optional) - Region, where your data are located. Currently, US and EU regions are supported.
+  - `From date` (optional) - The date from which, the data should be downloaded. It's required to use `YYYY-MM-DD` format, otherwise, an exception is raised. If left blank, extractor will automatically ignore the parameter and use the value from `Throwback`.
+  - `To date` (optional) - The date to which, the data should be downloaded. It's required to use `YYYY-MM-DD` format, otherwise, an exception is raised. If left blank, extractor will automatically ignore the parameter and use the value from `Throwback`.
+  - `Throwback` (optional) - Number of the latest full days prior to today, that should be downloaded. The parameter is ignored if both `From date` and `To date` are specified.
+  - `Events` (optional) - A list of events, for which the export should be filtered.
+  - `Where` (optional) - An expression to filter events by. More info on expression sequence structure can be found [here](https://developer.mixpanel.com/reference/segmentation-expressions)
+  - `Timezone` (required) - Timezone, in which your project is located. The parameter is required for `Throwback` parameter to work correctly. Improper definition of `Timezone` may lead to incomplete data. [Click here](https://help.mixpanel.com/hc/en-us/articles/115004547203-Project-Timezone) for more information.
+  - `Load Type` (optional) - Choose whether to load table incrementally or via full load.
+  - `Raw Data Export` (optional) - If set to `false`, the response from the API will be parsed and stored in storage in a key-value pair table. This is due to inconsistency of the returned JSON for each row. If set to `true`, the raw JSON response will be output to the storage and can be later parsed in e.g. Snowflake, Python transformations.
+
+### Output
+
+If raw data export is disabled, the extractor returns an output table with 3 columns. The output table is in the name-value pair format and may take the following form:
+
+| id 	| parameter 	| value 	|
+|----------------------------------	|-------------------------	|--------------------	|
+| 149883e1c6000df0f5dc4d521725679b 	| event 	| View Payslip Page 	|
+| 149883e1c6000df0f5dc4d521725679b 	| properties__time 	| 1561420800 	|
+| 149883e1c6000df0f5dc4d521725679b 	| properties__distinct_id 	| 0051o000009eqc1AAA 	|
+| 149883e1c6000df0f5dc4d521725679b 	| properties__$city 	| Evesham 	|
+
+The `id` column is created as an MD5 sum of the **unprocessed row** and is hence unique to each row in the **unprocessed output**. The column can be used to piece back together the desired `parameter`s and their `value`s.
+
+If raw data export is enabled, the extractor returns and output table with 2 columns: `id` and `raw`. The `id` columns is created as mentioned above. The `raw` column contains the **unprocessed output**.
+
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+MixPanel service analyzes user behavior across sites and applications.
+
+================================================
+File: /component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+	"type": "object",
+	"title": "Parameters",
+	"required": [
+		"#api_secret",
+		"from_date",
+		"to_date",
+		"throwback",
+		"timezone",
+		"incremental",
+		"raw_extract",
+		"residency_server"
+	],
+	"properties": {
+		"from_date": {
+			"type": "string",
+			"title": "From date",
+			"default": "",
+			"description": "Lower date bound of extraction in YYYY-MM-DD format. Leave blank for relative date.",
+			"propertyOrder": 200
+		},
+		"#api_secret": {
+			"type": "string",
+			"title": "API Secret",
+			"format": "password",
+			"default": "",
+			"description": "API Secret for MixPanel API.",
+			"propertyOrder": 100
+		},
+		"to_date": {
+			"type": "string",
+			"title": "To date",
+			"default": "",
+			"description": "Upper date bound of extraction in YYYY-MM-DD format. Leave blank for relative date.",
+			"propertyOrder": 300
+		},
+		"throwback": {
+			"type": "integer",
+			"title": "Throwback",
+			"default": -1,
+			"maximum": -1,
+			"propertyOrder": 400,
+			"description": "The number of full days of data, before today, to be extracted."
+		},
+		"events": {
+			"type": "array",
+			"title": "Events",
+			"description": "A list of events, for which the Mixpanel export will be filtered. If left empty, all events are downloaded.",
+			"propertyOrder": 450,
+			"default": [],
+			"items":{
+				"type": "string",
+				"title": "Event Name",
+				"description": "Name of the filtering event"
+			}
+		},
+		"where": {
+			"type": "string",
+			"title": "Where",
+			"description": "An expression to filter events by. More info on expression sequence structure can be found <a href='https://developer.mixpanel.com/reference/segmentation-expressions'>here</a>.",
+			"propertyOrder": 455
+		},
+		"timezone": {
+			"type": "string",
+			"description": "Timezone setting of the project. <a href='https://help.mixpanel.com/hc/en-us/articles/115004547203-Project-Timezone'>Click here</a> for more information.",
+			"enum": [
+				"Africa/Abidjan",
+				"Africa/Accra",
+				"Africa/Addis_Ababa",
+				"Africa/Algiers",
+				"Africa/Asmara",
+				"Africa/Asmera",
+				"Africa/Bamako",
+				"Africa/Bangui",
+				"Africa/Banjul",
+				"Africa/Bissau",
+				"Africa/Blantyre",
+				"Africa/Brazzaville",
+				"Africa/Bujumbura",
+				"Africa/Cairo",
+				"Africa/Casablanca",
+				"Africa/Ceuta",
+				"Africa/Conakry",
+				"Africa/Dakar",
+				"Africa/Dar_es_Salaam",
+				"Africa/Djibouti",
+				"Africa/Douala",
+				"Africa/El_Aaiun",
+				"Africa/Freetown",
+				"Africa/Gaborone",
+				"Africa/Harare",
+				"Africa/Johannesburg",
+				"Africa/Juba",
+				"Africa/Kampala",
+				"Africa/Khartoum",
+				"Africa/Kigali",
+				"Africa/Kinshasa",
+				"Africa/Lagos",
+				"Africa/Libreville",
+				"Africa/Lome",
+				"Africa/Luanda",
+				"Africa/Lubumbashi",
+				"Africa/Lusaka",
+				"Africa/Malabo",
+				"Africa/Maputo",
+				"Africa/Maseru",
+				"Africa/Mbabane",
+				"Africa/Mogadishu",
+				"Africa/Monrovia",
+				"Africa/Nairobi",
+				"Africa/Ndjamena",
+				"Africa/Niamey",
+				"Africa/Nouakchott",
+				"Africa/Ouagadougou",
+				"Africa/Porto-Novo",
+				"Africa/Sao_Tome",
+				"Africa/Timbuktu",
+				"Africa/Tripoli",
+				"Africa/Tunis",
+				"Africa/Windhoek",
+				"America/Adak",
+				"America/Anchorage",
+				"America/Anguilla",
+				"America/Antigua",
+				"America/Araguaina",
+				"America/Argentina/Buenos_Aires",
+				"America/Argentina/Catamarca",
+				"America/Argentina/ComodRivadavia",
+				"America/Argentina/Cordoba",
+				"America/Argentina/Jujuy",
+				"America/Argentina/La_Rioja",
+				"America/Argentina/Mendoza",
+				"America/Argentina/Rio_Gallegos",
+				"America/Argentina/Salta",
+				"America/Argentina/San_Juan",
+				"America/Argentina/San_Luis",
+				"America/Argentina/Tucuman",
+				"America/Argentina/Ushuaia",
+				"America/Aruba",
+				"America/Asuncion",
+				"America/Atikokan",
+				"America/Atka",
+				"America/Bahia",
+				"America/Bahia_Banderas",
+				"America/Barbados",
+				"America/Belem",
+				"America/Belize",
+				"America/Blanc-Sablon",
+				"America/Boa_Vista",
+				"America/Bogota",
+				"America/Boise",
+				"America/Buenos_Aires",
+				"America/Cambridge_Bay",
+				"America/Campo_Grande",
+				"America/Cancun",
+				"America/Caracas",
+				"America/Catamarca",
+				"America/Cayenne",
+				"America/Cayman",
+				"America/Chicago",
+				"America/Chihuahua",
+				"America/Coral_Harbour",
+				"America/Cordoba",
+				"America/Costa_Rica",
+				"America/Creston",
+				"America/Cuiaba",
+				"America/Curacao",
+				"America/Danmarkshavn",
+				"America/Dawson",
+				"America/Dawson_Creek",
+				"America/Denver",
+				"America/Detroit",
+				"America/Dominica",
+				"America/Edmonton",
+				"America/Eirunepe",
+				"America/El_Salvador",
+				"America/Ensenada",
+				"America/Fort_Nelson",
+				"America/Fort_Wayne",
+				"America/Fortaleza",
+				"America/Glace_Bay",
+				"America/Godthab",
+				"America/Goose_Bay",
+				"America/Grand_Turk",
+				"America/Grenada",
+				"America/Guadeloupe",
+				"America/Guatemala",
+				"America/Guayaquil",
+				"America/Guyana",
+				"America/Halifax",
+				"America/Havana",
+				"America/Hermosillo",
+				"America/Indiana/Indianapolis",
+				"America/Indiana/Knox",
+				"America/Indiana/Marengo",
+				"America/Indiana/Petersburg",
+				"America/Indiana/Tell_City",
+				"America/Indiana/Vevay",
+				"America/Indiana/Vincennes",
+				"America/Indiana/Winamac",
+				"America/Indianapolis",
+				"America/Inuvik",
+				"America/Iqaluit",
+				"America/Jamaica",
+				"America/Jujuy",
+				"America/Juneau",
+				"America/Kentucky/Louisville",
+				"America/Kentucky/Monticello",
+				"America/Knox_IN",
+				"America/Kralendijk",
+				"America/La_Paz",
+				"America/Lima",
+				"America/Los_Angeles",
+				"America/Louisville",
+				"America/Lower_Princes",
+				"America/Maceio",
+				"America/Managua",
+				"America/Manaus",
+				"America/Marigot",
+				"America/Martinique",
+				"America/Matamoros",
+				"America/Mazatlan",
+				"America/Mendoza",
+				"America/Menominee",
+				"America/Merida",
+				"America/Metlakatla",
+				"America/Mexico_City",
+				"America/Miquelon",
+				"America/Moncton",
+				"America/Monterrey",
+				"America/Montevideo",
+				"America/Montreal",
+				"America/Montserrat",
+				"America/Nassau",
+				"America/New_York",
+				"America/Nipigon",
+				"America/Nome",
+				"America/Noronha",
+				"America/North_Dakota/Beulah",
+				"America/North_Dakota/Center",
+				"America/North_Dakota/New_Salem",
+				"America/Ojinaga",
+				"America/Panama",
+				"America/Pangnirtung",
+				"America/Paramaribo",
+				"America/Phoenix",
+				"America/Port-au-Prince",
+				"America/Port_of_Spain",
+				"America/Porto_Acre",
+				"America/Porto_Velho",
+				"America/Puerto_Rico",
+				"America/Punta_Arenas",
+				"America/Rainy_River",
+				"America/Rankin_Inlet",
+				"America/Recife",
+				"America/Regina",
+				"America/Resolute",
+				"America/Rio_Branco",
+				"America/Rosario",
+				"America/Santa_Isabel",
+				"America/Santarem",
+				"America/Santiago",
+				"America/Santo_Domingo",
+				"America/Sao_Paulo",
+				"America/Scoresbysund",
+				"America/Shiprock",
+				"America/Sitka",
+				"America/St_Barthelemy",
+				"America/St_Johns",
+				"America/St_Kitts",
+				"America/St_Lucia",
+				"America/St_Thomas",
+				"America/St_Vincent",
+				"America/Swift_Current",
+				"America/Tegucigalpa",
+				"America/Thule",
+				"America/Thunder_Bay",
+				"America/Tijuana",
+				"America/Toronto",
+				"America/Tortola",
+				"America/Vancouver",
+				"America/Virgin",
+				"America/Whitehorse",
+				"America/Winnipeg",
+				"America/Yakutat",
+				"America/Yellowknife",
+				"Antarctica/Casey",
+				"Antarctica/Davis",
+				"Antarctica/DumontDUrville",
+				"Antarctica/Macquarie",
+				"Antarctica/Mawson",
+				"Antarctica/McMurdo",
+				"Antarctica/Palmer",
+				"Antarctica/Rothera",
+				"Antarctica/South_Pole",
+				"Antarctica/Syowa",
+				"Antarctica/Troll",
+				"Antarctica/Vostok",
+				"Arctic/Longyearbyen",
+				"Asia/Aden",
+				"Asia/Almaty",
+				"Asia/Amman",
+				"Asia/Anadyr",
+				"Asia/Aqtau",
+				"Asia/Aqtobe",
+				"Asia/Ashgabat",
+				"Asia/Ashkhabad",
+				"Asia/Atyrau",
+				"Asia/Baghdad",
+				"Asia/Bahrain",
+				"Asia/Baku",
+				"Asia/Bangkok",
+				"Asia/Barnaul",
+				"Asia/Beirut",
+				"Asia/Bishkek",
+				"Asia/Brunei",
+				"Asia/Calcutta",
+				"Asia/Chita",
+				"Asia/Choibalsan",
+				"Asia/Chongqing",
+				"Asia/Chungking",
+				"Asia/Colombo",
+				"Asia/Dacca",
+				"Asia/Damascus",
+				"Asia/Dhaka",
+				"Asia/Dili",
+				"Asia/Dubai",
+				"Asia/Dushanbe",
+				"Asia/Famagusta",
+				"Asia/Gaza",
+				"Asia/Harbin",
+				"Asia/Hebron",
+				"Asia/Ho_Chi_Minh",
+				"Asia/Hong_Kong",
+				"Asia/Hovd",
+				"Asia/Irkutsk",
+				"Asia/Istanbul",
+				"Asia/Jakarta",
+				"Asia/Jayapura",
+				"Asia/Jerusalem",
+				"Asia/Kabul",
+				"Asia/Kamchatka",
+				"Asia/Karachi",
+				"Asia/Kashgar",
+				"Asia/Kathmandu",
+				"Asia/Katmandu",
+				"Asia/Khandyga",
+				"Asia/Kolkata",
+				"Asia/Krasnoyarsk",
+				"Asia/Kuala_Lumpur",
+				"Asia/Kuching",
+				"Asia/Kuwait",
+				"Asia/Macao",
+				"Asia/Macau",
+				"Asia/Magadan",
+				"Asia/Makassar",
+				"Asia/Manila",
+				"Asia/Muscat",
+				"Asia/Nicosia",
+				"Asia/Novokuznetsk",
+				"Asia/Novosibirsk",
+				"Asia/Omsk",
+				"Asia/Oral",
+				"Asia/Phnom_Penh",
+				"Asia/Pontianak",
+				"Asia/Pyongyang",
+				"Asia/Qatar",
+				"Asia/Qostanay",
+				"Asia/Qyzylorda",
+				"Asia/Rangoon",
+				"Asia/Riyadh",
+				"Asia/Saigon",
+				"Asia/Sakhalin",
+				"Asia/Samarkand",
+				"Asia/Seoul",
+				"Asia/Shanghai",
+				"Asia/Singapore",
+				"Asia/Srednekolymsk",
+				"Asia/Taipei",
+				"Asia/Tashkent",
+				"Asia/Tbilisi",
+				"Asia/Tehran",
+				"Asia/Tel_Aviv",
+				"Asia/Thimbu",
+				"Asia/Thimphu",
+				"Asia/Tokyo",
+				"Asia/Tomsk",
+				"Asia/Ujung_Pandang",
+				"Asia/Ulaanbaatar",
+				"Asia/Ulan_Bator",
+				"Asia/Urumqi",
+				"Asia/Ust-Nera",
+				"Asia/Vientiane",
+				"Asia/Vladivostok",
+				"Asia/Yakutsk",
+				"Asia/Yangon",
+				"Asia/Yekaterinburg",
+				"Asia/Yerevan",
+				"Atlantic/Azores",
+				"Atlantic/Bermuda",
+				"Atlantic/Canary",
+				"Atlantic/Cape_Verde",
+				"Atlantic/Faeroe",
+				"Atlantic/Faroe",
+				"Atlantic/Jan_Mayen",
+				"Atlantic/Madeira",
+				"Atlantic/Reykjavik",
+				"Atlantic/South_Georgia",
+				"Atlantic/St_Helena",
+				"Atlantic/Stanley",
+				"Australia/ACT",
+				"Australia/Adelaide",
+				"Australia/Brisbane",
+				"Australia/Broken_Hill",
+				"Australia/Canberra",
+				"Australia/Currie",
+				"Australia/Darwin",
+				"Australia/Eucla",
+				"Australia/Hobart",
+				"Australia/LHI",
+				"Australia/Lindeman",
+				"Australia/Lord_Howe",
+				"Australia/Melbourne",
+				"Australia/NSW",
+				"Australia/North",
+				"Australia/Perth",
+				"Australia/Queensland",
+				"Australia/South",
+				"Australia/Sydney",
+				"Australia/Tasmania",
+				"Australia/Victoria",
+				"Australia/West",
+				"Australia/Yancowinna",
+				"Brazil/Acre",
+				"Brazil/DeNoronha",
+				"Brazil/East",
+				"Brazil/West",
+				"CET",
+				"CST6CDT",
+				"Canada/Atlantic",
+				"Canada/Central",
+				"Canada/Eastern",
+				"Canada/Mountain",
+				"Canada/Newfoundland",
+				"Canada/Pacific",
+				"Canada/Saskatchewan",
+				"Canada/Yukon",
+				"Chile/Continental",
+				"Chile/EasterIsland",
+				"Cuba",
+				"EET",
+				"EST",
+				"EST5EDT",
+				"Egypt",
+				"Eire",
+				"Etc/GMT",
+				"Etc/GMT+0",
+				"Etc/GMT+1",
+				"Etc/GMT+10",
+				"Etc/GMT+11",
+				"Etc/GMT+12",
+				"Etc/GMT+2",
+				"Etc/GMT+3",
+				"Etc/GMT+4",
+				"Etc/GMT+5",
+				"Etc/GMT+6",
+				"Etc/GMT+7",
+				"Etc/GMT+8",
+				"Etc/GMT+9",
+				"Etc/GMT-0",
+				"Etc/GMT-1",
+				"Etc/GMT-10",
+				"Etc/GMT-11",
+				"Etc/GMT-12",
+				"Etc/GMT-13",
+				"Etc/GMT-14",
+				"Etc/GMT-2",
+				"Etc/GMT-3",
+				"Etc/GMT-4",
+				"Etc/GMT-5",
+				"Etc/GMT-6",
+				"Etc/GMT-7",
+				"Etc/GMT-8",
+				"Etc/GMT-9",
+				"Etc/GMT0",
+				"Etc/Greenwich",
+				"Etc/UCT",
+				"Etc/UTC",
+				"Etc/Universal",
+				"Etc/Zulu",
+				"Europe/Amsterdam",
+				"Europe/Andorra",
+				"Europe/Astrakhan",
+				"Europe/Athens",
+				"Europe/Belfast",
+				"Europe/Belgrade",
+				"Europe/Berlin",
+				"Europe/Bratislava",
+				"Europe/Brussels",
+				"Europe/Bucharest",
+				"Europe/Budapest",
+				"Europe/Busingen",
+				"Europe/Chisinau",
+				"Europe/Copenhagen",
+				"Europe/Dublin",
+				"Europe/Gibraltar",
+				"Europe/Guernsey",
+				"Europe/Helsinki",
+				"Europe/Isle_of_Man",
+				"Europe/Istanbul",
+				"Europe/Jersey",
+				"Europe/Kaliningrad",
+				"Europe/Kiev",
+				"Europe/Kirov",
+				"Europe/Lisbon",
+				"Europe/Ljubljana",
+				"Europe/London",
+				"Europe/Luxembourg",
+				"Europe/Madrid",
+				"Europe/Malta",
+				"Europe/Mariehamn",
+				"Europe/Minsk",
+				"Europe/Monaco",
+				"Europe/Moscow",
+				"Europe/Nicosia",
+				"Europe/Oslo",
+				"Europe/Paris",
+				"Europe/Podgorica",
+				"Europe/Prague",
+				"Europe/Riga",
+				"Europe/Rome",
+				"Europe/Samara",
+				"Europe/San_Marino",
+				"Europe/Sarajevo",
+				"Europe/Saratov",
+				"Europe/Simferopol",
+				"Europe/Skopje",
+				"Europe/Sofia",
+				"Europe/Stockholm",
+				"Europe/Tallinn",
+				"Europe/Tirane",
+				"Europe/Tiraspol",
+				"Europe/Ulyanovsk",
+				"Europe/Uzhgorod",
+				"Europe/Vaduz",
+				"Europe/Vatican",
+				"Europe/Vienna",
+				"Europe/Vilnius",
+				"Europe/Volgograd",
+				"Europe/Warsaw",
+				"Europe/Zagreb",
+				"Europe/Zaporozhye",
+				"Europe/Zurich",
+				"GB",
+				"GB-Eire",
+				"GMT",
+				"GMT+0",
+				"GMT-0",
+				"GMT0",
+				"Greenwich",
+				"HST",
+				"Hongkong",
+				"Iceland",
+				"Indian/Antananarivo",
+				"Indian/Chagos",
+				"Indian/Christmas",
+				"Indian/Cocos",
+				"Indian/Comoro",
+				"Indian/Kerguelen",
+				"Indian/Mahe",
+				"Indian/Maldives",
+				"Indian/Mauritius",
+				"Indian/Mayotte",
+				"Indian/Reunion",
+				"Iran",
+				"Israel",
+				"Jamaica",
+				"Japan",
+				"Kwajalein",
+				"Libya",
+				"MET",
+				"MST",
+				"MST7MDT",
+				"Mexico/BajaNorte",
+				"Mexico/BajaSur",
+				"Mexico/General",
+				"NZ",
+				"NZ-CHAT",
+				"Navajo",
+				"PRC",
+				"PST8PDT",
+				"Pacific/Apia",
+				"Pacific/Auckland",
+				"Pacific/Bougainville",
+				"Pacific/Chatham",
+				"Pacific/Chuuk",
+				"Pacific/Easter",
+				"Pacific/Efate",
+				"Pacific/Enderbury",
+				"Pacific/Fakaofo",
+				"Pacific/Fiji",
+				"Pacific/Funafuti",
+				"Pacific/Galapagos",
+				"Pacific/Gambier",
+				"Pacific/Guadalcanal",
+				"Pacific/Guam",
+				"Pacific/Honolulu",
+				"Pacific/Johnston",
+				"Pacific/Kiritimati",
+				"Pacific/Kosrae",
+				"Pacific/Kwajalein",
+				"Pacific/Majuro",
+				"Pacific/Marquesas",
+				"Pacific/Midway",
+				"Pacific/Nauru",
+				"Pacific/Niue",
+				"Pacific/Norfolk",
+				"Pacific/Noumea",
+				"Pacific/Pago_Pago",
+				"Pacific/Palau",
+				"Pacific/Pitcairn",
+				"Pacific/Pohnpei",
+				"Pacific/Ponape",
+				"Pacific/Port_Moresby",
+				"Pacific/Rarotonga",
+				"Pacific/Saipan",
+				"Pacific/Samoa",
+				"Pacific/Tahiti",
+				"Pacific/Tarawa",
+				"Pacific/Tongatapu",
+				"Pacific/Truk",
+				"Pacific/Wake",
+				"Pacific/Wallis",
+				"Pacific/Yap",
+				"Poland",
+				"Portugal",
+				"ROC",
+				"ROK",
+				"Singapore",
+				"Turkey",
+				"UCT",
+				"US/Alaska",
+				"US/Aleutian",
+				"US/Arizona",
+				"US/Central",
+				"US/East-Indiana",
+				"US/Eastern",
+				"US/Hawaii",
+				"US/Indiana-Starke",
+				"US/Michigan",
+				"US/Mountain",
+				"US/Pacific",
+				"US/Samoa",
+				"UTC",
+				"Universal",
+				"W-SU",
+				"WET",
+				"Zulu"
+			],
+			"default": "UTC",
+			"title": "Project timezone",
+			"propertyOrder": 500
+		},
+		"incremental": {
+			"type": "number",
+			"title": "Load Type",
+			"enum": [
+				1,
+				0
+			],
+			"options": {
+				"enum_titles": [
+					"Incremental Load",
+					"Full Load"
+				]
+			},
+			"default": 0,
+			"description": "Incremental load will load the table with primary keys and upsert new data. Full load will overwrite existing table all of the time.",
+			"propertyOrder": 600
+		},
+		"residency_server": {
+			"type": "string",
+			"enum": [
+				"US",
+				"EU"
+			],
+			"title": "Residency Data Server",
+			"description": "Marks in what region are the data located.",
+			"propertyOrder": 150,
+			"default": "US"
+		},
+		"raw_extract": {
+			"type": "boolean",
+			"title": "Raw Data Export",
+			"description": "If set to true, the raw JSON response of the API will be pasted into the resulting table. If set to false, the JSON response will be parsed and stored in key-value pair table.",
+			"propertyOrder": 700,
+			"default": false
+		}
+	}
+}
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+    "storage": {
+      "input": {
+        "files": [],
+        "tables": []
+      },
+      "output": {
+        "files": [],
+        "tables": []
+      }
+    },
+    "parameters": {
+      "#api_secret": "XXXXXXXXXXXXXXX",
+      "from_date": "",
+      "throwback": "-1",
+      "to_date": "",
+      "timezone": "UTC",
+      "events": [
+        "$identify"
+      ]
+    },
+    "image_parameters": {}
+  }
+  
+
+================================================
+File: /component_config/sample-config/out/tables/output.csv
+================================================
+"id","parameter","value"
+"149883e1c6000df0f5dc4d521725679b","event","View Payslip Page"
+"149883e1c6000df0f5dc4d521725679b","properties__time","1561420800"
+"149883e1c6000df0f5dc4d521725679b","properties__distinct_id","0051o000009eqc1AAA"
+"149883e1c6000df0f5dc4d521725679b","properties__$city","Evesham"
+
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+fi
+
+echo "Updating logger settings"
+
+value=`cat component_config/logger`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} logger --value="$value"
+else
+    echo "logger type is empty!"
+fi
+
+echo "Updating logger configuration"
+value=`cat component_config/loggerConfiguration.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} loggerConfiguration --value="$value"
+else
+    echo "loggerConfiguration is empty!"
+fi
+
+================================================
+File: /scripts/run.sh
+================================================
+#!/bin/sh
+set -e
+
+TABLES_PATH=$KBC_DATADIR/out/tables
+
+# Clean up out folder first
+
+if [ "$(ls -A $TABLES_PATH)" ]; then
+    TABLES_PATH=$TABLES_PATH/*
+     rm -r $TABLES_PATH
+fi
+
+python /code/src/main.py
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.component==1.3.7
+keboola.utils==1.1.0
+logging-gelf==0.0.26
+pytz==2022.1
+urllib3==1.26.11
+mock==4.0.3
+freezegun==1.2.2
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.11-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN apt-get update && apt-get install -y curl
+
+RUN pip install flake8
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files, to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# MixPanel
+
+## Overview
+
+The MixPanel is a service analyzing user behavior across sites and apps. The extractor uses the [MixPanel API](https://developer.mixpanel.com/docs/exporting-raw-data) to export raw data about user behavior and allows to analyze data further. All of the data is returned in `json` format, delimited by new line between records. However, not all records consist of same parameter keys, hence the extractor processes the output into name-value pair (NVP) format.
+
+The output is a table of 3 columns, which is **not** loaded incrementally.
+
+#### Note on the exports
+Due to vast amount of data, the extractor may run for hours, hence it is recommended to split the data into parts, if a full download is required. You can do so, by correctly specifying `From date` and `To date` parameters.
+In case that full download of the data is not required (i.e. extractor is ran every night in the orchestration), it's best to use `Throwback` parameter, which automatically downloads the specified number of full days of data. Specifying `Throwback=-1` downloads 1 last day full of data, i.e. date prior to day; `Throwback=-2` downloads data for 2 full days prior to today, etc.
+
+## Configuration
+
+##### Note on the exports
+
+Due to vast amount of data, the extractor may run for hours, hence it is recommended to split the data into parts, if a full download is required. You can do so, by correctly specifying `From date` and `To date` parameters.
+In case that full download of the data is not required (i.e. extractor is ran every night in the orchestration), it's best to use `Throwback` parameter, which automatically downloads the specified number of full days of data. Specifying `Throwback=-1` downloads 1 last day full of data, i.e. date prior to day; `Throwback=-2` downloads data for 2 full days prior to today, etc.
+
+##### Note on timezones
+
+All timestamps returned from the extractor are in the timezone, of your project; **they're not in UTC** timezone.
+
+### Input
+
+The extractor accepts 5 parameters, of which 2 are required and the rest requires to have a combination present. The parameters are:
+
+  - `API Secret` (required) - API secret for the project from which the data should be downloaded. [Click here](https://help.mixpanel.com/hc/en-us/articles/115004490503-Project-Token-API-Key-API-Secret) for information on how to retrieve the API secret.
+  - `Residency Server Region` (optional) - Region, where your data are located. Currently, US and EU regions are supported.
+  - `From date` (optional) - The date from which, the data should be downloaded. It's required to use `YYYY-MM-DD` format, otherwise, an exception is raised. If left blank, extractor will automatically ignore the parameter and use the value from `Throwback`.
+  - `To date` (optional) - The date to which, the data should be downloaded. It's required to use `YYYY-MM-DD` format, otherwise, an exception is raised. If left blank, extractor will automatically ignore the parameter and use the value from `Throwback`.
+  - `Throwback` (optional) - Number of the latest full days prior to today, that should be downloaded. The parameter is ignored if both `From date` and `To date` are specified.
+  - `Events` (optional) - A list of events, for which the export should be filtered.
+  - `Where` (optional) - A string that will be used for the where filter when downloading data.
+  - `Timezone` (required) - Timezone, in which your project is located. The parameter is required for `Throwback` parameter to work correctly. Improper definition of `Timezone` may lead to incomplete data. [Click here](https://help.mixpanel.com/hc/en-us/articles/115004547203-Project-Timezone) for more information.
+  - `Load Type` (optional) - Choose whether to load table incrementally or via full load.
+  - `Raw Data Export` (optional) - If set to `false`, the response from the API will be parsed and stored in storage in a key-value pair table. This is due to inconsistency of the returned JSON for each row. If set to `true`, the raw JSON response will be output to the storage and can be later parsed in e.g. Snowflake, Python transformations.
+
+### Output
+
+If raw data export is disabled, the extractor returns an output table with 3 columns. The output table is in the name-value pair format and may take the following form:
+
+| id 	| parameter 	| value 	|
+|----------------------------------	|-------------------------	|--------------------	|
+| 149883e1c6000df0f5dc4d521725679b 	| event 	| View Payslip Page 	|
+| 149883e1c6000df0f5dc4d521725679b 	| properties__time 	| 1561420800 	|
+| 149883e1c6000df0f5dc4d521725679b 	| properties__distinct_id 	| 0051o000009eqc1AAA 	|
+| 149883e1c6000df0f5dc4d521725679b 	| properties__$city 	| Evesham 	|
+
+The `id` column is created as an MD5 sum of the **unprocessed row** and is hence unique to each row in the **unprocessed output**. The column can be used to piece back together the desired `parameter`s and their `value`s.
+
+If raw data export is enabled, the extractor returns and output table with 2 columns: `id` and `raw`. The `id` columns is created as mentioned above. The `raw` column contains the **unprocessed output**.
+
+### Developer Notes
+
+Do not use the [MixPanel Utils](https://github.com/mixpanel/mixpanel-utils) library to download data, it downloads all data into memory, which will lead to a memory leak in Keboola.
+

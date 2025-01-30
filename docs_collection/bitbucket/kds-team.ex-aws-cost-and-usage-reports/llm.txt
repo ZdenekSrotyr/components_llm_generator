@@ -1,0 +1,1608 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-aws-cost-and-usage-reports/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   └── woskpace_client.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    example
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "asigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "asigning travis tag"
+	export TAG="$TRAVIS_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.1**
+
+- fix requirements
+- add src folder to path for tests
+
+**0.1.0**
+
+- src folder structure
+- remove dependency on handler lib - import the code directly to enable modifications until its released
+
+**0.0.2**
+
+- add dependency to base lib
+- basic tests
+
+**0.0.1**
+
+- add utils scripts
+- move kbc tests directly to pipelines file
+- use uptodate base docker image
+- add changelog
+
+
+================================================
+File: /src/component.py
+================================================
+import json
+import logging
+import os
+import re
+import sys
+import tempfile
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+import boto3
+import pytz
+from botocore.exceptions import ClientError
+from kbc.env_handler import KBCEnvHandler
+
+from woskpace_client import SnowflakeClient
+
+# configuration variables
+# aws params
+KEY_AWS_PARAMS = 'aws_parameters'
+KEY_AWS_API_KEY_ID = 'api_key_id'
+KEY_AWS_API_KEY_SECRET = '#api_key_secret'
+KEY_AWS_REGION = 'aws_region'
+KEY_AWS_S3_BUCKET = 's3_bucket'
+
+KEY_LOADING_OPTIONS = 'loading_options'
+KEY_LOADING_OPTIONS_PKEY = 'pkey'
+KEY_LOADING_OPTIONS_INCREMENTAL_OUTPUT = 'incremental_output'
+
+KEY_MIN_DATE = 'min_date_since'
+KEY_MAX_DATE = 'max_date'
+KEY_SINCE_LAST = 'since_last'
+
+KEY_REPORT_PATH_PREFIX = 'report_path_prefix'
+
+# #### Keep for debug
+KEY_DEBUG = 'debug'
+
+# list of mandatory parameters => if some is missing, component will fail with readable message on initialization.
+MANDATORY_PARS = [KEY_AWS_PARAMS, KEY_REPORT_PATH_PREFIX]
+MANDATORY_IMAGE_PARS = []
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, debug=False):
+        # for easier local project setup
+        default_data_dir = Path(__file__).resolve().parent.parent.joinpath('data').as_posix() \
+            if not os.environ.get('KBC_DATADIR') else None
+
+        KBCEnvHandler.__init__(self, MANDATORY_PARS, log_level=logging.DEBUG if debug else logging.INFO,
+                               data_path=default_data_dir)
+        # override debug from config
+        if self.cfg_params.get(KEY_DEBUG):
+            debug = True
+
+        if debug:
+            logging.getLogger().setLevel(logging.DEBUG)
+        else:
+            logging.getLogger('snowflake.connector').setLevel(
+                logging.WARNING)  # avoid detail logs from the library
+        logging.info('Loading configuration...')
+
+        try:
+            # validation of mandatory parameters. Produces ValueError
+            self.validate_config(MANDATORY_PARS)
+            self.validate_image_parameters(MANDATORY_IMAGE_PARS)
+        except ValueError as e:
+            logging.exception(e)
+            exit(1)
+
+        self.bucket = self.cfg_params[KEY_AWS_PARAMS][KEY_AWS_S3_BUCKET]
+        self.report_prefix = self.cfg_params[KEY_REPORT_PATH_PREFIX]
+        self._cleanup_report_prefix()
+
+        self.s3_client = boto3.client('s3',
+                                      region_name=self.cfg_params[KEY_AWS_PARAMS][KEY_AWS_REGION],
+                                      aws_access_key_id=self.cfg_params[KEY_AWS_PARAMS][KEY_AWS_API_KEY_ID],
+                                      aws_secret_access_key=self.cfg_params[KEY_AWS_PARAMS][KEY_AWS_API_KEY_SECRET])
+
+        snfk_authorisation = self.configuration.get_authorization()[
+            'workspace']
+        params = self.cfg_params  # noqa
+        snfwlk_credentials = {
+            "account": snfk_authorisation['host'].replace('.snowflakecomputing.com', ''),
+            "user": snfk_authorisation['user'],
+            "password": snfk_authorisation['password'],
+            "database": snfk_authorisation['database'],
+            "schema": snfk_authorisation['schema'],
+            "warehouse": snfk_authorisation['warehouse']
+        }
+
+        self.snowflake_client = SnowflakeClient(**snfwlk_credentials)
+
+        # last state
+        self.last_state = self.get_state_file()
+        self.last_report_id = self.last_state.get('last_report_id')
+        self.last_header = self.last_state.get('report_header', [])
+
+    def run(self):
+        '''
+        Main execution code
+        '''
+        params = self.cfg_params  # noqa
+
+        # last state
+        since = params.get(KEY_MIN_DATE) if params.get(
+            KEY_MIN_DATE) else '2000-01-01'
+        until = params.get(KEY_MAX_DATE) if params.get(KEY_MAX_DATE) else 'now'
+        logging.info(f"{since} {until}")
+        start_date, end_date = self.get_date_period_converted(since, until)
+
+        until_timestamp = pytz.utc.localize(end_date)
+
+        incremental_fetch = params.get(KEY_SINCE_LAST)
+
+        last_file_timestamp = self.last_state.get('last_file_timestamp')
+        if last_file_timestamp and incremental_fetch:
+            since_timestamp = datetime.fromisoformat(last_file_timestamp)
+        else:
+            since_timestamp = pytz.utc.localize(start_date)
+
+        report_name = self.report_prefix.split('/')[-1].replace('*', '')
+
+        latest_report_id = self.last_report_id
+
+        logging.info(
+            f"Collecting recent files for report '{report_name}', since {since_timestamp}")
+
+        all_files = self._get_s3_objects(
+            self.bucket, self.report_prefix, since_timestamp)
+        manifests = self._retrieve_report_manifests(all_files, report_name)
+
+        if not incremental_fetch:
+            # get only report in specified period
+            manifests = [m for m in manifests if
+                         datetime.strftime(until_timestamp, '%Y%m%d') >=
+                         m['billingPeriod']['start'].split(
+                             'T')[0] >= datetime.strftime(since_timestamp, '%Y%m%d')
+                         ]
+
+        # prep the output
+        output_table = os.path.join(self.tables_out_path, report_name)
+
+        # download report files
+        reports_found = len(manifests)
+        if reports_found > 0:
+            logging.info(
+                f"{len(manifests)} recent reports found. Downloading...")
+        else:
+            logging.warning(
+                "No reports found for the specified period. If there are some available check the prefix setting.")
+            self.write_state_file(self.last_state)
+            exit(0)
+
+        # get max header
+        max_header = self._get_max_header_normalized(manifests)
+        # create result table
+        self.snowflake_client.open_connection()
+        try:
+            self._create_result_table(report_name, max_header)
+
+            for man in manifests:
+                # just in case
+                if incremental_fetch and man['assemblyId'] == self.last_report_id:
+                    logging.warning(
+                        f"Report ID {man['assemblyId']} already downloaded, skipping.")
+                    continue
+
+                if since_timestamp < man['last_modified']:
+                    since_timestamp = man['last_modified']
+                    latest_report_id = man['assemblyId']
+
+                self._upload_report_chunks_to_workspace(man, report_name)
+
+            self._write_table_manifest(output_table)
+            self.write_state_file({"last_file_timestamp": since_timestamp.isoformat(),
+                                   "last_report_id": latest_report_id,
+                                   "report_header": self.last_header})
+
+            logging.info(
+                f"Extraction finished at {datetime.now().isoformat()}.")
+        except Exception as e:
+            raise e
+        finally:
+            self.snowflake_client.close()
+
+    def _write_table_manifest(self, output_table):
+        loading_options = self.cfg_params.get(KEY_LOADING_OPTIONS, {})
+        incremental = bool(loading_options.get(
+            KEY_LOADING_OPTIONS_INCREMENTAL_OUTPUT, False))
+        pkey = loading_options.get(KEY_LOADING_OPTIONS_PKEY, [])
+        self.configuration.write_table_manifest(output_table,
+                                                columns=self.last_header,
+                                                primary_key=pkey,
+                                                incremental=incremental)
+
+    def _retrieve_report_manifests(self, all_files, report_name):
+        manifests = []
+        for obj in all_files:
+            object_name = obj['Key'].split('/')[-1]
+            parent_folder_name = obj['Key'].split('/')[-2]
+            start_date, end_date = self._try_to_parse_report_period(
+                parent_folder_name)
+            # get only root (period) manifests
+            manifest_file_name = f"{report_name}-Manifest.json"
+            if start_date and object_name == manifest_file_name:
+                # download file content
+                manifest = json.loads(self._read_s3_file_contents(obj['Key']))
+                manifest['last_modified'] = obj['LastModified']
+                manifest['report_folder'] = obj['Key'].replace(
+                    f'/{manifest_file_name}', '')
+                manifest['period'] = parent_folder_name
+                manifests.append(manifest)
+        return manifests
+
+    def _download_and_unzip(self, key: str, local_path) -> str:
+        """
+        Download ZIP file from S3, unzip
+        Args:
+            key:
+            local_path:
+
+        Returns:
+
+        """
+        self.s3_client.download_file(self.bucket, key, local_path)
+        temp_dir = tempfile.mkdtemp(suffix='_report.zip')
+
+        # unzip
+        with zipfile.ZipFile(local_path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+        # get all files in temp dir
+        files = os.listdir(temp_dir)
+        return os.path.join(temp_dir, files[0])
+
+    def _upload_report_chunks_to_workspace(self, manifest, table_name):
+        logging.info(
+            f"Uploading report ID {manifest['assemblyId']} for period {manifest['period']}"
+            f" in {len(manifest['reportKeys'])} report chunks.")
+        columns = self._get_manifest_normalized_columns(manifest)
+        is_zip = True if manifest['reportKeys'] and manifest['reportKeys'][0].endswith('zip') else False
+        if is_zip:
+            logging.info("Processing zip file via local stage")
+
+        for key in manifest['reportKeys']:
+            # support for // syntax
+            key_split = key.split('/')
+            if '//' in manifest['report_folder']:
+                key = f"{manifest['report_folder']}/{key_split[-2]}/{key_split[-1]}"
+
+            # download
+            s3_path = f's3://{self.bucket}/{key}'
+
+            logging.info(f"Uploading chunk {key_split[-1]}")
+            if s3_path.endswith('.zip'):
+                # download zip
+                res_gz = self._download_and_unzip(key, f'/tmp/{key_split[-1]}.zip')
+
+                self.snowflake_client.copy_csv_into_table_from_file(table_name, columns, res_gz)
+            else:
+                self.snowflake_client.copy_csv_into_table_from_s3(table_name,
+                                                                  columns,
+                                                                  s3_path,
+                                                                  self.cfg_params[KEY_AWS_PARAMS][KEY_AWS_API_KEY_ID],
+                                                                  self.cfg_params[KEY_AWS_PARAMS][
+                                                                      KEY_AWS_API_KEY_SECRET])
+
+    def _read_s3_file_contents(self, key):
+        try:
+            response = self.s3_client.get_object(Bucket=self.bucket, Key=key)
+            return response['Body'].read()
+        except ClientError as error:
+            if error.response['Error']['Code'] == 'NoSuchKey':
+                logging.exception("The specified object was not found.")
+            elif error.response['Error']['Code'] == 'AccessDenied':
+                logging.exception(
+                    "Permission to access the object from S3 is missing.")
+            else:
+                logging.exception(str(error))
+            raise
+
+    def _try_to_parse_report_period(self, folder_name):
+        periods = folder_name.split('-')
+        start_date = None
+        end_date = None
+        if len(periods) == 2:
+            try:
+                start_date = datetime.strptime(periods[0], '%Y%m%d')
+                end_date = datetime.strptime(periods[1], '%Y%m%d')
+            except Exception:
+                pass
+
+        return start_date, end_date
+
+    def _get_s3_objects(self, bucket, prefix, since=None, until=None):
+        if prefix.endswith('*'):
+            is_wildcard = True
+            prefix = prefix[:-1]
+        else:
+            is_wildcard = False
+        try:
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+        except ClientError as error:
+            logging.error(f"Error occurred while listing S3 objects: {error}")
+            raise
+
+        params = dict(Bucket=bucket,
+                      Prefix=prefix,
+                      PaginationConfig={
+                          'MaxItems': 100000,
+                          'PageSize': 1000
+                      })
+
+        counter = 0
+        pages = paginator.paginate(**params)
+        for page in pages:
+
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+
+                if since and obj['LastModified'] <= since:
+                    continue
+                if until and obj['LastModified'] > until:
+                    continue
+
+                if (is_wildcard and key.startswith(prefix)) or key == prefix:
+                    counter += 1
+                    yield obj
+
+    def _cleanup_report_prefix(self):
+        # clean prefix
+        if self.report_prefix.endswith('/'):
+            self.report_prefix = self.report_prefix[:-1]
+
+        if not self.report_prefix.endswith('*'):
+            self.report_prefix = self.report_prefix + '*'
+
+    def _get_max_header_normalized(self, manifests):
+        for m in manifests:
+            # normalize
+            norm_cols = set(self._get_manifest_normalized_columns(m))
+            if not norm_cols.issubset(set(self.last_header)):
+                norm_cols.update(set(self.last_header))
+                self.last_header = list(norm_cols)
+                self.last_header.sort()
+
+        return self.last_header
+
+    def _get_manifest_normalized_columns(self, manifest):
+        # normalize
+        man_cols = [col['category'] + '/' + col['name']
+                    for col in manifest['columns']]
+        man_cols = self._kbc_normalize_header(man_cols)
+        return self._dedupe_header(man_cols)
+
+    def _kbc_normalize_header(self, header):
+        normalized = []
+
+        for h in header:
+            new_h = h.replace('/', '__')
+            new_h = re.sub("[^a-zA-Z\\d_]", "_", new_h)
+            normalized.append(new_h)
+        return normalized
+
+    def _dedupe_header(self, header, index_separator='_'):
+        new_header = list()
+        new_header_lower = list()
+        dup_cols = dict()
+        for c in header:
+            if c.lower() in new_header_lower:
+                new_index = dup_cols.get(c.lower(), 0) + 1
+                new_header.append(c + index_separator + str(new_index))
+                dup_cols[c.lower()] = new_index
+            else:
+                new_header_lower.append(c.lower())
+                new_header.append(c)
+        return new_header
+
+    # TODO: support for datatypes
+    def _create_result_table(self, report_name, max_header):
+        columns = []
+        for h in max_header:
+            columns.append({"name": h, "type": 'TEXT'})
+        self.snowflake_client.create_table(report_name, columns)
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        debug_arg = sys.argv[1]
+    else:
+        debug_arg = False
+    try:
+        comp = Component(debug_arg)
+        comp.run()
+    except Exception as exc:
+        logging.exception(exc)
+        exit(1)
+
+
+================================================
+File: /src/woskpace_client.py
+================================================
+import sqlalchemy
+from snowflake.sqlalchemy import URL
+
+
+class SnowflakeClient:
+    DEFAULT_FILE_FORMAT = dict(TYPE="CSV", FIELD_DELIMITER="','", SKIP_HEADER=1, FIELD_OPTIONALLY_ENCLOSED_BY="'\"'",
+                               ERROR_ON_COLUMN_COUNT_MISMATCH=False)
+
+    def __init__(self, account, user, password, database, schema, warehouse):
+        self._engine = sqlalchemy.create_engine(URL(
+            account=account,
+            user=user,
+            password=password,
+            database=self._wrap_in_quote(database),
+            schema=self._wrap_in_quote(schema),
+            warehouse=self._wrap_in_quote(warehouse),
+            cache_column_metadata=True,
+            echo=True
+        ))
+        self._connection: sqlalchemy.engine.Connection
+
+    def execute_query(self, query):
+        """
+        executes the query
+        """
+
+        if self._connection.closed:
+            self.open_connection()
+
+        results = self._connection.execute(query).fetchall()
+        return results
+
+    def open_connection(self):
+        self._connection = self._engine.connect()
+
+    def close_connection(self):
+        self._connection.close()
+
+    def create_table(self, name, columns: [dict]):
+        query = f"""
+        CREATE OR REPLACE TABLE {self._wrap_in_quote(name)} (
+        """
+        col_defs = [f"\"{col['name']}\" {col['type']}" for col in columns]
+        query += ', '.join(col_defs)
+        query += ");"
+        self.execute_query(query)
+
+    def extend_table_columns(self, table_name, columns: [dict]):
+        """
+        Expand add non-existent columns to the table.
+        :param table_name:
+        :param columns: dictionary {'name': ,'type'}
+        :return:
+        """
+        table_name = self._wrap_in_quote(table_name)
+        existing_columns = self.get_table_column_names(table_name)
+        for col in columns:
+            if col['name'] not in existing_columns:
+                self.execute_query(f"ALTER TABLE {table_name} ADD COLUMN {col['name']} {col['type']};")
+
+    def get_table_column_names(self, table_name):
+        table_name = self._wrap_in_quote(table_name)
+        query = f"""select COLUMN_NAME
+                        from INFORMATION_SCHEMA.COLUMNS
+                        where TABLE_NAME = '{table_name}';
+                """
+        return [col['column_name'] for col in self.execute_query(query)]
+
+    def copy_csv_into_table_from_s3(self, table_name, table_columns, path_to_object, aws_access_key_id,
+                                    aws_secret_access_key,
+                                    file_format: dict = None):
+        """
+        Import from S3 file by default CSV format with skip header setup and ERROR_ON_COLUMN_COUNT_MISMATCH=false.
+        :param path_to_object:
+        :param aws_access_key_id:
+        :param aws_secret_access_key:
+        :param file_format:
+        :return:
+        """
+        if not file_format:
+            file_format = self.DEFAULT_FILE_FORMAT
+
+        table_name = self._wrap_in_quote(table_name)
+        columns = self._wrap_columns_in_quotes(table_columns)
+        query = f"""
+        COPY INTO {table_name} ({', '.join(columns)}) FROM {path_to_object}
+             CREDENTIALS =(aws_key_id = '{aws_access_key_id}' aws_secret_key = '{aws_secret_access_key}')
+        """
+        query += "FILE_FORMAT = ("
+        for key in file_format:
+            query += f"{key}={file_format[key]} "
+        query += ");"
+        self.execute_query(query)
+
+    def create_temp_stage(self, name: str, file_format: dict = None):
+        if not file_format:
+            file_format = self.DEFAULT_FILE_FORMAT
+        query = f"""
+            CREATE OR REPLACE TEMP STAGE  {name}
+            """
+
+        query += " FILE_FORMAT = ("
+        for key in file_format:
+            query += f"{key}={file_format[key]} "
+        query += ");"
+
+        self.execute_query(query)
+
+    def copy_csv_into_table_from_file(self, table_name: str, table_columns: list[str], csv_file_path: str,
+                                      file_format: dict = None):
+        """
+        Import from file by default CSV format with skip header setup and ERROR_ON_COLUMN_COUNT_MISMATCH=false.
+
+        Args:
+            table_name:
+            table_columns:
+            csv_file_path:
+            file_format:
+        """
+        if not file_format:
+            file_format = self.DEFAULT_FILE_FORMAT
+        table_name = self._wrap_in_quote(table_name)
+        # create temp stage
+        self.create_temp_stage(table_name, file_format)
+        # copy to stage
+        stage_sql = f"PUT file://{csv_file_path} @{table_name} AUTO_COMPRESS=TRUE;"
+        self.execute_query(stage_sql)
+
+        # insert data
+        columns = self._wrap_columns_in_quotes(table_columns)
+        query = f"COPY INTO {table_name} ({', '.join(columns)}) FROM @{table_name}"
+        query += " FILE_FORMAT = ("
+        for key in file_format:
+            query += f"{key}={file_format[key]} "
+        query += ");"
+        self.execute_query(query)
+
+    def _wrap_columns_in_quotes(self, columns):
+        return [self._wrap_in_quote(col) for col in columns]
+
+    def _wrap_in_quote(self, s):
+        return s if s.startswith('"') else '"' + s + '"'
+
+    def close(self):
+        self._connection.close()
+        self._engine.dispose()
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            #            - echo 'Pushing test image to repo. [tag=test]'
+            #            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            #            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            #            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            #            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+The AWS Cost & Usage Report itemizes usage at the account or Organization level by product code,
+ usage type and operation. These costs can be further organized by enabling Cost Allocation tags and Cost Categories. 
+The AWS Cost & Usage Report is available at an hourly, daily, or monthly level of granularity.
+
+This extractor downloads AWS CUR reports exported to S3 in CSV format.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+This extractor downloads AWS CUR reports exported to S3 in CSV format. 
+
+### Prerequisite: The AWS setup
+
+First, the CUR report exports need to be set up in the AWS account to be exported to S3 bucket 
+in the selected granularity and CSV format. Follow this [guide](https://docs.aws.amazon.com/cur/latest/userguide/cur-create.html)
+ to set up the export.
+ 
+ Export Setup:
+ 
+ - Setup S3 bucket
+ - Set the report prefix
+ - Select granularity
+ - Select report versioning (overwrite recommended)
+ - Choose GZIP compression type
+ 
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+The AWS Cost & Usage Report contains the most comprehensive set of AWS cost and usage data available, 
+including additional metadata about AWS services, pricing, Reserved Instances, and Savings Plans.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{
+}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Configuration",
+  "required": [
+    "aws_parameters",
+    "report_path_prefix",
+    "min_date_since",
+    "max_date",
+    "since_last"
+  ],
+  "properties": {
+    "aws_parameters": {
+      "type": "object",
+      "format": "grid",
+      "title": "AWS config",
+      "required": [
+        "api_key_id",
+        "#api_key_secret",
+        "s3_bucket",
+        "aws_region"
+      ],
+      "propertyOrder": 1,
+      "properties": {
+        "api_key_id": {
+          "type": "string",
+          "title": "AWS API Key ID",
+          "options": {
+            "grid_columns": "2"
+          },
+          "propertyOrder": 1
+        },
+        "#api_key_secret": {
+          "type": "string",
+          "title": "AWS API Key Secret",
+          "options": {
+            "grid_columns": "2"
+          },
+          "format": "password",
+          "propertyOrder": 2
+        },
+        "s3_bucket": {
+          "type": "string",
+          "title": "AWS S3 bucket name",
+          "description": "An existing S3 bucket name that will be used for lambda function package staging.",
+          "propertyOrder": 3
+        },
+        "aws_region": {
+          "type": "string",
+          "title": "AWS Region",
+          "enum": [
+            "us-east-1",
+            "us-west-1",
+            "us-west-2",
+            "ap-east-1",
+            "ap-south-1",
+            "ap-northeast-2",
+            "ap-southeast-1",
+            "ap-southeast-2",
+            "ap-northeast-1",
+            "ca-central-1",
+            "cn-north-1",
+            "cn-northwest-1",
+            "eu-central-1",
+            "eu-west-1",
+            "eu-west-2",
+            "eu-west-3",
+            "eu-north-1",
+            "me-south-1",
+            "sa-east-1",
+            "us-gov-east-1",
+            "us-gov-west-1"
+          ],
+          "default": "eu-central-1",
+          "propertyOrder": 4
+        }
+      }
+    },
+    "loading_options": {
+      "type": "object",
+      "title": "Loading Options",
+      "propertyOrder": 2,
+      "format": "grid",
+      "required": [
+        "incremental_output",
+        "pkey"
+      ],
+      "properties": {
+        "pkey": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "title": "col name"
+          },
+          "title": "Primary key",
+          "propertyOrder": 5000
+        },
+        "incremental_output": {
+          "type": "number",
+          "enum": [
+            0,
+            1
+          ],
+          "options": {
+            "enum_titles": [
+              "Full Load",
+              "Incremental Update"
+            ]
+          },
+          "default": 0,
+          "title": "Load type",
+          "description": "If set to Incremental update, the result tables will be updated based on primary key. Full load overwrites the destination table each time. NOTE: If you wish to remove deleted records, this needs to be set to Full load and the Period from attribute empty.",
+          "propertyOrder": 450
+        }
+      }
+    },
+    "since_last": {
+      "propertyOrder": 3,
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "New files only.",
+      "default": true,
+      "description": "Download only new reports since last run. The Maximum date parameter is ignored."
+    },
+    "min_date_since": {
+      "propertyOrder": 5,
+      "type": "string",
+      "title": "Minimum date since",
+      "description": "Lowest report date to download. When New files only is checked, this applies only on first run, reset the state to backfill. Date in YYYY-MM-DD format or dateparser string i.e. 5 days ago, 1 month ago, yesterday, etc. If left empty, all records are downloaded."
+    },
+    "max_date": {
+      "propertyOrder": 7,
+      "type": "string",
+      "title": "Maximum date",
+      "default": "now",
+      "description": "Max report date to download. Date in YYYY-MM-DD format or dateparser string i.e. 5 days ago, 1 month ago, yesterday, etc. If left empty, all records are downloaded."
+    },
+    "report_path_prefix": {
+      "propertyOrder": 10,
+      "type": "string",
+      "title": "Report prefix",
+      "description": "The prefix as you set up in the AWS CUR config. In S3 bucket this is path to your report. E.g. my-report or some/long/prefix/myreport"
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.4.4.zip#egg=kbc
+requests===2.23.0
+mock
+freezegun
+boto3===1.15.9
+snowflake-connector-python
+snowflake-sqlalchemy
+dateparser==1.0.0
+pytz==2022.6
+regex==2022.3.2
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.10-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install --upgrade pip
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# AWS CUR reports extractor
+
+This extractor downloads AWS CUR reports exported to S3 in CSV format. 
+
+**Table of contents:**  
+  
+[TOC]
+
+# AWS Setup
+
+First, the CUR report exports need to be set up in the AWS account to be exported to S3 bucket 
+in the selected granularity and CSV format. Follow this [guide](https://docs.aws.amazon.com/cur/latest/userguide/cur-create.html)
+ to set up the export.
+ 
+ Export Setup:
+ 
+ - Setup S3 bucket
+ - Set the report prefix
+ - Select granularity
+ - Select report versioning (overwrite recommended)
+ - Choose GZIP compression type
+ 
+ ![Aws setup](docs/imgs/aws_screen.png)
+ 
+
+# Functionality notes
+
+The extractor downloads the latest complete CUR report pushed to the S3. It handles changing report schema 
+by expanding the existing column set, if some column is removed it will contain NULL/Empty values.
+
+# Configuration
+
+## AWS config
+
+Your S3 bucket details and credentials as set up in the AWS console
+
+## New files only
+
+If set to true, only newly generated report is downloaded each execution.
+
+## Minimum date since
+
+Minimum date of the report. Lowest report date to download. When **New files** only option is checked, 
+this applies only to the first run, reset the state to backfill. Date in YYYY-MM-DD format 
+or a string i.e. 5 days ago, 1 month ago, yesterday, etc. If left empty, all records are downloaded.
+
+## Maximum date
+
+Maximum date of the report. Max report date to download. When **New files** only option is checked, 
+this applies only to the first run, reset the state to backfill. Date in YYYY-MM-DD format 
+or a string i.e. 5 days ago, 1 month ago, yesterday, etc. If left empty, all records are downloaded.
+
+## Report prefix
+
+The prefix as you set up in the AWS CUR config. 
+In S3 bucket this is path to your report. E.g. my-report or some/long/prefix/my_report
+
+In most cases this would be the prefix you've chosen. If unsure, refer to the S3 bucket containing the report
+ and copy the path of the report folder.
+
+# Output
+
+The output schema is described [here](https://docs.aws.amazon.com/cur/latest/userguide/data-dictionary.html)
+
+
+**IMPORTANT NOTE** The result column names are modified to match the KBC Storage column name requirements:
+
+- Categories are separated by `__`. e.g.`bill/BillingPeriodEndDate` is converted to `bill__billingPeriodEndDate`
+- Any characters that are not alphanumeric or `_` underscores are replaced by underscore. 
+E.g. `resourceTags/user:owner` is converted to `resourceTags__user_owner`
+- The KBC Storage is case insesitive so the above may lead to duplicate names. In such case the names are deduplicated by adding an index. 
+e.g `resourceTags/user:name` and `resourceTags/user:Name` lead to `resourceTags__user_Name` and `resourcetags__user_name_1` 
+columns respectively
+
+**Note** That the output schema changes often and may be also affected by the tags and custom columns you define.
+
+
+# Development
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path in the docker-compose file:
+
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone repo_path my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+

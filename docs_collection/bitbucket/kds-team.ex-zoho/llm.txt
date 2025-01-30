@@ -1,0 +1,2230 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-zoho/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   └── zoho/
+    │       ├── initialization.py
+    │       ├── bulk_read.py
+    │       └── __init__.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── logger
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── loggerConfiguration.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.1**
+
+- fix requirements
+- add src folder to path for tests
+
+**0.1.0**
+
+- src folder structure
+- remove dependency on handler lib - import the code directly to enable modifications until its released
+
+**0.0.2**
+
+- add dependency to base lib
+- basic tests
+
+**0.0.1**
+
+- add utils scripts
+- move kbc tests directly to pipelines file
+- use uptodate base docker image
+- add changelog
+
+
+================================================
+File: /src/component.py
+================================================
+"""
+Zoho CRM Extractor component main module.
+
+"""
+import logging
+import dateparser
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Optional
+import os
+import json
+
+from keboola.component.base import ComponentBase, sync_action
+from keboola.component.exceptions import UserException
+from keboola.component.sync_actions import SelectElement
+
+import zoho.initialization
+import zoho.bulk_read
+
+from zcrmsdk.src.com.zoho.crm.api.modules import ModulesOperations
+from zcrmsdk.src.com.zoho.crm.api.fields import FieldsOperations
+from zcrmsdk.src.com.zoho.crm.api import ParameterMap
+
+
+# Configuration variables
+KEY_GROUP_ACCOUNT = "account"
+KEY_USER_EMAIL = "user_email"
+KEY_DATACENTER = "zoho_datacenter"
+KEY_GROUP_DESTINATION = "destination"
+KEY_LOAD_MODE = "load_mode"
+KEY_MODULE_RECORDS_DOWNLOAD_CONFIG = "module_records_download_config"
+
+KEY_OUTPUT_TABLE_NAME = "output_table_name"
+KEY_MODULE_NAME = "module_name"
+KEY_FIELD_NAMES = "field_names"
+KEY_GROUP_SYNC_OPTIONS = "sync_options"
+KEY_SYNC_MODE = "sync_mode"
+KEY_FILTERING_CRITERIA = "filtering_criteria"
+
+
+REQUIRED_PARAMETERS = [KEY_MODULE_RECORDS_DOWNLOAD_CONFIG, KEY_GROUP_SYNC_OPTIONS]
+
+# Other constants
+TMP_DATA_DIR_NAME = "tmp_data"
+TOKEN_STORE_FILE_NAME = "token_store.csv"
+ID_COLUMN_NAME = "Id"
+
+
+class ZohoCRMExtractor(ComponentBase):
+
+    def __init__(self):
+        super().__init__()
+        self.output_table_name = None
+        self.incremental = None
+        self.token_store_path = None
+        self.statefile = self.get_state_file()
+        self.ts_start = self.generate_timestamp()
+
+    def run(self):
+        self.validate_configuration_parameters(REQUIRED_PARAMETERS)
+
+        self._init_params()
+        self._init_client()
+
+        self.process_module_records_download_config(self.module_records_download_config)
+
+        self.write_state_file({"last_run": self.ts_start})
+
+    def process_module_records_download_config(self, config: dict):
+        """
+        Processes module records download config:
+        asks Zoho API to prepare the data for download and then downloads the data as sliced CSV.
+        Also creates appropriate manifest files.
+        """
+        module_name: str = config.get(KEY_MODULE_NAME)
+        field_names: Optional[List[str]] = config.get(KEY_FIELD_NAMES)
+
+        filtering_criteria = None
+        if self.filtering_criteria_dict:
+            key_comparator = self.filtering_criteria_dict.get(zoho.bulk_read.KEY_COMPARATOR)
+            key_group = self.filtering_criteria_dict.get(zoho.bulk_read.KEY_GROUP)
+
+            if key_comparator:
+                filtering_criteria = zoho.bulk_read.BulkReadJobFilteringCriterion.from_dict(
+                    self.filtering_criteria_dict)
+            elif key_group:
+                filtering_criteria = zoho.bulk_read.BulkReadJobFilteringCriteriaGroup.from_dict(
+                    self.filtering_criteria_dict)
+
+        table_def = self.create_out_table_definition(
+            name=f"{self.output_table_name}.csv",
+            incremental=self.incremental,
+            primary_key=[ID_COLUMN_NAME],
+            is_sliced=True)
+
+        os.makedirs(table_def.full_path, exist_ok=True)
+        logging.info(f"Attempting to download data for output table {self.output_table_name}.")
+
+        try:
+            bulk_read_job = zoho.bulk_read.BulkReadJobBatch(
+                module_api_name=module_name,
+                destination_folder=table_def.full_path,
+                file_name=table_def.name,
+                field_names=field_names,
+                filtering_criteria=filtering_criteria,
+            )
+
+            bulk_read_job.download_all_pages()
+        except Exception as e:
+            raise UserException("Failed to download data from Zoho API.\nReason:\n" + str(e)) from e
+
+        table_def.columns = bulk_read_job.field_names
+        self.write_manifest(table_def)
+
+    @staticmethod
+    def validate_filtering_criteria(criteria: dict) -> None:
+        # TODO: implement proper validation
+        allowed_keys = ["group", "field_name", "comparator", "value", "group_operator"]
+        for key in criteria:
+            if key not in allowed_keys:
+                raise UserException(f"{key} is not a valid filter key.")
+
+    @staticmethod
+    def get_fields(module_api_name: str, datetype: str = None) -> list:
+        fields_operations = FieldsOperations(module_api_name)
+        param_instance = ParameterMap()
+
+        response = fields_operations.get_fields(param_instance)
+
+        if response.get_status_code() != 200:
+            raise UserException(f"Cannot fetch the list of available Fields for module {module_api_name}. "
+                                f"Received status code: {response._APIResponse__status_code}")
+
+        data = response.get_object()
+
+        field_names = [
+            field._Field__api_name
+            for field in getattr(data, '_ResponseWrapper__fields', [])
+            if not datetype or (datetype and datetype == field._Field__data_type)
+        ]
+
+        return field_names
+
+    @staticmethod
+    def get_modules() -> list:
+        modules_operations = ModulesOperations()
+        response = modules_operations.get_modules()
+
+        if response.get_status_code() != 200:
+            raise UserException(f"Cannot fetch the list of available Modules. "
+                                f"Received status code: {response.__APIResponse__status_code}")
+
+        data = response.get_object()
+
+        module_names = [
+            module._Module__api_name
+            for module in getattr(data, '_ResponseWrapper__modules', [])
+        ]
+
+        return module_names
+
+    def _init_client(self):
+        self.token_store_path = self.tmp_dir_path / TOKEN_STORE_FILE_NAME
+        zoho.initialization.set_filestore_file(self.token_store_path, "")
+        try:
+            zoho.initialization.initialize(
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                refresh_token=self.refresh_token,
+                region_code=self.zoho_datacenter,
+                user_email=self.user_email,
+                tmp_dir_path=self.tmp_dir_path,
+                file_store_path=self.token_store_path,
+            )
+        except Exception as e:
+            raise UserException(f"Zoho Python SDK initialization failed.\nReason:\n + {str(e)}") from e
+
+    def _init_params(self):
+        params: dict = self.configuration.parameters
+        self.module_records_download_config: dict = params[KEY_MODULE_RECORDS_DOWNLOAD_CONFIG]
+
+        output_table_name = params.get(KEY_GROUP_DESTINATION, {}).get(KEY_OUTPUT_TABLE_NAME)
+        if not output_table_name:
+            default_table_name = self.module_records_download_config.get(KEY_MODULE_NAME)
+            logging.info(f"Custom output table name not set, defaulting to module name: {default_table_name}")
+            self.output_table_name = default_table_name
+
+        oauth_credentials = self.configuration.oauth_credentials.data
+        if not oauth_credentials:
+            raise UserException("oAuth credentials are not available. Please authorize the extractor.")
+
+        credentials = (self.configuration.config_data.get("authorization", {}).get("oauth_api", {})
+                       .get("credentials", {}))
+        credentials_data = json.loads(credentials.get("#data"))
+        self.refresh_token = credentials_data.get("refresh_token")
+        self.client_id = credentials.get("appKey")
+        self.client_secret = credentials.get("#appSecret")
+
+        self.user_email: str = params.get(KEY_GROUP_ACCOUNT, {}).get(KEY_USER_EMAIL)
+        if not self.user_email:
+            raise UserException("Parameter user_email is mandatory.")
+
+        self.zoho_datacenter: str = params.get(KEY_GROUP_ACCOUNT, {}).get(KEY_DATACENTER)
+        if not self.zoho_datacenter:
+            raise UserException("Parameter zoho_datacenter is mandatory.")
+
+        sync_options = params.get(KEY_GROUP_SYNC_OPTIONS)
+        self.filtering_criteria_dict = self._set_filters(sync_options)
+
+        load_mode: str = params.get(KEY_GROUP_DESTINATION, {}).get(KEY_LOAD_MODE, "full_load")
+        self.incremental: bool = load_mode == "incremental"
+
+        # Create directory for temporary data (Zoho SDK logging and token store)
+        data_dir_path = Path(self.data_folder_path)
+        self.tmp_dir_path = data_dir_path / TMP_DATA_DIR_NAME
+        self.tmp_dir_path.mkdir(parents=True, exist_ok=True)
+
+    def _set_filters(self, sync_options: dict) -> dict:
+        sync_mode = sync_options.get(KEY_SYNC_MODE)
+
+        if sync_mode == "full_sync":
+            filtering_criteria_dict = None
+        elif sync_mode == "advanced":
+            filtering_criteria_dict = sync_options.get(KEY_FILTERING_CRITERIA)
+            self.validate_filtering_criteria(filtering_criteria_dict)
+        elif sync_mode == "incremental_sync":
+            filtering_criteria_dict = self._get_incremental_sync_filter(sync_options)
+        else:
+            raise UserException(f"Unsupported sync_mode: {sync_mode}")
+
+        return filtering_criteria_dict
+
+    def _get_incremental_sync_filter(self, sync_options: dict) -> dict:
+        value = sync_options.get("value")
+
+        if value == "last_run":
+            timestamp = self.statefile.get("last_run")
+            if not timestamp:
+                logging.warning("Last run timestamp not found in statefile, performing full sync.")
+                return {}
+            else:
+                logging.info(f"Using timestamp from statefile: {timestamp}")
+        else:
+            value = dateparser.parse(value)
+            timestamp = self._format_datetime_with_offset(value)
+
+        return {
+            "field_name": sync_options.get("incremental_field"),
+            "comparator": sync_options.get("operator"),
+            "value": timestamp
+        }
+
+    @staticmethod
+    def _format_datetime_with_offset(dt) -> str:
+        date_str = dt.strftime("%Y-%m-%dT%H:%M:%S")
+        timezone_offset = datetime.now(timezone.utc).astimezone().strftime('%z')
+        return f"{date_str}{timezone_offset}"
+
+    @staticmethod
+    def generate_timestamp() -> str:
+        """
+        Generate a timestamp for the current time in the format: YYYY-MM-DDTHH:MM:SS+HHMM
+        Returns:
+            str: Formatted timestamp
+        """
+        current_datetime = datetime.now(timezone.utc)
+        formatted_date = current_datetime.strftime("%Y-%m-%dT%H:%M:%S")
+        timezone_offset = current_datetime.strftime('%z')
+        result = f"{formatted_date}{timezone_offset}"
+        return result
+
+    def _list_fields(self, datetype: str = None) -> List[SelectElement]:
+        self._init_params()
+        self._init_client()
+
+        module_name = self.module_records_download_config[KEY_MODULE_NAME]
+        if not module_name:
+            raise UserException("To list available fields, module_name parameter must be set.")
+
+        fields = self.get_fields(module_name, datetype=datetype)
+        if not fields:
+            raise UserException("Cannot list fields.")
+
+        return [SelectElement(label=field, value=field) for field in fields]
+
+    @sync_action("listModules")
+    def list_modules(self) -> List[SelectElement]:
+        self._init_params()
+        self._init_client()
+
+        modules = self.get_modules()
+        if not modules:
+            raise UserException("Cannot list modules.")
+
+        return [SelectElement(label=module, value=module) for module in modules]
+
+    @sync_action("listFields")
+    def list_fields(self) -> List[SelectElement]:
+        return self._list_fields()
+
+    @sync_action("listFieldsDatetime")
+    def list_fields_datetime(self) -> List[SelectElement]:
+        return self._list_fields("datetime")
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    try:
+        comp = ZohoCRMExtractor()
+        # this triggers the run method by default and is controlled by the configuration.action parameter
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /src/zoho/initialization.py
+================================================
+from pathlib import Path
+
+from zcrmsdk.src.com.zoho.crm.api.user_signature import UserSignature
+from zcrmsdk.src.com.zoho.crm.api.dc import (
+    EUDataCenter,
+    USDataCenter,
+    CNDataCenter,
+    INDataCenter,
+    AUDataCenter,
+    JPDataCenter,
+    DataCenter,
+)
+from zcrmsdk.src.com.zoho.api.authenticator.store import FileStore
+from zcrmsdk.src.com.zoho.api.logger import Logger
+from zcrmsdk.src.com.zoho.crm.api.initializer import Initializer
+from zcrmsdk.src.com.zoho.api.authenticator.oauth_token import OAuthToken
+from zcrmsdk.src.com.zoho.crm.api.sdk_config import SDKConfig
+
+
+def code_to_dc(code: str) -> DataCenter:
+    if code == "EU":
+        return EUDataCenter.PRODUCTION()
+    elif code == "US":
+        return USDataCenter.PRODUCTION()
+    elif code == "CN":
+        return CNDataCenter.PRODUCTION()
+    elif code == "IN":
+        return INDataCenter.PRODUCTION()
+    elif code == "AU":
+        return AUDataCenter.PRODUCTION()
+    elif code == "JP":
+        return JPDataCenter.PRODUCTION()
+    else:
+        raise ValueError(
+            "Invalid data center code, must be one of EU, US, CN, IN, AU, JP."
+        )
+
+
+def set_filestore_file(file_store_path: Path, content: str):
+    file_store_path.write_text(content)
+
+
+def get_filestore_file(file_store_path: Path):
+    return file_store_path.read_text()
+
+
+def initialize(
+        region_code: str,
+        refresh_token: str,
+        client_id: str,
+        client_secret: str,
+        user_email: str,
+        tmp_dir_path: Path,
+        file_store_path: Path):
+    """
+    Create an instance of Logger Class that takes two parameters
+    1 -> Level of the log messages to be logged.
+         Can be configured by typing Logger.Levels "." and choose any level from the list displayed.
+    2 -> Absolute file path, where messages need to be logged.
+    """
+    logger = Logger.get_instance(
+        level=Logger.Levels.INFO,
+        file_path=str(tmp_dir_path / "ZohoCRMSDK.log"),
+    )
+
+    # Create an UserSignature instance that takes user Email as parameter
+    user = UserSignature(email=user_email)
+
+    """
+        Configure the environment
+        which is of the pattern Domain.Environment
+        Available Domains: USDataCenter, EUDataCenter, INDataCenter, CNDataCenter, AUDataCenter
+        Available Environments: PRODUCTION(), DEVELOPER(), SANDBOX()
+        """
+    environment = code_to_dc(region_code)
+
+    """
+        Create a Token instance that takes the following parameters
+        1 -> OAuth client id.
+        2 -> OAuth client secret.
+        3 -> Grant token.
+        4 -> Refresh token.
+        5 ->> OAuth redirect URL.
+        6 ->> id
+        """
+    token = OAuthToken(
+        client_id=client_id,
+        client_secret=client_secret,
+        refresh_token=refresh_token
+    )
+
+    """
+        Create an instance of TokenStore
+        1 -> Absolute file path of the file to persist tokens
+        """
+    # Create file if it doesn't exist
+    store = FileStore(file_path=str(file_store_path))
+
+    """
+        auto_refresh_fields (Default value is False)
+            if True - all the modules' fields will be auto-refreshed in the background, every hour.
+            if False - the fields will not be auto-refreshed in the background. The user can manually
+                       delete the file(s) or refresh the fields using methods
+                       from ModuleFieldsHandler(zcrmsdk/src/com/zoho/crm/api/util/module_fields_handler.py)
+
+        pick_list_validation (Default value is True)
+        A boolean field that validates user input for a pick list field and allows or
+        disallows the addition of a new value to the list.
+            if True - the SDK validates the input. If the value does not exist in the pick list,
+                      the SDK throws an error.
+            if False - the SDK does not validate the input and makes the API request
+                       with the user’s input to the pick list
+
+        connect_timeout (Default value is None)
+            A  Float field to set connect timeout
+
+        read_timeout (Default value is None)
+            A  Float field to set read timeout
+        """
+    config = SDKConfig(
+        auto_refresh_fields=True,
+        pick_list_validation=False,
+        connect_timeout=60,
+        read_timeout=60,
+    )
+
+    """
+        The path containing the absolute directory path (in the key resource_path)
+        to store user-specific files containing information about fields in modules.
+        """
+    resource_path = str(tmp_dir_path)
+
+    """
+        Call the static initialize method of Initializer class that takes the following arguments
+        1 -> UserSignature instance
+        2 -> Environment instance
+        3 -> Token instance
+        4 -> TokenStore instance
+        5 -> SDKConfig instance
+        6 -> resource_path
+        7 -> Logger instance. Default value is None
+        8 -> RequestProxy instance. Default value is None
+        """
+    Initializer.initialize(
+        user=user,
+        environment=environment,
+        token=token,
+        store=store,
+        sdk_config=config,
+        resource_path=resource_path,
+        logger=logger,
+    )
+
+
+================================================
+File: /src/zoho/bulk_read.py
+================================================
+import csv
+from dataclasses import dataclass
+import os
+from time import sleep
+import zipfile
+import logging
+from typing import List, Literal, Optional, Union
+
+import dateparser
+
+from zcrmsdk.src.com.zoho.crm.api.bulk_read import (
+    BulkReadOperations,
+    RequestWrapper,
+    ResponseWrapper,
+    # CallBack,
+    Query,
+    Criteria,
+    ActionWrapper,
+    SuccessResponse,
+    APIException,
+    JobDetail,
+    FileBodyWrapper
+)
+
+from zcrmsdk.src.com.zoho.crm.api.util import Choice
+from zcrmsdk.src.com.zoho.crm.api.util import APIResponse
+
+# Module records download configs simple filtering criteria keys
+KEY_FIELD_NAME = "field_name"
+KEY_COMPARATOR = "comparator"
+KEY_VALUE = "value"
+KEY_PARSE_VALUE_AS_DATETIME = "parse_value_as_datetime"
+
+# Module records download configs simple filtering criteria keys
+KEY_GROUP = "group"
+KEY_GROUP_OPERATOR = "group_operator"
+
+# Other constants
+POLLING_PERIOD_SECONDS = 8
+
+
+def print_criteria(criteria: Criteria):  # TODO: change to str generating function
+    if criteria.get_api_name() is not None:
+        # Get the API Name of the Criteria
+        logging.debug("BulkRead Criteria API Name: " + criteria.get_api_name())
+
+    if criteria.get_comparator() is not None:
+        # Get the Comparator of the Criteria
+        logging.debug(
+            "BulkRead Criteria Comparator: " + criteria.get_comparator().get_value()
+        )
+
+    if criteria.get_value() is not None:
+        # Get the Value of the Criteria
+        logging.debug("BulkRead Criteria Value: " + str(criteria.get_value()))
+
+    # Get the List of Criteria instance of each Criteria
+    criteria_group = criteria.get_group()
+
+    if criteria_group is not None:
+        for each_criteria in criteria_group:
+            print_criteria(each_criteria)
+
+    if criteria.get_group_operator() is not None:
+        # Get the Group Operator of the Criteria
+        logging.debug(
+            "BulkRead Criteria Group Operator: "
+            + criteria.get_group_operator().get_value()
+        )
+
+
+def handle_api_exception(api_exception: APIException):
+    # Get the Status
+    logging.debug("Status: " + api_exception.get_status().get_value())
+
+    # Get the Code
+    logging.debug("Code: " + api_exception.get_code().get_value())
+
+    logging.debug("Details")
+
+    # Get the details dict
+    details = api_exception.get_details()
+
+    details_string = ""
+    for key, value in details.items():
+        msg = " " + key + ": " + str(value)
+        details_string = details_string + "\n" + msg
+    logging.debug(details_string)
+
+    # Get the Message
+    logging.debug("Message: " + api_exception.get_message().get_value())
+
+    # Raise an exception
+    raise RuntimeError(
+        f"API did not accept the request to get details of a bulk read job.\n"
+        f"Status: {api_exception.get_status().get_value()}\n"
+        f"Code: {api_exception.get_code().get_value()}\n"
+        f"Message: {api_exception.get_message().get_value()}\n"
+        f"Details: {details_string}"
+    )
+
+
+@dataclass(slots=True, frozen=True)
+class BulkReadJobFilteringCriterion:
+    field_name: str
+    comparator: Literal[
+        "equal",
+        "not_equal",
+        "in",
+        "not_in",
+        "between",
+        "not_between",
+        "greater_than",
+        "greater_equal",
+        "less_than",
+        "less_equal",
+    ]
+    value: Union[str, List[str]]
+
+    @classmethod
+    def from_dict(cls, dict: dict):
+        def parse(value):
+            return dateparser.parse(value).isoformat(timespec="seconds")
+
+        if dict.get(KEY_PARSE_VALUE_AS_DATETIME):
+            value: Union[str, List[str]] = (
+                parse(dict[KEY_VALUE])
+                if isinstance(dict[KEY_VALUE], str)
+                else [parse(v) for v in dict[KEY_VALUE]]
+            )
+        else:
+            value: Union[str, List[str]] = dict[KEY_VALUE]
+
+        return cls(
+            field_name=dict[KEY_FIELD_NAME],
+            comparator=dict[KEY_COMPARATOR],
+            value=value,
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class BulkReadJobFilteringCriteriaGroup:
+    group: List[BulkReadJobFilteringCriterion]
+    group_operator: Literal["and", "or"]
+
+    @classmethod
+    def from_dict(cls, dict: dict):
+        return cls(
+            group=[
+                BulkReadJobFilteringCriterion.from_dict(criterion)
+                for criterion in dict[KEY_GROUP]
+            ],
+            group_operator=dict[KEY_GROUP_OPERATOR],
+        )
+
+
+def create_query_criteria_object(
+    filtering_criteria: Union[
+        BulkReadJobFilteringCriterion, BulkReadJobFilteringCriteriaGroup
+    ]
+) -> Criteria:
+    if isinstance(filtering_criteria, BulkReadJobFilteringCriterion):
+        # Get instance of Criteria Class
+        criteria = Criteria()
+
+        # To set API name of a field
+        criteria.set_api_name(filtering_criteria.field_name)
+
+        # To set comparator(eg: equal, greater_than)
+        criteria.set_comparator(Choice(filtering_criteria.comparator))
+
+        value: Union[str, List[str]] = filtering_criteria.value
+
+        # To set the value to be compared
+        criteria.set_value(value)
+
+        return criteria
+    elif isinstance(filtering_criteria, BulkReadJobFilteringCriteriaGroup):
+        # Get instance of Criteria Class
+        criteria = Criteria()
+
+        # To set the group operator(i.e.: and, or)
+        criteria.set_group_operator(Choice(filtering_criteria.group_operator))
+
+        # To set the list of Criteria instances
+        criteria.set_group(
+            [
+                create_query_criteria_object(filtering_criterion)
+                for filtering_criterion in filtering_criteria.group
+            ]
+        )
+
+        return criteria
+    else:
+        raise ValueError(
+            "Argument filtering_criteria must be an instance of"
+            " BulkReadJobFilteringCriterion or BulkReadJobFilteringCriteriaGroup."
+        )
+
+
+@dataclass(slots=True)
+class BulkReadJobBatch:
+    module_api_name: str
+    destination_folder: str
+    file_name: str
+    field_names: Optional[List[str]] = None
+    filtering_criteria: Optional[
+        Union[BulkReadJobFilteringCriterion, BulkReadJobFilteringCriteriaGroup]
+    ] = None
+    _current_page: int = 1
+    _current_job_id: Optional[int] = None
+    _current_job_state: Optional[
+        Literal["ADDED", "QUEUED", "IN PROGRESS", "COMPLETED"]
+    ] = None
+    _more_pages: bool = True
+
+    def download_all_pages(self):  # TODO: Add support for parallel downloads of pages
+        while self._more_pages:
+            self.create()
+            logging.info(f"Created a bulk read job for page {self._current_page}.")
+            self.get_details()
+            while self._current_job_state != "COMPLETED":  # TODO: Add a timeout
+                logging.info(
+                    f"Page {self._current_page} not ready yet. Its current job state: {self._current_job_state}."
+                    f" Waiting {POLLING_PERIOD_SECONDS} seconds for API server to prepare it."
+                )
+                sleep(POLLING_PERIOD_SECONDS)
+                self.get_details()
+            logging.info(f"Page {self._current_page} ready. Downloading.")
+            self.download_result()
+            self._current_page += 1
+
+    def create(self):
+        # Get instance of BulkReadOperations Class
+        bulk_read_operations = BulkReadOperations()
+
+        # Get instance of RequestWrapper Class that will contain the request body
+        request = RequestWrapper()
+
+        # Get instance of Query Class
+        query = Query()
+
+        # Specifies the API Name of the module to be read.
+        query.set_module(self.module_api_name)
+
+        # Specifies the API Name of the fields to be fetched
+        if self.field_names:
+            query.set_fields(self.field_names)
+
+        # To set page value, By default value is 1.
+        query.set_page(self._current_page)
+
+        if self.filtering_criteria:
+            criteria = create_query_criteria_object(self.filtering_criteria)
+            # To filter the records to be exported
+            query.set_criteria(criteria)
+
+        # Set the query object
+        request.set_query(query)
+
+        # Specify the value for this key as "ics" to export all records in the Events module as an ICS file.
+        request.set_file_type(Choice("csv"))
+
+        # Call create_bulk_read_job method that takes RequestWrapper instance as parameter
+        response: APIResponse = bulk_read_operations.create_bulk_read_job(request)
+
+        if response is None:
+            raise RuntimeError(
+                "Got no response from API when attempting to create a bulk read job."
+            )
+
+        # Get the status code from response
+        logging.debug("Status Code: " + str(response.get_status_code()))
+
+        # Get object from response
+        response_object = response.get_object()
+
+        if response_object is None:
+            raise RuntimeError(
+                "Got no or empty response object from API when attempting to create a bulk read job."
+            )
+
+        # Check if expected ActionWrapper instance is received.
+        if isinstance(response_object, ActionWrapper):
+            action_response_list = response_object.get_data()
+            for action_response in action_response_list:
+                # Check if the request is successful
+                if isinstance(action_response, SuccessResponse):
+                    # Get the Status
+                    logging.debug("Status: " + action_response.get_status().get_value())
+
+                    # Get the Code
+                    logging.debug("Code: " + action_response.get_code().get_value())
+
+                    logging.debug("Details")
+
+                    # Get the details dict
+                    details = action_response.get_details()
+
+                    for key, value in details.items():
+                        logging.debug(key + " : " + str(value))
+
+                    self._current_job_id = details["id"]
+
+                    # Get the Message
+                    logging.debug(
+                        "Message: " + action_response.get_message().get_value()
+                    )
+
+                # Check if the request returned an exception
+                elif isinstance(action_response, APIException):
+                    # Get the Status
+                    logging.debug("Status: " + action_response.get_status().get_value())
+
+                    # Get the Code
+                    logging.debug("Code: " + action_response.get_code().get_value())
+
+                    logging.debug("Details")
+
+                    # Get the details dict
+                    details = action_response.get_details()
+
+                    for key, value in details.items():
+                        logging.debug(key + " : " + str(value))
+
+                    # Get the Message
+                    logging.debug(
+                        "Message: " + action_response.get_message().get_value()
+                    )
+
+        # Check if the request returned an exception
+        elif isinstance(response_object, APIException):
+            handle_api_exception(response_object)
+
+    def get_details(self):
+        # Get instance of BulkReadOperations Class
+        bulk_read_operations = BulkReadOperations()
+
+        # Call get_bulk_read_job_details method that takes jobId as parameter
+        response: APIResponse = bulk_read_operations.get_bulk_read_job_details(
+            self._current_job_id
+        )
+        if response is None:
+            raise RuntimeError(
+                "Got no response from API when attempting to get details of a bulk read job."
+            )
+
+        # Get the status code from response
+        logging.debug("Status Code: " + str(response.get_status_code()))
+
+        # Get object from response
+        response_object = response.get_object()
+
+        if response_object is None:
+            raise RuntimeError(
+                "Got no or empty response object from API when attempting to get details of a bulk read job."
+            )
+
+        # Check if expected ResponseWrapper instance is received
+        if isinstance(response_object, ResponseWrapper):
+
+            # Get the list of JobDetail instances
+            job_details_list: List[JobDetail] = response_object.get_data()
+
+            for job_detail in job_details_list:
+                # Get the Job ID of each jobDetail
+                logging.debug("Bulk read Job ID: " + str(job_detail.get_id()))
+
+                # Get the Operation of each jobDetail
+                logging.debug("Bulk read Operation: " + job_detail.get_operation())
+
+                # Get the State of each jobDetail
+                logging.debug("Bulk read State: " + job_detail.get_state().get_value())
+                self._current_job_state = job_detail.get_state().get_value()
+
+                # Get the Result instance of each jobDetail
+                result = job_detail.get_result()
+
+                if result is not None:
+                    # Get the Page of the Result
+                    logging.debug("Bulkread Result Page: " + str(result.get_page()))
+
+                    # Get the Count of the Result
+                    logging.debug("Bulkread Result Count: " + str(result.get_count()))
+
+                    # Get the Download URL of the Result
+                    logging.debug(
+                        "Bulkread Result Download URL: " + result.get_download_url()
+                    )
+
+                    # Get the Per_Page of the Result
+                    logging.debug(
+                        "Bulkread Result Per_Page: " + str(result.get_per_page())
+                    )
+
+                    # Get the MoreRecords of the Result
+                    logging.debug(
+                        "Bulkread Result MoreRecords: " + str(result.get_more_records())
+                    )
+                    self._more_pages = result.get_more_records()
+
+                # Get the Query instance of each jobDetail
+                query = job_detail.get_query()
+
+                if query is not None:
+                    # Get the Module Name of the Query
+                    logging.debug("Bulk read Query Module: " + query.get_module())
+
+                    # Get the Page of the Query
+                    logging.debug("Bulk read Query Page: " + str(query.get_page()))
+
+                    # Get the cvid of the Query
+                    logging.debug("Bulk read Query cvid: " + str(query.get_cvid()))
+
+                    # Get the fields List of the Query
+                    fields = query.get_fields()
+
+                    if fields is not None:
+                        logging.debug("Bulk read fields")
+                        for field in fields:
+                            logging.debug(field)
+
+                    # Get the Criteria instance of the Query
+                    criteria = query.get_criteria()
+
+                    if criteria is not None:
+                        print_criteria(criteria)
+
+                    # Get the CreatedBy User instance of each jobDetail
+                    created_by = job_detail.get_created_by()
+
+                    # Check if created_by is not None
+                    if created_by is not None:
+                        # Get the Name of the created_by User
+                        logging.debug(
+                            "Bulkread Created By - Name: " + created_by.get_name()
+                        )
+
+                        # Get the ID of the created_by User
+                        logging.debug(
+                            "Bulkread Created By - ID: " + str(created_by.get_id())
+                        )
+
+                    # Get the CreatedTime of each jobDetail
+                    logging.debug(
+                        "Bulkread CreatedTime: " + str(job_detail.get_created_time())
+                    )
+
+                    # Get the FileType of each jobDetail
+                    logging.debug("Bulkread File Type: " + job_detail.get_file_type())
+
+        # Check if the request returned an exception
+        elif isinstance(response_object, APIException):
+            handle_api_exception(response_object)
+
+    def download_result(self):
+        # Get instance of BulkReadOperations Class
+        bulk_read_operations = BulkReadOperations()
+
+        # Call download_result method that takes job_id as parameter
+        response: APIResponse = bulk_read_operations.download_result(
+            self._current_job_id
+        )
+
+        if response is None:
+            raise RuntimeError(
+                "Got no response from API when attempting to download a bulk read job result."
+            )
+
+        # Get the status code from response
+        logging.debug("Status Code: " + str(response.get_status_code()))
+
+        # Get object from response
+        response_object = response.get_object()
+
+        if response_object is None:
+            raise RuntimeError(
+                "Got no or empty response object from API when attempting to get details of a bulk read job."
+            )
+
+        # Check if expected FileBodyWrapper instance is received.
+        if isinstance(response_object, FileBodyWrapper):
+
+            # Get StreamWrapper instance from the returned FileBodyWrapper instance
+            stream_wrapper = response_object.get_file()
+
+            # Construct the file name by joining the destinationFolder and the name from StreamWrapper instance
+            zip_file_name = os.path.join(
+                self.destination_folder, stream_wrapper.get_name()
+            )
+
+            # Open the destination file where the file needs to be written in 'wb' mode
+            with open(zip_file_name, "wb") as f:
+                # Get the stream from StreamWrapper instance
+                for chunk in stream_wrapper.get_stream():
+                    f.write(chunk)
+
+            with zipfile.ZipFile(zip_file_name, "r") as zip_ref:
+                zip_ref.extractall(self.destination_folder)
+                csv_file_name = os.path.join(
+                    self.destination_folder, zip_ref.filelist[0].filename
+                )
+            os.remove(zip_file_name)
+
+            # Update field names according to the CSV file and remove header
+            temp_csv_file_name = csv_file_name + "_temp"
+            with open(csv_file_name, "r") as csv_file, open(
+                temp_csv_file_name, "w"
+            ) as csv_file_temp:
+                csv_reader = csv.reader(csv_file)
+                field_names = next(csv_reader)
+                csv_writer = csv.writer(csv_file_temp)
+                for row in csv_reader:
+                    csv_writer.writerow(row)
+            self.field_names = field_names
+            os.remove(csv_file_name)
+            os.rename(temp_csv_file_name, csv_file_name)
+
+        # Check if the request returned an exception
+        elif isinstance(response_object, APIException):
+            handle_api_exception(response_object)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - echo 'Pushing test image to repo. [tag=test]'
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+"""
+Created on 12. 11. 2018
+
+@author: esner
+"""
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import ZohoCRMExtractor
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {"KBC_DATADIR": "./non-existing-dir"})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = ZohoCRMExtractor()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/logger
+================================================
+gelf
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+Zoho CRM extractor using bulk read operations of the v2 API.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+Extracts data about Zoho CRM modules using the [Bulk Read APIs](https://www.zoho.com/crm/developer/docs/api/v2/bulk-read/overview.html).
+
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Zoho CRM's free tool helps you create, manage, and organize data in a way that drives sales and revenue.
+
+================================================
+File: /component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "title": "Zoho CRM API (v2) configuration",
+  "type": "object",
+  "required": [
+    "account"
+  ],
+  "properties": {
+    "account": {
+      "title": "Account",
+      "type": "object",
+      "required": [
+        "user_email",
+        "zoho_datacenter"
+      ],
+      "propertyOrder": 1,
+      "properties": {
+        "user_email": {
+          "title": "User email",
+          "type": "string",
+          "propertyOrder": 1
+        },
+        "zoho_datacenter": {
+          "title": "Zoho Datacenter",
+          "type": "string",
+          "enum": [
+            "EU",
+            "US",
+            "UK",
+            "IN",
+            "AU",
+            "JP",
+            "CA"
+          ],
+          "default": "COM",
+          "propertyOrder": 2
+        }
+      }
+    }
+  }
+}
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{
+  "title": "Zoho CRM API (v2) row configuration",
+  "type": "object",
+  "required": [
+    "module_records_download_config"
+  ],
+  "properties": {
+    "module_records_download_config": {
+      "title": "Bulk Read Job configuration",
+      "type": "object",
+      "required": [
+        "module_name"
+      ],
+      "properties": {
+        "module_name": {
+          "type": "string",
+          "title": "Module API name",
+          "description": "Use sync action to get a list of available modules.",
+          "propertyOrder": 1,
+          "options": {
+            "async": {
+              "cache": false,
+              "label": "List Modules",
+              "action": "listModules"
+            }
+          },
+          "items": {
+            "enum": [],
+            "type": "string"
+          },
+          "enum": []
+        },
+        "field_names": {
+          "type": "array",
+          "format": "select",
+          "title": "Fields (optional)",
+          "description": "List of field names to be downloaded",
+          "propertyOrder": 2,
+          "options": {
+            "async": {
+              "cache": false,
+              "label": "List Fields",
+              "action": "listFields"
+            }
+          },
+          "items": {
+            "enum": [],
+            "type": "string"
+          },
+          "uniqueItems": true
+        }
+      },
+      "minItems": 1,
+      "uniqueItems": true,
+      "propertyOrder": 1
+    },
+    "sync_options": {
+      "type": "object",
+      "title": "Sync Options",
+      "propertyOrder": 2,
+      "properties": {
+        "sync_mode": {
+          "type": "string",
+          "required": true,
+          "title": "Sync Mode",
+          "enum": [
+            "full_sync",
+            "incremental_sync",
+            "advanced"
+          ],
+          "options": {
+            "enum_titles": [
+              "Full Sync",
+              "Incremental Sync",
+              "Advanced"
+            ]
+          },
+          "default": "full_sync",
+          "description": "Full Sync downloads all data from the source every run, Incremental Sync downloads data created or updated in a specified time range and Advanced option enables custom filtering.",
+          "propertyOrder": 10
+        },
+        "incremental_field": {
+          "type": "string",
+          "title": "Incremental Field",
+          "description": "Field/column to be used for incremental fetching",
+          "propertyOrder": 20,
+          "options": {
+            "async": {
+              "label": "List DateTime Fields",
+              "action": "listFieldsDatetime"
+            },
+            "dependencies": {
+              "sync_mode": "incremental_sync"
+            }
+          },
+          "items": {
+            "enum": [],
+            "type": "string"
+          },
+          "enum": []
+        },
+        "operator": {
+          "type": "string",
+          "title": "Operator",
+          "default": "less_equal",
+          "description": "The operator you want to use to filter the field.",
+          "propertyOrder": 30,
+          "enum": [
+            "greater_than",
+            "greater_equal",
+            "less_than",
+            "less_equal"
+          ],
+          "options": {
+            "dependencies": {
+              "sync_mode": "incremental_sync"
+            },
+            "enum_titles": [
+              "Greater than",
+              "Greater than or equal to",
+              "Less than",
+              "Less than or equal to"
+            ]
+          }
+        },
+        "value": {
+          "type": "string",
+          "title": "Value",
+          "default": "now",
+          "description": "Either date in YYYY-MM-DD format or dateparser string i.e. 5 days ago, 1 month ago, last_run, now, etc.",
+          "propertyOrder": 40,
+          "options": {
+            "dependencies": {
+              "sync_mode": "incremental_sync"
+            }
+          }
+        },
+        "filtering_criteria": {
+          "type": "object",
+          "title": "Filtering Criteria",
+          "format": "editor",
+          "description": "Filtering criteria is either a single filtering criterion or a filtering criteria group. For more information, visit the <a href='https://bitbucket.org/kds_consulting_team/kds-team.ex-zoho/src/master/README.md'>Component's documentation</a>.",
+          "propertyOrder": 50,
+          "options": {
+            "dependencies": {
+              "sync_mode": "advanced"
+            }
+          }
+        }
+      }
+    },
+    "destination": {
+      "title": "Destination settings",
+      "type": "object",
+      "propertyOrder": 3,
+      "properties": {
+        "load_mode": {
+          "title": "Load mode",
+          "type": "string",
+          "enum": [
+            "full",
+            "incremental"
+          ],
+          "options": {
+            "enum_titles": [
+              "Full",
+              "Incremental"
+            ]
+          },
+          "propertyOrder": 3
+        },
+        "output_table_name": {
+          "title": "Output table name (Optional)",
+          "type": "string",
+          "propertyOrder": 1
+        }
+      }
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+fi
+
+echo "Updating logger settings"
+
+value=`cat component_config/logger`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} logger --value="$value"
+else
+    echo "logger type is empty!"
+fi
+
+echo "Updating logger configuration"
+value=`cat component_config/loggerConfiguration.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} loggerConfiguration --value="$value"
+else
+    echo "loggerConfiguration is empty!"
+fi
+
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.component==1.4.3
+keboola.utils
+keboola.http-client
+mock
+freezegun
+jsonschema
+zohocrmsdk2_0==5.1.0
+dateparser
+mysql-connector # zoho TokenStore dependency
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.11-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install --upgrade pip
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+Copyright (c) 2018 Keboola DS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+Zoho CRM Extractor
+=============
+
+Zoho CRM extractor using bulk read operations of v2 API.
+
+**Table of contents:**
+
+[TOC]
+
+Functionality notes
+===================
+Extracts data about Zoho CRM modules using the [Bulk Read APIs](https://www.zoho.com/crm/developer/docs/api/v2/bulk-read/overview.html).
+
+Supported endpoints
+===================
+- `crm/bulk/v2/read`
+- `crm/bulk/v2/read/{job_id}`
+- `crm/bulk/v2/read/{job_id}/result`
+
+If you need more endpoints, please submit your request to
+[ideas.keboola.com](https://ideas.keboola.com/)
+
+Configuration
+=============
+
+ - Account's user email (user_email) - [REQ] User email you used to generate the Self Client.
+ - Module records download configuration (module_records_download_config) - [REQ] job configuration
+    - Module name (module_name) [REQ] - The API name of the Zoho CRM module you want to extract records from.
+    - Field names (field_names) [OPT] - API names of the module records' fields you want to extract. Can be left empty or omitted to download all available fields.
+ - Sync Options (sync_options) [REQ] - There are three modes available: Full Sync, Incremental Sync and Advanced, where you can set up custom filtering.
+   - Filtering criteria (filtering_criteria) [OPT] - Filtering criteria enable you to filter the downloaded records using their fields' values. There is either a single filtering criterion or a filtering criteria group. Can be left empty or omitted to not apply any filtering.
+       - Case of single filtering criterion:
+           - Field name (field_name) [REQ] - The API name of the field you want to filter by.
+           - Operator (operator) [REQ] - The operator you want to use to filter the field.
+           - Value (value) [REQ] - The value you want to use to filter the field. Datetimes must always contain time zone information.
+       - Case of filtering criteria group:
+           - Group (group) [REQ] - List of simple filering criteria (see above).
+           - Group operator (group_operator) [REQ] - The operator you want to use to combine the filtering criteria - either `and` or `or`.
+ - Destination settings [REQ] - Is used to set Keboola Storage behaviour
+     - Output table name (output_table_name) [OPT] - The name of the table that should be created or updated in Keboola Connection storage. Defaults to Module name.
+     - Load mode (load_mode) [REQ] - If Full load is used, the destination table will be overwritten every run. If incremental load is used, data will be upserted into the destination table.
+
+Sample Configurations
+=============
+
+Simple configuration
+```json
+{
+  "parameters": {    
+    "account": {
+      "user_email": "component.factory@keboola.com"
+    },
+    "module_records_download_config": {
+      "module_name": "Deals",
+      "field_names": []
+    },
+    "sync_options": {
+      "sync_mode": "full_sync",
+      "filtering_criteria": {}
+    },
+    "destination": {
+      "load_mode": "full",
+      "output_table_name": "Leads"
+    }
+  }
+}
+```
+Defined field names and filtering criteria
+```json
+{
+  "parameters": {
+    "account": {
+      "user_email": "component.factory@keboola.com"
+    },
+    "module_records_download_config": {
+      "module_name": "Leads",
+      "field_names": []
+    },
+    "sync_options": {
+      "sync_mode": "advanced",
+      "filtering_criteria": {
+        "field_name": "Created_Time",
+        "comparator": "between",
+        "value": [
+          "2022-07-26T15:15:34+02:00",
+          "2022-07-26T16:58:45+02:00"
+        ]
+      }
+    },
+    "destination": {
+      "load_mode": "full",
+      "output_table_name": "Leads"
+    }
+  }
+}
+```
+Fitering Groups
+```json
+{
+  "parameters": {
+    "account": {
+      "user_email": "component.factory@keboola.com"
+    },
+    "module_records_download_config": {
+      "module_name": "Leads",
+      "field_names": []
+    },
+    "sync_options": {
+      "sync_mode": "advanced",
+      "filtering_criteria": {
+        "group": [
+          {
+            "field_name": "First_Name",
+            "comparator": "equal",
+            "value": "Jan"
+          },
+          {
+            "field_name": "Last_Name",
+            "comparator": "equal",
+            "value": "Stary"
+          }
+        ],
+        "group_operator": "or"
+      }
+    },
+    "destination": {
+      "load_mode": "full",
+      "output_table_name": "LeadsTest"
+    }
+  }
+}
+```
+
+Output
+======
+All output tables contain the `Id` column containing the record's unique ID. It is always used as the output tables primary key in Keboola Connection storage. Other fields depend on the module you are extracting records from and field names specified in the configuration.
+
+Development
+-----------
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path in
+the `docker-compose.yml` file:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clone this repository, init the workspace and run the component with following command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose build
+docker-compose run --rm dev
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run the test suite and lint check using this command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose run --rm test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Integration
+===========
+
+For information about deployment and integration with KBC, please refer to the
+[deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/)
+

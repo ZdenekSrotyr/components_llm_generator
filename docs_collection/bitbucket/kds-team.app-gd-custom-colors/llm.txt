@@ -1,0 +1,1419 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-gd-custom-colors/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── src/
+    │   ├── component.py
+    │   └── kbc/
+    │       ├── client_base.py
+    │       ├── __init__.py
+    │       └── env_handler.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   └── build_n_run.ps1
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    ├── default_hex.txt
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+      - KBC_TOKEN=test
+  test:
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+      - KBC_TOKEN=test
+    command: python -m unittest discover
+
+================================================
+File: /src/component.py
+================================================
+'''
+Template Component main class.
+
+'''
+
+from kbc.env_handler import KBCEnvHandler
+import logging
+import sys
+import json
+import requests
+import os
+
+KEY_COLORS = "colors"
+KEY_INCLUDE_DEFAULT = "include_default"
+KEY_CONFIG_ID = "config_id"
+KEY_PROJECT_ID = 'project_id'
+KEY_SYRUP_URL = 'syrup_url'
+
+PAR_DIRPATH = os.path.dirname(os.path.abspath(os.path.join(os.path.abspath(__file__), os.pardir)))
+DEFAULT_HEX_FILE_PATH = os.path.join(PAR_DIRPATH, "default_hex.txt")
+
+MANDATORY_PARS = [KEY_PROJECT_ID, KEY_CONFIG_ID]
+MANDATORY_IMAGE_PARAMS = [KEY_SYRUP_URL]
+
+APP_VERSION = '0.0.1'
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, debug=False):
+        KBCEnvHandler.__init__(self, MANDATORY_PARS)
+        # override debug from config
+        if self.cfg_params.get('debug'):
+            debug = True
+
+        self.set_default_logger('DEBUG' if debug else 'INFO')
+        logging.info('Running version %s', APP_VERSION)
+        logging.info('Loading configuration...')
+
+        try:
+            self.validate_config(MANDATORY_PARS)
+            self.validate_image_parameters(MANDATORY_IMAGE_PARAMS)
+        except ValueError as e:
+            logging.error(e)
+            exit(1)
+
+    def run(self, debug=False):
+        '''
+        Main execution code
+        '''
+        params = self.cfg_params  # noqa
+        project_id = params[KEY_PROJECT_ID]
+        config_id = params[KEY_CONFIG_ID]
+        include_default = params[KEY_INCLUDE_DEFAULT]
+        colors = params[KEY_COLORS]
+        storage_token = self.get_storage_token()
+        syrup_url = self.get_image_parameters()[KEY_SYRUP_URL]
+
+        try:
+            listing = self.color_prep(colors, include_default)
+            ch_info = self.put_gd(storage_token, project_id, config_id, listing, syrup_url)
+            logging.info(ch_info)
+            logging.info("------------------------")
+            result = json.loads(ch_info)
+            if result.get("status") == 'error':
+                logging.error('Update request failed. Status code: %s, Message: %s',
+                              result.get('code'), result.get('message'))
+                sys.exit(1)
+            logging.info("Job done.")
+
+        except ValueError as err:
+            logging.error(err)
+            sys.exit(1)
+
+        except Exception as err:
+            logging.error(err)
+            # traceback.print_exc(file=sys.stderr)
+            sys.exit(2)
+
+    def put_gd(self, storage, project, config_id, codes, syrup_url):
+        """
+        Request color change via GD writer login
+         - Codes are in final JSON format based on DG description
+         - identification from config: (storage, project, config(name of the writer))
+        """
+
+        json_string = '{"uri": "/gdc/projects/' + project + '/styleSettings/","payload":' + json.dumps(codes) + '}'
+        # doing there and back excercise to make sure the formatting works
+        parsed_json = json.loads(json_string)
+        values = json.dumps(parsed_json)
+        logging.debug(values)
+
+        headers = {
+            'Content-Type': 'application/json',
+            'X-StorageApi-Token': storage
+        }
+
+        # Colors change
+        url_change = (syrup_url + "/gooddata-writer/v2/" + config_id + "/proxy")
+        change_response = requests.put(url_change, headers=headers, data=values)
+
+        logging.info("Change request response: " + str(change_response.status_code))
+        logging.debug("------------------------")
+        change_info = change_response.text
+        logging.debug(change_response.headers)
+        logging.debug(json.dumps(change_info, indent=2))
+
+        return change_info
+
+    def default_hex(self):
+        """
+        Get default TXT config for colors in GD - HEX LIST
+        """
+
+        j = open(DEFAULT_HEX_FILE_PATH)
+        f = j.read()
+        j.close()
+
+        # Sending back just a string to keep the same formatting as user input
+        # data = f.split(",")
+        data = str(f)
+
+        return data
+
+    def hex_to_int_color(self, v):
+        """
+        Convert color from HEX -} LIST
+        """
+
+        if v[0] == '#':
+            v = v[1:]
+        assert (len(v) == 6)
+        hex_tuple = int(v[:2], 16), int(v[2:4], 16), int(v[4:6], 16)
+        return list(hex_tuple)
+
+    def int_to_hex_color(self, v):
+        """
+        ! UNUSED !
+        Convert color from RGB LIST -} HEX
+        """
+
+        assert (len(v) == 3)
+        return '#%02x%02x%02x' % v
+
+    def color_prep(self, colors_list, include_default):
+        """
+        Assemble JSON inject piece:
+         - Merge default colors with custom ones
+         - Create list of RGB codes for each color
+         - Create color list
+         - Create JSON piece
+        """
+
+        # Format user user input as a string for quick merge and unified conversion
+        colors = ','.join(str(x) for x in colors_list)
+        # Call default values and merge them with user input
+        if include_default == "YES":
+            default = self.default_hex()
+            list_merge = default + "," + colors
+        else:
+            list_merge = colors
+
+        list_custom = list_merge.split(",")
+        logging.info("Selected colors: " + str(list_custom))
+        logging.info("------------------------")
+
+        # Create list of RGB codes for each color
+        color_list = []
+        num_id = 0
+        for a in list_custom:
+            rgb_codes = self.hex_to_int_color(a)
+            # print rgb_codes
+            piece_r = rgb_codes[0]
+            piece_g = rgb_codes[1]
+            piece_b = rgb_codes[2]
+            num_id = num_id + 1
+            guid = "guid" + str(num_id)
+            # print guid
+            piece_color = {"guid": guid,
+                           "fill": {
+                               "r": piece_r,
+                               "g": piece_g,
+                               "b": piece_b
+                           }
+                           }
+            # print piece_color
+            color_list.append(piece_color)
+
+        # Create JSON piece
+        json_piece = {
+            "styleSettings": {
+                "chartPalette": color_list
+            }
+        }
+
+        return json_piece
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    comp = Component()
+    comp.run()
+
+
+================================================
+File: /src/kbc/client_base.py
+================================================
+"""
+Created on 5. 10. 2018
+
+@author: esner
+"""
+import requests
+import logging
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+
+
+class HttpClientBase:
+    """
+    Base class for implementing a single Http client related to some REST API.
+
+    """
+
+    def __init__(self, base_url, max_retries=10, backoff_factor=0.3,
+                 status_forcelist=(500, 502, 504), default_http_header=[], auth=None, default_params=None):
+        """
+        Create an endpoint.
+
+          Args:
+            base_url: The base URL for this endpoint. e.g. https://exampleservice.com/api_v1/
+            max_retries: Total number of retries to allow.
+            backoff_factor:  A back-off factor to apply between attempts.
+            status_forcelist:  A set of HTTP status codes that we should force a retry on. e.g. [500,502]
+            default_http_header (dict): Default header to be sent with each request
+                                        eg. {'Authorization': 'Bearer ' + token,
+                                                       'Content-Type' : 'application/json',
+                                                       'Accept' : 'application/json'}
+            auth: Default Authentication tuple or object to attach to (from  requests.Session().auth).
+                  eg. auth = (user, password)
+            default_params (dict): default parameters to be sent with each request eg. {'param':'value'}
+
+        """
+        if not base_url:
+            raise ValueError("Base URL is required.")
+        self.base_url = base_url
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        self.status_forcelist = status_forcelist
+        self._auth = auth
+        self._auth_header = default_http_header
+        self._default_params = default_params
+
+    def requests_retry_session(self, session=None):
+        session = session or requests.Session()
+        retry = Retry(
+            total=self.max_retries,
+            read=self.max_retries,
+            connect=self.max_retries,
+            backoff_factor=self.backoff_factor,
+            status_forcelist=self.status_forcelist,
+            method_whitelist=('GET', 'POST', 'PATCH', 'UPDATE')
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        return session
+
+    def _get_raw(self, url, params=None, **kwargs):
+        """
+        Construct a requests GET call with args and kwargs and process the
+        results.
+
+
+        Args:
+            url (str): requested url
+            params (dict): additional url params to be passed to the underlying
+                requests.get
+            **kwargs: Key word arguments to pass to the get requests.get
+
+        Returns:
+            r (requests.Response): :class:`Response <Response>` object.
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        s.auth = self._auth
+
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        s.headers.update(headers)
+        # set default params
+        if self._default_params:
+            params = self._default_params.update(params)
+
+        r = self.requests_retry_session(session=s).request('GET', url=url, params=params, auth=self._auth, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            # Handle different error codes
+            raise Exception('Request failed with code: {}, message: {}'.format(r.status_code, r.text))
+        else:
+            return r
+
+    def get(self, url, params=None, **kwargs):
+        r = self._get_raw(url, params, **kwargs)
+        return r.json()
+
+    def _post_raw(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+               Accepts supported params in requests.sessions.Session#request
+            **kwargs: Key word arguments to pass to the post request.
+               Accepts supported params in requests.sessions.Session#request
+               eg. params = {'locId':'1'}, header = {some additional header}
+               parameters and headers are appended to the default ones
+
+        Returns:
+            Response: Returns :class:`Response <Response>` object.
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        s.headers.update(headers)
+        s.auth = self._auth
+
+        params = kwargs.pop('params')
+        # set default params
+        if self._default_params:
+            kwargs.update({'params': self._default_params.update(params)})
+
+        r = self.requests_retry_session(session=s).request('POST', *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            logging.warning(e, exc_info=True)
+            # Handle different error codes
+            raise
+        else:
+            return r
+
+    def post(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+               Accepts supported params in requests.sessions.Session#request
+            **kwargs: Key word arguments to pass to the post request.
+               Accepts supported params in requests.sessions.Session#request
+               eg. params = {'locId':'1'}, header = {some additional header}
+               parameters and headers are appended to the default ones
+
+
+        Returns:
+            body: json reposonse json-encoded content of a response
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+
+        params = kwargs.pop('params', {})
+        # set default params
+        if self._default_params:
+            kwargs.update({'params': self._default_params.update(params)})
+        r = self.requests_retry_session(session=s).request('POST', headers=headers, *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            logging.warning(e, exc_info=True)
+            # Handle different error codes
+            raise
+        else:
+            return r.json()
+
+    def _patch(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+            **kwargs: Key word arguments to pass to the post request.
+
+        Returns:
+            body: Response body parsed from json.
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        r = requests.patch(headers=headers, *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            logging.warning(e, exc_info=True)
+            # Handle different error codes
+            raise
+        else:
+            return r
+
+
+================================================
+File: /src/kbc/env_handler.py
+================================================
+# ==============================================================================
+# KBC Env handler
+# ==============================================================================
+
+
+# ============================ Import libraries ==========================
+import logging
+import json
+import os
+import csv
+import pytz
+import math
+import sys
+from collections import Counter
+from keboola import docker
+import datetime
+from dateutil.relativedelta import relativedelta
+from _datetime import timedelta
+
+DEFAULT_DEL = ','
+DEFAULT_ENCLOSURE = '"'
+
+
+class KBCEnvHandler:
+    """
+    Class handling standard tasks for KBC component manipulation i.e. config load, validation
+
+    It contains some useful methods helping with boilerplate tasks.
+    """
+
+    def __init__(self, mandatory_params, data_path=None):
+        """
+
+        Args:
+            mandatory_params (array(str)): Array of parameter names that needs to be present in the config.json.
+            May be nested, see :func:`KBCEnvHandler.validateConfig()` docs for more details.
+
+            data_path (str): optional path to data folder - if not specified data folder if fetched from KBC_DATADIR
+            env variable by default.
+        """
+        if not data_path:
+            data_path = os.environ.get('KBC_DATADIR')
+
+        self.kbc_config_id = os.environ.get('KBC_CONFIGID')
+
+        self.data_path = data_path
+        self.configuration = docker.Config(data_path)
+        self.cfg_params = self.configuration.get_parameters()
+        self.image_params = self.configuration.config_data["image_parameters"]
+        self.tables_out_path = os.path.join(data_path, 'out', 'tables')
+        self.tables_in_path = os.path.join(data_path, 'in', 'tables')
+
+        self._mandatory_params = mandatory_params
+
+    # ==============================================================================
+
+    def validate_config(self, mandatory_params):
+        """
+                Validates config parameters based on provided mandatory parameters.
+                All provided parameters must be present in config to pass.
+                ex1.:
+                par1 = 'par1'
+                par2 = 'par2'
+                mandatory_params = [par1, par2]
+                Validation will fail when one of the above parameters is not found
+
+                Two levels of nesting:
+                Parameters can be grouped as arrays par3 = [groupPar1, groupPar2]
+                => at least one of the pars has to be present
+                ex2.
+                par1 = 'par1'
+                par2 = 'par2'
+                par3 = 'par3'
+                groupPar1 = 'groupPar1'
+                groupPar2 = 'groupPar2'
+                group1 = [groupPar1, groupPar2]
+                group3 = [par3, group1]
+                mandatory_params = [par1, par2, group1]
+
+                Folowing logical expression is evaluated:
+                Par1 AND Par2 AND (groupPar1 OR groupPar2)
+
+                ex3
+                par1 = 'par1'
+                par2 = 'par2'
+                par3 = 'par3'
+                groupPar1 = 'groupPar1'
+                groupPar2 = 'groupPar2'
+                group1 = [groupPar1, groupPar2]
+                group3 = [par3, group1]
+                mandatory_params = [par1, par2, group3]
+
+                Following logical expression is evaluated:
+                par1 AND par2 AND (par3 OR (groupPar1 AND groupPar2))
+                """
+        return self.validate_parameters(self.cfg_params, mandatory_params, 'config parameters')
+
+    def validate_image_parameters(self, mandatory_params):
+        """
+                Validates image parameters based on provided mandatory parameters.
+                All provided parameters must be present in config to pass.
+                ex1.:
+                par1 = 'par1'
+                par2 = 'par2'
+                mandatory_params = [par1, par2]
+                Validation will fail when one of the above parameters is not found
+
+                Two levels of nesting:
+                Parameters can be grouped as arrays par3 = [groupPar1, groupPar2]
+                => at least one of the pars has to be present
+                ex2.
+                par1 = 'par1'
+                par2 = 'par2'
+                par3 = 'par3'
+                groupPar1 = 'groupPar1'
+                groupPar2 = 'groupPar2'
+                group1 = [groupPar1, groupPar2]
+                group3 = [par3, group1]
+                mandatory_params = [par1, par2, group1]
+
+                Folowing logical expression is evaluated:
+                Par1 AND Par2 AND (groupPar1 OR groupPar2)
+
+                ex3
+                par1 = 'par1'
+                par2 = 'par2'
+                par3 = 'par3'
+                groupPar1 = 'groupPar1'
+                groupPar2 = 'groupPar2'
+                group1 = [groupPar1, groupPar2]
+                group3 = [par3, group1]
+                mandatory_params = [par1, par2, group3]
+
+                Following logical expression is evaluated:
+                par1 AND par2 AND (par3 OR (groupPar1 AND groupPar2))
+                """
+        return self.validate_parameters(self.image_params, mandatory_params, 'image/stack parameters')
+
+    def validate_parameters(self, parameters, mandatory_params, _type):
+        """
+        Validates provided parameters based on provided mandatory parameters.
+        All provided parameters must be present in config to pass.
+        ex1.:
+        par1 = 'par1'
+        par2 = 'par2'
+        mandatory_params = [par1, par2]
+        Validation will fail when one of the above parameters is not found
+
+        Two levels of nesting:
+        Parameters can be grouped as arrays par3 = [groupPar1, groupPar2] => at least one of the pars has to be present
+        ex2.
+        par1 = 'par1'
+        par2 = 'par2'
+        par3 = 'par3'
+        groupPar1 = 'groupPar1'
+        groupPar2 = 'groupPar2'
+        group1 = [groupPar1, groupPar2]
+        group3 = [par3, group1]
+        mandatory_params = [par1, par2, group1]
+
+        Folowing logical expression is evaluated:
+        Par1 AND Par2 AND (groupPar1 OR groupPar2)
+
+        ex3
+        par1 = 'par1'
+        par2 = 'par2'
+        par3 = 'par3'
+        groupPar1 = 'groupPar1'
+        groupPar2 = 'groupPar2'
+        group1 = [groupPar1, groupPar2]
+        group3 = [par3, group1]
+        mandatory_params = [par1, par2, group3]
+
+        Following logical expression is evaluated:
+        par1 AND par2 AND (par3 OR (groupPar1 AND groupPar2))
+        """
+        missing_fields = []
+        for field in mandatory_params:
+            if isinstance(field, list):
+                missing_fields.extend(self._validate_par_group(field, parameters))
+            elif not parameters.get(field):
+                missing_fields.append(field)
+
+        if missing_fields:
+            raise ValueError(
+                'Missing mandatory {} fields: [{}] '.format(_type, ', '.join(missing_fields)))
+
+    def _validate_par_group(self, par_group, parameters):
+        missing_fields = []
+        is_present = False
+        for par in par_group:
+            if isinstance(par, list):
+                missing_subset = self._get_par_missing_fields(par, parameters)
+                missing_fields.extend(missing_subset)
+                if not missing_subset:
+                    is_present = True
+
+            elif parameters.get(par):
+                is_present = True
+            else:
+                missing_fields.append(par)
+        if not is_present:
+            return missing_fields
+        else:
+            return []
+
+    def _get_par_missing_fields(self, mand_params, parameters):
+        missing_fields = []
+        for field in mand_params:
+            if not parameters.get(field):
+                missing_fields.append(field)
+        return missing_fields
+
+    def get_storage_token(self):
+        try:
+            return os.environ["KBC_TOKEN"]
+        except Exception:
+            logging.error("Storage token is missing in KBC_TOKEN env variable")
+            exit(2)
+
+    def get_input_table_by_name(self, table_name):
+        tables = self.configuration.get_input_tables()
+        table = [t for t in tables if t.get('destination') == table_name]
+        if not table:
+            raise ValueError(
+                'Specified input mapping [{}] does not exist'.format(table_name))
+        return table[0]
+
+    def get_image_parameters(self):
+        return self.configuration.config_data["image_parameters"]
+
+    # ================================= Logging ==============================
+
+    def set_default_logger(self, log_level='INFO'):  # noqa: E301
+        """
+        Sets default console logger.
+
+        Args:
+            log_level: logging level, default: 'INFO'
+
+        Returns: logging object
+
+        """
+
+        class InfoFilter(logging.Filter):
+            def filter(self, rec):
+                return rec.levelno in (logging.DEBUG, logging.INFO)
+
+        hd1 = logging.StreamHandler(sys.stdout)
+        hd1.addFilter(InfoFilter())
+        hd2 = logging.StreamHandler()
+        hd2.setLevel(logging.WARNING)
+
+        logging.basicConfig(
+            level=log_level,
+            format='%(levelname)s - %(message)s',
+            handlers=[hd1, hd2])
+
+        logger = logging.getLogger()
+        return logger
+
+    def get_state_file(self):
+        """
+
+        Return dict representation of state file or nothing if not present
+
+        Returns:
+            dict:
+
+        """
+        logging.getLogger().info('Loading state file..')
+        state_file_path = os.path.join(self.data_path, 'in', 'state.json')
+        if not os.path.isfile(state_file_path):
+            logging.getLogger().info('State file not found. First run?')
+            return
+        try:
+            with open(state_file_path, 'r') \
+                    as state_file:
+                return json.load(state_file)
+        except (OSError, IOError):
+            raise ValueError(
+                "State file state.json unable to read "
+            )
+
+    def write_state_file(self, state_dict):
+        """
+        Stores state file.
+        Args:
+            state_dict:
+        """
+        if not isinstance(state_dict, dict):
+            raise TypeError('Dictionary expected as a state file datatype!')
+
+        with open(os.path.join(self.configuration.data_dir, 'out', 'state.json'), 'w+') as state_file:
+            json.dump(state_dict, state_file)
+
+    def create_sliced_tables(self, folder_name, pkey=None, incremental=False,
+                             src_delimiter=DEFAULT_DEL, src_enclosure=DEFAULT_ENCLOSURE, dest_bucket=None):
+        """
+        Creates prepares sliced tables from all files in DATA_PATH/out/tables/{folder_name} - i.e. removes all headers
+        and creates single manifest file based on provided parameters.
+
+        Args:
+            folder_name: folder name present in DATA_PATH directory that contains files for slices,
+        the same name will be used as table name
+            pkey: array of pkeys
+            incremental: boolean
+            src_delimiter: delimiter of the source file [,]
+            src_enclosure: enclosure of the source file ["]
+            dest_bucket: name of the destination bucket, eg. in.c-input (optional)
+
+
+        """
+        log = logging
+        log.info('Creating sliced tables for [{}]..'.format(folder_name))
+
+        folder_path = os.path.join(self.tables_out_path, folder_name)
+
+        if not os.path.isdir(folder_path):
+            raise ValueError("Specified folder ({}) does not exist in the data folder ({})".format(
+                folder_name, self.data_path))
+
+        # get files
+        files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if os.path.isfile(
+            os.path.join(folder_path, f))]
+
+        header = self.get_and_remove_headers_in_all(
+            files, src_delimiter, src_enclosure)
+        if dest_bucket:
+            destination = dest_bucket + '.' + folder_name
+        else:
+            destination = folder_name
+
+        log.info('Creating manifest file..')
+        self.configuration.write_table_manifest(
+            file_name=folder_path, destination=destination, primary_key=pkey, incremental=incremental, columns=header)
+
+    def get_and_remove_headers_in_all(self, files, delimiter, enclosure):
+        """
+        Removes header from all specified files and return it as a list of strings
+
+        Throws error if there is some file with different header.
+
+        """
+        first_run = True
+        for file in files:
+            curr_header = self._get_and_remove_headers(
+                file, delimiter, enclosure)
+            if first_run:
+                header = curr_header
+                first_file = file
+                first_run = False
+            # check whether header matches
+            if Counter(header) != Counter(curr_header):
+                raise Exception('Header in file {}:[{}] is different than header in file {}:[{}]'.format(
+                    first_file, header, file, curr_header))
+        return header
+
+    def _get_and_remove_headers(self, file, delimiter, enclosure):
+        """
+        Removes header from specified file and return it as a list of strings.
+        Creates new updated file 'upd_'+origFileName and deletes the original
+        """
+        head, tail = os.path.split(file)
+        with open(file, "r") as input_file:
+            with open(os.path.join(head, 'upd_' + tail), 'w+', newline='') as updated:
+                reader = csv.DictReader(
+                    input_file, delimiter=delimiter, quotechar=enclosure)
+                header = reader.fieldnames
+                writer = csv.DictWriter(
+                    updated, fieldnames=header, delimiter=DEFAULT_DEL, quotechar=DEFAULT_ENCLOSURE)
+                for row in reader:
+                    # write row
+                    writer.writerow(row)
+        os.remove(file)
+        return header
+
+    def process_results(self, res_files, def_bucket_name, output_bucket):
+        for res in res_files:
+            dest_bucket = def_bucket_name + str(self.kbc_config_id)
+            if output_bucket:
+                suffix = '-' + output_bucket
+            else:
+                suffix = ''
+
+            # build manifest
+            self.configuration.write_table_manifest(
+                file_name=res['full_path'],
+                destination=dest_bucket + suffix + '.' + res['name'],
+                primary_key=res['pkey'],
+                incremental=True)
+
+    def process_results_sliced(self, res_files):
+        res_sliced_folders = {}
+        for file in res_files:
+            res_sliced_folders.update({file['name']: file['pkey']})
+
+        for folder in res_sliced_folders:
+            self.create_sliced_tables(folder, res_sliced_folders[folder], True)
+
+    # ==============================================================================
+    # == UTIL functions
+
+    def get_past_date(self, str_days_ago, to_date=None, tz=pytz.utc):
+        """
+        Returns date in specified timezone relative to today.
+
+        e.g.
+        '5 hours ago',
+        'yesterday',
+        '3 days ago',
+        '4 months ago',
+        '2 years ago',
+        'today'
+        """
+        if to_date:
+            TODAY = to_date
+        else:
+            TODAY = datetime.datetime.now(tz)
+        splitted = str_days_ago.split()
+        if len(splitted) == 1 and splitted[0].lower() == 'today':
+            return TODAY
+        elif len(splitted) == 1 and splitted[0].lower() == 'yesterday':
+            date = TODAY - relativedelta(days=1)
+            return date
+        elif splitted[1].lower() in ['hour', 'hours', 'hr', 'hrs', 'h']:
+            date = datetime.datetime.now() - \
+                   relativedelta(hours=int(splitted[0]))
+            return date.date()
+        elif splitted[1].lower() in ['day', 'days', 'd']:
+            date = TODAY - relativedelta(days=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['wk', 'wks', 'week', 'weeks', 'w']:
+            date = TODAY - relativedelta(weeks=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['mon', 'mons', 'month', 'months', 'm']:
+            date = TODAY - relativedelta(months=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['yrs', 'yr', 'years', 'year', 'y']:
+            date = TODAY - relativedelta(years=int(splitted[0]))
+            return date
+        else:
+            raise ValueError('Invalid relative period!')
+
+    def split_dates_to_chunks(self, start_date, end_date, intv, strformat="%m%d%Y"):
+        """
+        Splits dates in given period into chunks of specified max size.
+
+        Params:
+        start_date -- start_period [datetime]
+        end_date -- end_period [datetime]
+        intv -- max chunk size
+        strformat -- dateformat of result periods
+
+        Usage example:
+        list(split_dates_to_chunks("2018-01-01", "2018-01-04", 2, "%Y-%m-%d"))
+
+            returns [{start_date: "2018-01-01", "end_date":"2018-01-02"}
+                     {start_date: "2018-01-02", "end_date":"2018-01-04"}]
+        """
+        return list(self._split_dates_to_chunks_gen(start_date, end_date, intv, strformat))
+
+    def _split_dates_to_chunks_gen(self, start_date, end_date, intv, strformat="%m%d%Y"):
+        """
+        Splits dates in given period into chunks of specified max size.
+
+        Params:
+        start_date -- start_period [datetime]
+        end_date -- end_period [datetime]
+        intv -- max chunk size
+        strformat -- dateformat of result periods
+
+        Usage example:
+        list(split_dates_to_chunks("2018-01-01", "2018-01-04", 2, "%Y-%m-%d"))
+
+            returns [{start_date: "2018-01-01", "end_date":"2018-01-02"}
+                     {start_date: "2018-01-02", "end_date":"2018-01-04"}]
+        """
+
+        nr_days = (end_date - start_date).days
+
+        if nr_days <= intv:
+            yield {'start_date': start_date.strftime(strformat),
+                   'end_date': end_date.strftime(strformat)}
+        elif intv == 0:
+            diff = timedelta(days=1)
+            for i in range(nr_days):
+                yield {'start_date': (start_date + diff * i).strftime(strformat),
+                       'end_date': (start_date + diff * i).strftime(strformat)}
+        else:
+            nr_parts = math.ceil(nr_days / intv)
+            diff = (end_date - start_date) / nr_parts
+            for i in range(nr_parts):
+                yield {'start_date': (start_date + diff * i).strftime(strformat),
+                       'end_date': (start_date + diff * (i + 1)).strftime(strformat)}
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          #- echo 'Pushing test image to repo. [tag=test]'
+          #- export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          #- docker tag $APP_IMAGE:latest $REPOSITORY:test
+          #- eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          #- docker push $REPOSITORY:test
+
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover          
+          - echo "Preparing KBC test image"
+          - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+          # push test image to ECR - uncomment when initialised
+          # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          # - docker push $REPOSITORY:test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+          - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+
+    def testRunEmptyFails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    #import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+### What is this component for? ###
+
+Keboola Connection component to create a custom color palette in GoodData platform. App has an option to add default color set from GD. More information: [GoodData Help Page](https://help.gooddata.com/display/doc/Importing+Custom+Color+Palettes)
+
+
+#### Configuration ####
+You will need to know this info:
+
+- GOODDATA PROJECT ID
+- GOODDATA WRITER ID
+
+
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+    "title": "Parameters",
+    "type": "object",
+    "required": [
+        "project_id",
+        "config_id",
+		"include_default",
+		"colors"
+    ],
+    "properties": {
+        "project_id": {
+            "title": "GoodData Project ID",
+            "type": "string",
+            "minLength": 1,
+            "default": ""
+        },
+        "config_id": {
+            "title": "Configuration ID of GoodData Writer",
+			"description": "Writer configuration ID can be identified from the URL of the writer page: \nhttps://connection.keboola.com/admin/projects/kbcproject/writers/gooddata-writer/<WRITER_ID>",
+            "type": "string",
+            "minLength": 1,
+            "default": ""
+        },
+        "include_default": {
+            "title": "Default Colors",
+            "description": "Select YES to include default GD colors",
+            "type": "string",
+            "enum": [
+                "YES",
+                "NO"
+            ],
+            "default": "YES"
+        },
+        "colors": {
+            "type": "array",
+            "title": "Custom Colors",
+            "description": "Add your custom colors here. You may add as many colors as you want.",
+            "uniqueItems": true,
+            "items": {
+                "type": "string",
+                "title": "Color",
+                "format": "color",
+                "default": "#ffffff"
+            }
+        }
+    }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+    "parameters": {
+        "colors": [
+            "#ffffff"
+        ],
+        "config_id": "test",
+        "project_id": "XXX",
+        "include_default": "YES",
+		"debug":true
+    },
+    "image_parameters": {"syrup_url" : "https://syrup.keboola.com"},
+    "action": "run",
+    "storage": {},
+    "authorization": {}
+}
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /requirements.txt
+================================================
+https://github.com/keboola/python-docker-application/zipball/master#egg=keboola
+pytz
+python-dateutil
+requests
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.7.1-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+Copyright (c) 2018 Keboola DS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /default_hex.txt
+================================================
+#2b6bae,#69aa51,#eeb14c,#d53c38,#894d94,#737373,#44a9be,#96bd5f,#fd9369,#e15d86,#7c6fad,#a5a5a5,#7aa6d5,#82d08d,#ffd289,#f18480,#bf90c6,#bfbfbf
+
+================================================
+File: /README.md
+================================================
+### What is this component for? ###
+
+Keboola Connection component to create a custom color palette in GoodData platform. App has an option to add default color set from GD. More information: [GoodData Help Page](https://help.gooddata.com/display/doc/Importing+Custom+Color+Palettes)
+
+### Configuration ###
+
+You will need to know this info:
+
+* GOODDATA PROJECT ID
+* KBC STORAGE TOKEN
+* GOODDATA WRITER ID
+
+### Contact ###
+
+* Email: vfisa.stuff at gmail.com  
+* Twitter: VFisa
+

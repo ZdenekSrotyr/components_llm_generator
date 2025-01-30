@@ -1,0 +1,1405 @@
+Directory structure:
+└── kds_consulting_team-keboola-typeform-surveys-extractor/
+    ├── LICENSE
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   ├── kbc/
+    │   │   ├── client_base.py
+    │   │   ├── __init__.py
+    │   │   └── env_handler.py
+    │   └── main.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_UI.json
+    ├── data/
+    │   ├── config.json
+    │   ├── in/
+    │   │   ├── state.json
+    │   │   ├── tables/
+    │   │   │   ├── test.csv
+    │   │   │   └── test.csv.manifest
+    │   │   └── files/
+    │   │       └── order1.xml
+    │   └── out/
+    │       ├── tables/
+    │       │   └── test.csv
+    │       └── files/
+    │           └── order1.xml
+    ├── deployment/
+    │   ├── flake8.cfg
+    │   └── deploy.sh
+    ├── component_config/
+    │   ├── configuration_description.md
+    │   ├── stack_parameters.json
+    │   └── configSchema.json
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── util-scripts/
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   └── build_n_run.ps1
+    └── README.md
+
+================================================
+File: /LICENSE
+================================================
+MIT License
+
+Copyright (c) 2018 Radim Kašpárek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================
+File: /change_log.md
+================================================
+**0.0.1**
+
+- clone of radim-kasparek.ex-typeform-surveys
+
+
+================================================
+File: /src/component.py
+================================================
+'''
+Template Component main class.
+
+'''
+
+
+from kbc.env_handler import KBCEnvHandler
+import logging
+
+KEY_PROJECT_ID = 'project_id'
+KEY_API_TOKEN = '#api_token'
+KEY_PERIOD_FROM = 'period_from'
+KEY_PERIOD_TO = 'period_to'
+KEY_RELATIVE_PERIOD = 'relative_period'
+
+
+KEY_MAND_PERIOD_GROUP = [KEY_PERIOD_FROM, KEY_PERIOD_TO]
+KEY_MAND_DATE_GROUP = [KEY_RELATIVE_PERIOD, KEY_MAND_PERIOD_GROUP]
+
+MANDATORY_PARS = [KEY_PROJECT_ID, KEY_API_TOKEN, KEY_MAND_DATE_GROUP]
+
+APP_VERSION = '1.0.3'
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, debug=False):
+        KBCEnvHandler.__init__(self, MANDATORY_PARS)
+        # override debug from config
+        if(self.cfg_params.get('debug')):
+            debug = True
+
+        self.set_default_logger('DEBUG' if debug else 'INFO')
+        logging.info('Running version %s', APP_VERSION)
+        logging.info('Loading configuration...')
+
+        try:
+            self.validateConfig()
+        except ValueError as e:
+            logging.error(e)
+            exit(1)
+
+    def run(self, debug=False):
+        '''
+        Main execution code
+        '''
+        params = self.cfg_params # noqa
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    comp = Component()
+    comp.run()
+
+
+================================================
+File: /src/kbc/client_base.py
+================================================
+'''
+Created on 5. 10. 2018
+
+@author: esner
+'''
+import requests
+import logging
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+
+
+class HttpClientBase:
+    """
+    Base class for implementing a single endpoint related to a single entities
+
+    Attributes:
+        base_url (str): The base URL for this endpoint.
+    """
+
+    def __init__(self, base_url, max_retries=10, backoff_factor=0.3,
+                 status_forcelist=(500, 502, 504), default_http_header=[], auth=None, default_params=None):
+        """
+        Create an endpoint.
+
+        Args
+            root_url (str): Root url of API.
+
+        """
+        if not base_url:
+            raise ValueError("Base URL is required.")
+        self.base_url = base_url
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        self.status_forcelist = status_forcelist
+        self._auth = auth
+        self._auth_header = default_http_header
+        self._default_params = default_params
+
+    def requests_retry_session(self, session=None):
+        session = session or requests.Session()
+        retry = Retry(
+            total=self.max_retries,
+            read=self.max_retries,
+            connect=self.max_retries,
+            backoff_factor=self.backoff_factor,
+            status_forcelist=self.status_forcelist,
+            method_whitelist=('GET', 'POST', 'PATCH', 'UPDATE')
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        return session
+
+    def _get_raw(self, url, params=None, **kwargs):
+        """
+        Construct a requests GET call with args and kwargs and process the
+        results.
+
+
+        Args:
+            url (str): requested url
+            params (dict): additional url params to be passed to the underlying
+                requests.get
+            **kwargs: Key word arguments to pass to the get requests.get
+
+        Returns:
+            r (requests.Response): object
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        s.auth = self._auth
+
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        s.headers.update(headers)
+        # set default params
+        if self._default_params:
+            params = self._default_params.update(params)
+
+        r = self.requests_retry_session(session=s).request('GET', url=url, params=params, auth=self._auth, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            # Handle different error codes
+            raise Exception('Request failed with code: {}, message: {}'.format(r.status_code, r.text))
+        else:
+            return r
+
+    def get(self, url, params=None, **kwargs):
+        r = self._get_raw(url, params, **kwargs)
+        return r.json()
+
+    def _post_raw(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+            **kwargs: Key word arguments to pass to the post request.
+
+        Returns:
+            body:
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        s.headers.update(headers)
+        s.auth = self._auth
+
+        params = kwargs.pop('params')
+        # set default params
+        if self._default_params:
+            kwargs.update({'params': self._default_params.update(params)})
+
+        r = self.requests_retry_session(session=s).request('POST', *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            logging.warning(e, exc_info=True)
+            # Handle different error codes
+            raise
+        else:
+            return r
+
+    def post(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+            **kwargs: Key word arguments to pass to the post request.
+
+        Returns:
+            body: json reposonse
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+
+        params = kwargs.pop('params', {})
+        # set default params
+        if self._default_params:
+            kwargs.update({'params': self._default_params.update(params)})
+        r = self.requests_retry_session(session=s).request('POST', headers=headers, *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            logging.warning(e, exc_info=True)
+            # Handle different error codes
+            raise
+        else:
+            return r.json()
+
+    def _patch(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+            **kwargs: Key word arguments to pass to the post request.
+
+        Returns:
+            body: Response body parsed from json.
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        r = requests.patch(headers=headers, *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            logging.warning(e, exc_info=True)
+            # Handle different error codes
+            raise
+        else:
+            return r
+
+
+================================================
+File: /src/kbc/env_handler.py
+================================================
+# ==============================================================================
+# KBC Env handler
+# ==============================================================================
+
+
+# ============================ Import libraries ==========================
+import logging
+import json
+import os
+import csv
+import pytz
+import math
+import sys
+from collections import Counter
+from keboola import docker
+import datetime
+from dateutil.relativedelta import relativedelta
+from _datetime import timedelta
+
+DEFAULT_DEL = ','
+DEFAULT_ENCLOSURE = '"'
+
+
+class KBCEnvHandler:
+    def __init__(self, mandatory_params, data_path=None):
+        # fetch data folder from ENV by default
+        if not data_path:
+            data_path = os.environ.get('KBC_DATADIR')
+
+        self.kbc_config_id = os.environ.get('KBC_CONFIGID')
+
+        self.data_path = data_path
+        self.configuration = docker.Config(data_path)
+        self.cfg_params = self.configuration.get_parameters()
+        self.tables_out_path = os.path.join(data_path, 'out', 'tables')
+        self.tables_in_path = os.path.join(data_path, 'in', 'tables')
+
+        self._mandatory_params = mandatory_params
+
+# ==============================================================================
+
+    def validateConfig(self):
+        '''
+        Validates config based on provided mandatory params.
+        Parameters can be grouped as arrays [Par1,Par2] => at least one of the pars has to be present
+        [par1,[par2,par3]] => either par1 OR both par2 and par3 needs to be present
+        '''
+        parameters = self.cfg_params
+        missing_fields = []
+        for field in self._mandatory_params:
+            if isinstance(field, list):
+                missing_fields.extend(self._validate_par_group(field))
+            elif not parameters.get(field):
+                missing_fields.append(field)
+
+        if missing_fields:
+            raise ValueError(
+                'Missing mandatory configuration fields: [{}] '.format(', '.join(missing_fields)))
+
+    def _validate_par_group(self, par_group):
+        missing_fields = []
+        is_present = False
+        for par in par_group:
+            if isinstance(par, list):
+                missing_subset = self._get_par_missing_fields(par)
+                missing_fields.extend(missing_subset)
+                if not missing_subset:
+                    is_present = True
+
+            elif self.cfg_params.get(par):
+                is_present = True
+            else:
+                missing_fields.append(par)
+        if not is_present:
+            return missing_fields
+        else:
+            return []
+
+    def _get_par_missing_fields(self, mand_params):
+        parameters = self.cfg_params
+        missing_fields = []
+        for field in mand_params:
+            if not parameters.get(field):
+                missing_fields.append(field)
+        return missing_fields
+
+    def get_input_table_by_name(self, table_name):
+        tables = self.configuration.get_input_tables()
+        table = [t for t in tables if t.get('destination') == table_name]
+        if not table:
+            raise ValueError(
+                'Specified input mapping [{}] does not exist'.format(table_name))
+        return table[0]
+
+
+# ================================= Logging ==============================
+
+    def set_default_logger(self, log_level='INFO'):  # noqa: E301
+
+        hdl = logging.StreamHandler(sys.stdout)
+        logging.basicConfig(
+            level=log_level,
+            format='%(levelname)s - %(message)s',
+            handlers=[hdl])
+
+        logger = logging.getLogger()
+        return logger
+
+    def get_state_file(self):
+        logging.getLogger().info('Loading state file..')
+        state_file_path = os.path.join(self.data_path, 'in', 'state.json')
+        if not os.path.isfile(state_file_path):
+            logging.getLogger().info('State file not found. First run?')
+            return
+        try:
+            with open(state_file_path, 'r') \
+                    as state_file:
+                return json.load(state_file)
+        except (OSError, IOError):
+            raise ValueError(
+                "State file state.json unable to read "
+            )
+
+    def write_state_file(self, state_dict):
+        if not isinstance(state_dict, dict):
+            raise TypeError('Dictionary expected as a state file datatype!')
+
+        with open(os.path.join(self.configuration.data_dir, 'out', 'state.json'), 'w+') as state_file:
+            json.dump(state_dict, state_file)
+
+    def create_sliced_tables(self, folder_name, pkey=None, incremental=False,
+                             src_delimiter=DEFAULT_DEL, src_enclosure=DEFAULT_ENCLOSURE, dest_bucket=None):
+        """
+        Creates prepares sliced tables from all files in DATA_PATH/out/tables/{folder_name} - i.e. removes all headers
+        and creates single manifest file based on provided parameters.
+
+        folder_name -- folder name in DATA_PATH directory that contains files for slices,
+        the same name will be used as table name
+
+        src_enclosure -- enclosure of the source file ["]
+        src_delimiter -- delimiter of the source file [,]
+        dest_bucket -- name of the destination bucket (optional)
+
+
+        """
+        log = logging
+        log.info('Creating sliced tables for [{}]..'.format(folder_name))
+
+        folder_path = os.path.join(self.tables_out_path, folder_name)
+
+        if not os.path.isdir(folder_path):
+            raise ValueError("Specified folder ({}) does not exist in the data folder ({})".format(
+                folder_name, self.data_path))
+
+        # get files
+        files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if os.path.isfile(
+            os.path.join(folder_path, f))]
+
+        header = self.get_and_remove_headers_in_all(
+            files, src_delimiter, src_enclosure)
+        if dest_bucket:
+            destination = dest_bucket + '.' + folder_name
+        else:
+            destination = folder_name
+
+        log.info('Creating manifest file..')
+        self.configuration.write_table_manifest(
+            file_name=folder_path, destination=destination, primary_key=pkey, incremental=incremental, columns=header)
+
+    def get_and_remove_headers_in_all(self, files, delimiter, enclosure):
+        """
+        Removes header from all specified files and return it as a list of strings
+
+        Throws error if there is some file with different header.
+
+        """
+        first_run = True
+        for file in files:
+            curr_header = self._get_and_remove_headers(
+                file, delimiter, enclosure)
+            if first_run:
+                header = curr_header
+                first_file = file
+                first_run = False
+            # check whether header matches
+            if Counter(header) != Counter(curr_header):
+                raise Exception('Header in file {}:[{}] is different than header in file {}:[{}]'.format(
+                    first_file, header, file, curr_header))
+        return header
+
+    def _get_and_remove_headers(self, file, delimiter, enclosure):
+        """
+        Removes header from specified file and return it as a list of strings.
+        Creates new updated file 'upd_'+origFileName and deletes the original
+        """
+        head, tail = os.path.split(file)
+        with open(file, "r") as input_file:
+            with open(os.path.join(head, 'upd_' + tail), 'w+', newline='') as updated:
+                reader = csv.DictReader(
+                    input_file, delimiter=delimiter, quotechar=enclosure)
+                header = reader.fieldnames
+                writer = csv.DictWriter(
+                    updated, fieldnames=header, delimiter=DEFAULT_DEL, quotechar=DEFAULT_ENCLOSURE)
+                for row in reader:
+                    # write row
+                    writer.writerow(row)
+        os.remove(file)
+        return header
+
+    def process_results(self, res_files, def_bucket_name, output_bucket):
+        for res in res_files:
+            dest_bucket = def_bucket_name + str(self.kbc_config_id)
+            if output_bucket:
+                suffix = '-' + output_bucket
+            else:
+                suffix = ''
+
+            # build manifest
+            self.configuration.write_table_manifest(
+                file_name=res['full_path'],
+                destination=dest_bucket + suffix + '.' + res['name'],
+                primary_key=res['pkey'],
+                incremental=True)
+
+    def process_results_sliced(self, res_files):
+        res_sliced_folders = {}
+        for file in res_files:
+            res_sliced_folders.update({file['name']: file['pkey']})
+
+        for folder in res_sliced_folders:
+            self.create_sliced_tables(folder, res_sliced_folders[folder], True)
+
+# ==============================================================================
+# == UTIL functions
+
+    def get_past_date(self, str_days_ago, to_date=None, tz=pytz.utc):
+        '''
+        Returns date in specified timezone relative to today.
+
+        e.g.
+        '5 hours ago',
+        'yesterday',
+        '3 days ago',
+        '4 months ago',
+        '2 years ago',
+        'today'
+        '''
+        if to_date:
+            TODAY = to_date
+        else:
+            TODAY = datetime.datetime.now(tz)
+        splitted = str_days_ago.split()
+        if len(splitted) == 1 and splitted[0].lower() == 'today':
+            return TODAY
+        elif len(splitted) == 1 and splitted[0].lower() == 'yesterday':
+            date = TODAY - relativedelta(days=1)
+            return date
+        elif splitted[1].lower() in ['hour', 'hours', 'hr', 'hrs', 'h']:
+            date = datetime.datetime.now() - \
+                relativedelta(hours=int(splitted[0]))
+            return date.date()
+        elif splitted[1].lower() in ['day', 'days', 'd']:
+            date = TODAY - relativedelta(days=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['wk', 'wks', 'week', 'weeks', 'w']:
+            date = TODAY - relativedelta(weeks=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['mon', 'mons', 'month', 'months', 'm']:
+            date = TODAY - relativedelta(months=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['yrs', 'yr', 'years', 'year', 'y']:
+            date = TODAY - relativedelta(years=int(splitted[0]))
+            return date
+        else:
+            raise ValueError('Invalid relative period!')
+
+    def split_dates_to_chunks(self, start_date, end_date, intv, strformat="%m%d%Y"):
+        '''
+        Splits dates in given period into chunks of specified max size.
+
+        Params:
+        start_date -- start_period [datetime]
+        end_date -- end_period [datetime]
+        intv -- max chunk size
+        strformat -- dateformat of result periods
+
+        Usage example:
+        list(split_dates_to_chunks("2018-01-01", "2018-01-04", 2, "%Y-%m-%d"))
+
+            returns [{start_date: "2018-01-01", "end_date":"2018-01-02"}
+                     {start_date: "2018-01-02", "end_date":"2018-01-04"}]
+        '''
+        return list(self._split_dates_to_chunks_gen(start_date, end_date, intv, strformat))
+
+    def _split_dates_to_chunks_gen(self, start_date, end_date, intv, strformat="%m%d%Y"):
+        '''
+        Splits dates in given period into chunks of specified max size.
+
+        Params:
+        start_date -- start_period [datetime]
+        end_date -- end_period [datetime]
+        intv -- max chunk size
+        strformat -- dateformat of result periods
+
+        Usage example:
+        list(split_dates_to_chunks("2018-01-01", "2018-01-04", 2, "%Y-%m-%d"))
+
+            returns [{start_date: "2018-01-01", "end_date":"2018-01-02"}
+                     {start_date: "2018-01-02", "end_date":"2018-01-04"}]
+        '''
+
+        nr_days = (end_date - start_date).days
+
+        if nr_days <= intv:
+            yield {'start_date': start_date.strftime(strformat),
+                   'end_date': end_date.strftime(strformat)}
+        elif intv == 0:
+            diff = timedelta(days=1)
+            for i in range(nr_days):
+                yield {'start_date': (start_date + diff * i).strftime(strformat),
+                       'end_date': (start_date + diff * i).strftime(strformat)}
+        else:
+            nr_parts = math.ceil(nr_days / intv)
+            diff = (end_date - start_date) / nr_parts
+            for i in range(nr_parts):
+                yield {'start_date': (start_date + diff * i).strftime(strformat),
+                       'end_date': (start_date + diff * (i + 1)).strftime(strformat)}
+
+
+================================================
+File: /src/main.py
+================================================
+import pandas as pd
+import requests
+from pandas.io.json import json_normalize
+import numpy as np
+from keboola import docker
+from datetime import datetime, timedelta
+import logging
+import sys
+
+if not sys.warnoptions:
+    import warnings
+    warnings.simplefilter("ignore")
+
+sys.tracebacklimit = 0
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt="%Y-%m-%d %H:%M:%S")
+
+cfg = docker.Config('/data/')
+
+try:
+    token = cfg.get_parameters()['#token']
+    form_id = cfg.get_parameters()['form_id']
+    dayspan = cfg.get_parameters()['dayspan']
+
+    if not int(dayspan) >= 1:
+        logging.info('Please use value larger or equal to 1 in the\
+             `How many days back you want to go?` parameter.')
+        sys.exit(1)
+
+    since = (datetime.utcnow() - timedelta(days=int(dayspan)))\
+        .isoformat()
+    params = {'since': since
+              }
+except:  # noqa
+    logging.info('Check the inputs, please!')
+    sys.exit(1)
+
+headers = {
+    'Authorization': 'bearer %s' % token,
+    'User-Agent': 'Mozilla/5.0'
+}
+
+# url and the request
+
+url_responses = 'https://api.typeform.com/forms/' + \
+    form_id + '/responses?page_size=1000'
+resp = requests.get(url=url_responses, params=params, headers=headers)
+
+if resp.status_code != 200:
+    if resp.status_code == 401 or resp.status_code == 403:
+        logging.error('The response from the API is: ' + str(resp.status_code))
+        logging.info(
+            'Please check the form ID and your access token please.\
+             Either your access token is incorrect, or you don\'t have access to this responses ID')
+        sys.exit(1)
+    else:
+        logging.error('The response from the API is: ' + str(resp.status_code))
+        if resp.status_code == 404:
+            logging.info('We haven\'t found a survey with this ID, please check the form ID.')
+        sys.exit(1)
+
+responses = resp.json()['items']
+
+if resp.json()['page_count'] > 1:
+    for i in range(resp.json()['page_count'] + 100):
+        before_token = resp.json()['items'][-1]['token']
+        params = {'since': since,
+                  'before': before_token
+                  }
+        resp = requests.get(url=url_responses, params=params, headers=headers)
+        responses.extend(resp.json()['items'])
+
+        if resp.json()['page_count'] == 1:
+            print('Everything looped')
+            break
+
+no_n_responses = len(responses)
+logging.info('The number of new responses is: ' + str(no_n_responses))
+
+url_questions = 'https://api.typeform.com/forms/' + form_id
+resp_questions = requests.get(
+    url=url_questions, params=params, headers=headers)
+
+
+# flattening the response
+results_df = pd.DataFrame(np.zeros((0, 0)))
+answers_df = pd.DataFrame(np.zeros((0, 0)))
+questions_df = pd.DataFrame(np.zeros((0, 0)))
+
+if no_n_responses > 0:
+    for i in range(len(responses)):
+        logging.info('Retrieving response #' + str(i))
+        # id of the applicant + time_submitted
+        id_applicant = responses[i]['metadata']['referer']
+        time_submitted = responses[i]['submitted_at']
+        id_applicant2 = responses[i]['landing_id']
+
+        # create df from flattened json
+        try:
+            response_df = json_normalize(responses[i]['answers'])
+            resp_df_cols = response_df.columns
+
+            # all the columns that could be of interest
+            all_cols_needed = ['choices.labels', 'email', 'number', 'text',
+                               'boolean', 'field.id', 'url', 'choice.label',
+                               'file_url', 'date', 'payment']
+            try:
+                responses[0]['hidden']
+                hidden_fields = True
+            except KeyError:
+                hidden_fields = False
+
+            if hidden_fields:
+                hidden_dict = responses[0]['hidden']
+                hidden_dict = {k+'_hidden': v for k, v in hidden_dict.items()}
+            else:
+                pass
+
+            # add the columns to those responses that do not contain them
+            for col_name in resp_df_cols:
+                response_df[col_name] = '' if (col_name not in all_cols_needed) \
+                                        else response_df[col_name]
+
+            # take only the columns of interest, switch NaNs with '' for later concat
+            answers = response_df\
+                .loc[:, all_cols_needed]\
+                .fillna('')
+
+            # cast the columns as strings
+            answers['choices.labels'] = answers['choices.labels']\
+                .astype(str)
+            answers['choice.label'] = answers['choice.label']\
+                .astype(str)
+            answers['number'] = answers['number']\
+                .astype(str)
+            answers['boolean'] = answers['boolean']\
+                .astype(str)
+
+            # concat the values
+            answers['ans_concat'] = answers[['text', 'email', 'number',
+                                             'choices.labels', 'boolean',
+                                             'url', 'choice.label']]\
+                .apply(lambda x: ''.join(x), axis=1)
+
+            # id of the question + value
+            results_df_tmp = answers[['field.id', 'ans_concat']]
+
+            if hidden_fields:
+                hidden_appendix = pd.DataFrame(list(hidden_dict.items()), columns=[
+                    'field.id', 'ans_concat'])
+                results_df_tmp = results_df_tmp.append(hidden_appendix)
+            else:
+                pass
+
+            results_df_tmp = results_df_tmp.set_index('field.id').T
+            results_df_tmp['id'] = [id_applicant]
+            results_df_tmp['time_submitted'] = [time_submitted]
+            results_df_tmp['id2'] = [id_applicant2]
+
+            answers_df_tmp = answers[['field.id', 'ans_concat']]
+            if hidden_fields:
+                answers_df_tmp = answers_df_tmp.append(hidden_appendix)
+            else:
+                pass
+
+            answers_df_tmp.insert(0, 'id', id_applicant)
+            answers_df_tmp.insert(3, 'time_submitted', time_submitted)
+            answers_df_tmp.insert(4, 'id2', id_applicant2)
+
+            # in the first run create the df, in the following just append
+            if results_df.empty:
+                results_df = results_df_tmp
+            else:
+                results_df = results_df.append(results_df_tmp)
+
+            if answers_df.empty:
+                answers_df = answers_df_tmp
+            else:
+                answers_df = answers_df.append(answers_df_tmp)
+
+            logging.info('Response #%s retrieved' % str(i))
+        except KeyError:
+            logging.info(
+                'Response #%s not retrieved. No answers provided!' % str(i))
+            pass
+
+    for i in range(len(resp_questions.json()['fields'])):
+        question = resp_questions.json()['fields'][i]
+        question_dict = {
+            'id': [question['id']],
+            'title': [question['title']],
+            'date': [str(datetime.utcnow())]
+        }
+        questions_df_tmp = pd.DataFrame(data=question_dict)
+
+        if questions_df.empty:
+            questions_df = questions_df_tmp
+        else:
+            questions_df = questions_df.append(questions_df_tmp)
+
+
+# write the results
+    # results_df.to_csv('/data/out/tables/answers_applicants.csv', index=False)
+    answers_df.to_csv(
+        '/data/out/tables/NVP_answers_applicants.csv', index=False)
+    questions_df.to_csv('/data/out/tables/NVP_questions.csv', index=False)
+
+else:
+    logging.info('No new responses to fetch.')
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/deployment/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+
+  tags:
+    '*':
+      - step:
+          script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/deployment/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover          
+          - echo "Preparing KBC test image"
+          - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+          # push test image to ECR - uncomment when initialised
+          # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          # - docker push $REPOSITORY:test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+          - ./deployment/deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+
+    def testRunEmptyFails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    #import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_UI.json
+================================================
+{
+  "type": "object",
+  "title": "Typeform",
+  "required": [
+    "#token",
+    "form_id",
+    "dayspan"
+  ],
+  "properties": {
+    "#token": {
+      "type": "string",
+      "title": "Personal access token",
+      "format": "password",
+      "propertyOrder": 1
+    },
+    "dayspan": {
+      "type": "integer",
+      "title": "How many days back you want to go?",
+      "propertyOrder": 3
+    },
+    "form_id": {
+      "type": "string",
+      "title": "Id of the questionnaire",
+      "propertyOrder": 2
+    }
+  }
+}
+
+================================================
+File: /data/config.json
+================================================
+{
+	"parameters": {
+		"#token": "",
+		"form_id": "",
+		"dayspan": "5"
+	}
+}
+
+
+================================================
+File: /data/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /data/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /data/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /data/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /data/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /data/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /deployment/flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deployment/deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Typeform",
+  "required": [
+    "#token",
+    "form_id",
+    "dayspan"
+  ],
+  "properties": {
+    "#token": {
+      "type": "string",
+      "title": "Personal access token",
+      "format": "password",
+      "propertyOrder": 1
+    },
+    "dayspan": {
+      "type": "integer",
+      "title": "How many days back you want to go?",
+      "propertyOrder": 3
+    },
+    "form_id": {
+      "type": "string",
+      "title": "Id of the questionnaire",
+      "propertyOrder": 2
+    }
+  }
+}
+
+================================================
+File: /requirements.txt
+================================================
+https://github.com/keboola/python-docker-application/zipball/master#egg=keboola
+pytz
+python-dateutil
+
+================================================
+File: /Dockerfile
+================================================
+FROM quay.io/keboola/docker-custom-python:latest
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+# COPY /data/ /data/
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/main.py"]
+
+
+================================================
+File: /util-scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /util-scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /util-scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -t $COMP_TAG ../
+
+echo Running component...
+$DATA_PATH = Read-Host -Prompt 'Input data folder path:'
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /README.md
+================================================
+# ex-typeform-surveys
+
+Keboola Connection docker app for fetching responses from Typeform Responses API. Available under `kds-team.ex-typeform-surveys`
+
+## Functionality
+This component allows KBC to fetch responses to Typeform questionnaires.
+
+## Parameters
+
+There are currently three options in the UI:  
+- **Personal access token** - https://developer.typeform.com/get-started/personal-access-token/  
+- **ID of the questionnaire** - can be found in the URL of the questionnaire  
+- **How many days back you want to go** - denotes the start of the time interval you fetch responses from.
+
+## Outcome
+Outcome
+The component returns two tables. The first one is called NVP_questions and contains three columns:  
+- **id** (ID of the question)  
+- **title** (Title of the question)  
+- **date** (Exact timestamp when the question was extracted)
+
+The second one is called NVP_answers_applicants and contains five columns:  
+- **id** (URL from which the applicant came)  
+- **field_id** (ID of the question. Pairs with the id column of the NVP_questions table.)  
+- **ans_concat** (Answer)  
+- **time_submitted** (Time when the applicant submitted the questionnaire)  
+- **id2** (Internal ID of the applicant assigned by Typeform)
+
+

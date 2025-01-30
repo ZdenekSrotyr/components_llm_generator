@@ -1,0 +1,3569 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-klaviyo-v2/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── src/
+    │   ├── schemas/
+    │   │   ├── catalog_item.json
+    │   │   ├── campaign.json
+    │   │   ├── metric_aggregates.json
+    │   │   ├── list_profile.json
+    │   │   ├── list.json
+    │   │   ├── segment.json
+    │   │   ├── profile.json
+    │   │   ├── event.json
+    │   │   ├── metric.json
+    │   │   ├── campaign_excluded_audience.json
+    │   │   ├── catalog_categories.json
+    │   │   ├── campaign_audience.json
+    │   │   ├── flow.json
+    │   │   ├── template.json
+    │   │   ├── segment_profile.json
+    │   │   └── campaign_message.json
+    │   ├── component.py
+    │   ├── json_parser.py
+    │   └── client/
+    │       ├── __init__.py
+    │       └── client.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── logger
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── loggerConfiguration.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── TEMPLATE_README.md
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    example
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/schemas/catalog_item.json
+================================================
+{
+  "name": "catalog_item",
+  "description": "",
+  "primary_keys": [
+    "id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "external_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "title",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "url",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "description",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "created",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "published",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "image_thumbnail_url",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "image_full_url",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "images",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+================================================
+File: /src/schemas/campaign.json
+================================================
+{
+  "name": "campaign",
+  "description": "",
+  "primary_keys": [
+    "id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "channel",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "message",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "status",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "send_time",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "scheduled_at",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "created_at",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated_at",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "archived",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "send_strategy_options_static_is_local",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "send_strategy_method",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "send_strategy_options_throttled",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "send_strategy_options_static_datetime",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "send_strategy_options_static_send_past_recipients_immediately",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "send_strategy_options_sto",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "send_strategy_options_static",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "send_options_use_smart_sending",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "send_options_ignore_unsubscribes",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "tracking_options_is_tracking_opens",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "tracking_options_is_add_utm",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "tracking_options_utm_params",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "tracking_options_is_tracking_clicks",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+
+================================================
+File: /src/schemas/metric_aggregates.json
+================================================
+{
+    "name": "metric_aggregates",
+    "description": "",
+    "primary_keys": [
+      "id"
+    ],
+    "fields": [
+      {
+        "name": "id",
+        "description": "",
+        "base_type": "STRING"
+      },
+      {
+        "name": "metric_id",
+        "description": "",
+        "base_type": "STRING"
+      },
+      {
+        "name": "date",
+        "description": "",
+        "base_type": "STRING"
+      },
+      {
+        "name": "unique",
+        "description": "",
+        "base_type": "STRING"
+      },
+      {
+        "name": "sum_value",
+        "description": "",
+        "base_type": "STRING"
+      },
+      {
+        "name": "count",
+        "description": "",
+        "base_type": "STRING"
+      },
+      {
+        "name": "dimensions",
+        "description": "",
+        "base_type": "STRING"
+      }
+    ]
+  }
+
+================================================
+File: /src/schemas/list_profile.json
+================================================
+{
+  "name": "list_profile",
+  "description": "",
+  "primary_keys": [
+    "id",
+    "list_id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "list_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "external_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "anonymous_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "title",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "first_name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "last_name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "email",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "phone_number",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "organization",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "image",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_address1",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_address2",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_city",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_region",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_timezone",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_latitude",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_longitude",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_zip",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_country",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "last_event_date",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "created",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+
+================================================
+File: /src/schemas/list.json
+================================================
+{
+  "name": "list",
+  "description": "",
+  "primary_keys": [
+    "id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "created",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+================================================
+File: /src/schemas/segment.json
+================================================
+{
+  "name": "segment",
+  "description": "",
+  "primary_keys": [
+    "id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "created",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+================================================
+File: /src/schemas/profile.json
+================================================
+{
+  "name": "profile",
+  "description": "",
+  "primary_keys": [
+    "id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "external_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "anonymous_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "title",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "first_name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "last_name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "email",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "phone_number",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "organization",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "image",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_address1",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_address2",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_city",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_region",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_timezone",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_latitude",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_longitude",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_zip",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_country",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "last_event_date",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "created",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+
+================================================
+File: /src/schemas/event.json
+================================================
+{
+  "name": "event",
+  "description": "",
+  "primary_keys": [
+    "id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "uuid",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "timestamp",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+
+================================================
+File: /src/schemas/metric.json
+================================================
+{
+  "name": "metric",
+  "description": "",
+  "primary_keys": [
+    "id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "created",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "integration_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "integration_name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "integration_object",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "integration_category",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "integration_key",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+================================================
+File: /src/schemas/campaign_excluded_audience.json
+================================================
+{
+  "name": "campaign_excluded_audience",
+  "description": "",
+  "primary_keys": [
+    "campaign_id",
+    "list_id"
+  ],
+  "fields": [
+    {
+      "name": "campaign_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "list_id",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+================================================
+File: /src/schemas/catalog_categories.json
+================================================
+{
+  "name": "catalog_categories",
+  "description": "",
+  "primary_keys": [
+    "id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "external_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+================================================
+File: /src/schemas/campaign_audience.json
+================================================
+{
+  "name": "campaign_audience",
+  "description": "",
+  "primary_keys": [
+    "campaign_id",
+    "list_id"
+  ],
+  "fields": [
+    {
+      "name": "campaign_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "list_id",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+================================================
+File: /src/schemas/flow.json
+================================================
+{
+  "name": "flow",
+  "description": "",
+  "primary_keys": [
+    "id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "created",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "status",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "trigger_type",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "archived",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+================================================
+File: /src/schemas/template.json
+================================================
+{
+  "name": "template",
+  "description": "",
+  "primary_keys": [
+    "id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "company_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "html",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "editor_type",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "text",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "created",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+================================================
+File: /src/schemas/segment_profile.json
+================================================
+{
+  "name": "segment_profile",
+  "description": "",
+  "primary_keys": [
+    "id",
+    "segment_id"
+  ],
+  "fields": [
+    {
+      "name": "id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "segment_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "external_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "anonymous_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "title",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "first_name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "last_name",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "email",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "phone_number",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "organization",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "image",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_address1",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_address2",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_city",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_region",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_timezone",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_latitude",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_longitude",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_zip",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "location_country",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "last_event_date",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "created",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+
+================================================
+File: /src/schemas/campaign_message.json
+================================================
+{
+  "name": "campaign_message",
+  "description": "",
+  "primary_keys": [
+    "campaign_id",
+    "created_at"
+  ],
+  "fields": [
+    {
+      "name": "campaign_id",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "created_at",
+      "description": "",
+      "base_type": "STRING"
+    },
+    {
+      "name": "updated_at",
+      "description": "",
+      "base_type": "STRING"
+    }
+  ]
+}
+
+================================================
+File: /src/component.py
+================================================
+import copy
+import json
+import logging
+import warnings
+from typing import List, Callable, Dict
+
+import dateparser
+from keboola.component.base import ComponentBase, sync_action
+from keboola.component.dao import TableDefinition
+from keboola.component.exceptions import UserException
+from keboola.component.sync_actions import ValidationResult, MessageType, SelectElement
+from keboola.csvwriter import ElasticDictWriter
+from keboola.utils import header_normalizer
+
+from client import KlaviyoClient, KlaviyoClientException
+from json_parser import FlattenJsonParser
+
+KEY_API_TOKEN = "#api_token"
+
+KEY_OBJECTS = "objects"
+
+KEY_TIME_RANGE_SETTINGS = "time_range_settings"
+KEY_DATE_FROM = "date_from"
+KEY_DATE_TO = "date_to"
+
+KEY_CATALOGS_SETTINGS = "catalogs_settings"
+KEY_CATALOGS_SETTINGS_FETCH_CATALOG_CATEGORIES = "fetch_catalog_categories"
+
+KEY_CAMPAIGNS_SETTINGS = "campaigns_settings"
+KEY_CAMPAIGNS_SETTINGS_FETCH_CAMPAIGN_CHANNELS = "fetch_campaign_channels"
+
+KEY_EVENTS_SETTINGS = "events_settings"
+
+KEY_PROFILES_SETTINGS = "profiles_settings"
+KEY_PROFILES_SETTINGS_FETCH_PROFILES_MODE = "fetch_profiles_mode"
+KEY_PROFILES_SETTINGS_FETCH_BY_LIST = "fetch_profiles_by_list"
+KEY_PROFILES_SETTINGS_FETCH_BY_SEGMENT = "fetch_profiles_by_segment"
+
+KEY_METRIC_AGGREGATES_SETTINGS = "metric_aggregates_settings"
+KEY_METRIC_AGGREGATES_SETTINGS_METRIC_IDS = "metric_aggregates_ids"
+KEY_METRIC_AGGREGATES_SETTINGS_INTERVAL = "metric_aggregates_interval"
+KEY_METRIC_AGGREGATES_SETTING_BY = 'metric_aggregates_partitioning_by'
+
+KEY_STORE_NESTED_ATTRIBUTES = "store_nested_attributes"
+
+REQUIRED_PARAMETERS = [KEY_API_TOKEN, KEY_OBJECTS]
+REQUIRED_IMAGE_PARS = []
+
+OBJECT_ENDPOINTS = ["campaigns", "flows", "templates", "catalogs", "events", "metrics",
+                    "lists", "segments", "profiles", "metric_aggregates"]
+
+# Ignore dateparser warnings regarding pytz
+warnings.filterwarnings(
+    "ignore",
+    message="The localize method is no longer necessary, as this time zone supports the fold attribute",
+)
+
+DEFAULT_DATE_FROM = "1990-01-01"
+
+
+class Component(ComponentBase):
+
+    def __init__(self):
+        self.endpoint_func_mapping = {
+            "campaigns": self.get_campaigns,
+            "catalogs": self.get_catalogs,
+            "events": self.get_events,
+            "metrics": self.get_metrics,
+            "lists": self.get_lists,
+            "segments": self.get_segments,
+            "profiles": self.get_profiles,
+            "flows": self.get_flows,
+            "templates": self.get_templates,
+            "metric_aggregates": self.get_metric_aggregates
+        }
+        self.client = None
+        self.result_writers = {}
+        self.state = {}
+        self.new_state = {}
+        self.store_nested_attributes = False
+        super().__init__()
+
+    def run(self):
+        self.validate_configuration_parameters(REQUIRED_PARAMETERS)
+        self.validate_image_parameters(REQUIRED_IMAGE_PARS)
+
+        self.state = self.get_state_file()
+        self.new_state = copy.deepcopy(self.state)
+        self.new_state["last_run"] = self._parse_date("now")
+
+        params = self.configuration.parameters
+        self.store_nested_attributes = params.get(KEY_STORE_NESTED_ATTRIBUTES, False)
+
+        self._init_client()
+        self._validate_user_parameters()
+
+        objects = params.get(KEY_OBJECTS)
+
+        for object_name in OBJECT_ENDPOINTS:
+            if objects.get(object_name):
+                logging.info(f"Fetching data of {object_name}")
+                self.endpoint_func_mapping[object_name]()
+
+        self._close_all_result_writers()
+        self.write_state_file(self.new_state)
+
+    def _init_client(self):
+        params = self.configuration.parameters
+        api_token = params.get(KEY_API_TOKEN)
+        self.client = KlaviyoClient(api_token=api_token)
+
+    def fetch_and_write_object_data(self, object_name: str, data_generator: Callable, **data_generator_kwargs) -> None:
+        self._initialize_result_writer(object_name)
+        parser = FlattenJsonParser()
+
+        extra_data = {}
+        for arg_name in data_generator_kwargs:
+            if "_id" in arg_name:
+                extra_data = {arg_name: data_generator_kwargs[arg_name]}
+
+        for i, page in enumerate(data_generator(**data_generator_kwargs)):
+            if i > 0 and i % 100 == 0:
+                logging.info(f"Already fetched {i} pages of data of object {object_name}")
+
+            for item in page:
+
+                if self.store_nested_attributes:
+                    parsed_attributes = item["attributes"]
+                else:
+                    parsed_attributes = parser.parse_row(item["attributes"])
+
+                row = {"id": item["id"], **parsed_attributes, **extra_data}
+
+                self._get_result_writer(object_name).writerow(row)
+
+    def _add_columns_from_state_to_table_definition(self, object_name: str,
+                                                    table_definition: TableDefinition) -> TableDefinition:
+        if object_name in self.state:
+            all_columns = table_definition.column_names
+            for column in self.state.get(object_name):
+                if column not in all_columns:
+                    all_columns.append(column)
+            table_definition.schema = all_columns
+        return table_definition
+
+    def get_metrics(self) -> None:
+        self.fetch_and_write_object_data("metric", self.client.get_metrics)
+
+    def get_lists(self) -> None:
+        self.fetch_and_write_object_data("list", self.client.get_lists)
+
+    def get_segments(self) -> None:
+        self._initialize_result_writer("segment")
+
+        for batch in self.client.get_segments(fields_segment=["name", "definition"]):
+            for item in batch:
+                name = item["attributes"].get("name")
+                definition = item["attributes"].get("definition")
+                self._get_result_writer("segment").writerow({"id": item["id"], "name": name, "definition": definition})
+
+    def get_catalogs(self) -> None:
+        self.fetch_and_write_object_data("catalog_item", self.client.get_catalog_items)
+
+        catalog_settings = self.configuration.parameters.get(KEY_CATALOGS_SETTINGS)
+        if catalog_settings.get(KEY_CATALOGS_SETTINGS_FETCH_CATALOG_CATEGORIES):
+            self.fetch_and_write_object_data("catalog_categories", self.client.get_catalog_categories)
+
+    def get_campaigns(self) -> None:
+        channels = self.configuration.parameters.get(KEY_CAMPAIGNS_SETTINGS, ["email", "sms"])
+
+        self._initialize_result_writer("campaign")
+        self._initialize_result_writer("campaign_audience")
+        self._initialize_result_writer("campaign_excluded_audience")
+        parser = FlattenJsonParser()
+
+        for channel in channels:
+            for batch in self.client.get_campaigns(channel=channel):
+                for item in batch:
+                    audiences = item.get("attributes").pop("audiences")
+                    included_audiences = audiences.get("included")
+                    excluded_audiences = audiences.get("excluded")
+
+                    self.get_campaign_messages(campaign_id=item["id"])
+
+                    for included_audience in included_audiences:
+                        self._get_result_writer("campaign_audience").writerow(
+                            {"campaign_id": item["id"], "list_id": included_audience})
+                    for excluded_audiences in excluded_audiences:
+                        self._get_result_writer("campaign_excluded_audience").writerow(
+                            {"campaign_id": item["id"], "list_id": excluded_audiences})
+
+                    parsed_attributes = parser.parse_row(item["attributes"])
+                    self._get_result_writer("campaign").writerow({"id": item["id"], **parsed_attributes})
+
+    def get_campaign_messages(self, campaign_id: str) -> None:
+        self._initialize_result_writer("campaign_message")
+        parser = FlattenJsonParser()
+
+        for batch in self.client.get_campaign_messages(campaign_id=campaign_id):
+            for item in batch:
+                parsed_attributes = parser.parse_row(item["attributes"])
+                self._get_result_writer("campaign_message").writerow({"campaign_id": campaign_id, **parsed_attributes})
+
+    def get_events(self) -> None:
+        params = self.configuration.parameters
+        event_settings = params.get(KEY_EVENTS_SETTINGS)
+        time_range_setting = params.get(KEY_TIME_RANGE_SETTINGS)
+
+        if time_range_setting:
+            from_timestamp = self._parse_date(time_range_setting.get(KEY_DATE_FROM))
+            to_timestamp = self._parse_date(time_range_setting.get(KEY_DATE_TO))
+        # Stay here bacause for backward compatibility
+        else:
+            from_timestamp = self._parse_date(event_settings.get(KEY_DATE_FROM))
+            to_timestamp = self._parse_date(event_settings.get(KEY_DATE_TO))
+
+        self.fetch_and_write_object_data("event", self.client.get_events,
+                                         from_timestamp_value=from_timestamp,
+                                         to_timestamp_value=to_timestamp)
+
+    def get_profiles(self) -> None:
+        params = self.configuration.parameters
+        profile_settings = params.get(KEY_PROFILES_SETTINGS)
+        fetch_profiles_mode = profile_settings.get(KEY_PROFILES_SETTINGS_FETCH_PROFILES_MODE)
+
+        if fetch_profiles_mode == "fetch_all":
+            self.fetch_and_write_object_data("profile", self.client.get_profiles)
+
+        elif fetch_profiles_mode == "fetch_by_segment":
+            segments = profile_settings.get(KEY_PROFILES_SETTINGS_FETCH_BY_SEGMENT, [])
+            for segment_id in segments:
+                self.fetch_and_write_object_data("segment_profile", self.client.get_segment_profiles,
+                                                 segment_id=segment_id)
+
+        elif fetch_profiles_mode == "fetch_by_list":
+            lists = profile_settings.get(KEY_PROFILES_SETTINGS_FETCH_BY_LIST, [])
+            for list_id in lists:
+                self.fetch_and_write_object_data("list_profile", self.client.get_list_profiles, list_id=list_id)
+
+    def get_flows(self) -> None:
+        self.fetch_and_write_object_data("flow", self.client.get_flows)
+
+    def get_templates(self) -> None:
+        self.fetch_and_write_object_data("template", self.client.get_templates)
+
+    def get_metric_aggregates(self) -> None:
+        params = self.configuration.parameters
+        metric_aggregates_settings = params.get(KEY_METRIC_AGGREGATES_SETTINGS)
+
+        time_range_settings = params.get(KEY_TIME_RANGE_SETTINGS)
+        interval = metric_aggregates_settings.get(KEY_METRIC_AGGREGATES_SETTINGS_INTERVAL)
+        from_timestamp = self._parse_date(time_range_settings.get(KEY_DATE_FROM))
+        to_timestamp = self._parse_date(time_range_settings.get(KEY_DATE_TO))
+        ids = metric_aggregates_settings.get(KEY_METRIC_AGGREGATES_SETTINGS_METRIC_IDS)
+        by = metric_aggregates_settings.get(KEY_METRIC_AGGREGATES_SETTING_BY)
+
+        for id in ids:
+            self.fetch_and_write_object_data(
+                "metric_aggregates",
+                self.client.query_metric_aggregates,
+                metric_id=id,
+                interval=interval,
+                from_timestamp=from_timestamp,
+                to_timestamp=to_timestamp,
+                by=by
+            )
+
+    def _parse_date(self, date_to_parse: str) -> int:
+        if date_to_parse.lower() in {"last", "lastrun", "last run"}:
+            # remove 1 hour / 3600s so there is no issue if data is being downloaded at the same time an object is
+            # being inserted/ being updated
+            return int(self.state.get("last_run", int(dateparser.parse(DEFAULT_DATE_FROM).timestamp()))) - 3600
+        try:
+            parsed_timestamp = int(dateparser.parse(date_to_parse).timestamp())
+        except (AttributeError, TypeError) as err:
+            raise UserException(f"Failed to parse date '{date_to_parse}', make sure the date is either in YYYY-MM-DD "
+                                f"format or relative date i.e. 5 days ago, 1 month ago, yesterday, etc.") from err
+        return parsed_timestamp
+
+    def _initialize_result_writer(self, object_name: str) -> None:
+        if object_name not in self.result_writers:
+            table_schema = self.get_table_schema_by_name(object_name)
+            table_definition = self.create_out_table_definition_from_schema(table_schema, incremental=True)
+            table_definition = self._add_columns_from_state_to_table_definition(object_name, table_definition)
+            writer = ElasticDictWriter(table_definition.full_path, table_definition.column_names)
+            self.result_writers[object_name] = {"table_definition": table_definition, "writer": writer}
+
+    def _get_result_writer(self, object_name: str) -> ElasticDictWriter:
+        return self.result_writers.get(object_name).get("writer")
+
+    def _close_all_result_writers(self) -> None:
+        for object_name in self.result_writers:
+            writer = self._get_result_writer(object_name)
+            table_definition = self.result_writers.get(object_name).get("table_definition")
+            writer.close()
+            self.new_state[object_name] = copy.deepcopy(writer.fieldnames)
+
+            writer_columns = copy.deepcopy(writer.fieldnames)
+            table_definition = self._deduplicate_column_names_and_metadata(table_definition, writer_columns)
+
+            deduped_columns = table_definition.column_names.copy()
+            table_definition.schema = self._normalize_headers(deduped_columns)
+            table_definition = self._add_missing_metadata(table_definition)
+
+            self.write_manifest(table_definition)
+
+    @staticmethod
+    def _add_missing_metadata(table_definition: TableDefinition) -> TableDefinition:
+        """
+        This method is used to add dummy metadata to a column in cases where the metadata
+        is missing from the table definition. This can occur in some cases when old native types are enabled.
+        """
+        for column in table_definition.column_names:
+            if column not in table_definition.table_metadata.column_metadata.keys():
+                table_definition.table_metadata.column_metadata[column] = {
+                    'KBC.description': '',
+                    'KBC.datatype.basetype': 'STRING',
+                    'KBC.datatype.nullable': True}
+                logging.info(f"Creating dummy metadata for column {column} in table {table_definition.name}")
+        return table_definition
+
+    @staticmethod
+    def _normalize_headers(columns: List[str]) -> List[str]:
+        head_norm = header_normalizer.get_normalizer(strategy=header_normalizer.NormalizerStrategy.ENCODER,
+                                                     char_encoder="unicode")
+        return head_norm.normalize_header(columns)
+
+    def _deduplicate_column_names_and_metadata(self, table_definition: TableDefinition,
+                                               columns: List[str]) -> TableDefinition:
+        """
+            Method to update duplicate columns and their metadata.
+            Klaviyo allows duplicate column names when the case is different
+            e.g. columns property_name and property_Name are 2 valid distinct data columns. In Keboola, this leads to
+            a duplicate column error, and we must rename the columns to property_name and property_Name_2 in this
+            case.
+        """
+        final_columns = []
+        column_count = {}
+        for column in columns:
+            # keboola_column_name is the resulting column name in Keboola, no spaces, and lowercase.
+            # Lowercase because Keboola takes column name Product and product as the same.
+            keboola_column_name = column.lower().replace(" ", "_")
+            column_name = column
+            if keboola_column_name not in column_count:
+                column_count[keboola_column_name] = 1
+            else:
+                column_count[keboola_column_name] += 1
+                column_name = f"{column_name}_{column_count[keboola_column_name]}"
+                # If column metadata is present we must update the metadata information as well.
+                table_definition.table_metadata.column_metadata = self.swap_key(
+                    table_definition.table_metadata.column_metadata, column,
+                    column_name)
+            final_columns.append(column_name)
+        table_definition.schema = final_columns
+        return table_definition
+
+    @staticmethod
+    def swap_key(dictionary: Dict, old_key: str, new_key: str) -> Dict:
+        if old_key in dictionary:
+            dictionary[new_key] = dictionary.pop(old_key)
+        return dictionary
+
+    def _validate_user_parameters(self) -> None:
+        params = self.configuration.parameters
+        objects = params.get(KEY_OBJECTS)
+        events = objects.get("events")
+        metric_aggregates = objects.get("metric_aggregates")
+
+        # Old version of time range, kept for backward compatibility
+        # Validate Date From and Date for events, if events are to be downloaded
+        event_settings = params.get(KEY_EVENTS_SETTINGS)
+        if event_settings and events:
+            logging.info("Validating Event parameters...")
+            self._parse_date(event_settings.get(KEY_DATE_FROM))
+            self._parse_date(event_settings.get(KEY_DATE_TO))
+            logging.info("Event parameters are valid")
+
+        # Validate Date From and Date for time ranged endpoints
+        time_range_setting = params.get(KEY_TIME_RANGE_SETTINGS)
+        if (events or metric_aggregates) and time_range_setting:
+            logging.info("Validating Date range parameters...")
+            self._parse_date(time_range_setting.get(KEY_DATE_FROM))
+            self._parse_date(time_range_setting.get(KEY_DATE_TO))
+            logging.info("Date range parameters are valid")
+
+        # Validate if segment ids for profile fetching are valid
+        profile_settings = params.get(KEY_PROFILES_SETTINGS, {})
+        profile_mode = profile_settings.get(KEY_PROFILES_SETTINGS_FETCH_PROFILES_MODE)
+        if profile_mode == "fetch_by_segment" and objects.get("profiles"):
+            logging.info("Validating Profile fetching parameters...")
+            segments = profile_settings.get(KEY_PROFILES_SETTINGS_FETCH_BY_SEGMENT, [])
+            for segment_id in segments:
+                try:
+                    self.client.get_segment(segment_id)
+                except KlaviyoClientException as e:
+                    raise UserException(f"Segment with ID {segment_id} not found.") from e
+            logging.info("Profile fetching parameters are valid")
+
+        # Validate if list ids for profile fetching are valid
+        if profile_mode == "fetch_by_list" and objects.get("profiles"):
+            logging.info("Validating Profile fetching parameters...")
+            lists = profile_settings.get(KEY_PROFILES_SETTINGS_FETCH_BY_LIST, [])
+            for list_id in lists:
+                self.client.get_list(list_id)
+            logging.info("Profile fetching parameters are valid")
+
+        # Validate if list ids for metric aggregates are valid
+        metric_aggregates_settings = params.get(KEY_METRIC_AGGREGATES_SETTINGS)
+        if metric_aggregates_settings and metric_aggregates:
+            metric_aggregates_ids = metric_aggregates_settings.get(KEY_METRIC_AGGREGATES_SETTINGS_METRIC_IDS)
+            logging.info("Validating metric aggregates parametrs...")
+            for metric_id in metric_aggregates_ids:
+                try:
+                    self.client.get_metric(metric_id)
+                except KlaviyoClientException as e:
+                    raise UserException(f"Metric with ID {metric_id} not found.") from e
+            logging.info("Metric aggregates parameters are valid")
+        # sync action that is executed when configuration.json "action":"testConnection" parameter is present.
+
+    @sync_action('validate_connection')
+    def test_connection(self) -> ValidationResult:
+        self._init_client()
+        credentials_valid, missing_scopes, last_exception = self.client.test_credentials()
+
+        result = ValidationResult("Credentials are valid!", MessageType.SUCCESS)
+
+        if not credentials_valid:
+            result = ValidationResult(
+                "The provided API token is invalid. Unauthorized.",
+                MessageType.DANGER)
+
+        elif missing_scopes:
+            scope_rows = "\n".join([f'| {scope} | {detail} |' for scope, detail in missing_scopes.items()])
+            missing_scopes_str = f'| Scope | Error |\n|-------|-------|\n{scope_rows}'
+
+            result = ValidationResult(
+                "The provided token is valid but some scopes are unauthorized. "
+                "Please enable RO for following scopes or fix related issues: \n\n"
+                f"{missing_scopes_str}"
+                "\n\nFor more information refer to [the documentation](https://help.klaviyo.com/"
+                "hc/en-us/articles/7423954176283#add-a-scope-to-a-private-api-key-2)",
+                MessageType.WARNING)
+
+        return result
+
+    @sync_action("loadListIds")
+    def load_list_ids(self) -> List[SelectElement]:
+        self._init_client()
+        try:
+            list_ids = self.client.get_list_ids()
+            r = [SelectElement(value=list_id.get("id"), label=json.dumps(list_id.get("name"))) for list_id in list_ids]
+        except Exception as e:
+            raise UserException(e) from e
+        return r
+
+    @sync_action("loadSegmentIds")
+    def load_segment_ids(self) -> List[SelectElement]:
+        self._init_client()
+        try:
+            segment_ids = self.client.get_segment_ids()
+            r = [SelectElement(value=segment_id.get("id"), label=json.dumps(segment_id.get("name")))
+                 for segment_id in segment_ids]
+        except Exception as e:
+            raise UserException(e) from e
+        return r
+
+    @sync_action("loadMetricIds")
+    def load_metric_ids(self) -> List[SelectElement]:
+        self._init_client()
+        try:
+            metric_ids = self.client.get_metric_ids()
+            r = [SelectElement(value=metric_id.get("id"), label=json.dumps(metric_id.get("name")))
+                 for metric_id in metric_ids]
+        except Exception as e:
+            raise UserException(e) from e
+        return r
+
+
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        # this triggers the run method by default and is controlled by the configuration.action parameter
+        comp.execute_action()
+    except KlaviyoClientException as exc:
+        logging.exception(exc)
+        exit(1)
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /src/json_parser.py
+================================================
+class FlattenJsonParser:
+    def __init__(self, child_separator: str = '_'):
+        self.child_separator = child_separator
+
+    def parse_data(self, data):
+        for i, row in enumerate(data):
+            data[i] = self._flatten_row(row)
+        return data
+
+    def parse_row(self, row: dict):
+        return self._flatten_row(row)
+
+    @staticmethod
+    def _construct_key(parent_key, separator, child_key):
+        return "".join([parent_key, separator, child_key]) if parent_key else child_key
+
+    def _flatten_row(self, nested_dict):
+        if len(nested_dict) == 0:
+            return {}
+        flattened_dict = {}
+
+        def _flatten(dict_object, name_with_parent=''):
+            if isinstance(dict_object, dict):
+                for key in dict_object:
+                    new_parent_name = self._construct_key(name_with_parent, self.child_separator, key)
+                    _flatten(dict_object[key], name_with_parent=new_parent_name)
+            else:
+                flattened_dict[name_with_parent] = dict_object
+
+        _flatten(nested_dict)
+        return flattened_dict
+
+
+================================================
+File: /src/client/__init__.py
+================================================
+from .client import KlaviyoClient, KlaviyoClientException  # noqa
+
+
+================================================
+File: /src/client/client.py
+================================================
+import backoff
+import json
+import logging
+from typing import Iterator, Callable, Dict, List, Tuple
+from datetime import datetime
+
+from keboola.component.exceptions import UserException
+
+from klaviyo_api import KlaviyoAPI
+from openapi_client.exceptions import OpenApiException
+from openapi_client.models import MetricAggregateQuery
+from openapi_client.api_arg_options import USE_DICTIONARY_FOR_RESPONSE_DATA
+
+MAX_DELAY = 60
+MAX_RETRIES = 5
+
+
+class KlaviyoClientException(Exception):
+    pass
+
+
+class KlaviyoClient:
+    def __init__(self, api_token: str):
+        self.client = KlaviyoAPI(
+            api_token,
+            max_delay=MAX_DELAY,
+            max_retries=MAX_RETRIES,
+            options={USE_DICTIONARY_FOR_RESPONSE_DATA: True})
+
+    def get_metrics(self) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Metrics.get_metrics)
+
+    def get_catalog_items(self) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Catalogs.get_catalog_items)
+
+    def get_catalog_categories(self) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Catalogs.get_catalog_categories)
+
+    def get_events(self, from_timestamp_value: int, to_timestamp_value: int) -> Iterator[List[Dict]]:
+        request_filter = f"greater-or-equal(timestamp,{from_timestamp_value})," \
+                         f"less-or-equal(timestamp,{to_timestamp_value})"
+        return self._paginate_cursor_endpoint(self.client.Events.get_events, filter=request_filter)
+
+    def get_lists(self) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Lists.get_lists)
+
+    def get_list(self, list_id: str) -> Dict:
+        try:
+            return self.client.Lists.get_list(list_id)
+        except OpenApiException as api_exc:
+            error_message = self._process_error(api_exc)
+            raise KlaviyoClientException(error_message) from api_exc
+
+    def get_list_ids(self) -> List[Dict]:
+        all_list_ids = []
+        for page in self._paginate_cursor_endpoint(self.client.Lists.get_lists):
+            all_list_ids.extend({"id": row.get("id"), "name": row.get("attributes").get("name")} for row in page)
+        return all_list_ids
+
+    def get_segment_ids(self) -> List[Dict]:
+        all_segment_ids = []
+        for page in self._paginate_cursor_endpoint(self.client.Segments.get_segments):
+            all_segment_ids.extend({"id": row.get("id"), "name": row.get("attributes").get("name")} for row in page)
+        return all_segment_ids
+
+    def get_metric_ids(self) -> List[Dict]:
+        all_metric_ids = []
+        for page in self._paginate_cursor_endpoint(self.client.Metrics.get_metrics):
+            all_metric_ids.extend({"id": row.get("id"), "name": row.get("attributes").get("name")} for row in page)
+        return all_metric_ids
+
+    def get_list_profiles(self, list_id: str) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Lists.get_list_profiles, list_id=list_id)
+
+    def get_profiles(self) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Profiles.get_profiles)
+
+    def get_segments(self, fields_segment: list[str]) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Segments.get_segments, fields_segment=fields_segment)
+
+    def get_segment(self, segment_id):
+        try:
+            return self.client.Segments.get_segment(segment_id)
+        except OpenApiException as api_exc:
+            error_message = self._process_error(api_exc)
+            raise KlaviyoClientException(error_message) from api_exc
+
+    def get_segment_profiles(self, segment_id: str) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Segments.get_segment_profiles, id=segment_id)
+
+    def get_flows(self) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Flows.get_flows)
+
+    def get_templates(self) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Templates.get_templates)
+
+    def get_campaigns(self, channel: str) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Campaigns.get_campaigns,
+                                              filter=f"equals(messages.channel,'{channel}')")
+
+    def get_campaign_messages(self, campaign_id: str) -> Iterator[List[Dict]]:
+        return self._paginate_cursor_endpoint(self.client.Campaigns.get_campaign_campaign_messages, id=campaign_id)
+
+    def get_metric(self, metric_id: str):
+        try:
+            return self.client.Metrics.get_metric(metric_id)
+        except OpenApiException as api_exc:
+            error_message = self._process_error(api_exc)
+            raise KlaviyoClientException(error_message) from api_exc
+
+    def query_metric_aggregates(self,
+                                metric_id: str,
+                                interval: str,
+                                from_timestamp: int,
+                                to_timestamp: int,
+                                by: list) -> Iterator[List[Dict]]:
+        metric_aggregate_query = {
+            "data": {
+                "type": "metric-aggregate",
+                "attributes": {
+                    "interval": interval,
+                    "page_size": None,
+                    "timezone": "UTC",
+                    "measurements": [
+                        "count",
+                        "unique",
+                        "sum_value"
+                    ],
+                    "by": by,
+                    "return_fields": None,
+                    "filter": [
+                        f"greater-or-equal(datetime,{datetime.fromtimestamp(from_timestamp).date()}T00:00:00)",
+                        f"less-than(datetime,{datetime.fromtimestamp(to_timestamp).date()}T00:00:00)"
+                    ],
+                    "metric_id": metric_id,
+                    "sort": None
+                }
+            }
+        }
+        for page in self._paginate_cursor_endpoint(
+                self.client.Metrics.query_metric_aggregates,
+                metric_aggregate_query=MetricAggregateQuery.from_dict(metric_aggregate_query)):
+            yield self._normalize_aggregated_response(page, metric_id)
+
+    def _normalize_aggregated_response(self, json_data: Dict, metric_id: str) -> Dict:
+        """
+        This method normalizes the response data from the Query Metric Aggregates endpoint,
+        transforming it into a structure compatible with the default parser.
+        """
+
+        json_data = self._repair_metric_aggregates_response(json_data)
+        transformed_data = []
+        try:
+            dates = json_data["attributes"]["dates"]
+            data = json_data["attributes"]["data"]
+            for partitioned_data in data:
+                counts = partitioned_data["measurements"]["count"]
+                uniques = partitioned_data["measurements"]["unique"]
+                sum_value = partitioned_data["measurements"]["sum_value"]
+                dimensions = partitioned_data["dimensions"]
+                for idx, date in enumerate(dates):
+                    record = {
+                        "type": "metric_aggregate",
+                        "id": f"{date}_{metric_id}{self._join_list_to_string(dimensions)}",
+                        "attributes": {
+                            "metric_id": metric_id,
+                            "date": date,
+                            "count": counts[idx],
+                            "unique": uniques[idx],
+                            "sum_value": sum_value[idx],
+                            "dimensions": self._fill_empty_dimension(dimensions)
+                        }
+                    }
+                    transformed_data.append(record)
+        except (IndexError, TypeError, AttributeError) as err:
+            raise UserException(err) from err
+
+        return transformed_data
+
+    def _fill_empty_dimension(self, dimensions: list) -> List[str]:
+        filled_dimensions = []
+        if len(dimensions) == 0:
+            filled_dimensions.append('NO DIMENSIONS SELECTED')
+        else:
+            filled_dimensions = ['DIMENSION NOT AVAILABLE' if dim == "" else dim for dim in dimensions]
+        return filled_dimensions
+
+    def _repair_metric_aggregates_response(self, json_data: Dict) -> Dict:
+        """
+        Handles cases where the query metric aggregates response has only a single zero instead of all zeros
+        when using the "by" parameter, replacing missing data columns with None.
+        """
+
+        dates = json_data["attributes"]["dates"]
+
+        for item in json_data["attributes"]["data"]:
+            measurements = item["measurements"]
+            keys_to_check = ["count", "unique", "sum_value"]
+
+            for key in keys_to_check:
+                if key in measurements:
+                    if len(measurements[key]) != len(dates):
+                        measurements[key] = [None] * len(dates)
+
+        return json_data
+
+    def _join_list_to_string(self, join_list: list) -> str:
+        if len(join_list) < 1:
+            return ""
+        joined_list = ""
+        for item in join_list:
+            if item != "":
+                joined_list += f"_{item}"
+        return joined_list
+
+    def _paginate_cursor_endpoint(self, endpoint_func: Callable, **kwargs) -> Iterator[List[Dict]]:
+
+        @backoff.on_exception(backoff.expo, OpenApiException, max_tries=5, factor=5)
+        def fetch_page(**kwargs):
+            return endpoint_func(**kwargs)
+
+        try:
+            current_page = fetch_page(**kwargs)
+        except OpenApiException as api_exc:
+            error_message = self._process_error(api_exc)
+            raise KlaviyoClientException(error_message) from api_exc
+        yield current_page.get("data")
+
+        while next_page := current_page.get("links").get("next"):
+            try:
+                current_page = fetch_page(**kwargs, page_cursor=next_page)
+            except OpenApiException as api_exc:
+                error_message = self._process_error(api_exc)
+                raise KlaviyoClientException(error_message) from api_exc
+            yield current_page.get("data")
+
+    def _process_error(self, api_exc: Exception) -> str:
+        try:
+            error_data = json.loads(api_exc.body)
+        except json.JSONDecodeError as exc:
+            raise KlaviyoClientException(f"Error Occurred. Failed to decode error : {api_exc.body}") from exc
+        if len(error_data.get('errors', [])) == 0:
+            return error_data
+        error = error_data.get('errors')[0]
+        return self._generate_error_message_v2_client(error)
+
+    @staticmethod
+    def _generate_error_message_v2_client(error_data: Dict) -> str:
+        error_detail = f"{error_data.get('title')} {error_data.get('detail')}"
+        if error_data.get('status') == 401:
+            error_name = f"Not Authorized Error ({error_data.get('status')})"
+        elif error_data.get('status') == 403:
+            error_name = f"Forbidden Error ({error_data.get('status')})"
+        elif error_data.get('status') == 404:
+            error_name = f"Not Found Error ({error_data.get('status')})"
+        else:
+            error_name = f"{error_data.get('code')} ({error_data.get('status')})"
+        return f"{error_name} : {error_detail}"
+
+    def test_credentials(self) -> Tuple[bool, Dict, Exception]:
+        """
+        Test credentials. Returns list of unauthorized scopes if present,
+
+        Returns:
+
+        """
+        missing_scopes = dict()
+        valid_token = False
+        last_exception = None
+        test_scopes = {"campaigns": self.client.Campaigns.get_campaigns,
+                       "catalogs": self.client.Catalogs.get_catalog_items,
+                       "events": self.client.Events.get_events,
+                       "lists": self.client.Lists.get_lists,
+                       "metrics": self.client.Metrics.get_metrics,
+                       "profiles": self.client.Profiles.get_profiles,
+                       "segments": self.client.Segments.get_segments
+                       }
+
+        # test scopes
+        for scope in test_scopes:
+            try:
+                if scope == "campaigns":
+                    test_scopes[scope](filter="equals(messages.channel,'email')")
+                else:
+                    test_scopes[scope]()
+
+                valid_token = True
+            except OpenApiException as e:
+                json_resp = json.loads(e.body)
+                detail = ''
+                reason = e.reason
+                if json_resp.get('errors'):
+                    detail = json_resp['errors'][0]["detail"]
+
+                logging.debug(f"Test {scope} scope failed with {e}")
+                missing_scopes[scope] = f'{reason}: {detail}'
+                # token is valid when unauthorized error received
+                if e.status == 403:
+                    valid_token = True
+                else:
+                    last_exception = e
+
+        return valid_token, missing_scopes, last_exception
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+            - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:$TEST_TAG
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/logger
+================================================
+gelf
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+This component uses the Klaviyo APIs to extract data on all objects from Klaviyo. 
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+# Prerequisites
+to get your API Token:
+
+1. Log into your Klaviyo platform
+2. Your profile name (bottom left)
+3. Account
+4. Settings
+5. API Keys
+6. Create Private API Key with Read-Only privileges
+
+For more information follow [this guide on from Klaviyo](https://developers.klaviyo.com/en/docs/retrieve_api_credentials)
+
+# Supported endpoints
+
+- [Campaigns](https://developers.klaviyo.com/en/v1-2/reference/get-campaigns)
+- [Catalogs](https://developers.klaviyo.com/en/reference/get_catalog_items)
+- [Segments](https://developers.klaviyo.com/en/reference/get_segments)
+- [Lists](https://developers.klaviyo.com/en/reference/get_lists)
+- [Profiles](https://developers.klaviyo.com/en/reference/get_profiles)
+- [Metrics](https://developers.klaviyo.com/en/reference/get_metrics)
+- [Events](https://developers.klaviyo.com/en/reference/get_events)
+- [Metric aggergates](https://developers.klaviyo.com/en/reference/query_metric_aggregates)
+
+# Limitations
+
+When fetching profiles the maximum amount of profiles is 25,000 due to fetching times. If you wish to fetch more, 
+it is recommended to create multiple segments or lists and download them in multiple runs of the component.
+
+## Metric aggregates limtation
+
+When using the by parameter to aggregate data over a specified period, if no data is available for the selected time range, the endpoint returns a single aggregated value instead of a list of values for each aggregated period. In such cases, the returned values are supplemented with null values, which can result in empty columns in the output of the consuming component. This occurs because the endpoint does not return the expected data points for each aggregation period.
+
+This behavior should be considered when processing the results, as the absence of data for specific periods may affect the integrity of the final output.
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+A marketing automation platform, used primarily for email marketing and SMS marketing. 
+
+================================================
+File: /component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Authorization configuration",
+  "required": [
+    "#api_token"
+  ],
+  "properties": {
+    "#api_token": {
+      "type": "string",
+      "title": "API Token",
+      "propertyOrder": 1,
+      "description": "<a href=\"https://help.klaviyo.com/hc/en-us/articles/7423954176283#add-a-scope-to-a-private-api-key-2\">Private API Key</a> with Read-Only access to all Klaviyo Objects",
+      "format": "password"
+    },
+    "test_connection": {
+      "type": "button",
+      "format": "sync-action",
+      "propertyOrder": 30,
+      "options": {
+        "async": {
+          "label": "TEST CONNECTION",
+          "action": "validate_connection"
+        }
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Configuration",
+  "id": "rootschema",
+  "required": [
+    "objects"
+  ],
+  "properties": {
+    "objects": {
+      "type": "object",
+      "title": "Endpoints",
+      "format": "grid-strict",
+      "propertyOrder": 10,
+      "properties": {
+        "campaigns": {
+          "title": "Campaigns",
+          "format": "checkbox",
+          "type": "boolean",
+          "default": true,
+          "options": {
+            "grid_columns": 3
+          }
+        },
+        "catalogs": {
+          "title": "Catalog Items",
+          "format": "checkbox",
+          "type": "boolean",
+          "default": true,
+          "options": {
+            "grid_columns": 3
+          }
+        },
+        "events": {
+          "title": "Events",
+          "format": "checkbox",
+          "type": "boolean",
+          "default": false,
+          "options": {
+            "grid_columns": 3
+          }
+        },
+        "metrics": {
+          "title": "Metrics",
+          "format": "checkbox",
+          "type": "boolean",
+          "default": true,
+          "options": {
+            "grid_columns": 3
+          }
+        },
+        "lists": {
+          "title": "Lists",
+          "format": "checkbox",
+          "type": "boolean",
+          "default": true,
+          "options": {
+            "grid_columns": 3
+          }
+        },
+        "segments": {
+          "title": "Segments",
+          "format": "checkbox",
+          "type": "boolean",
+          "default": true,
+          "options": {
+            "grid_columns": 3
+          }
+        },
+        "profiles": {
+          "title": "Profiles",
+          "format": "checkbox",
+          "type": "boolean",
+          "default": false,
+          "options": {
+            "grid_columns": 3
+          }
+        },
+        "flows": {
+          "title": "Flows",
+          "format": "checkbox",
+          "type": "boolean",
+          "default": true,
+          "options": {
+            "grid_columns": 3
+          }
+        },
+        "templates": {
+          "title": "Templates",
+          "format": "checkbox",
+          "type": "boolean",
+          "default": true,
+          "options": {
+            "grid_columns": 3
+          }
+        },
+        "metric_aggregates": {
+          "title": "Metric aggregates",
+          "format": "checkbox",
+          "type": "boolean",
+          "default": true,
+          "options": {
+            "grid_columns": 3
+          }
+        }
+      }
+    },
+    "catalogs_settings": {
+      "title": "Catalogs - Additional Options",
+      "type": "object",
+      "propertyOrder": 30,
+      "options": {
+        "dependencies": {
+          "catalogs_hidden": "true"
+        }
+      },
+      "properties": {
+        "fetch_catalog_categories": {
+          "title": "Fetch Catalog Categories",
+          "propertyOrder": 10,
+          "format": "checkbox",
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "campaigns_settings": {
+      "title": "Campaigns - Channel Options",
+      "type": "array",
+      "items": {
+        "enum": [
+          "email",
+          "sms"
+        ],
+        "type": "string"
+      },
+      "propertyOrder": 40,
+      "options": {
+        "dependencies": {
+          "campaigns_hidden": "true"
+        }
+      },
+      "properties": {
+        "fetch_campaign_channels": {
+          "title": "Fetch Campaign Channels",
+          "propertyOrder": 10,
+          "format": "string",
+          "enum": [
+            "email",
+            "sms"
+          ],
+          "default": true
+        }
+      }
+    },
+    "time_range_settings": {
+      "title": "Time range options",
+      "type": "object",
+      "propertyOrder": 50,
+      "options": {
+        "dependencies": {
+          "dummy_element": [
+            "false-true",
+            "true-false",
+            "true-true"
+          ]
+        }
+      },
+      "description": "This setting applies to the following endpoints: Events, Metric Aggregates.",
+      "properties": {
+        "date_from": {
+          "title": "Fetch From Date",
+          "propertyOrder": 10,
+          "type": "string",
+          "description": "Date from which data is downloaded. Either date in YYYY-MM-DD format or relative date string i.e. 5 days ago, 1 month ago, yesterday, etc. You can also set this as last run, which will fetch data from the last run of the component.",
+          "default": "last run"
+        },
+        "date_to": {
+          "title": "Fetch To Date",
+          "propertyOrder": 20,
+          "type": "string",
+          "description": "Date to which data is downloaded. Either date in YYYY-MM-DD format or relative date string i.e. 5 days ago, 1 month ago, now, etc.",
+          "default": "now"
+        }
+      }
+    },
+    "dummy_element": {
+      "type": "string",
+      "description": "Helper dummy element to render time range options",
+      "template": "{{aggregates}}-{{events}}",
+      "watch": {
+        "aggregates": "objects.metric_aggregates",
+        "events": "objects.events"
+      },
+      "options": {
+        "hidden": true
+      }
+    },
+    "profiles_settings": {
+      "title": "Profiles - Additional Options",
+      "type": "object",
+      "propertyOrder": 60,
+      "options": {
+        "dependencies": {
+          "profiles_hidden": "true"
+        }
+      },
+      "properties": {
+        "fetch_profiles_mode": {
+          "title": "Fetch Profiles Mode",
+          "propertyOrder": 10,
+          "required": true,
+          "type": "string",
+          "enum": [
+            "fetch_all",
+            "fetch_by_segment",
+            "fetch_by_list"
+          ],
+          "options": {
+            "enum_titles": [
+              "Fetch All Profiles",
+              "Fetch Profiles by Segment IDs",
+              "Fetch Profiles by List IDs"
+            ]
+          }
+        },
+        "fetch_profiles_by_list": {
+          "title": "List IDs",
+          "propertyOrder": 20,
+          "uniqueItems": true,
+          "description": "Select which List IDs you wish to fetch profiles for",
+          "type": "array",
+          "format": "select",
+          "items": {
+            "enum": [],
+            "type": "string"
+          },
+          "options": {
+            "dependencies": {
+              "fetch_profiles_mode": "fetch_by_list"
+            },
+            "async": {
+              "label": "Load List IDs",
+              "action": "loadListIds"
+            }
+          }
+        },
+        "fetch_profiles_by_segment": {
+          "title": "Segment IDs",
+          "propertyOrder": 30,
+          "description": "Select which Segment IDs you wish to fetch profiles for",
+          "type": "array",
+          "format": "select",
+          "uniqueItems": true,
+          "items": {
+            "enum": [],
+            "type": "string"
+          },
+          "options": {
+            "dependencies": {
+              "fetch_profiles_mode": "fetch_by_segment"
+            },
+            "async": {
+              "label": "Load Segment IDs",
+              "action": "loadSegmentIds"
+            }
+          }
+        }
+      }
+    },
+    "metric_aggregates_settings": {
+      "title": "Metric aggregates - Additional Options",
+      "type": "object",
+      "propertyOrder": 70,
+      "options": {
+        "dependencies": {
+          "metric_aggregates_hidden": "true"
+        }
+      },
+      "properties": {
+        "metric_aggregates_ids": {
+          "title": "Metric IDs",
+          "propertyOrder": 10,
+          "description": "Select which Metric IDs you wish to download aggregates values for.",
+          "type": "array",
+          "format": "select",
+          "uniqueItems": true,
+          "items": {
+            "enum": [],
+            "type": "string"
+          },
+          "options": {
+            "async": {
+              "label": "Load Metric IDs",
+              "action": "loadMetricIds"
+            }
+          }
+        },
+        "metric_aggregates_interval": {
+          "title": "Aggregate interval",
+          "propertyOrder": 20,
+          "type": "string",
+          "enum": [
+            "hour",
+            "day",
+            "week",
+            "month"
+          ],
+          "default": "day"
+        },
+        "metric_aggregates_partitioning_by": {
+          "title": "Partitioning by",
+          "description": "Optional attribute(s) used for partitioning by the aggregation function",
+          "propertyOrder": 30,
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "store_nested_attributes": {
+      "title": "Store Nested Attributes",
+      "propertyOrder": 20,
+      "format": "checkbox",
+      "type": "boolean",
+      "description": "You can use this options if you are fetching deeply nested attributes and you are encountering Output mapping errors due to 64 characters limit for columns.",
+      "default": false
+    },
+    "campaigns_hidden": {
+      "type": "string",
+      "watch": {
+        "campaigns_hidden": "rootschema.objects.campaigns"
+      },
+      "options": {
+        "hidden": true
+      },
+      "template": "{{campaigns_hidden}}"
+    },
+    "catalogs_hidden": {
+      "type": "string",
+      "watch": {
+        "catalogs_hidden": "rootschema.objects.catalogs"
+      },
+      "options": {
+        "hidden": true
+      },
+      "template": "{{catalogs_hidden}}"
+    },
+    "flows_hidden": {
+      "type": "string",
+      "watch": {
+        "flows_hidden": "rootschema.objects.flows"
+      },
+      "options": {
+        "hidden": true
+      },
+      "template": "{{flows_hidden}}"
+    },
+    "profiles_hidden": {
+      "type": "string",
+      "watch": {
+        "profiles_hidden": "rootschema.objects.profiles"
+      },
+      "options": {
+        "hidden": true
+      },
+      "template": "{{profiles_hidden}}"
+    },
+    "metric_aggregates_hidden": {
+      "type": "string",
+      "watch": {
+        "metric_aggregates_hidden": "rootschema.objects.metric_aggregates"
+      },
+      "options": {
+        "hidden": true
+      },
+      "template": "{{metric_aggregates_hidden}}"
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+fi
+
+echo "Updating logger settings"
+
+value=`cat component_config/logger`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} logger --value="$value"
+else
+    echo "logger type is empty!"
+fi
+
+echo "Updating logger configuration"
+value=`cat component_config/loggerConfiguration.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} loggerConfiguration --value="$value"
+else
+    echo "loggerConfiguration is empty!"
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.component==1.6.8
+keboola.csvwriter==1.0.1
+keboola.utils
+keboola.http-client
+mock
+freezegun
+klaviyo-api==14.0.0
+tenacity==9.0.0 # klaviyo-api dependency
+backoff
+
+================================================
+File: /TEMPLATE_README.md
+================================================
+# KBC Component Python template
+
+Python template for KBC Component creation. Defines the default structure and all Bitbucket pipeline CI scripts for automatic deployment.
+
+Use as a starting point when creating a new component.
+
+Example uses [keboola.component](https://pypi.org/project/keboola.component) library providing useful methods for KBC related tasks 
+and boilerplate methods often needed by components, for more details see [documentation](https://github.com/keboola/python-component/blob/main/README.md)
+
+*NOTE: Previously the template was based on top of the deprecated [keboola-python-util-lib library](https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/src/master/)*
+
+**Table of contents:**  
+  
+[TOC]
+
+# Recommended component architecture
+It is recommended to use the [keboola.component library](https://pypi.org/project/keboola.component), 
+for each component. Major advantage is that it reduces the boilerplate code replication, the developer can focus on core component logic 
+and not on boilerplate tasks. If anything is missing in the library, please fork and create a pull request with additional changes, 
+so we can all benefit from it
+
+**Base components on [CommonInterface](https://htmlpreview.github.io/?https://raw.githubusercontent.com/keboola/python-component/main/docs/api-html/component/interface.html#keboola.component.interface.CommonInterface)**
+
+- No need to write configuration processing and validation code each time
+- No need to setup logging environment manually
+- No need to write code to store manifests, write statefile, retrieve dates based on relative period, and many more.
+- The main focus can be the core component logic, which increases the code readability for new comers.
+
+**Base Client on [HtttpClient](https://pypi.org/project/keboola.http-client/)**
+
+- No need to write HTTP request handling over and over again
+- Covers basic authentication, retry strategy, headers, default parameters
+
+
+## Architecture using the template
+
+![picture](docs/imgs/architecture.png)
+
+## Example component
+This template contains functional example of an [hello-world component](https://bitbucket.org/kds_consulting_team/kbc-python-template/src/master/src/component.py), 
+it can be run with [sample configuration](https://bitbucket.org/kds_consulting_team/kbc-python-template/src/master/data/) and it produces valid results. 
+It is advisable to use this structure as a base for new components. Especially the `component.py` module, which should only 
+contain the base logic necessary for communication with KBC interface, processing parameters, collecting results
+ and calling targeted API service methods. 
+
+
+# Creating a new component
+Clone this repository into new folder and remove git history
+```bash
+git clone https://bitbucket.org/kds_consulting_team/kbc-python-template.git my-new-component
+cd my-new-component
+rm -rf .git
+git init
+git remote add origin PATH_TO_YOUR_BB_REPO
+git add .
+git commit -m 'initial'
+git push -u origin master
+```
+
+**Method #2:**
+
+Copy the contents of the template folder into your clone empty repository
+
+```bash
+git clone PATH_TO_YOUR_BB_REPO my-new-component
+# now copy the contents of the template into the my-new-component dir
+cd my-new-component
+git add .
+git commit -m 'initial'
+git push -u origin master
+```
+
+# Setting up the CI
+ - Bitbucket: Enable [pipelines](https://confluence.atlassian.com/bitbucket/get-started-with-bitbucket-pipelines-792298921.html) in the repository.
+    - For Github: Check that the [workflows are enabled](https://docs.github.com/en/actions/managing-workflow-runs/disabling-and-enabling-a-workflow).
+    The actions are present in `.github/workflows/` folder. 
+ - Set `KBC_DEVELOPERPORTAL_APP` env variable (dev portal app id)
+ 
+ In case it is not set on the account level, set also other required dev portal env variables:
+ 
+ - `KBC_DEVELOPERPORTAL_PASSWORD` - service account password
+ - `KBC_DEVELOPERPORTAL_USERNAME` - service account username
+ - `KBC_DEVELOPERPORTAL_VENDOR` - dev portal vendor
+ - `KBC_STORAGE_TOKEN` - (optional) in case you wish to run KBC automated tests
+  
+ 
+ ![picture](docs/imgs/ci_variable.png)
+ 
+The script execution is defined in three stages:
+
+## Default stage
+This script is executed on push to any branch except the master branch. It executes basic build and code quality steps. Following steps are performed:
+Build docker image
+Execute flake8 lint tests
+Execute python unittest
+(Optional) Push image with tag :test into the AWS repository for manual testing in KBC
+If any of the above steps results in non 0 status, the build will fail. It is impossible to merge branches that fail to build into the master branch.
+
+## Master stage
+This script is executed on any push or change in the master branch. It performs every step as the default stage. Additionally, 
+the `./scripts/update_dev_portal_properties.sh` script is executed. 
+This script propagates all changes in the Component configuration files (component_config folder) to the Developer portal.
+Currently these Dev Portal configuration parameters are supported:
+
+ - `configSchema.json`
+ - `configRowSchema.json`
+ - `component_short_description.md`
+ - `component_long_description.md`    
+
+The choice to include this script directly in the master branch was made to simplify ad-hoc changes of the component configuration parameters. For instance if you wish to slightly modify the configuration schema without affecting the code itself, it is possible to simply push the changes directly into the master and these will be automatically propagated to the production without rebuilding the image itself. Solely Developer Portal configuration metadata is deployed at this stage.
+
+## Tagged commit stage
+Whenever a tagged commit is added, or tag created this script gets executed. This is a deployment phase, so a successful build results in new code being deployed in KBC production.
+At this stage all steps present in the default and master stage are executed. Additionally, 
+`deploy.sh` script that pushes the newly built image / tag into the ECR repository and KBC production is executed.
+The deploy script is executed only after all tests and proper build steps passed. 
+Moreover, the `deploy.sh` script will be executed **only in the master branch**. In other words if you create a tagged commit in another branch, the pipeline gets triggered but deployment script will fail, because it is not triggered within a master branch. This is to prevent accidental deployment from a feature branch.
+
+ 
+# GELF logging
+
+The template automatically chooses between STDOUT and GELF logger based on the Developer Portal configuration.
+
+To fully leverage the benefits such as outputting the `Stack Trace` into the log event detail (available by clicking on the log event) 
+log exceptions using `logger.exception(ex)`.
+
+**TIP:** When the logger verbosity is set to `verbose` you may leverage `extra` fields to log the detailed message in the detail of the log event by adding extra fields to you messages:
+
+```python
+logging.error(f'{error}. See log detail for full query. ',
+                         extra={"failed_query": json.dumps(query)})
+```
+
+Recommended [GELF logger setup](https://developers.keboola.com/extend/common-interface/logging/#setting-up) (Developer Portal) to allow debug mode logging:
+
+```json
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+``` 
+ 
+# Development
+ 
+This example contains runnable container with simple unittest. For local testing it is useful to include `data` folder in the root
+and use docker-compose commands to run the container or execute tests. 
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path:
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone https://bitbucket.org:kds_consulting_team/kbc-python-template.git my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+## Testing
+
+The preset pipeline scripts contain sections allowing pushing testing image into the ECR repository and automatic 
+testing in a dedicated project. These sections are by default commented out. 
+
+**Running KBC tests on deploy step, before deployment**
+
+Uncomment following section in the deployment step in `bitbucket-pipelines.yml` file:
+
+```yaml
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+```
+
+Make sure that you have `KBC_STORAGE_TOKEN` env. variable set, containing appropriate storage token with access 
+to your KBC project. Also make sure to create a functional testing configuration and replace the `BASE_KBC_CONFIG` placeholder with its id.
+
+**Pushing testing image for manual KBC tests**
+
+In some cases you may wish to execute a testing version of your component manually prior to publishing. For instance to test various
+configurations on it. For that it may be convenient to push the `test` image on every push either to master, or any branch.
+
+To achieve that simply uncomment appropriate sections in `bitbucket-pipelines.yml` file, either in master branch step or in `default` step.
+
+```yaml
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+```
+ 
+ Once the build is finished, you may run such configuration in any KBC project as many times as you want by using [run-job](https://kebooladocker.docs.apiary.io/#reference/run/create-a-job-with-image/run-job) API call, using the `test` image tag.
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.12-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+Klaviyo Extractor
+=============
+
+Klaviyo is a marketing automation platform, used primarily for email marketing and SMS marketing.
+
+This component uses the Klaviyo APIs to extract data on all objects from Klaviyo.
+
+**Table of contents:**
+
+[TOC]
+
+Prerequisites
+=============
+to get your API Token:
+
+1. Log into your Klaviyo platform
+2. Your profile name (bottom left)
+3. Account
+4. Settings
+5. API Keys
+6. Create Private API Key with Read-Only privileges
+
+For more information follow [this guide on from Klaviyo](https://developers.klaviyo.com/en/docs/retrieve_api_credentials)
+
+Supported endpoints
+===================
+
+- [Campaigns](https://developers.klaviyo.com/en/v1-2/reference/get-campaigns)
+- [Catalogs](https://developers.klaviyo.com/en/reference/get_catalog_items)
+- [Segments](https://developers.klaviyo.com/en/reference/get_segments)
+- [Lists](https://developers.klaviyo.com/en/reference/get_lists)
+- [Profiles](https://developers.klaviyo.com/en/reference/get_profiles)
+- [Metrics](https://developers.klaviyo.com/en/reference/get_metrics)
+- [Events](https://developers.klaviyo.com/en/reference/get_events)
+- [Flows](https://developers.klaviyo.com/en/reference/get_flows)
+- [Templates](https://developers.klaviyo.com/en/reference/get_templates)
+- [Metric aggergates](https://developers.klaviyo.com/en/reference/query_metric_aggregates)
+
+
+
+If you need more endpoints, please submit your request to
+[ideas.keboola.com](https://ideas.keboola.com/)
+
+Configuration
+=============
+
+Authorization configuration
+---------------------------
+
+- API Token (#api_token) - [REQ] API token generated following the steps in the Prerequisites
+
+Configuration
+-------------
+
+- Endpoints (objects) - [REQ] Key value pair of Klaviyo objects and a boolean value to signify whether or not to extract them
+    - Campaigns (campaigns)
+    - Catalog Items (catalogs)
+    - Events (events)
+    - Metrics (metrics)
+    - Lists (lists)
+    - Segments (segments)
+    - Profiles (profiles)
+    - Flows (flows)
+    - Templates (templates)
+    - Query Metric Aggregates (metric_aggregates)
+- Campaigns : Additional Options (campaigns_settings) - [OPT] Additional options if campaigns are being downloaded
+    - Channel Options (fetch_campaign_channels) - [OPT] Campaign channels (sms, email). Defaults to all channels.
+- Catalogs : Additional Options (catalogs_settings) - [OPT] Additional options if catalogs are being downloaded
+    - Fetch Catalog Categories (fetch_catalog_categories) - [OPT] Boolean value to indicate if catalog categories should be fetched
+- Time range options : Additional Options (time_range_settings) - [OPT] Additional options for the following endpoints: Events, Metric Aggregates.
+    - Fetch From Date (date_from) - [OPT] Date from which data is downloaded. Either date in YYYY-MM-DD format or relative date string i.e. 5 days ago, 1 month ago, yesterday, etc. You can also set this as last run, which will fetch data from the last run of the component.
+    - Fetch To Date (date_to) - [OPT] Date to which data is downloaded. Either date in YYYY-MM-DD format or relative date string i.e. 5 days ago, 1 month ago, now, etc.
+- Store nested attributes (store_nested_attributes) - [OPT] You can use this options if you are fetching deeply nested attributes and you are encountering Output mapping errors due to 64 characters limit for columns. This option will store attributes in a single column.
+- Flows : Additional Options (flows_settings) - [OPT] Additional options if flows are being downloaded
+    - Fetch Flow Actions (fetch_flows) - [OPT] Boolean value to indicate if flow actions should be fetched
+- Profiles : Additional Options (profiles_settings) - [OPT] Additional options if profiles are being downloaded
+    - Fetch Profiles Mode (fetch_profiles_mode) - [OPT] either "fetch_all", "fetch_by_segment", "fetch_by_list". 
+"fetch_all" extracts all profiles.
+"fetch_by_list" extracts all profiles contained in specific lists, specified in the list of List IDs.
+"fetch_by_segment" extracts all profiles contained in specific segments, specified in the list of Segment IDs.        
+    - List IDs (fetch_profiles_by_list) - [OPT] array of list IDs
+    - Segment IDs (fetch_profiles_by_segment) - [OPT] array of segment IDs
+- Metric aggregates - Additional Options (metric_aggregates_settings) - [OPT] Additional options if aggregated metrics are being downloaded
+    - Metric IDs (metric_aggregates_ids) - [OPT] array of metric IDs
+    - Aggregate interval (metric_aggregates_interval) - [OPT] Granularity of aggregatin. Choose from "hour", "day", "week", "month"
+    - Partitioning by (metric_aggregates_partitioning_by) - [OPT] Array of dimensions for partitioning aggregated values
+    - (metric_aggregates_measurements) - [OPT] An array with the selected aggregation. It cannot be changed, as the endpoint returns all three values.
+
+**Note:** Events endpoint contains deeply nested data, which can lead to long column names. This has to be addressed using Rename Columns processor or using the store_nested_attributes parameter.
+
+Sample Configuration
+=============
+
+```json
+{
+  "parameters": {
+    "#api_token": "SECRET_VALUE",
+    "objects": {
+      "campaigns": true,
+      "catalogs": true,
+      "events": true,
+      "metrics": true,
+      "lists": true,
+      "segments": true,
+      "profiles": true,
+      "flows": false,
+      "templates": false,
+      "metric_aggregates": true
+    },
+    "campaigns_settings": {
+      "fetch_campaign_recipients": true
+    },
+    "catalogs_settings": {
+      "fetch_catalog_categories": true
+    },
+    "time_range_settings": {
+      "date_from": "last run",
+      "date_to": "now"
+    },
+    "profiles_settings": {
+      "fetch_profiles_mode": "fetch_by_segment",
+      "fetch_profiles_by_segment": ["segid"]
+    },
+    "metric_aggregates_settings": {
+      "metric_aggregates_ids": ["metric_id e.g. SUCEUS"],
+      "metric_aggregates_measurements": [
+        "count", "unique", "sum_value"
+      ],
+      "metric_aggregates_interval": "day",
+      "metric_aggregates_partitioning_by": ["dimensions_name e.g Campaign Name"]
+    },
+  },
+  "action": "run"
+}
+```
+
+Output
+======
+
+List of tables, foreign keys, schema.
+
+Query Metric Aggregates limitations
+-----------------------------------
+
+### Empty period
+When using the by parameter to aggregate data over a specified period, if no data is available for the selected time range, the endpoint returns a single aggregated value instead of a list of values for each aggregated period. In such cases, the returned values are supplemented with null values, which can result in empty columns in the output of the consuming component. This occurs because the endpoint does not return the expected data points for each aggregation period.
+
+This behavior should be considered when processing the results, as the absence of data for specific periods may affect the integrity of the final output.
+
+### Partitioning
+
+In cases where data partitioning is based on specific dimensions, there are situations where some dimensions are empty or unavailable for partitioning in a given category. This can occur when a dataset is categorized by multiple dimensions, but for certain records or categories, one or more dimensions lack valid values.
+
+When this happens, the system substitutes the empty dimension with a placeholder value:
+
+-	“DIMENSION NOT AVAILABLE” – used when a specific dimension is missing.
+-	“NO DIMENSIONS SELECTED” – used when no dimensions are selected at all.
+
+**Examples**
+
+No partitioning selected
+
+| id | metric_id | date  | unique  | sum_value  | count   | dimensions   | 
+| ------------ | ------------ | ------------ | ------------ | ------------ | ------------ | ------------ |
+|2024-09-01T00:00:00+00:00_SUCEUS|SUCEUS|2024-09-01T00:00:00+00:00|10.0|5.0|0.0|['NO DIMENSIONS SELECTED']|
+
+One existing partitioning selected
+
+| id | metric_id | date  | unique  | sum_value  | count   | dimensions   | 
+| ------------ | ------------ | ------------ | ------------ | ------------ | ------------ | ------------ |
+|2024-09-01T00:00:00+00:00_SUCEUS|SUCEUS|2024-09-01T00:00:00+00:00|10.0|5.0|0.0|['Internal Klaviyo - Test Campaign Name']|
+
+One existing partitioning selected and two missing selected
+
+| id | metric_id | date  | unique  | sum_value  | count   | dimensions   | 
+| ------------ | ------------ | ------------ | ------------ | ------------ | ------------ | ------------ |
+|2024-09-01T00:00:00+00:00_SUCEUS|SUCEUS|2024-09-01T00:00:00+00:00|10.0|5.0|0.0|['Internal Klaviyo - Test Campaign Name', 'DIMENSION NOT AVAILABLE', 'DIMENSION NOT AVAILABLE']|
+
+Development
+-----------
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path in
+the `docker-compose.yml` file:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clone this repository, init the workspace and run the component with following command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose build
+docker-compose run --rm dev
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run the test suite and lint check using this command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose run --rm test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Integration
+===========
+
+For information about deployment and integration with KBC, please refer to the
+[deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/)
+

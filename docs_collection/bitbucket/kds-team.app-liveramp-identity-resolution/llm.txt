@@ -1,0 +1,1202 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-liveramp-identity-resolution/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── abilitec/
+    │   │   ├── component.py
+    │   │   ├── client.py
+    │   │   └── result.py
+    │   └── main.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/abilitec/component.py
+================================================
+import csv
+import glob
+import json  # noqa
+import logging
+import os
+import sys
+from datetime import datetime
+from typing import List
+from kbc.env_handler import KBCEnvHandler
+from abilitec.client import AbilitecClient
+from abilitec.result import AbilitecWriter
+
+APP_VERSION = '0.1.0'
+BATCH_MAX_RECORDS = 100
+
+KEY_CLIENTID = 'client_id'
+KEY_CLIENTSECRET = '#client_secret'
+KEY_ENDPOINT = 'endpoint'
+KEY_TESTENV = 'test_environment'
+KEY_INCREMENTALLOAD = 'incremental_load'
+KEY_DEBUGMODE = 'debug_mode'
+
+MANDATORY_PARAMS = [KEY_CLIENTID, KEY_CLIENTSECRET, KEY_ENDPOINT]
+
+
+class AbilitecComponent(KBCEnvHandler):
+
+    def __init__(self):
+
+        super().__init__(mandatory_params=MANDATORY_PARAMS, log_level='DEBUG')
+        logging.info(f"Running component version {APP_VERSION}.")
+        self.validate_config(MANDATORY_PARAMS)
+        self.current_date = datetime.date(datetime.now())
+
+        self.param_client_id = self.cfg_params[KEY_CLIENTID]
+        self.param_client_secret = self.cfg_params[KEY_CLIENTSECRET]
+        self.param_endpoint = self.cfg_params[KEY_ENDPOINT]
+        self.param_test_env = bool(self.cfg_params.get(KEY_TESTENV, False))
+        self.param_incremental = bool(self.cfg_params.get(KEY_INCREMENTALLOAD, True))
+        self.param_debug_mode = self.cfg_params.get(KEY_DEBUGMODE, False)
+
+        self.client = AbilitecClient(client_id=self.param_client_id,
+                                     client_secret=self.param_client_secret,
+                                     test_env=self.param_test_env)
+
+        self.writer = AbilitecWriter(self.tables_out_path, self.param_incremental, self.param_debug_mode)
+        self.getInputTables()
+
+    def getInputTables(self):
+
+        input_tables = glob.glob(os.path.join(self.tables_in_path, '*.csv'))
+
+        if len(input_tables) == 0:
+            logging.error("No input tables specified.")
+            sys.exit(1)
+
+        tables_with_missing_id = []
+        for t in input_tables:
+            with open(t) as in_table:
+                _rdr = csv.DictReader(in_table)
+
+                if 'record_id' not in _rdr.fieldnames:  # using 'record_id' since 'id' is included in the API response
+                    tables_with_missing_id += [os.path.basename(t)]
+
+        if len(tables_with_missing_id) != 0:
+            logging.error(f"Column \"record_id\" is missing in table(s): {tables_with_missing_id}.")
+            sys.exit(1)
+
+        self.var_input_tables = input_tables
+
+    def flattenAndWriteData(self, record_ids: List, matched_data: List):
+
+        for r_id, data in zip(record_ids, matched_data):
+            for obj_type in data:
+                obj_data = self.writer._flatten(data[obj_type])
+                for data_pt in obj_data:
+
+                    json_row = {
+                        'type': obj_type,
+                        'record_id': r_id,
+                        'extraction_date': self.current_date,
+                        'key': data_pt,
+                        'value': obj_data[data_pt]
+                    }
+                    self.writer.writerow(json_row)
+
+    def writeRawData(self, record_ids: List, data: List):
+
+        for r_id, d in zip(record_ids, data):
+            _out = {
+                'record_id': r_id,
+                'result': json.dumps(d)
+            }
+
+            self.writer.writerow_raw(_out)
+
+    def run(self):
+
+        for table in self.var_input_tables:
+            logging.info('Parsing records from [{}]'.format(table))
+            with open(table) as in_table:
+
+                _rdr = csv.DictReader(in_table)
+                table_name = table.split('/tables/')[1]
+                num_of_rows = sum(1 for row in _rdr)
+                logging.info('[{}] - Total records: {}'.format(table_name, num_of_rows))
+
+                in_table.seek(0)
+                next(in_table)
+
+                count = 0
+
+                records_to_parse = []
+                record_ids = []
+
+                for row in _rdr:
+                    count += 1
+
+                    record_ids += [row['record_id']]
+                    del row['record_id']
+                    records_to_parse += [row.copy()]
+
+                    if count % BATCH_MAX_RECORDS == 0 or count == num_of_rows:
+                        matched_data = self.client.sendBatchMatchRequest(endpoint=self.param_endpoint,
+                                                                         record_ids=record_ids,
+                                                                         batch_list=records_to_parse)
+                        self.flattenAndWriteData(record_ids, matched_data)
+
+                        if self.param_debug_mode is True:
+                            self.writeRawData(record_ids, matched_data)
+
+                        records_to_parse = []
+                        record_ids = []
+
+                    else:
+                        continue
+
+                    if count % BATCH_MAX_RECORDS == 0 or count == num_of_rows:
+                        logging.info('[{}] - Records parsed: {} - Records remaining: {}'.format(table_name, count,
+                                                                                                num_of_rows-count))
+
+
+================================================
+File: /src/abilitec/client.py
+================================================
+import logging
+import sys
+from kbc.client_base import HttpClientBase
+from urllib.parse import urljoin, urlencode
+from typing import List
+
+BASE_URL_TEST = 'https://test.api.acxiom.com/v1/'
+BASE_URL_PROD = 'https://us.identity.api.liveramp.com/v1/'
+
+LOGIN_URL_TEST = 'https://login.myacxiom.com/api/v1/auth/oauth2/token'
+LOGIN_URL_PROD = 'https://us.identity.api.liveramp.com/token'
+
+
+class AbilitecClient(HttpClientBase):
+
+    def __init__(self, client_id, client_secret, test_env=True):
+
+        _def_header = {
+            'Accept': 'application/json'
+        }
+
+        super().__init__(base_url=BASE_URL_TEST if test_env else BASE_URL_PROD, default_http_header=_def_header)
+        self.par_client_id = client_id
+        self.par_client_secret = client_secret
+        self.par_test_env = test_env
+        # self.par_base_url = base_url
+
+        self.refreshAccessToken()
+
+    def refreshAccessToken(self):
+
+        url_access = LOGIN_URL_TEST if self.par_test_env else LOGIN_URL_PROD
+        logging.info(f"Using {url_access} to log in.")
+        body_access = {
+            'client_id': self.par_client_id,
+            'client_secret': self.par_client_secret,
+            'grant_type': 'client_credentials'
+        }
+
+        headers_access = {
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+
+        request_access = self.post_raw(url_access, headers=headers_access, data=body_access)
+        sc_access = request_access.status_code
+
+        if sc_access == 200:
+
+            logging.debug("Access token obtained.")
+            self.par_access_token = request_access.json()['access_token']
+            self._auth_header = {
+                'Authorization': f'Bearer {self.par_access_token}',
+                'Accept': 'application/json'  # instead of format=json parameter
+            }
+
+        else:
+            logging.error(f"Could not refresh access token. Received: {sc_access} - {request_access.text}.")
+            sys.exit(1)
+
+    def sendMatchRequest(self, endpoint, parameters):
+
+        url_match = urljoin(self.base_url, f"{endpoint}/match")
+        params_match = parameters
+
+        req_match = self.get_raw(url_match, params_match)
+        sc_match, js_match = req_match.status_code, req_match.json()
+
+        if sc_match == 200:
+            return js_match
+
+        else:
+            logging.error(f"Received: {sc_match} - {js_match}.")
+            sys.exit(1)  # Hard fail for now, can be adjusted later
+
+    def sendBatchMatchRequest(self, endpoint: str, record_ids: List, batch_list: List):
+
+        url_batch = urljoin(self.base_url, 'batch/match')
+        body_batch = []
+        prefix_batch = f'/{endpoint}/match?'
+
+        for r in batch_list:
+            body_batch += [prefix_batch + urlencode(r)]
+
+        # logging.debug(body_batch)
+
+        req_batch = self.post_raw(url_batch, json=body_batch)
+        sc_batch, js_batch = req_batch.status_code, req_batch.json()
+
+        if sc_batch != 200:
+
+            logging.exception("Could not batch match identity data.")
+            logging.error(f"Received: {sc_batch} - {js_batch}")
+            sys.exit(1)
+
+        else:
+            results = []
+
+            for r_id, i in zip(record_ids, js_batch):
+                if i['code'] == 200:
+                    results += [i['document']]
+
+                else:
+                    logging.exception(f"Could not match data for records id {r_id}.")
+                    logging.error(f"Received: {i['code']} - {i['document']}.")
+                    logging.debug(f"Full response: {i}.")
+                    sys.exit(1)
+
+            return results
+
+
+================================================
+File: /src/abilitec/result.py
+================================================
+import csv
+import os
+import json
+
+FIELDS_RESULTS = [
+    'type',
+    'record_id',
+    'extraction_date',
+    'key',
+    'value'
+]
+PK_RESULTS = [
+    'type',
+    'record_id',
+    'extraction_date',
+    'key'
+]
+
+FIELDS_RESULTS_RAW = ['record_id', 'result']
+PK_RESULTS_RAW = ['record_id']
+
+
+class AbilitecWriter:
+
+    def __init__(self, data_out_path, incremental_load=True, raw=False):
+
+        self.par_data_out_path = data_out_path
+        self.par_table_path = os.path.join(self.par_data_out_path, 'results.csv')
+        self.par_table_path_raw = os.path.join(self.par_data_out_path, 'results-raw.csv')
+        self.par_incremental_load = incremental_load
+        self.par_raw_write = raw
+
+        self._createManifest()
+        self._createWriter()
+
+    def _createManifest(self):
+
+        _template = {
+            'incremental': self.par_incremental_load,
+            'primary_key': PK_RESULTS,
+            'columns': FIELDS_RESULTS
+        }
+
+        with open(self.par_table_path + '.manifest', 'w') as manFile:
+            json.dump(_template, manFile)
+
+        if self.par_raw_write is True:
+
+            _template = {
+                'incremental': self.par_incremental_load,
+                'primary_key': PK_RESULTS_RAW,
+                'columns': FIELDS_RESULTS_RAW
+            }
+
+            with open(self.par_table_path_raw + '.manifest', 'w') as manFile:
+                json.dump(_template, manFile)
+
+    def _flatten(self, obj):
+
+        out = {}
+
+        def flatten(x, name=''):
+            if type(x) is dict:
+                for a in x:
+                    flatten(x[a], name + a + '.')
+            elif type(x) is list:
+                i = 0
+                for a in x:
+                    flatten(a, name + str(i) + '.')
+                    i += 1
+            else:
+                out[name[:-1]] = x
+
+        flatten(obj)
+        return out
+
+    def _createWriter(self):
+
+        self.writer = csv.DictWriter(open(self.par_table_path, 'w'), fieldnames=FIELDS_RESULTS, restval='',
+                                     extrasaction='ignore', quotechar='\"', quoting=csv.QUOTE_ALL)
+
+        if self.par_raw_write is True:
+            self.writer_raw = csv.DictWriter(open(self.par_table_path_raw, 'w'), fieldnames=FIELDS_RESULTS_RAW,
+                                             restval='', extrasaction='ignore', quotechar='\"', quoting=csv.QUOTE_ALL)
+
+    def writerow(self, rowDict):
+
+        self.writer.writerow(rowDict)
+
+    def writerow_raw(self, rowDict):
+
+        self.writer_raw.writerow(rowDict)
+
+
+================================================
+File: /src/main.py
+================================================
+import logging
+import sys
+from abilitec.component import AbilitecComponent
+
+# Environment setup
+sys.tracebacklimit = 0
+
+if __name__ == '__main__':
+
+    c = AbilitecComponent()
+    c.run()
+
+    logging.info("Matching finished.")
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+#          - echo 'Pushing test image to repo. [tag=test]'
+#          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+AbiliTec was designed to solve some of the main challenges with customer and prospect data by returning people-based identifiers and metadata for your consumer records. Clients can use these outputs to connect fragmented data sets, move data without sending PII, and increase the accuracy of CRM files.
+
+## Configuration
+This component has configured to request against 'Match Endpoints'. The input data is taken through a sequence of matching steps utilizing various components of the PII unitl a match to a maintained AbiliTech ID is found.
+
+## API Usage and Rate Limits
+
+ - 50 calls per minute
+ - If limit is exceed, your calls will fail and an error message will be returned until the minute is up and you are allowed another 50 calls
+
+## Parameters
+
+1. Client ID
+2. Client Secret
+3. Endpoint
+    1. People
+    2. Places
+    3. Households
+    4. Entities
+4. Test Environment
+    - If user wants to fetch related endpoint data from 'Test Environment'
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+This component has configured to request against 'Match Endpoints'. The input data is taken through a sequence of matching steps utilizing various components of the PII unitl a match to a maintained AbiliTech ID is found.
+
+## API Usage and Rate Limits
+
+ - 50 calls per minute
+ - If limit is exceed, your calls will fail and an error message will be returned until the minute is up and you are allowed another 50 calls
+
+## Parameters
+
+1. Client ID
+2. Client Secret
+3. Endpoint
+    1. People
+    2. Places
+    3. Households
+    4. Entities
+4. Test Environment
+    - If user wants to fetch related endpoint data from 'Test Environment'
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Solving some of the main challenges with customer and prospect data by returning people-based identifiers and metadata for your consumer records
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+    "title": "API configuration",
+    "type": "object",
+    "required": [
+        "client_id",
+        "#client_secret",
+        "endpoint",
+        "test_environment",
+        "incremental_load",
+        "debug_mode"
+    ],
+    "properties": {
+        "client_id": {
+            "title": "Client ID",
+            "type": "string",
+            "minLength": 4,
+            "propertyOrder": 100
+        },
+        "#client_secret": {
+            "title": "Client Secret",
+            "type": "string",
+            "minLength": 4,
+            "format": "password",
+            "propertyOrder": 200
+        },
+        "endpoint": {
+            "title": "Endpoint",
+            "type": "string",
+            "default": "people",
+            "propertyOrder": 300,
+            "enum": [
+                "people",
+                "places",
+                "households",
+                "entities"
+            ],
+            "options": {
+                "enum_titles": [
+                    "People",
+                    "Places",
+                    "Households",
+                    "Entities"
+                ]
+            }
+        },
+        "test_environment": {
+            "title": "Environment",
+            "type": "number",
+            "enum": [
+                0,
+                1
+            ],
+            "propertyOrder": 400,
+            "options": {
+                "enum_titles": [
+                    "Production - https://us.identity.api.liveramp.com/v1/",
+                    "Test - https://test.api.acxiom.com/v1/"
+                ]
+            },
+            "default": 0
+        },
+        "incremental_load": {
+            "title": "Load Type",
+            "type": "number",
+            "enum": [
+                0,
+                1
+            ],
+            "propertyOrder": 500,
+            "options": {
+                "enum_titles": [
+                    "Full Load",
+                    "Incremental Load"
+                ]
+            },
+            "default": 0
+        },
+        "debug_mode": {
+            "title": "Raw Data Output",
+            "description": "When set to true, additional table with raw API results in JSON format is also produced.",
+            "type": "boolean",
+            "default": false,
+            "propertyOrder": 600
+        }
+    }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.7.zip#egg=kbc
+mock
+freezegun
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.1-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+RUN pip install -r /code/requirements.txt
+WORKDIR /code/
+
+CMD ["python", "-u", "/code/src/main.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# LiveRamp Identity Resolution application
+AbiliTec was designed to solve some of the main challenges with customer and prospect data by returning people-based identifiers and metadata for your consumer records. Clients can use these outputs to connect fragmented data sets, move data without sending PII, and increase the accuracy of CRM files.
+
+## Configuration
+This component has configured to request against 'Match Endpoints'. The input data is taken through a sequence of matching steps utilizing various components of the PII unitl a match to a maintained AbiliTech ID is found.
+
+## API Usage and Rate Limits
+
+ - 50 calls per minute
+ - If limit is exceed, your calls will fail and an error message will be returned until the minute is up and you are allowed another 50 calls
+
+## Parameters
+
+1. Client ID
+2. Client Secret
+3. Endpoint
+    1. People
+    2. Places
+    3. Households
+    4. Entities
+4. Test Environment
+    - If user wants to fetch related endpoint data from 'Test Environment'
+

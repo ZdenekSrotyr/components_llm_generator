@@ -1,0 +1,2189 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-datahub/
+    ├── .travis.yml
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── src/
+    │   ├── definitions.py
+    │   ├── component.py
+    │   ├── logging_helper.py
+    │   ├── scripts/
+    │   │   ├── ingestion_provider.py
+    │   │   └── datahub_ingestion_checkpointing_provider.py
+    │   ├── utils.py
+    │   └── client.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── logger
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── loggerConfiguration.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /.travis.yml
+================================================
+sudo: false
+
+services:
+  - docker
+
+jobs:
+  include:
+    - stage: tests
+      script:
+        - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+        - docker run $APP_IMAGE python -m unittest discover
+      # push test image to ECR - uncomment for testing before deployment
+      #  - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+      #  - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+      #  - docker tag $APP_IMAGE:latest $REPOSITORY:test
+      #  - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+      #  - docker push $REPOSITORY:test
+      #  - docker pull quay.io/keboola/syrup-cli:latest
+    - stage: deploy_dev_portal
+      if: branch = master
+      script: "./scripts/update_dev_portal_properties.sh"
+
+before_script:
+  - export APP_IMAGE=keboola-component
+  - docker -v
+  - docker build -t $APP_IMAGE .
+  - chmod +x ./scripts/update_dev_portal_properties.sh
+  - chmod +x ./deploy.sh
+
+after_success:
+  - docker images
+
+deploy:
+  provider: script
+  skip_cleanup: true
+  script: ./deploy.sh
+  on:
+    tags: true
+    branch: master
+
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    example
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/definitions.py
+================================================
+from datahub.metadata.schema_classes import (
+    StringTypeClass,
+    BooleanTypeClass,
+    DateTypeClass,
+    NumberTypeClass,
+    TimeTypeClass)
+
+field_type_mapping = {
+    'varchar': StringTypeClass,
+    'boolean': BooleanTypeClass,
+    'date': DateTypeClass,
+    'float': NumberTypeClass,
+    'integer': NumberTypeClass,
+    'numeric': NumberTypeClass,
+    'string': StringTypeClass,
+    'character varying': StringTypeClass,
+    'text': StringTypeClass,
+    'timestamp': TimeTypeClass,
+    'timestamp with time zone': TimeTypeClass,
+    'timestamp ntz': DateTypeClass,
+    'number': NumberTypeClass,
+}
+
+jobs_and_requirements = {
+    "table-level-metadata.csv": {
+        "required_cols":
+            ['id', 'project_id', 'org_table_id', 'name', 'description', 'primary_key',
+             'rows_count', 'data_size_bytes', 'is_alias', 'is_default', 'bucket_id', 'bucket_name',
+             'last_import_date', 'last_change_date', 'source_table_id', 'project_name',
+             'table_columns', 'table_level_md'],
+        "available_jobs": ["properties", "schema", "tags"]},
+    "datajob.csv": {
+        "required_cols":
+            ['config_id', 'config_name', 'config_created', 'config_component_type', 'config_is_deleted',
+             'config_description', 'orchestration_id', 'project_id', 'task_id', 'mode', 'continue_on_failure',
+             'enabled', 'phase_id', 'phase_index', 'config_ids', 'config_depends_on'],
+        "available_jobs": ["data_lineage"]
+    },
+    "orchestrations_v2.csv": {
+        "required_cols": ["id", "region", "project_id", "name", "description", "created_time", "token_id",
+                          "token_description", "version", "is_disabled", "is_deleted"],
+        "available_jobs": ["data_lineage"]
+    },
+    "dataset.csv": {
+        "required_cols": ["config_id", "project_id", "project_name", "name", "component_name", "component_type",
+                          "storage_inputs_sources", "storage_outputs_destinations", "orchestration_id"],
+        "available_jobs": ["data_lineage"]
+    },
+    "storage-inputs-and-outputs.csv": {
+        "required_cols":
+            ['id', 'region', 'project_id', 'name', 'component_id',
+             'component_name', 'component_type', 'storage_inputs_sources',
+             'storage_inputs_destinations', 'storage_outputs_sources',
+             'storage_outputs_destinations'],
+        "available_jobs": []
+    }}
+
+
+================================================
+File: /src/component.py
+================================================
+"""
+Template Component main class.
+
+"""
+import _csv
+import csv
+import logging
+import sys
+from datetime import datetime
+from collections import defaultdict
+import json
+from json.decoder import JSONDecodeError
+from typing import Tuple, List, Optional
+
+from definitions import jobs_and_requirements
+from client import DataHubClient, DataHubClientException
+from logging_helper import LoggingTqdm
+
+from keboola.component.base import ComponentBase
+from keboola.component.exceptions import UserException
+
+from utils import get_dataset_urn
+
+
+# the following is an override for _csv.Error: field larger than field limit (131072)
+# source: https://stackoverflow.com/questions/15063936/csv-error-field-larger-than-field-limit-131072
+maxInt = sys.maxsize
+
+while True:
+    # decrease the maxInt value by factor 10
+    # as long as the OverflowError occurs.
+    try:
+        csv.field_size_limit(maxInt)
+        logging.debug(f"CSV max field size is set to {maxInt}.")
+        break
+    except OverflowError:
+        maxInt = int(maxInt / 10)
+
+# configuration variables
+DATAHUB_TOKEN = '#datahub_token'
+SERVER_ADDRESS = "server_address"
+TAGS = 'tags'
+JOBS = 'jobs'
+DEPRECATED_IN = 'deprecated_in'
+EXCLUDE_DEV_BRANCH_DATA = 'exclude_dev_branch_data'
+
+# list of mandatory parameters => if some is missing,
+# component will fail with readable message on initialization.
+REQUIRED_PARAMETERS = [DATAHUB_TOKEN, SERVER_ADDRESS]
+
+
+class Component(ComponentBase):
+
+    def __init__(self):
+        super().__init__()
+        self.client = None
+        self.input_tables = None
+        self.validate_configuration_parameters(REQUIRED_PARAMETERS)
+        params = self.configuration.parameters
+        self.datahub_token = params.get(DATAHUB_TOKEN)
+        self.server_address = str(params.get(SERVER_ADDRESS))
+        self.tags = params.get(TAGS)
+        self.jobs = params.get(JOBS)
+
+        if params.get(DEPRECATED_IN):
+            self.deprecated_in = params.get(DEPRECATED_IN)
+        else:
+            self.deprecated_in = 90
+        self.exclude_dev_branch_data = params.get(EXCLUDE_DEV_BRANCH_DATA, False)
+        self.sys_time = datetime.now()
+        self.current_time_unix = int(datetime.timestamp(self.sys_time)) * 1000
+
+    def run(self):
+        """
+        Main execution code
+        """
+
+        self.input_tables = self.get_input_tables_definitions()
+        self.check_required_jobs(self.input_tables)
+        selected_jobs = [k for k, v in self.jobs.items() if v is True]
+        logging.info(f"Selected jobs: {selected_jobs}")
+
+        try:
+            self.client = DataHubClient(self.server_address, self.datahub_token, self.current_time_unix)
+        except DataHubClientException as e:
+            raise UserException(f"Cannot initialize DataHub client: {e}") from e
+
+        self.client.create_keboola_logo()
+
+        if any((self.jobs.get("properties"), self.jobs.get("schema"), self.jobs.get("tags"))):
+            table = self.get_input_table_definition_by_name("table-level-metadata.csv")
+            if self.detect_input_table_type(table)[0] == "table-level-metadata.csv":
+                with open(table.full_path, mode='r') as f:
+                    self.process_table_level_metadata(f)
+            else:
+                raise UserException("Mapped table is not in format that is required for processing selected jobs.")
+
+        if self.jobs.get("data_lineage", {}):
+            # Lineage job requires three tables to work
+            try:
+                table_orchestrations_v2 = self.get_input_table_definition_by_name("orchestrations_v2.csv")
+                table_datajob = self.get_input_table_definition_by_name("datajob.csv")
+                table_dataset = self.get_input_table_definition_by_name("dataset.csv")
+            except ValueError as e:
+                raise UserException("Data Lineage requires orchestrations_v2.csv, datajob.csv and dataset.csv "
+                                    "to work.") from e
+
+            self.emit_datajob(table_datajob, table_orchestrations_v2)
+            self.emit_dataset(table_dataset)
+
+    def check_required_jobs(self, input_tables) -> None:
+        """
+        Raises UserException when encountered with not matching data or unsupported job type.
+        """
+        required_jobs = [k for k, v in self.jobs.items() if v is True]
+        available_tables = []
+        supported_jobs = []
+        unsupported_jobs = []
+        missing_columns_by_table = {}
+
+        for table in input_tables:
+            table_type, missing_columns = self.detect_input_table_type(table)
+            if table_type is None:
+                raise UserException(
+                    f"Unknown table format detected in table inputs: {table.name}. "
+                    f"Missing columns: {missing_columns}. "
+                    f"Needed columns are: {jobs_and_requirements[table.name]['required_cols']}")
+            if missing_columns:
+                missing_columns_by_table[table.name] = missing_columns
+                logging.error(f"Table '{table.name}' is missing columns: {missing_columns}")
+            available_tables.append(table_type)
+
+        for table in available_tables:
+            for job in jobs_and_requirements[table]["available_jobs"]:
+                supported_jobs.append(job)
+
+        for job in required_jobs:
+            if job not in supported_jobs:
+                unsupported_jobs.append(job)
+
+        if unsupported_jobs or missing_columns_by_table:
+            raise UserException(f"Cannot process job(s) of type(s): {unsupported_jobs} "
+                                f"Available jobs based on data in your inputs: {set(supported_jobs)}\n"
+                                f"Missing columns: {missing_columns_by_table}")
+
+    @staticmethod
+    def detect_input_table_type(table) -> Tuple[Optional[str], List[str]]:
+        """Returns table type as string and list of missing columns if all required columns of specific table type
+        are present. Otherwise, returns None as table type and the list of missing columns."""
+        table_type = table.name
+        missing_columns = []
+        if table_type in jobs_and_requirements:
+            present_columns = [x.lower() for x in table.columns]
+            required_columns = jobs_and_requirements[table_type]["required_cols"]
+            missing_columns = [col for col in required_columns if col not in present_columns]
+
+            if not missing_columns:
+                return table_type, missing_columns
+        return None, missing_columns
+
+    def process_table_level_metadata(self, table):
+        lines = int(len(table.readlines()) - 1)
+        table.seek(0)
+        reader = csv.DictReader(table)
+        row_nr = 1
+
+        try:
+            for row in LoggingTqdm(reader, total=lines):
+
+                if not self.exclude_dev_branch_data or (row["is_default"].lower() == "true"
+                                                        and self.exclude_dev_branch_data):
+                    dataset_urn = get_dataset_urn(row['project_name'], row['bucket_name'], row['name'])
+                    logging.debug(f"Processing dataset with urn: {dataset_urn}")
+                    if self.jobs["properties"]:
+                        self.client.emit_properties(row, dataset_urn)
+                    if self.jobs["schema"]:
+                        self.client.emit_schema(row, dataset_urn)
+                    if self.jobs["tags"]:
+                        self.client.emit_tags(row, self.tags, dataset_urn)
+                    # Emitting component_type is done in client.emit_datajob method which works with datajob.csv
+                    row_nr += 1
+                else:
+                    logging.info(f"Row with id {row['id']} skipped due to exclude dev branch data being set to true.")
+        except _csv.Error as e:
+            raise UserException(f"CSV error for table {table.name}, please check field sizes of "
+                                f"row {row_nr + 1}. "
+                                f"Max field size = {csv.field_size_limit(sys.maxsize)}") from e
+        logging.info("Finished processing table table level metadata.")
+
+    @staticmethod
+    def make_lineage_dict(table_datajob):
+        d = defaultdict(dict)
+        with open(table_datajob.full_path, mode='r') as f:
+            reader = csv.DictReader(f)
+            row_nr = 1
+            try:
+                for row in reader:
+                    # TODO: HOW TO PROPERLY HANDLE ORCHESTRATION_ID?
+                    orchestration_id = row["orchestration_id"] if row["orchestration_id"] else "123"
+                    config_id = row["config_id"]
+                    d[orchestration_id][config_id] = {
+                        "config_name": row["config_name"],
+                        "config_description": row["config_description"],
+                        "config_created": row["config_created"],
+                        "config_component_type": row["config_component_type"],
+                        "config_is_deleted": row["config_is_deleted"],
+                        "mode": row["mode"],
+                        "continue_on_failure": row["continue_on_failure"],
+                        "enabled": row["enabled"],
+                        "phase_index": row["phase_index"],
+                        "config_depends_on": row["config_depends_on"],
+                        "phase_id": row["phase_id"]
+                    }
+
+                for _orchestration_id in d:
+                    for config_id in d[_orchestration_id]:
+                        try:
+                            res = json.loads(d[_orchestration_id][config_id]["config_depends_on"])
+                            d[_orchestration_id][config_id]["config_depends_on"] = list(
+                                map(int, res))
+                        except (JSONDecodeError, ValueError):
+                            d[_orchestration_id][config_id]["config_depends_on"] = []
+                    row_nr += 1
+            except _csv.Error as e:
+                raise UserException(f"CSV error for table {table_datajob.name}, please check field sizes of "
+                                    f"row {row_nr + 1}. "
+                                    f"Max field size = {csv.field_size_limit(sys.maxsize)}") from e
+            return d
+
+    def need_to_emit_component_type_tag(self) -> bool:
+        emit_component_type_tag = False
+        if self.jobs.get("tags"):
+            if "component_type" in self.tags:
+                emit_component_type_tag = True
+                logging.info("The component will emit component_type tag for DataJobs.")
+
+        return emit_component_type_tag
+
+    def emit_datajob(self, datajob_table, orchestrations_v2_table):
+        with open(orchestrations_v2_table.full_path, mode='r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                self.client.emit_dataflow(row)
+            logging.info("Finished processing DataFlow.")
+
+        emit_component_type_tag = self.need_to_emit_component_type_tag()
+
+        d = self.make_lineage_dict(datajob_table)
+        for orchestration_id in d:
+            subset = (d[str(orchestration_id)])
+            sorted_dict = {k: v for k, v in sorted(subset.items(), key=lambda item: item[1].get('phase_index', ''))}
+            for config_id in sorted_dict:
+                row = (d[str(orchestration_id)][config_id])
+                self.client.emit_datajob(row, orchestration_id, config_id=config_id, emit_tags=emit_component_type_tag)
+        logging.info("Finished processing DataJobs.")
+
+    def emit_dataset(self, dataset_table):
+        batch = defaultdict(list)
+
+        with open(dataset_table.full_path, mode='r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                batch[row["config_id"]].append(row)
+
+        for config_id, batch in batch.items():
+            # process each batch of rows with the same config_id
+            try:
+                self.client.emit_dataset(batch)
+            except DataHubClientException as e:
+                logging.error(f"Error occured when processing the following batch: {batch}")
+                raise UserException(e) from e
+        logging.info("Finished processing DataSets.")
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    LOGGER = logging.getLogger(__name__)
+    try:
+        comp = Component()
+        # this triggers the run method by default and is controlled by the configuration.action parameter
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /src/logging_helper.py
+================================================
+from tqdm import tqdm
+import logging
+
+
+class LoggingTqdm(tqdm):
+    # from: https://github.com/tqdm/tqdm/issues/313#issuecomment-850698822
+    def __init__(
+            self,
+            *args,
+            logger: logging.Logger = None,
+            mininterval: float = 300,
+            maxinterval: int = 310,
+            bar_format: str = '{desc}{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, ' '{rate_fmt}{'
+                              'postfix}]',
+            desc: str = 'progress:',
+            **kwargs):
+        self._logger = logger
+        super().__init__(
+            *args,
+            mininterval=mininterval,
+            maxinterval=maxinterval,
+            bar_format=bar_format,
+            desc=desc,
+            **kwargs
+        )
+
+    @property
+    def logger(self):
+        if self._logger is not None:
+            return self._logger
+        return LOGGER
+
+    def display(self, msg=None, pos=None):
+        if not self.n:
+            # skip progress bar before having processed anything
+            return
+        if not msg:
+            msg = self.__str__()
+        self.logger.info('%s', msg)
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+================================================
+File: /src/scripts/ingestion_provider.py
+================================================
+from abc import abstractmethod
+from dataclasses import dataclass
+from typing import Any, Dict, NewType, Optional, Type, TypeVar
+
+import datahub.emitter.mce_builder as builder
+from datahub.configuration.common import ConfigModel
+from datahub.ingestion.api.committable import CommitPolicy, StatefulCommittable
+from datahub.ingestion.api.common import PipelineContext
+from datahub.metadata.schema_classes import DatahubIngestionCheckpointClass
+
+JobId = NewType("JobId", str)
+CheckpointJobStateType = DatahubIngestionCheckpointClass
+CheckpointJobStatesMap = Dict[JobId, CheckpointJobStateType]
+
+
+class IngestionCheckpointingProviderConfig(ConfigModel):
+    pass
+
+
+_Self = TypeVar("_Self", bound="IngestionCheckpointingProviderBase")
+
+
+@dataclass()
+class IngestionCheckpointingProviderBase(StatefulCommittable[CheckpointJobStatesMap]):
+    """
+    The base class for all checkpointing state provider implementations.
+    """
+
+    def __init__(
+        self, name: str, commit_policy: CommitPolicy = CommitPolicy.ON_NO_ERRORS
+    ):
+        # Set the initial state to an empty dict.
+        super().__init__(name, commit_policy, {})
+
+    @classmethod
+    @abstractmethod
+    def create(
+        cls: Type[_Self], config_dict: Dict[str, Any], ctx: PipelineContext, name: str
+    ) -> "_Self":
+        pass
+
+    @abstractmethod
+    def commit(self) -> None:
+        pass
+
+    @abstractmethod
+    def get_latest_checkpoint(
+        self,
+        pipeline_name: str,
+        job_name: JobId,
+    ) -> Optional[DatahubIngestionCheckpointClass]:
+        pass
+
+    @staticmethod
+    def get_data_job_urn(
+        orchestrator: str,
+        pipeline_name: str,
+        job_name: JobId,
+    ) -> str:
+        """
+        Standardizes datajob urn minting for all ingestion job state providers.
+        """
+        return builder.make_data_job_urn(orchestrator, pipeline_name, job_name)
+
+
+================================================
+File: /src/scripts/datahub_ingestion_checkpointing_provider.py
+================================================
+import logging
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from datahub.configuration.common import ConfigurationError
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.ingestion.api.common import PipelineContext
+from datahub.ingestion.api.ingestion_job_checkpointing_provider_base import (
+    IngestionCheckpointingProviderBase,
+    IngestionCheckpointingProviderConfig,
+    JobId,
+)
+from datahub.ingestion.graph.client import DatahubClientConfig, DataHubGraph
+from datahub.metadata.schema_classes import DatahubIngestionCheckpointClass, StatusClass
+
+logger = logging.getLogger(__name__)
+
+
+class DatahubIngestionStateProviderConfig(IngestionCheckpointingProviderConfig):
+    datahub_api: Optional[DatahubClientConfig] = DatahubClientConfig()
+
+
+class DatahubIngestionCheckpointingProvider(IngestionCheckpointingProviderBase):
+    orchestrator_name: str = "datahub"
+
+    def __init__(self, graph: DataHubGraph, name: str):
+        super().__init__(name)
+        self.graph = graph
+        if not self._is_server_stateful_ingestion_capable():
+            raise ConfigurationError(
+                "Datahub server is not capable of supporting stateful ingestion."
+                " Please consider upgrading to the latest server version to use this feature."
+            )
+
+    @classmethod
+    def create(
+        cls, config_dict: Dict[str, Any], ctx: PipelineContext, name: str
+    ) -> "DatahubIngestionCheckpointingProvider":
+        if ctx.graph:
+            # Use the pipeline-level graph if set
+            return cls(ctx.graph, name)
+        elif config_dict is None:
+            raise ConfigurationError("Missing provider configuration.")
+        else:
+            provider_config = DatahubIngestionStateProviderConfig.parse_obj(config_dict)
+            if provider_config.datahub_api:
+                graph = DataHubGraph(provider_config.datahub_api)
+                return cls(graph, name)
+            else:
+                raise ConfigurationError(
+                    "Missing datahub_api. Provide either a global one or under the state_provider."
+                )
+
+    def _is_server_stateful_ingestion_capable(self) -> bool:
+        server_config = self.graph.get_config() if self.graph else None
+        if server_config and server_config.get("statefulIngestionCapable"):
+            return True
+        return False
+
+    def get_latest_checkpoint(
+        self,
+        pipeline_name: str,
+        job_name: JobId,
+    ) -> Optional[DatahubIngestionCheckpointClass]:
+        logger.debug(
+            f"Querying for the latest ingestion checkpoint for pipelineName:'{pipeline_name}',"
+            f" job_name:'{job_name}'"
+        )
+
+        data_job_urn = self.get_data_job_urn(
+            self.orchestrator_name, pipeline_name, job_name
+        )
+
+        latest_checkpoint: Optional[
+            DatahubIngestionCheckpointClass
+        ] = self.graph.get_latest_timeseries_value(
+            entity_urn=data_job_urn,
+            aspect_type=DatahubIngestionCheckpointClass,
+            filter_criteria_map={
+                "pipelineName": pipeline_name,
+            },
+        )
+        if latest_checkpoint:
+            logger.debug(
+                f"The last committed ingestion checkpoint for pipelineName:'{pipeline_name}',"
+                f" job_name:'{job_name}' found with start_time:"
+                f" {datetime.utcfromtimestamp(latest_checkpoint.timestampMillis/1000)}"
+            )
+            return latest_checkpoint
+        else:
+            logger.debug(
+                f"No committed ingestion checkpoint for pipelineName:'{pipeline_name}',"
+                f" job_name:'{job_name}' found"
+            )
+
+        return None
+
+    def commit(self) -> None:
+        if not self.state_to_commit:
+            logger.warning(f"No state available to commit for {self.name}")
+            return None
+
+        for job_name, checkpoint in self.state_to_commit.items():
+            # Emit the ingestion state for each job
+            logger.info(
+                f"Committing ingestion checkpoint for pipeline:'{checkpoint.pipelineName}', "
+                f"job:'{job_name}'"
+            )
+
+            self.committed = False
+
+            datajob_urn = self.get_data_job_urn(
+                self.orchestrator_name,
+                checkpoint.pipelineName,
+                job_name,
+            )
+
+            self.graph.emit_mcp(
+                # We don't want the state payloads to show up in search. As such, we emit the
+                # dataJob aspects as soft-deleted. This doesn't affect the ability to query
+                # them using the timeseries API.
+                MetadataChangeProposalWrapper(
+                    entityUrn=datajob_urn,
+                    aspect=StatusClass(removed=True),
+                )
+            )
+            self.graph.emit_mcp(
+                MetadataChangeProposalWrapper(
+                    entityUrn=datajob_urn,
+                    aspect=checkpoint,
+                )
+            )
+
+            self.committed = True
+
+            logger.debug(
+                f"Committed ingestion checkpoint for pipeline:'{checkpoint.pipelineName}', "
+                f"job:'{job_name}'"
+            )
+
+
+================================================
+File: /src/utils.py
+================================================
+from dateutil.parser import parse, ParserError
+from datetime import datetime
+from definitions import field_type_mapping
+import ast
+import logging
+
+from datahub.metadata.schema_classes import StringTypeClass
+from datahub.api.entities.datajob import DataJob, DataFlow
+from datahub.emitter.mce_builder import make_dataset_urn
+import datahub.emitter.mce_builder as builder
+
+
+ORCHESTRATOR = "keboola"
+
+
+def _lst_of_dicts_to_row_as_dict(row: dict) -> dict:
+    lst_of_dicts = ast.literal_eval(row["table_level_md"])
+    return {k: v for d in lst_of_dicts for k, v in d.items()}
+
+
+def get_dataset_urn(project_name, bucket_name, name):
+    urn_pre = project_name + "." + bucket_name + "." + name
+    return make_dataset_urn(platform=ORCHESTRATOR, name=urn_pre, env="PROD")
+
+
+def get_field_type(field: str, row: dict):
+    """
+    Args:
+        field: str
+        row: dict
+    Returns: Field type class
+    """
+    row_as_dict = _lst_of_dicts_to_row_as_dict(row)
+    field_type = "STRING"  # default field type in case assigning logic fails
+    if field in row_as_dict:
+        try:
+            fields = row_as_dict[field]
+            for table_item in fields:
+                if table_item.endswith("datatype.type"):
+                    field_type = fields[table_item]
+        except KeyError:
+            field_type = "STRING"
+        if field_type.lower() in field_type_mapping.keys():
+            type_class = field_type_mapping[field_type.lower()]
+            logging.debug(f"Field type: {field_type}, translated to type class: {str(type_class)}", )
+        else:
+            type_class = StringTypeClass
+    else:
+        type_class = StringTypeClass
+    return type_class()
+
+
+def get_native_field_type(field: str, row: dict) -> str:
+    """
+    Args:
+        field: str
+        row: dict
+    Returns: Field type as string
+    """
+    row_as_dict = _lst_of_dicts_to_row_as_dict(row)
+    field_type = "STRING"  # default field type in case assigning logic fails
+    if field in row_as_dict:
+        try:
+            fields = row_as_dict[field]
+            for table_item in fields:
+                if table_item.endswith("datatype.type"):
+                    field_type = fields[table_item]
+        except KeyError:
+            field_type = "STRING"
+    return field_type
+
+
+def get_field_description(field: str, row: dict) -> str:
+    """
+    Args:
+        field:
+        row:
+    Returns: description as string
+    """
+    row_as_dict = _lst_of_dicts_to_row_as_dict(row)
+    description = ""
+    if field in row_as_dict:
+        try:
+            fields = row_as_dict[field]
+            for table_item in fields:
+                if table_item.endswith("description"):
+                    description = fields[table_item]
+        except KeyError:
+            pass
+    return description
+
+
+def need_to_emit_alias_tag(row) -> bool:
+    """
+    Sets alias tag based on Keboola metadata.
+    """
+    if row["is_alias"] == "True":
+        return True
+    return False
+
+
+def need_to_emit_deprecated_tag(row, deprecated_in):
+    """
+    Compares the last_change date from Keboola with current date.
+    If the delta is bigger than param deprecated_in, tags the data as deprecated.
+    """
+    try:
+        last_change = parse(row["last_change_date"])
+    except ParserError:
+        logging.info(f"Cannot decide if deprecated for {row['id']} due to last_change_date "
+                     f"{row['last_change_date']} being unparsable")
+        return False
+    tz_info = last_change.tzinfo
+    delta = datetime.now(tz_info) - last_change
+    if delta.days > deprecated_in:
+        return True
+    return False
+
+
+def make_upstream_urns(row, orchestration_id: str, cluster="PROD", orchestrator=ORCHESTRATOR):
+    urn_list = []
+    dataflow = (DataFlow(cluster=cluster, orchestrator=orchestrator, id=orchestration_id))
+    for config_id in row["config_depends_on"]:
+        datajob = DataJob(flow_urn=dataflow.urn, id=config_id)
+        urn_list.append(datajob.urn)
+    return urn_list
+
+
+def extract_ip_port(url):
+    if url.startswith("http://"):
+        parts = url[len("http://"):].split(":")
+        if len(parts) == 1:
+            return parts[0], 80
+        else:
+            return parts[0], int(parts[1])
+    elif url.startswith("https://"):
+        parts = url[len("https://"):].split(":")
+        if len(parts) == 1:
+            return parts[0], 443
+        else:
+            return parts[0], int(parts[1])
+    else:
+        raise ValueError("Invalid URL format: " + url)
+
+
+def build_input_datasets(batch, env="PROD", platform=ORCHESTRATOR):
+    input_datasets = []
+    for row in batch:
+        urn = builder.make_dataset_urn(platform=platform, name=row["source_urn_pre"], env=env)
+        input_datasets.append(urn)
+    return input_datasets
+
+
+def build_output_datasets(batch, env="PROD", platform=ORCHESTRATOR):
+    output_datasets = []
+    for row in batch:
+        urn = builder.make_dataset_urn(platform=platform, name=row["destination_urn_pre"], env=env)
+        output_datasets.append(urn)
+    return output_datasets
+
+
+def build_urn_pre(row):
+    """
+    Extracts the source and destination URN prefixes from the storage_inputs_sources and
+    storage_outputs_destinations values in the given row, and adds them as new keys
+    'source_urn_pre' and 'destination_urn_pre', respectively.
+
+    If storage_inputs_sources or storage_outputs_destinations are empty, a warning will be logged,
+    and the respective URN prefix will be set to a default value.
+
+    Args:
+        row (dict): A dictionary containing keys 'storage_inputs_sources', 'storage_outputs_destinations',
+                    and 'project_name'.
+
+    Returns:
+        None. The function updates the given row dictionary in-place.
+    """
+    if not row["storage_inputs_sources"]:
+        msg = f"config_id: {row['config_id']}, project_id: {row['project_id']}, name: {row['name']}"
+        logging.debug(f"Empty storage_inputs_sources in row: {msg}")
+        row["source_urn_pre"] = "EMPTY_SOURCE"
+    else:
+        source = row["storage_inputs_sources"].split(".", 1)[1] if "." in row["storage_inputs_sources"] else \
+            row["storage_inputs_sources"]
+        row["source_urn_pre"] = f"{row['project_name']}.{source}" if "." in row[
+            "storage_inputs_sources"] else source
+
+    if not row["storage_outputs_destinations"]:
+        msg = f"config_id: {row['config_id']}, project_id: {row['project_id']}, name: {row['name']}"
+        logging.debug(f"Empty storage_outputs_destinations in row: {msg}")
+        row["destination_urn_pre"] = "EMPTY_DESTINATION"
+    else:
+        dest = row["storage_outputs_destinations"].split(".", 1)[1] if "." in row[
+            "storage_outputs_destinations"] else \
+            row["storage_outputs_destinations"]
+        row["destination_urn_pre"] = f"{row['project_name']}.{dest}" if "." in row["storage_outputs_destinations"] \
+            else dest
+
+
+================================================
+File: /src/client.py
+================================================
+import ast
+import logging
+import http.client
+import ssl
+import json
+import socket
+import backoff
+
+from typing import List, Optional
+
+import datahub.configuration.common
+import requests.exceptions
+from datahub.api.entities.datajob import DataJob, DataFlow
+import datahub.emitter.mce_builder as builder
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.emitter.rest_emitter import DatahubRestEmitter
+from datahub.emitter.mce_builder import make_data_platform_urn, make_tag_urn
+from datahub.configuration.common import ConfigurationError, OperationalError
+from datahub.ingestion.graph.client import DataHubGraph, DatahubClientConfig
+from datahub.metadata.schema_classes import (
+    DatasetPropertiesClass,
+    ChangeTypeClass,
+    AuditStampClass,
+    OtherSchemaClass,
+    SchemaMetadataClass,
+    SchemaFieldClass,
+    SchemaFieldDataTypeClass,
+    GlobalTagsClass,
+    TagAssociationClass, DataJobInputOutputClass, TimeStampClass)
+
+from utils import (
+    ORCHESTRATOR,
+    get_field_type,
+    get_native_field_type,
+    get_field_description,
+    need_to_emit_alias_tag,
+    need_to_emit_deprecated_tag,
+    make_upstream_urns,
+    extract_ip_port,
+    build_input_datasets,
+    build_output_datasets,
+    build_urn_pre)
+
+
+class DataHubClientException(Exception):
+    pass
+
+
+class DataHubClient:
+
+    def __init__(self, server_address, datahub_token, current_time_unix, deprecated_in: int = 90):
+        self.server_address = server_address
+        self.datahub_token = datahub_token
+        self.current_time_unix = current_time_unix
+        self.deprecated_in = deprecated_in
+
+        try:
+            self.emitter = self.get_emitter()
+            self.graph = self.get_graph()
+        except requests.exceptions.JSONDecodeError:
+            raise DataHubClientException("Received invalid response from DataHub server "
+                                         "when initializing DataHub client.")
+        except requests.exceptions.InvalidURL as e:
+            raise DataHubClientException(f"Invalid URL when initializing DataHub client: {e}")
+        except requests.exceptions.ConnectionError as e:
+            raise DataHubClientException(f"Cannot connect to {self.server_address}") from e
+
+    def get_emitter(self):
+        return DatahubRestEmitter(gms_server=self.server_address, token=self.datahub_token, extra_headers={})
+
+    def get_graph(self):
+        try:
+            return DataHubGraph(DatahubClientConfig(server=self.server_address, token=self.datahub_token))
+        except ConfigurationError as e:
+            if "connected to the frontend instead of the GMS endpoint" in str(e):
+                raise DataHubClientException(
+                    "Invalid server address. Please check if the address points to the GMS endpoint.") from e
+            else:
+                raise DataHubClientException("Cannot Initialize DataHub Graph.") from e
+
+    def emit_properties(self, row, dataset_urn) -> None:
+        dataset_properties = DatasetPropertiesClass(
+            description=row['description'],
+            name=row['name'],
+            lastModified=TimeStampClass(
+                time=self.current_time_unix, actor="urn:li:corpuser:ingestion"
+            ),
+            customProperties={
+                'primary_key': row['primary_key'],
+                'last_imported': str(row['last_import_date']),  # metadata,
+                'last_changed': str(row['last_change_date']),  # metadata,
+                'rows_count': str(row['rows_count']),  # metadata,
+                'data_size': str(row['data_size_bytes'])  # metadata,
+            })
+
+        metadata_event = MetadataChangeProposalWrapper(
+            entityType="dataset",
+            changeType=ChangeTypeClass.UPSERT,
+            entityUrn=dataset_urn,
+            aspectName="datasetProperties",
+            aspect=dataset_properties)
+
+        self.emitter.emit(metadata_event)
+
+    def emit_schema(self, row, dataset_urn) -> None:
+        """Method responsible for creating datasets."""
+        event = MetadataChangeProposalWrapper(
+            entityType="dataset",
+            changeType=ChangeTypeClass.UPSERT,
+            entityUrn=dataset_urn,
+            aspectName="schemaMetadata",
+            aspect=SchemaMetadataClass(
+                schemaName=row['name'],  # not used
+                platform=make_data_platform_urn(ORCHESTRATOR),  # important <- platform must be an urn
+                version=1,
+                # when the source system has a notion of versioning of schemas, insert this in, otherwise
+                # leave as 0
+                hash="",
+                platformSchema=OtherSchemaClass(rawSchema="__insert raw schema here__"),
+                lastModified=AuditStampClass(
+                    time=self.current_time_unix, actor="urn:li:corpuser:ingestion"
+                ),
+                fields=self._get_schema_metadata(row)
+            ))
+
+        self._emit_schema_with_retry(event)
+
+    @backoff.on_exception(backoff.expo, OperationalError, max_tries=5)
+    def _emit_schema_with_retry(self, event):
+        self.emitter.emit(event)
+
+    def _get_schema_metadata(self, row):
+        fields: List[SchemaFieldClass] = []
+        for field in ast.literal_eval(row["table_columns"]):
+            schema_field = SchemaFieldClass(
+                fieldPath=field,
+                type=SchemaFieldDataTypeClass(type=get_field_type(field, row)),
+                nativeDataType=get_native_field_type(field, row),
+                description=get_field_description(field, row),
+                lastModified=AuditStampClass(
+                    time=self.current_time_unix, actor="urn:li:corpuser:ingestion"
+                )
+            )
+            fields.append(schema_field)
+        return fields
+
+    def emit_tags(self, row, tags, dataset_urn) -> None:
+        tags_to_add = []
+        for tag in tags:
+            if tag == "stage":
+                bucket_id = row["bucket_id"]
+                tags_to_add.append("stage-" + str(bucket_id.split(".")[0]))
+
+            if tag == "is_alias":
+                if need_to_emit_alias_tag(row):
+                    tags_to_add.append(tag)
+
+            if tag == "is_deprecated":
+                if need_to_emit_deprecated_tag(row, self.deprecated_in):
+                    tags_to_add.append(tag)
+
+        if len(tags_to_add) > 0:
+            for tag_to_add in tags_to_add:
+
+                try:
+                    current_tags: Optional[GlobalTagsClass] = self.graph.get_aspect(
+                        entity_urn=dataset_urn,
+                        aspect_type=GlobalTagsClass,
+                    )
+                except requests.exceptions.HTTPError:
+                    logging.warning(f"Cannot fetch existing tags for urn: {dataset_urn}")
+                    current_tags = None
+
+                tag_to_add = make_tag_urn(tag_to_add)
+                tag_association_to_add = TagAssociationClass(tag=tag_to_add)
+
+                need_write = False
+                if current_tags:
+                    if tag_to_add not in [x.tag for x in current_tags.tags]:
+                        current_tags.tags.append(TagAssociationClass(tag_to_add))
+                        need_write = True
+                else:
+                    current_tags = GlobalTagsClass(tags=[tag_association_to_add])
+                    need_write = True
+                if need_write:
+                    event: MetadataChangeProposalWrapper = MetadataChangeProposalWrapper(
+                        entityUrn=dataset_urn,
+                        aspect=current_tags,
+                    )
+                    try:
+                        self.graph.emit(event)
+                    except OperationalError as e:
+                        raise DataHubClientException(
+                            f"Encountered error when emitting tag {tag_to_add} for dataset_urn: "
+                            f"{dataset_urn}") from e
+
+    def emit_dataflow(self, row: dict,
+                      cluster: str = "PROD",
+                      orchestrator: str = ORCHESTRATOR) -> None:
+
+        dataflow = DataFlow(cluster=cluster,
+                            orchestrator=orchestrator,
+                            id=row["id"],
+                            name=row["name"],
+                            description=row["description"])
+        dataflow.properties["created_time"] = row["created_time"]
+        dataflow.properties["is_disabled"] = row["is_disabled"]
+        dataflow.properties["is_deleted"] = row["is_deleted"]
+        dataflow.emit(self.emitter)
+        logging.debug(f"Emitted dataflow for orchestration {row['name']}")
+
+    def emit_datajob(self, row, orchestration_id, config_id, cluster="PROD", orchestrator=ORCHESTRATOR,
+                     emit_tags: bool = False):
+        urn_list = make_upstream_urns(row, orchestration_id=orchestration_id)
+        dataflow = DataFlow(cluster=cluster, orchestrator=orchestrator, id=orchestration_id)
+
+        if row["config_depends_on"]:
+            datajob = DataJob(flow_urn=dataflow.urn,
+                              id=config_id,
+                              name=row["config_name"],
+                              description=row["config_description"],
+                              upstream_urns=urn_list)
+        else:
+            datajob = DataJob(flow_urn=dataflow.urn,
+                              id=config_id,
+                              name=row["config_name"],
+                              description=row["config_description"])
+
+        datajob.properties["mode"] = row["mode"]
+        datajob.properties["continue_on_failure"] = row["continue_on_failure"]
+        datajob.properties["enabled"] = row["enabled"]
+        datajob.properties["config_created"] = row["config_created"]
+        datajob.properties["config_component_type"] = row["config_component_type"]
+        datajob.properties["config_is_deleted"] = row["config_is_deleted"]
+
+        if emit_tags:
+            datajob.tags = {row["config_component_type"]}
+
+        datajob.emit(self.emitter)
+        logging.debug(f"Emitted datajob for config with name {row['config_name']}")
+
+    def create_keboola_logo(self):
+
+        headers_list = {
+            "Accept": "*/*",
+            "User-Agent": "Thunder Client (https://www.thunderclient.com)",
+            "Authorization": f"Bearer {self.datahub_token}",
+            "Content-Type": "application/json"
+        }
+
+        payload = json.dumps({
+            "entity": {
+                "value": {
+                    "com.linkedin.metadata.snapshot.DataPlatformSnapshot": {
+                        "aspects": [
+                            {
+                                "com.linkedin.dataplatform.DataPlatformInfo": {
+                                    "datasetNameDelimiter": ".",
+                                    "name": "keboola",
+                                    "type": "OTHERS",
+                                    "logoUrl": "https://avatars.githubusercontent.com/u/1424387?s=200&v=4"
+                                }
+                            }
+                        ],
+                        "urn": "urn:li:dataPlatform:keboola"
+                    }
+                }
+            }})
+
+        try:
+            ip, port = extract_ip_port(self.server_address)
+            logging.info(f"Inferred hostname/ip: {ip}, port: {port}")
+        except ValueError:
+            logging.info(
+                f"Unable to Obtain url/hostname and port from DataHub server address: {self.server_address} "
+                f"This means that the component cannot emit Keboola logo into target DataHub instance.")
+            return
+
+        conn = http.client.HTTPConnection(ip, port)
+
+        try:
+            conn.request("POST", "/entities?action=ingest", payload, headers_list)
+            response = conn.getresponse()
+            if response.status == 200:
+                logging.info("Keboola logo has been emitted successfully")
+            else:
+                logging.warning(
+                    f"Failed to emit Keboola logo. Response status: {response.status}, reason: {response.reason},"
+                    f" content: {response.read()}")
+        except (ssl.SSLError, socket.gaierror) as e:
+            logging.error(f"Cannot emit Keboola logo due to error: {e}")
+        except Exception as e:
+            logging.error(f"Cannot emit Keboola logo due to unspecified error: {e}")
+
+    def _process_emitting_dataset(self, batch, orchestrator=ORCHESTRATOR, cluster="PROD"):
+        datajob_input_output = DataJobInputOutputClass(
+            inputDatasets=build_input_datasets(batch),
+            outputDatasets=build_output_datasets(batch)
+        )
+        # Construct a MetadataChangeProposalWrapper object.
+        # NOTE: This will overwrite all the existing lineage information associated with this job.
+        urn = builder.make_data_job_urn(
+                orchestrator=orchestrator, flow_id=set(item["orchestration_id"] for item in batch).pop(),
+                job_id=set(item["config_id"] for item in batch).pop(), cluster=cluster)
+
+        datajob_input_output_mcp = MetadataChangeProposalWrapper(
+            entityType="dataJob",
+            changeType=ChangeTypeClass.UPSERT,
+            entityUrn=urn,
+            aspectName="dataJobInputOutput",
+            aspect=datajob_input_output)
+
+        self.emitter.emit_mcp(datajob_input_output_mcp)
+
+    def emit_dataset(self, batch):
+        for row in batch:
+            build_urn_pre(row)
+        try:
+            self._process_emitting_dataset(batch)
+        except datahub.configuration.common.OperationalError as e:
+            raise DataHubClientException(e) from e
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - echo 'Pushing test image to repo. [tag=test]'
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/logger
+================================================
+standard
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+LinkedIn's DataHub is an open-source metadata management and discovery platform that serves as a centralized repository for storing and managing metadata about various data assets, enabling effective data governance and collaboration within organizations. It provides a unified interface for data engineers and scientists to explore, search, and document data resources, track their lineage, and facilitate data-driven decision-making.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+How to setup Datahub: https://help.keboola.com/templates/datahub/
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+This application can be used to emit Keboola's metadata into Datahub instance.
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "extractor configuration",
+  "required": [
+    "#datahub_token",
+    "server_address"
+  ],
+  "properties": {
+    "#datahub_token": {
+      "type": "string",
+      "title": "Datahub Token",
+      "format": "password",
+      "description": "Datahub Token",
+      "propertyOrder": 1
+    },
+    "server_address": {
+      "type": "string",
+      "title": "Datahub server address",
+      "description": "Datahub server address as url or IP in format (http://IP:PORT)",
+      "propertyOrder": 2
+    },
+    "jobs": {
+      "type": "object",
+      "title": "Jobs",
+      "description": "Select which jobs is the component supposed to do.",
+      "properties": {
+        "properties": {
+          "type": "boolean",
+          "format": "checkbox"
+        },
+        "schema": {
+          "type": "boolean",
+          "format": "checkbox"
+        },
+        "tags": {
+          "type": "boolean",
+          "format": "checkbox"
+        },
+        "data_lineage": {
+          "type": "boolean",
+          "format": "checkbox"
+        }
+      },
+      "propertyOrder": 3
+    },
+    "tags": {
+      "type": "array",
+      "title": "Tags",
+      "format": "select",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "is_alias",
+          "is_deprecated",
+          "stage",
+          "component_type"
+        ]
+      },
+      "options": {
+        "dependencies": {
+          "jobs.tags": true
+        }
+      },
+      "description": "Select which tags to emit.",
+      "propertyOrder": 4
+    },
+    "deprecated_in": {
+      "type": "integer",
+      "title": "Deprecates in",
+      "default": 90,
+      "description": "Days after data becomes tagged with deprecated tag (uses last_updated_at value).",
+      "propertyOrder": 5
+    },
+    "exclude_dev_branch_data": {
+      "type": "boolean",
+      "title": "Exclude dev branch data",
+      "default": true,
+      "description": "If set to true, the component does not process data from dev branch.",
+      "propertyOrder": 6
+    }
+  }
+}
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+fi
+
+echo "Updating logger settings"
+
+value=`cat component_config/logger`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} logger --value="$value"
+else
+    echo "logger type is empty!"
+fi
+
+echo "Updating logger configuration"
+value=`cat component_config/loggerConfiguration.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} loggerConfiguration --value="$value"
+else
+    echo "loggerConfiguration is empty!"
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.component==1.3.5
+keboola.utils
+# keboola.http-client
+mock
+freezegun
+acryl-datahub==0.10.2.2
+urllib3
+python-dateutil
+tqdm
+backoff
+pydantic==1.10.2
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.6-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# DataHub
+
+Datahub application can be used to populate Keboola metadata into DataHub instance.
+Please use the [DataHub template](https://help.keboola.com/templates/datahub/) which provides a one click setup.
+
+The following information in mean mainly for maintainers of the component.
+
+
+## Prerequisites
+
+- Running DataHub instance (The instance must have all services including gms running.)
+- Input tables are described in the Input section of this readme.
+
+## Configuration
+
+* Datahub Token (#datahub_token): Is used to authenticate.
+* Server Address (server_address): Address of DataHub instance, must include http:// or https:// prefix.
+* Jobs (jobs): Is used to select what jobs you want to process.
+* Tags (tags): If "tags" job is selected, this is used to pick what tags are emitted.
+* Deprecates in (deprecates_in): This option defines after how many days of no updates a dataset is tagged as "deprecated".
+* Exclude dev branch data (exclude_dev_branch_data): If this option is enabled, the component does not emit dev branch data.
+
+
+### Sample Configuration
+
+```json
+{
+  "parameters": {
+    "jobs": {
+      "tags": true,
+      "schema": true,
+      "properties": true,
+      "data_lineage": true
+    },
+    "tags": [
+      "is_alias",
+      "is_deprecated",
+      "stage",
+      "component_type"
+    ],
+    "deprecated_in": 90,
+    "#datahub_token": "KBC::ProjectSecure::xxxxxxxx",
+    "server_address": "http://datahub.keboola.com:8080",
+    "exclude_dev_branch_data": true
+  }
+}
+
+```
+
+## Input
+
+- Input tables must be set up using [DataHub template](https://help.keboola.com/templates/datahub/). 
+- Required tables are:
+    `table-level-metadata.csv` - is needed to process "tags", "schema" and "properties"
+    `orchestrations_v2.csv`, `datajob.csv`, `dataset.csv` - is needed to process "data_lineage"
+    
+
+## Output
+
+Outputs are stored in Datahub instance
+
+## Development
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to
+your custom path in the `docker-compose.yml` file:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clone this repository, init the workspace and run the component with following
+command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+git clone https://bitbucket.org/kds_consulting_team/kds-team.app-datahub/src/master/ kds-team.app-datahub
+cd kds-team.app-datahub
+docker-compose build
+docker-compose run --rm dev
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run the test suite and lint check using this command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose run --rm test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+## Integration
+
+For information about deployment and integration with KBC, please refer to the
+[deployment section of developers
+documentation](https://developers.keboola.com/extend/component/deployment/)
+

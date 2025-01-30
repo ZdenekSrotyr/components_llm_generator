@@ -1,0 +1,1447 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-data-quality-test/
+    ├── .travis.yml
+    ├── README_template.md
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   └── component.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /.travis.yml
+================================================
+sudo: false
+
+services:
+  - docker
+
+jobs:
+  include:
+    - stage: tests
+      script:
+        - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+        - docker run $APP_IMAGE python -m unittest discover
+      # push test image to ECR - uncomment for testing before deployment
+      #  - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+      #  - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+      #  - docker tag $APP_IMAGE:latest $REPOSITORY:test
+      #  - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+      #  - docker push $REPOSITORY:test
+      #  - docker pull quay.io/keboola/syrup-cli:latest
+    - stage: deploy_dev_portal
+      if: branch = master
+      script: "./scripts/update_dev_portal_properties.sh"
+    - stage: deploy
+      if: tag IS present AND  branch = master
+      script: "./deploy.sh"
+
+
+before_script:
+  - export APP_IMAGE=keboola-component
+  - docker -v
+  - docker build -t $APP_IMAGE .
+
+
+after_success:
+  - docker images
+
+
+================================================
+File: /README_template.md
+================================================
+# KBC Component
+
+Description
+
+**Table of contents:**  
+  
+[TOC]
+
+
+# Functionality notes
+
+
+# Configuration
+
+## Param 1
+
+## Param 2
+
+
+## Development
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path in the docker-compose file:
+
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone repo_path my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.1**
+
+- fix requirements
+- add src folder to path for tests
+
+**0.1.0**
+
+- src folder structure
+- remove dependency on handler lib - import the code directly to enable modifications until its released
+
+**0.0.2**
+
+- add dependency to base lib
+- basic tests
+
+**0.0.1**
+
+- add utils scripts
+- move kbc tests directly to pipelines file
+- use uptodate base docker image
+- add changelog
+
+
+================================================
+File: /src/component.py
+================================================
+import json
+import logging
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+from great_expectations.dataset import SqlAlchemyDataset
+from kbc.env_handler import KBCEnvHandler
+from snowflake.connector import connect
+from snowflake.connector.pandas_tools import write_pandas
+from snowflake.sqlalchemy import URL
+from sqlalchemy import create_engine
+
+sys.tracebacklimit = 3
+
+# configuration variables
+TABLES_DICT = 'tables'
+OUTPUT_BUCKET = 'output_bucket'
+
+# #### Keep for debug
+KEY_DEBUG = 'debug'
+
+MANDATORY_PARS = [TABLES_DICT, OUTPUT_BUCKET]
+MANDATORY_IMAGE_PARS = []
+
+# for easier local project setup
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent.joinpath('data').as_posix() \
+    if not os.environ.get('KBC_DATADIR') else None
+
+APP_VERSION = 'DEV'
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, debug=False):
+        KBCEnvHandler.__init__(self, MANDATORY_PARS,
+                               log_level='DEBUG' if debug else 'INFO')  # override debug from config
+        if self.cfg_params.get(KEY_DEBUG):
+            debug = True
+        if debug:
+            logging.getLogger().setLevel(logging.DEBUG)
+        logging.info('Running version %s', APP_VERSION)
+        logging.info('Loading configuration...')
+        logging.getLogger('snowflake.connector').setLevel(logging.WARNING)  # avoid detail logs from the library
+
+        try:
+            self.validate_config(MANDATORY_PARS)
+            self.validate_image_parameters(MANDATORY_IMAGE_PARS)
+        except ValueError as e:
+            logging.exception(e)
+            exit(1)
+
+    def create_manifest(self, table_path, columns, primary_keys, incremental_flag, destination):
+        with open(table_path + '.manifest', 'w') as _man_file:
+            json.dump(
+                {
+                    'columns': columns,
+                    'incremental': incremental_flag,
+                    'primary_key': primary_keys,
+                    'destination': destination
+                },
+                _man_file
+            )
+
+    def get_table_columns(self, table_name):
+        """
+        outputs list of two values - list of columns available for the table and the table name
+        """
+        with open(f'{self.tables_in_path}/{table_name}.manifest') as manifest:
+            man_file = json.load(manifest)
+            try:
+                return man_file['columns'], table_name
+            except KeyError:
+                logging.error(f'The manifest for table {table_name} does not contain the key columns!')
+                sys.exit(1)
+            except Exception as e:
+                logging.error('Exception encountered in the get_table_columns function.')
+                logging.error(e)
+                sys.exit(1)
+
+    def get_table_columns_types(self, table_name):
+        """
+        outputs a dictionary - dict(column_name:type)
+        """
+        with open(f'{self.tables_in_path}/{table_name}.manifest') as manifest:
+            column_metadata = json.load(manifest)["column_metadata"]
+            column_types = {}
+            for column_name in column_metadata.keys():
+                for metadata_set in column_metadata[column_name]:
+                    try:
+                        if metadata_set["key"] == "KBC.datatype.basetype":
+                            column_types[column_name] = metadata_set["value"]
+                    except KeyError:
+                        pass
+                if column_name in column_types:
+                    pass
+                else:
+                    column_types[column_name] = 'VARCHAR(16777216)'
+        return column_types
+
+    def get_tables_coltypes(self):
+        """
+        outputs a dictionary - table_name:dict(column_name:type)
+        """
+        input_tables = [re.sub('.manifest$', '', i) for i in os.listdir(self.tables_in_path) if
+                        ('.DS_Store' not in i)]
+        tables_column_types = {}
+        for in_table in input_tables:
+            tables_column_types[in_table] = self.get_table_columns_types(in_table)
+
+        return tables_column_types
+
+    def get_required_columns_from_test(self, table_name, test_name, test_specs):
+        """
+        outputs list of two values - list of columns required for the test and the table name
+        arguments:
+        table_name --
+        test_name --
+        test-specs --
+        """
+        if 'expect_column_pair' in test_name:
+            return test_specs.split(',')[:2], table_name
+
+        elif 'expect_multicolumn' in test_name:
+            return test_specs.split(',')[0], table_name
+
+        elif 'expect_column' in test_name:
+            return [test_specs.split(',')[0].lstrip('\'').rstrip('\'')], table_name
+
+        elif 'expect_table' in test_name:
+            return [], table_name
+
+        elif 'expect_file' in test_name:
+            logging.error('File tests are not supported.')
+
+    def check_required_vs_available_columns(self):
+        """
+        returns three dictionaries
+        missing_columns - {table:[col_list]}. contains info about columns that are required for the tests but not
+                          available
+        available_columns - {table:[col_list]}. contains info about columns that are present in the tables
+        available_columns - {table:[col_list]}. contains info about columns that are required for the tests
+        """
+        # get the tables in the input mapping
+        input_tables = [re.sub('.manifest$', '', i) for i in os.listdir(self.tables_in_path) if
+                        ('.DS_Store' not in i)]
+
+        # get available tables and their columns
+        available_tables_cols = {}
+        for input_table in input_tables:
+            cols_real = self.get_table_columns(table_name=input_table)
+            available_tables_cols[cols_real[1]] = cols_real[0]
+
+        # get required tables and their columns
+        required_tables_cols = {}
+        for tested_table in self.cfg_params['tables']:
+            for test in tested_table['tests']:
+                cols_required = self.get_required_columns_from_test(table_name=tested_table['table_name'],
+                                                                    test_name=test['type'],
+                                                                    test_specs=test['test_specification'])
+                if tested_table['table_name'] in required_tables_cols.keys():
+                    required_tables_cols[tested_table['table_name']].extend(cols_required[0])
+                else:
+                    required_tables_cols[tested_table['table_name']] = cols_required[0]
+
+        missing_columns = {}
+        for table in required_tables_cols.keys():
+            missing_cols_for_table = list(set(required_tables_cols[table]) - set(available_tables_cols[table]))
+            if len(missing_cols_for_table) > 0:
+                missing_columns[table] = missing_cols_for_table
+
+        return missing_columns, available_tables_cols, required_tables_cols
+
+    def build_the_rename_table_query(self, table_name):
+        """
+        returns a string
+        """
+        return f'ALTER TABLE IF EXISTS "{table_name}" RENAME TO "{table_name.upper()}"'
+
+    def build_the_rename_column_query(self, table_name, column):
+        """
+        returns a string
+        """
+        return f"ALTER TABLE IF EXISTS \"{table_name}\"  RENAME COLUMN  \"{column}\" TO {column.upper()};"
+
+    def build_the_create_or_replace_table_query(self, table_name, column_types):
+        """
+        returns a string
+        """
+        column_statements_list = [f'"{k}" :: {column_types[table_name][k]} AS "{k}"' for k in
+                                  column_types[table_name].keys()]
+        select_statement = ','.join(column_statements_list)
+        return f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT {select_statement} FROM "{table_name}"'
+
+    def build_engine(self, creds):
+        """
+        creates the engine used for connecting to the Snowflake Workspace
+        """
+        engine = create_engine(URL(
+            account=creds["account"],
+            user=creds["user"],
+            password=creds["password"],
+            database=creds["database"],
+            schema=creds["schema"],
+            warehouse=creds["warehouse"],
+            cache_column_metadata=True,
+            echo=True
+        ))
+        return engine
+
+    def execute_query(self, engine, query):
+        """
+        executes the query in the Snowflake workspace specified by the engine
+        """
+        try:
+            connection = engine.connect()
+            results = connection.execute(query).fetchall()
+            logging.info(results[0])
+        except Exception as e:
+            logging.info(repr(e))
+        finally:
+            connection.close()
+
+    def create_snfk_table_from_pd(self, df, table_name, connection):
+        """
+        loads a pandas Dataframe to a Snowflake workspace specified by credentials parameters
+        arguments:
+        creds -- dictionary containing the connection specs
+        df --
+        table -- the name of the object that will be created
+        """
+
+        columns_to_create = [f'\"{c}\" string' for c in list(df.columns)]
+        query = ','.join(columns_to_create)
+
+        connection.cursor().execute(f'CREATE OR REPLACE TABLE {table_name}({query})')
+
+        if df.shape[0] > 0:
+            success, nchunks, nrows, _ = write_pandas(conn=connection, df=df, table_name=table_name)
+            if success:
+                logging.info(f'The table {table_name} has been loaded to the snowflake workspace.')
+            # connection.close()
+            return 0
+        else:
+            logging.info(f'The table {table_name} has been loaded to the snowflake workspace, it doesn\'t have any '
+                         f'rows.')
+            # connection.close()
+            return 0
+
+    def uppercase_objects_in_snowflake_workspace(self, db_engine, available_tables_cols):
+        """
+        because GE and SqlAlchemy do not deal well with all lowercase object names, we need to uppercase all
+        all-lowercase object names before running the data quality tests
+
+        arguments:
+        available_tables_cols -- dictionary containing tables and their columns
+        db_engine --
+        """
+        for table in available_tables_cols.keys():
+            if table.lower() == table:
+                self.execute_query(engine=db_engine, query=self.build_the_rename_table_query(table_name=table))
+                logging.info(f'Object {table}: name has been uppercased')
+                result_table_name = table.upper()
+            else:
+                logging.info(f"Table {table}: table name is not all lowercase, not uppercasing this one.")
+                result_table_name = table
+            for column in available_tables_cols[table]:
+                if column == column.lower():
+                    self.execute_query(engine=db_engine,
+                                       query=self.build_the_rename_column_query(table_name=result_table_name,
+                                                                                column=column))
+            logging.info(f'Object {table}: all-lowercase columns have been uppercased')
+        logging.info('All tables have been succesfully uppercased.')
+
+        return 0
+
+    def cast_datatypes_objects_in_snowflake_workspace(self, db_engine, tables_column_types):
+        """
+        performs create or replace table and casts columns with proper datatypes
+
+        arguments:
+        tables_column_types -- dictionary containing tables and column types
+        db_engine --
+        """
+        for table in tables_column_types.keys():
+            create_or_replace_query = self.build_the_create_or_replace_table_query(table, tables_column_types)
+            self.execute_query(engine=db_engine, query=create_or_replace_query)
+            logging.info(f'Object {table}: columns have been casted')
+
+        logging.info('Casting finished')
+
+    def run_ge_tests(self, tables, engine, missing_columns):
+        """
+        this function executes the defined tests and returns two lists:
+            - ignored_tests (tests that could not be performed because of some issue and the issue details)
+            - performed_tests (test that were performed and their results)
+        """
+        ignored_tests = []
+        performed_tests = []
+        for table in tables:
+            table_name = table['table_name']
+            table_missing_columns = missing_columns.get(table_name)
+            dataset = SqlAlchemyDataset(table_name=table_name, engine=engine)  # noqa
+            for test in table['tests']:
+                t_type = test['type']
+                test_specification = test['test_specification']
+                test_column = test_specification.split(',', 1)[0].replace("'", "").strip()
+                if table_missing_columns is not None and test_column in table_missing_columns:
+                    logging.info(table_name, test_column, 'missing')
+                    ignored_tests.append([str(table_name), str(test_column), 'missing_column'])
+                else:
+                    test_result_format = test['result_format']
+                    ge_test = f'dataset.{t_type}({test_specification}, result_format="{test_result_format}")'
+                    try:
+                        expectation_result = eval(ge_test)
+                        logging.info(expectation_result)
+                        performed_tests.append([table_name,
+                                                str(expectation_result.expectation_config[
+                                                        'expectation_type']),
+                                                str(expectation_result.success),
+                                                str(expectation_result.expectation_config['kwargs']),
+                                                str(test_result_format),
+                                                str(expectation_result.result),
+                                                str(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))])
+                    except Exception as e:
+                        if 'snowflake.connector.errors.ProgrammingError' in e.args[0]:
+                            logging.info('The query sent is invalid!')
+                            logging.info(e)
+                        elif e.args[0] == 'invalid syntax':
+                            logging.info(f'The syntax of the GE function is invalid. Please check how you specified '
+                                         f'the tests for table {table_name}!')
+                            logging.info(f'The problematic test is: {e.args[1][3]}.')
+
+                        ignored_tests.append([str(table_name), str(ge_test), str(e), str(datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"))])
+                        pass
+        return ignored_tests, performed_tests
+
+    def run(self):
+        """
+        Main execution code
+        """
+        snfk_authorisation = self.configuration.get_authorization()['workspace']
+        params = self.cfg_params  # noqa
+        credentials = {
+            "account": snfk_authorisation['host'].replace('.snowflakecomputing.com', ''),
+            "user": snfk_authorisation['user'],
+            "password": snfk_authorisation['password'],
+            "database": snfk_authorisation['database'],
+            "schema": snfk_authorisation['schema'],
+            "warehouse": snfk_authorisation['warehouse']
+        }
+
+        missing_columns, available_tables_cols, required_tables_cols = self.check_required_vs_available_columns()
+        tables_n_column_types = self.get_tables_coltypes()
+
+        db_engine = self.build_engine(creds=credentials)
+        db_connection = connect(account=credentials["account"],
+                                user=credentials["user"],
+                                password=credentials["password"],
+                                database=credentials["database"],
+                                schema=credentials["schema"],
+                                warehouse=credentials["warehouse"])
+
+        # cast the columns as the datatypes specified in manifest
+        self.cast_datatypes_objects_in_snowflake_workspace(db_engine=db_engine,
+                                                           tables_column_types=tables_n_column_types)
+
+        # make sure the Great Expectations library can deal with the tables
+        self.uppercase_objects_in_snowflake_workspace(db_engine=db_engine,
+                                                      available_tables_cols=available_tables_cols)
+
+        # executes the actual tests
+        ignored_tests, performed_tests = self.run_ge_tests(tables=self.cfg_params['tables'],
+                                                           engine=db_engine,
+                                                           missing_columns=missing_columns)
+
+        # writes the failed tests table to Snowflake
+        ignored_tests_headers = ['table_name', 'test', 'exception', 'timestamp']
+        ignored_tests_df = pd.DataFrame(ignored_tests, columns=ignored_tests_headers)
+        self.create_snfk_table_from_pd(df=ignored_tests_df,
+                                       table_name='IGNORED_TESTS', connection=db_connection)
+
+        self.create_manifest(table_path=f"{self.tables_out_path}/IGNORED_TESTS", columns=ignored_tests_headers,
+                             primary_keys=ignored_tests_headers, incremental_flag=True,
+                             destination=f"in.c-{self.cfg_params['output_bucket']}.IGNORED_TESTS")
+
+        # writes the performed tests table to Snowflake
+        performed_tests_headers = ['table_name', 'test', 'success', 'config', 'log_level', 'result', 'timestamp']
+        performed_tests_df = pd.DataFrame(performed_tests, columns=performed_tests_headers)
+        self.create_snfk_table_from_pd(df=performed_tests_df,
+                                       table_name='PERFORMED_TESTS', connection=db_connection)
+
+        db_connection.close()
+        db_engine.dispose()
+
+        self.create_manifest(table_path=f"{self.tables_out_path}/PERFORMED_TESTS",
+                             columns=performed_tests_headers,
+                             primary_keys=performed_tests_headers, incremental_flag=True,
+                             destination=f"in.c-{self.cfg_params['output_bucket']}.PERFORMED_TESTS")
+
+        logging.info('success')
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        debug_arg = sys.argv[1]
+    else:
+        debug_arg = False
+    try:
+        comp = Component(debug_arg)
+        comp.run()
+        exit(0)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(1)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+#          - echo 'Pushing test image to repo. [tag=test]'
+#          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+DQ test app
+
+This app allows you to check if your datasets conform to a set of rules.
+It is based on the [Great Expectations](https://github.com/great-expectations/great_expectations) python library.
+When the component is run, a Snowflake workspace is created, the datasets specified in the input mapping are loaded in
+and during the component run, the Python programme running in the Docker Container is connecting to this workspace and
+the tests are performed in that workspace. All results are captured in the Docker Container and once all tests are
+finished, the tables containing the results are loaded into the Snowflake workspace, where from they are loaded to 
+Keboola Storage.
+
+The component outputs two tables:
+
+- PERFORMED_TESTS (tests that have been conducted)
+    - table_name: name of the table on which the test has been conducted
+    - test: name of the test
+    - success: whether the dataset passed
+    - config: the actual config of the test
+    - log_level:
+    - result: the output of the test
+    - timestamp: timestamp from when test was finished
+    
+- IGNORED TESTS (tests that have not been performed because of an issue)
+    - table_name: name of the table on which the test has been conducted
+    - test: configuration of the test
+    - exception: the exception returned
+    - timestamp: timestamp from when test was finished
+    
+
+    
+ 
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+DQ test app
+
+- **Table Input Mapping**:
+    Specify the tables you want to have checked. Make sure all necessary columns are there.
+    
+- **Table Output Mapping**:
+    The tables in the Snowflake workspace are called FAILED_TESTS and PERFORMED_TESTS. Make sure you are 
+    fetching those
+ 
+- **Add Table**:
+    Specify the tables you want to perform the tests on. Make sure the Table Name conforms to the name
+    in the input mapping
+- **Add Test**:
+    Specify the tests you want to perform on the table
+    - **Test Type**: Choose the test you want to perform
+    - **Log Level**: Specify how detailed logs you want to get back. You can use `BOOLEAN_ONLY`, `BASIC`, `SUMMARY`,
+    or `COMPLETE`. Details on the log levels [here](https://docs.greatexpectations.io/en/v0.4.0/result_format.html) (look 
+    for parameter result_format)
+    - **Test Specification**: The parameters passed to the function. You can find the specific parameters that need
+    to be passed to each expectation [here](https://docs.greatexpectations.io/en/v0.4.0/glossary.html). Please make
+    sure the column names are exactly the same as the column names in the table.
+- **Output Bucket**:
+    - The name of the output bucket. If you use value `sample`, the output bucket will be `in.c-sample`.
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+DQ test app
+Have your datasets checked with a set of predefined rules
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "title": "Config",
+  "type": "object",
+  "options": {
+    "disable_collapse": true,
+    "disable_properties": true
+  },
+  "properties": {
+    "tables": {
+      "type": "array",
+      "title": "Tables",
+      "propertyOrder": 2,
+      "uniqueItems": false,
+      "items": {
+        "type": "object",
+        "required": [
+          "table_name"
+        ],
+        "format": "table",
+        "title": "Table",
+        "properties": {
+          "table_name": {
+            "title": "Table Name",
+            "type": "string",
+            "propertyOrder": 1
+          },
+          "tests": {
+            "type": "array",
+            "title": "Tests",
+            "propertyOrder": 2,
+            "uniqueItems": false,
+            "items": {
+              "type": "object",
+              "title": "Test",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "title": "Test Type",
+                  "enum": [
+                    "expect_column_to_exist",
+                    "expect_table_columns_to_match_ordered_list",
+                    "expect_table_row_count_to_be_between",
+                    "expect_table_row_count_to_equal",
+                    "expect_table_row_count_to_equal_other_table",
+                    "expect_column_values_to_be_unique",
+                    "expect_column_values_to_be_of_type",
+                    "expect_column_values_to_be_in_type_list",
+                    "expect_column_values_to_be_in_set",
+                    "expect_column_values_to_not_be_in_set",
+                    "expect_column_values_to_be_between",
+                    "expect_column_value_lengths_to_be_between",
+                    "expect_column_value_lengths_to_equal",
+                    "expect_column_values_to_match_regex",
+                    "expect_column_values_to_not_match_regex",
+                    "expect_column_values_to_match_regex_list",
+                    "expect_column_values_to_not_match_regex_list",
+                    "expect_column_values_to_match_like_pattern",
+                    "expect_column_values_to_not_match_like_pattern",
+                    "expect_column_values_to_match_like_pattern_list",
+                    "expect_column_values_to_not_match_like_pattern_list",
+                    "expect_column_distinct_values_to_be_in_set",
+                    "expect_column_distinct_values_to_contain_set",
+                    "expect_column_distinct_values_to_equal_set",
+                    "expect_column_mean_to_be_between",
+                    "expect_column_median_to_be_between",
+                    "expect_column_quantile_values_to_be_between",
+                    "expect_column_stdev_to_be_between",
+                    "expect_column_unique_value_count_to_be_between",
+                    "expect_column_sum_to_be_between",
+                    "expect_column_pair_values_A_to_be_greater_than_B",
+                    "expect_column_pair_values_to_be_equal",
+                    "expect_column_pair_values_to_be_in_set",
+                    "expect_multicolumn_values_to_be_unique",
+                    "expect_multicolumn_sum_to_equal",
+                    "expect_column_kl_divergence_to_be_less_than",
+                    "expect_column_bootstrapped_ks_test_p_value_to_be_greater_than",
+                    "expect_column_chisquare_test_p_value_to_be_greater_than",
+                    "expect_column_parameterized_distribution_ks_test_p_value_to_be_greater_than"
+                  ],
+                  "default": "expect_column_values_to_be_in_set"
+                },
+                "test_specification": {
+                  "title": "Test Specification",
+                  "type": "string",
+                  "default": "my_var,['B', 'C', 'D', 'F', 'G', 'H']"
+                },
+                "result_format": {
+                  "type": "string",
+                  "title": "Log Level",
+                  "required": true,
+                  "enum": [
+                    "SUMMARY",
+                    "BASIC",
+                    "COMPLETE",
+                    "BOOLEAN_ONLY"
+                  ],
+                  "default": "SUMMARY"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "output_bucket": {
+      "title": "Output Bucket",
+      "type": "string",
+      "propertyOrder": 1
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.4.4.zip#egg=kbc
+mock
+requests===2.23.0
+freezegun
+great_expectations
+sqlalchemy
+snowflake-connector-python
+snowflake.sqlalchemy
+pyarrow===0.17.0
+pandas
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.7.9-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# DQ test app
+
+This app allows you to check if your datasets conform to a set of rules.
+It is based on the [Great Expectations](https://github.com/great-expectations/great_expectations) python library.
+When the component is run, a Snowflake workspace is created, the datasets specified in the input mapping are loaded in
+and during the component run, the Python programme running in the Docker Container is connecting to this workspace and
+the tests are performed in that workspace. All results are captured in the Docker Container and once all tests are
+finished, the tables containing the results are loaded into the Snowflake workspace, where from they are loaded to 
+Keboola Storage.
+
+#### Output
+The component outputs two tables:
+
+- Performed Tests (tests that have been conducted)
+    - table_name: name of the table on which the test has been conducted
+    - test: name of the test
+    - success: whether the dataset passed
+    - config: the actual config of the test
+    - result: the output of the test
+    - timestamp: the timestamp when the test was performed
+    
+- Failed Tests (tests that have not been performed because of an issue)
+    - table_name: name of the table on which the test has been conducted
+    - test: configuration of the test
+    - exception: the exception returned
+    - timestamp: the timestamp when the test was performed
+    
+
+    
+ 
+

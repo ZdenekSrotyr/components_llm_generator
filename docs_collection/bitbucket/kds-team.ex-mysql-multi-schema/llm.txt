@@ -1,0 +1,1448 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-mysql-multi-schema/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── src/
+    │   ├── mysql_connect/
+    │   │   ├── __init__.py
+    │   │   └── client.py
+    │   └── component.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/mysql_connect/client.py
+================================================
+import logging
+import time
+
+import pymysql
+import regex
+
+MAX_CHUNK_SIZE = 500000
+
+READ_TIMEOUT = 1800
+
+MAX_RETRIES = 2
+
+RETRY_CODES = [2013]
+
+
+class ClientError(Exception):
+    """
+
+    """
+
+
+class Client:
+
+    def __init__(self, host, port, user, password):
+        """Creates a mysql client and initiates connection"""
+        db_opts = {
+            'user': user,
+            'password': password,
+            'host': host,
+            'port': port,
+            'read_timeout': READ_TIMEOUT
+        }
+
+        self.db = pymysql.connect(**db_opts)
+
+    def get_available_schemas(self):
+        cur = self.__get_cursor()
+
+        sql = 'SHOW SCHEMAS'
+        rows = []
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        except Exception as e:
+            self.db.close()
+            raise ClientError(f'Failed to retrieve schemas! {e}')
+
+        return rows
+
+    def get_schemas_by_pattern(self, pattern):
+        schemas = self.get_available_schemas()
+        return [s[0] for s in schemas if regex.search(pattern, s[0])]
+
+    def get_table_data_buffered(self, table_name, schema, columns=None, row_limit=None, since_index=None,
+                                sort_key_col=None, sort_key_type=None):
+        cur = self.db.cursor()
+
+        start = time.perf_counter()
+        sql = self.__build_select_query(columns, sort_key_col, sort_key_type, since_index, row_limit, schema,
+                                        table_name)
+        rows = []
+        col_names = []
+        last_id = None
+        try:
+            if logging.DEBUG == logging.root.level:
+                # wait before each message
+                # time.sleep(0.5)
+                logging.debug(f'Executing query: {sql}')
+            cur = self.__try_execute(cur, sql, buffered=True)
+            rows = cur.fetchall()
+            if rows:
+                if logging.DEBUG == logging.root.level:
+                    logging.info(f'Fetched {len(rows)} rows from {schema}.{table_name}')
+                for i in cur.description:
+                    col_names.append(i[0])
+                last_id = self._get_last_id(rows, col_names, sort_key_col)
+
+            # timer
+            elapsed = time.perf_counter() - start
+            logging.debug(f'Query took: {elapsed:.5f}s')
+
+        except pymysql.Error as e:
+            if e.args[0] == 1146:
+                logging.warning(f'Table {table_name} does not exist in schema {schema}, '
+                                f'skipping!')
+            else:
+                raise ClientError(f'Failed to execute query {sql}!') from e
+            pass
+        except Exception as e:
+            self.db.close()
+            raise ClientError(f'Failed to execute query {sql}!') from e
+
+        return rows, col_names, str(last_id)
+
+    def get_table_data_chunks(self, table_name, schema, columns=None, row_limit=None, since_index=None,
+                              sort_key_col=None, sort_key_type=None):
+        cur = self.db.cursor(pymysql.cursors.SSCursor)
+
+        start = time.perf_counter()
+        sql = self.__build_select_query(columns, sort_key_col, sort_key_type, since_index, row_limit, schema,
+                                        table_name)
+        rows = []
+        last_id = None
+        try:
+            if logging.DEBUG == logging.root.level:
+                # wait before each message
+                # time.sleep(0.5)
+                logging.debug(f'Executing query: {sql}')
+            cur = self.__try_execute(cur, sql, buffered=False)
+            while True:
+                rows = cur.fetchmany(MAX_CHUNK_SIZE)
+                if rows:
+                    col_names = []
+                    if logging.DEBUG == logging.root.level:
+                        logging.info(f'Fetched {len(rows)} rows from {schema}.{table_name}')
+                    for i in cur.description:
+                        col_names.append(i[0])
+                    last_id = self._get_last_id(rows, col_names, sort_key_col)
+                    yield rows, col_names, str(last_id)
+                else:
+                    break
+            # timer
+            elapsed = time.perf_counter() - start
+            logging.debug(f'Query took: {elapsed:.5f}s')
+
+        except pymysql.Error as e:
+            if e.args[0] == 1146:
+                logging.warning(f'Table {table_name} does not exist in schema {schema}, '
+                                f'skipping!')
+            else:
+                raise ClientError(f'Failed to execute query {sql}!') from e
+            pass
+        except Exception as e:
+            self.db.close()
+            raise ClientError(f'Failed to execute query {sql}!') from e
+
+    def __build_select_query(self, columns, sort_key_col, sort_key_type, since_index, row_limit, schema, table_name):
+        if columns and columns != []:
+            columns = ','.join(columns)
+        else:
+            columns = '*'
+
+        sql = f'SELECT {columns} FROM {schema}.{table_name}'
+
+        if sort_key_col and since_index not in [None, 'None']:
+            if sort_key_type == 'string':
+                since_index = f"'{since_index}'"
+            sql += f' WHERE {sort_key_col} >= {since_index} ORDER BY {sort_key_col}'
+        elif sort_key_col:
+            sql += f' ORDER BY {sort_key_col}'
+
+        if row_limit:
+            sql += f' LIMIT {row_limit}'
+        return sql
+
+    def get_table_row_count(self, table_name, schema, last_index, sort_key_col, sort_key_type):
+        cur = self.db.cursor()
+        sql = f"SELECT COUNT(*) as cnt, '{last_index}' as last_index, " \
+              f"'{sort_key_col}' as sort_key_col  FROM {schema}.{table_name}"
+        if sort_key_type == 'string':
+            last_index = f"'{last_index}'"
+        if last_index and last_index != 'None':
+            sql += f' WHERE {sort_key_col} <= {last_index};'
+
+        rows = []
+        col_names = []
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            if rows:
+                for i in cur.description:
+                    col_names.append(i[0])
+
+        except Exception as e:
+            self.db.close()
+            raise ClientError(f'Failed to execute query {sql}! {e}')
+
+        return rows, col_names
+
+    def __try_execute(self, cursor, query, buffered=True):
+        retries = 1
+        retry = True
+        while retry:
+            try:
+                cursor.execute(query)
+                retry = False
+            except pymysql.Error as e:
+                if e.args[0] in RETRY_CODES and retries <= MAX_RETRIES:
+                    logging.warning(f'Query failed retrying {retries}x')
+                    time.sleep(2 ^ retries)
+                    retries += 1
+                    self.db.close()
+                    self.db.connect()
+                    if buffered:
+                        cursor = self.db.cursor()
+                    else:
+                        cursor = self.db.cursor(pymysql.cursors.SSCursor)
+                else:
+                    raise e
+        return cursor
+
+    def __get_cursor(self):
+        try:
+            self.db.ping(reconnect=True)
+        except pymysql.Error as err:
+            logging.debug(f'Ping failed, reconnecting. {err}')
+            # reconnect your cursor
+            self.db.close()
+            self.db.connect()
+        return self.db.cursor()
+
+    def _get_last_id(self, rows, col_names, index_column):
+        if not index_column:
+            return None
+        pk_index = col_names.index(index_column)
+        return rows[-1][pk_index]
+
+
+================================================
+File: /src/component.py
+================================================
+'''
+Template Component main class.
+
+'''
+
+import gzip
+
+import base64
+import csv
+import json
+import logging
+import os
+import sys
+import time
+from kbc.env_handler import KBCEnvHandler
+
+from mysql_connect.client import Client
+
+# configuration variables
+KEY_DEST_BUCKET = 'dest_bucket'
+KEY_ROW_LIMIT = 'row_limit'
+KEY_PKEY = 'pkey'
+# sort key column parameters
+KEY_SORT_KEY = 'sort_key'
+KEY_SORTKEY_TYPE = 'sort_key_type'
+KEY_SORT_KEY_COL = 'col_name'
+
+KEY_COLUMNS = 'columns'
+KEY_NAME = 'name'
+KEY_SCHEMA_PATTERN = 'schema_pattern'
+KEY_SCHEMA_LIST = 'schema_list'
+KEY_USER = 'user'
+KEY_PASSWORD = '#password'
+KEY_HOST = 'host'
+KEY_PORT = 'port'
+KEY_TABLES = 'tables'
+KEY_INCREMENTAL_FETCH = 'incremental_fetch'
+KEY_MAX_RUNTIME_SEC = 'max_runtime_sec'
+
+KEY_VALIDATION_MODE = 'validation_mode'
+
+# max runtime default 6.5hrs
+MAX_RUNTIME_SEC = 21600
+# #### Keep for debug
+KEY_DEBUG = 'debug'
+MANDATORY_PARS = [KEY_USER, KEY_PASSWORD, KEY_HOST, KEY_PORT, KEY_TABLES, [KEY_SCHEMA_PATTERN, KEY_SCHEMA_LIST]]
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, debug=False):
+        KBCEnvHandler.__init__(self, MANDATORY_PARS, )
+        # override debug from config
+        if self.cfg_params.get(KEY_DEBUG):
+            debug = True
+
+        log_level = logging.DEBUG if debug else logging.INFO
+        # setup GELF if available
+        if os.getenv('KBC_LOGGER_ADDR', None):
+            self.set_gelf_logger(log_level)
+        else:
+            self.set_default_logger(log_level)
+        logging.info('Loading configuration...')
+
+        try:
+            self.validate_config(MANDATORY_PARS)
+        except ValueError as e:
+            logging.exception(e)
+            exit(1)
+        state = self.get_state_file()
+        self.last_state = state if state else dict()
+        # init execution timer
+        self.start_time = time.perf_counter()
+        self.max_runtime_sec = float(self.cfg_params.get(KEY_MAX_RUNTIME_SEC, MAX_RUNTIME_SEC))
+        self._res_file_cache = dict()
+
+    def run(self):
+        '''
+        Main execution code
+        '''
+        params = self.cfg_params  # noqa
+
+        cl = Client(params[KEY_HOST], params[KEY_PORT], params[KEY_USER], params[KEY_PASSWORD])
+        schema_pattern = params.get(KEY_SCHEMA_PATTERN)
+        schema_list = params.get(KEY_SCHEMA_LIST)
+        if not schema_list:
+            schemas = cl.get_schemas_by_pattern(schema_pattern)
+        else:
+            schemas = schema_list
+
+        validation_mode = params.get(KEY_VALIDATION_MODE, False)
+        # iterate through schemas
+        last_state = self.get_last_state()
+        res_tables = dict()
+        last_indexes = dict()
+        total_schemas = len(schemas)
+        logging.info(f'{total_schemas} schemas found matching the filter/pattern.')
+        for i, s in enumerate(schemas):
+            logging.info(f'Dowloading all tables from schema {s}')
+            if i % 10 == 0:
+                logging.info(f'Processing {i}. schema out of {total_schemas}.')
+            table_cols, downloaded_tables_indexes = self.download_tables(s, params, last_state, cl)
+            last_indexes = {**last_indexes, **downloaded_tables_indexes}
+            res_tables = {**res_tables, **table_cols}
+            # get table counts if validation
+            if validation_mode:
+                table_cols = self.download_table_row_counts(s, params, downloaded_tables_indexes, cl)
+                res_tables = {**res_tables, **table_cols}
+            if self.is_timed_out():
+                logging.warning(f'Max exection time of {self.max_runtime_sec}s has been reached. '
+                                f'Terminating. Job will continue next run.')
+                break
+
+        # gzip and store state
+        data = json.dumps(last_indexes)
+        data_gzipped = gzip.compress(bytes(data, 'utf-8'))
+        data_gzipped = str(base64.b64encode(data_gzipped), 'utf-8')
+        self.write_state_file({'data': data_gzipped})
+
+        # store manifest
+        default_bucket = f'in.c-kds-team-ex-mysql-multi-schema-{os.getenv("KBC_CONFIGID")}'
+        if params.get(KEY_DEST_BUCKET):
+            default_bucket = params.get(KEY_DEST_BUCKET)
+        for t in res_tables:
+            self.configuration.write_table_manifest(os.path.join(self.tables_out_path, t),
+                                                    destination=f'{default_bucket}.{t}',
+                                                    columns=res_tables[t]['columns'],
+                                                    incremental=True, primary_key=res_tables[t]['pk'])
+        self._close_res_stream()
+
+    def download_tables(self, schema, params, last_state, client):
+        """
+        Download tables using buffered cursor (in-mem full result)
+        """
+        cl = client
+        downloaded_tables = {}
+        downloaded_tables_indexes = dict()
+        for t in params[KEY_TABLES]:
+            incremental_fetch = t.get(KEY_INCREMENTAL_FETCH, True)
+            name = t[KEY_NAME]
+            columns = t[KEY_COLUMNS]
+            pkey = t.get(KEY_PKEY)
+            last_index = None
+            row_limit = None
+            sort_key = dict()
+            if not isinstance(pkey, list):
+                pkey = [pkey]
+            if incremental_fetch:
+                row_limit = params.get(KEY_ROW_LIMIT)
+                sort_key = t.get(KEY_SORT_KEY, {KEY_SORTKEY_TYPE: 'numeric', KEY_SORT_KEY_COL: ','.join(pkey)})
+                last_index = last_state.get(schema, {}).get(name)
+
+            # get sort key
+            # validate
+            if incremental_fetch and len(pkey) > 1 and not t.get(KEY_SORT_KEY):
+                raise Exception(
+                    f'Table "{name}" containing a composite pkey is set to incremental fetch '
+                    f'but no sort key is specified! ')
+
+            logging.debug(f"Downloading table '{name}' from schema '{schema}''.")
+
+            buffered_cursor = False if not incremental_fetch or (
+                    incremental_fetch and int(row_limit) > 500000) else True
+            if buffered_cursor:
+                downloaded_tables, downloaded_tables_indexes = self.get_table_data(name, schema, columns, pkey,
+                                                                                   row_limit, last_index,
+                                                                                   sort_key,
+                                                                                   downloaded_tables,
+                                                                                   downloaded_tables_indexes, cl)
+            else:
+                downloaded_tables, downloaded_tables_indexes = self.get_table_data_chunks(name, schema, columns, pkey,
+                                                                                          row_limit, last_index,
+                                                                                          sort_key,
+                                                                                          downloaded_tables,
+                                                                                          downloaded_tables_indexes, cl)
+            if self.is_timed_out():
+                logging.warning(f'Max exection time of {self.max_runtime_sec}s has been reached. '
+                                f'Terminating. Job will continue next run.')
+                break
+
+        return downloaded_tables, downloaded_tables_indexes
+
+    def get_table_data_chunks(self, name, schema, columns, pkey, row_limit, last_index, sort_key, downloaded_tables,
+                              downloaded_tables_indexes, client):
+        """
+        Download tables using sccursor (in chunks)
+        :param name:
+        :param schema:
+        :param columns:
+        :param pkey:
+        :param row_limit:
+        :param last_index:
+        :param sort_key:
+        :param downloaded_tables:
+        :param downloaded_tables_indexes:
+        :param client:
+        :return:
+        """
+        has_data = False
+        col_names = []
+        for data, col_names, last_id in client.get_table_data_chunks(name, schema, columns=columns,
+                                                                     row_limit=row_limit, since_index=last_index,
+                                                                     sort_key_col=sort_key.get(KEY_SORT_KEY_COL),
+                                                                     sort_key_type=sort_key.get(KEY_SORTKEY_TYPE)):
+
+            if data:
+                has_data = True
+                col_names = col_names
+                self.store_table_data(data, name, schema)
+
+        if has_data:
+            # append schema col
+            col_names.append('schema_nm')
+            pkey.append('schema_nm')
+            downloaded_tables[name] = {'columns': col_names, 'pk': pkey}
+            downloaded_tables_indexes[schema] = {**downloaded_tables_indexes.get(schema, dict()), **{name: last_id}}
+
+        return downloaded_tables, downloaded_tables_indexes
+
+    def get_table_data(self, name, schema, columns, pkey, row_limit, last_index, sort_key, downloaded_tables,
+                       downloaded_tables_indexes, client):
+        data, col_names, last_id = client.get_table_data_buffered(name, schema, columns=columns,
+                                                                  row_limit=row_limit, since_index=last_index,
+                                                                  sort_key_col=sort_key.get(KEY_SORT_KEY_COL),
+                                                                  sort_key_type=sort_key.get(KEY_SORTKEY_TYPE))
+
+        if data:
+            # append schema col
+            col_names.append('schema_nm')
+            pkey.append('schema_nm')
+            self.store_table_data(data, name, schema)
+            downloaded_tables[name] = {'columns': col_names, 'pk': pkey}
+            downloaded_tables_indexes[schema] = {**downloaded_tables_indexes.get(schema, dict()), **{name: last_id}}
+
+        return downloaded_tables, downloaded_tables_indexes
+
+    def download_table_row_counts(self, schema, params, table_indexes, client):
+        """
+        Get count of rows until provided last index
+        :param schema:
+        :param params:
+        :param table_indexes:
+        :param client: MySQL client instance
+        :return:
+        """
+        cl = client
+        downloaded_tables = {}
+        # downloaded_tables_indexes = dict()
+        for t in params[KEY_TABLES]:
+            name = t[KEY_NAME]
+            if name not in table_indexes.get(schema, {}).keys():
+                continue
+            last_index = table_indexes[schema][name]
+            logging.debug(f"Downloading row count of table '{name}' from schema '{schema}''.")
+            pkey = t.get(KEY_PKEY)
+            if not isinstance(pkey, list):
+                pkey = [pkey]
+            sort_key = t.get(KEY_SORT_KEY, {KEY_SORTKEY_TYPE: 'numeric', KEY_SORT_KEY_COL: ','.join(pkey)})
+            data, col_names = cl.get_table_row_count(name, schema, last_index,
+                                                     sort_key.get(KEY_SORT_KEY_COL),
+                                                     sort_key.get(KEY_SORTKEY_TYPE))
+
+            if data:
+                # append schema col
+                col_names.append('table')
+                self.store_table_count_data(data, name, schema)
+                downloaded_tables['row_counts'] = {'columns': col_names, 'pk': ['table']}
+            if self.is_timed_out():
+                logging.warning(f'Max exection time of {self.max_runtime_sec}s has been reached. '
+                                f'Terminating. Job will continue next run.')
+                break
+
+        return downloaded_tables
+
+    def store_table_count_data(self, data, name, schema):
+        folder_path = os.path.join(self.tables_out_path, 'row_counts')
+        if not os.path.exists(folder_path):
+            os.mkdir(folder_path)
+
+        file_path = os.path.join(folder_path, 'row_counts' + '.csv')
+
+        # append if exists
+        if self._res_file_cache.get(file_path):
+            out_file = self._res_file_cache.get(file_path)
+        else:
+            out_file = open(file_path, 'w+', encoding='utf-8', newline='')
+            self._res_file_cache[file_path] = out_file
+
+        writer = csv.writer(out_file)
+        for r in data:
+            # append schema name
+            r = list(r)
+            r.append(f'{schema}.{name}')
+            writer.writerow(r)
+
+    def store_table_data(self, data, name, schema):
+        folder_path = os.path.join(self.tables_out_path, name)
+        if not os.path.exists(folder_path):
+            os.mkdir(folder_path)
+
+        file_path = os.path.join(folder_path, name + '.csv')
+
+        # append if exists
+        if self._res_file_cache.get(file_path):
+            out_file = self._res_file_cache.get(file_path)
+        else:
+            out_file = open(file_path, 'w+', encoding='utf-8', newline='')
+            self._res_file_cache[file_path] = out_file
+
+        writer = csv.writer(out_file)
+        for r in data:
+            # append schema name
+            r = list(r)
+            r.append(schema)
+            writer.writerow(r)
+
+    def is_timed_out(self):
+        elapsed = time.perf_counter() - self.start_time
+        return elapsed >= self.max_runtime_sec
+
+    def get_last_state(self):
+        last_state = self.last_state
+        if not last_state.get('data'):
+            return dict()
+        else:
+            # unzip
+            val = gzip.decompress(base64.b64decode(last_state['data'].encode('utf-8'))).decode()
+            return json.loads(val)
+
+    def _close_res_stream(self):
+        """
+        Close all output streams / files. Has to be called at end of extraction, before result processing.
+
+        :return:
+        """
+        for res in self._res_file_cache:
+            self._res_file_cache[res].close()
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        debug = sys.argv[1]
+    else:
+        debug = False
+    try:
+        comp = Component(debug)
+        comp.run()
+    except Exception as e:
+        logging.exception(e)
+        exit(1)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - echo 'Pushing test image to repo. [tag=test]'
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+Simple MySQL extractor supporting downloading same table structure from multiple schemas at once.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+## Configuration
+    
+- **Connection parameters**
+
+    ```"#password": "mypass",
+    "user": "root",
+    "host": "localhost",
+    "port": 3308,
+  ```
+- **`schema_pattern`** - regex schema pattern, all schemas matching the pattern will be queried, ex "northwind*"
+- **`schema_list`** - explicit schema list, overrides `schema_pattern`
+- **`dest_bucket`** - optional destination bucket ID
+- **`row_limit`** - optional limit of rows each run will retrieve - to limit db load, only used with incremental fetch set to true. 
+- **`tables`** - List of tables that will be downloaded from each schema - must have same structure.
+  - `name` - table name
+  - `incremental_fetch` - true/false, if set to true the extractor will always continue from the last point defined by the index column value. Default is `true` if omitted.
+  - `columns` - array of column names, if empty all available columns downloaded
+  - `pkey` - array or single name of the primary key column to support incremental fetching
+  - `sort_key` - only used with incremental fetch, parameters of a column that should be used for incremental fetching => each new record has larger or equal value 
+     of that key than the previous one. If left empty 'pkey' with type 'numeric' is used. If pkey is composite and incremental fetch is true,
+      this must be set, otherwise it fails.
+    - `col_name` - name of the sort column, e.g. "order_date"
+    - `sort_key_type` - type of the sort column: either `string` or `numeric`
+    
+```json
+{
+"tables": [
+      {"name": "orders",
+       "incremental_fetch": true,
+      "columns": [],
+      "pkey": ["id"],
+      "sort_key" : {
+        "col_name": "order_date",
+        "sort_key_type":  "string"
+      }}
+    ]
+}
+  ```
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Download data from MySQL server, from multiple schemas at once.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.5.zip#egg=kbc
+mock
+freezegun
+pymysql
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.7.2-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Simple multischema mysql extractor
+
+## Configuration
+    
+**Connection parameters**
+
+```
+    "#password": "mypass",
+    "user": "root",
+    "host": "localhost",
+    "port": 3308,
+```
+
+- **schema_pattern** - regex schema pattern, all schemas matching the pattern will be queried, ex "northwind*"
+- **schema_list** - explicit schema list, overrides `schema_pattern`
+- **row_limit** - optional limit of rows each run will retrieve - to limit db load, only used with incremental fetch set to true. 
+- **tables** - List of tables that will be downloaded from each schema - must have same structure.
+    - `name` - table name
+    - `incremental_fetch` - true/false, if set to true the extractor will always continue from the last point defined 
+by the index column value. Default is `true` if omitted.
+    - `columns` - array of column names, if empty all available columns downloaded
+    - `pkey` - array or single name of the primary key column to support incremental fetching
+    - `sort_key` - only used with incremental fetch, parameters of a column that should be used for incremental fetching => each new record has larger or equal value 
+     of that key than the previous one. If left empty 'pkey' with type 'numeric' is used. If pkey is composite and incremental fetch is true,
+      this must be set, otherwise it fails.
+        - `col_name` - name of the sort column, e.g. "order_date"
+        - `sort_key_type` - type of the sort column: either `string` or `numeric`
+    
+    
+```json
+{
+"tables": [
+      {"name": "orders",
+       "incremental_fetch": true,
+      "columns": [],
+      "pkey": ["id"],
+      "sort_key" : {
+        "col_name": "order_date",
+        "sort_key_type":  "string"
+      }}
+    ]
+}
+```
+
+### Example config
+
+```json
+{
+    "#password": "test",
+    "user": "root",
+    "host": "localhost",
+    "port": 3308
+    "schema_pattern": "northwind*",
+    "schema_list": [],
+    "row_limit": 10,
+    "tables": [
+      {"name": "customers",
+    "incremental_fetch": true,
+      "columns": [],
+      "pkey": "id"},
+      {"name": "orders",,
+    "incremental_fetch": true,
+      "columns": [],
+      "pkey": ["id","id2"],
+      "sort_key" : {
+            "col_name": "order_date",
+            "sort_key_type":  "string"
+      }}
+    ]
+  }
+```
+  
+
+ 
+## Development
+ 
+This example contains runnable container with simple unittest. For local testing it is useful to include `data` folder in the root
+and use docker-compose commands to run the container or execute tests. 
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path:
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone https://bitbucket.org:kds_consulting_team/kbc-python-template.git my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+

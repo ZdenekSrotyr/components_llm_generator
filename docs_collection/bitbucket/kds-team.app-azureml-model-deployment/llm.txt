@@ -1,0 +1,1203 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-azureml-model-deployment/
+    ├── files_samples/
+    │   ├── score.py
+    │   └── 95209190.sklearn_regression_model.pkl
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   └── .DS_Store
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── myenv.yml
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── .DS_Store
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   └── .DS_Store
+    │       │   ├── files/
+    │       │   │   ├── score.py
+    │       │   │   ├── sklearn_regression_model.pkl
+    │       │   │   └── .DS_Store
+    │       │   └── .DS_Store
+    │       ├── .DS_Store
+    │       └── out/
+    │           ├── tables/
+    │           │   └── .DS_Store
+    │           ├── files/
+    │           │   └── .DS_Store
+    │           └── .DS_Store
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   ├── .DS_Store
+    │   └── imgs/
+    │       └── .DS_Store
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /files_samples/score.py
+================================================
+
+import numpy as np
+
+from sklearn.externals import joblib
+import pickle
+
+from inference_schema.schema_decorators import input_schema, output_schema
+from inference_schema.parameter_types.numpy_parameter_type import NumpyParameterType
+
+from azureml.core.model import Model
+import logging
+logging.basicConfig(level=logging.DEBUG)
+print(Model.get_model_path(model_name='MODEL_NAME_PLACEHOLDER'))
+
+
+def init():
+    global model
+    # AZUREML_MODEL_DIR is an environment variable created during deployment.
+    # Join this path with the filename of the model file.
+    # It holds the path to the directory that contains the deployed model
+    # (./azureml-models/$MODEL_NAME/$VERSION).
+    # If there are multiple models, this value is the path to the directory containing all deployed models
+    # (./azureml-models).
+    model_path = Model.get_model_path('MODEL_NAME_PLACEHOLDER')
+    # Deserialize the model file back into a sklearn model
+    try:
+        model = pickle.load(open(model_path, 'rb'))
+    except pickle.UnpicklingError:
+        model = joblib.load(model_path)
+
+
+input_sample = np.array([[10, 9, 8, 7, 6, 5, 4, 3, 2, 1]])
+output_sample = np.array([3726.995])
+
+
+@input_schema('data', NumpyParameterType(input_sample))
+@output_schema(NumpyParameterType(output_sample))
+def run(data):
+    try:
+        result = model.predict(data)
+        # You can return any data type, as long as it is JSON serializable.
+        return result.tolist()
+    except Exception as e:
+        error = str(e)
+        return error
+
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.1**
+
+- fix requirements
+- add src folder to path for tests
+
+**0.1.0**
+
+- src folder structure
+- remove dependency on handler lib - import the code directly to enable modifications until its released
+
+**0.0.2**
+
+- add dependency to base lib
+- basic tests
+
+**0.0.1**
+
+- add utils scripts
+- move kbc tests directly to pipelines file
+- use uptodate base docker image
+- add changelog
+
+
+================================================
+File: /src/component.py
+================================================
+'''
+Template Component main class.
+
+'''
+
+import logging
+import os
+import sys
+import json
+
+from kbc.env_handler import KBCEnvHandler
+
+from azureml.core import Workspace
+from azureml.core.model import Model
+from azureml.core.model import InferenceConfig
+from azureml.core.webservice import AciWebservice
+from azureml.core.authentication import ServicePrincipalAuthentication
+from azureml.exceptions import UserErrorException
+from azureml.exceptions import AzureMLException
+from azureml.exceptions import WebserviceException
+from msrest.exceptions import AuthenticationError
+
+# configuration variables
+# workspace creation
+SUBSCRIPTION_ID = 'subscription_id'
+RESOURCE_GROUP = 'resource_group'
+WORKSPACE_NAME = 'workspace_name'
+
+# authentication
+TENANT_ID = "tenant_id"
+SERVICE_PRINCIPAL_ID = "service_principal_id"
+SERVICE_PRINCIPAL_PASSWORD = "#service_principal_password"
+
+# model registering
+MODEL_NAME = 'model_name'
+
+# YAML for InferenceConfig
+DEPS = 'dependencies'
+PY = 'pip_yaml'
+
+# Deployment
+CPU_CORES = 'cpu_cores'
+MEMORY_GB = 'memory_gb'
+AUTH = 'auth'
+WEBSERVICE_NAME = 'webservice_name'
+
+# #### Keep for debug
+KEY_STDLOG = 'stdlogging'
+KEY_DEBUG = 'debug'
+MANDATORY_PARS = []
+MANDATORY_IMAGE_PARS = []
+
+APP_VERSION = '0.2.0'
+
+sys.tracebacklimit = 0
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, debug=False):
+        KBCEnvHandler.__init__(self, MANDATORY_PARS)
+
+        # override debug from config
+        if self.cfg_params.get(KEY_DEBUG):
+            debug = True
+
+        log_level = logging.DEBUG if debug else logging.INFO
+        # setup GELF if available
+        if os.getenv('KBC_LOGGER_ADDR', None):
+            self.set_gelf_logger(log_level)
+        else:
+            self.set_default_logger(log_level)
+        logging.info('Running version %s', APP_VERSION)
+        logging.info('Loading configuration...')
+
+        try:
+            self.validate_config()
+            self.validate_image_parameters(MANDATORY_IMAGE_PARS)
+        except ValueError as e:
+            logging.exception(e)
+            exit(1)
+
+        self.SUBSCRIPTION_ID = self.cfg_params[SUBSCRIPTION_ID]
+        self.RESOURCE_GROUP = self.cfg_params[RESOURCE_GROUP]
+        self.WORKSPACE_NAME = self.cfg_params[WORKSPACE_NAME]
+
+        self.TENANT_ID = self.cfg_params[TENANT_ID]
+        self.SERVICE_PRINCIPAL_ID = self.cfg_params[SERVICE_PRINCIPAL_ID]
+        self.SERVICE_PRINCIPAL_PASSWORD = self.cfg_params[SERVICE_PRINCIPAL_PASSWORD]
+
+        self.MODEL_PATH = [i for i in os.listdir(
+            '/data/in/files/') if '.pkl' in i and 'manifest' not in i][0]
+        self.SCORE_PATH = [i for i in os.listdir(
+            '/data/in/files/') if 'score.py' in i and 'manifest' not in i][0]
+
+        self.MODEL_NAME = self.cfg_params[MODEL_NAME]
+
+        self.DEPS = self.cfg_params[DEPS]
+        self.PY = self.cfg_params[PY]
+
+        # Deployment
+        self.CPU_CORES = self.cfg_params[CPU_CORES]
+        self.MEMORY_GB = self.cfg_params[MEMORY_GB]
+        self.AUTH = self.cfg_params[AUTH]
+        self.WEBSERVICE_NAME = self.cfg_params[WEBSERVICE_NAME]
+
+    def run(self):
+        '''
+        Main execution code
+        '''
+        params = self.cfg_params  # noqa
+
+        if not self.AUTH:
+            auth_invalid = True
+        else:
+            auth_invalid = False
+
+        if self.SERVICE_PRINCIPAL_PASSWORD.strip() == '':
+            spp_invalid = True
+        else:
+            spp_invalid = False
+
+        if self.SERVICE_PRINCIPAL_ID.strip() == '':
+            spi_invalid = True
+        else:
+            spi_invalid = False
+
+        if self.TENANT_ID.strip() == '':
+            ti_invalid = True
+        else:
+            ti_invalid = False
+
+        if sum([auth_invalid, spp_invalid, spi_invalid, ti_invalid]) > 0:
+            if auth_invalid:
+                logging.error(
+                    'Please set the Authorization parameter to true.')
+            if spp_invalid:
+                logging.error('Service Principal Password is invalid.')
+            if spi_invalid:
+                logging.error('Service Principal ID is invalid.')
+            if ti_invalid:
+                logging.error('Tenant ID is invalid.')
+
+            sys.exit(1)
+
+        logging.info('Creating workspace...')
+        logging.info('SUBSCRIPTION_ID ' + self.SUBSCRIPTION_ID)
+
+        svc_pr = ServicePrincipalAuthentication(
+            tenant_id=self.TENANT_ID,
+            service_principal_id=self.SERVICE_PRINCIPAL_ID,
+            service_principal_password=self.SERVICE_PRINCIPAL_PASSWORD)
+
+        try:
+            ws = Workspace(subscription_id=self.SUBSCRIPTION_ID,
+                           resource_group=self.RESOURCE_GROUP,
+                           workspace_name=self.WORKSPACE_NAME,
+                           auth=svc_pr,
+                           _location=None,
+                           _disable_service_check=False,
+                           sku='basic')
+            logging.info("Workspace {} loaded.".format(self.WORKSPACE_NAME))
+
+        except UserErrorException as e:
+            logging.error('{}'.format(e.message))
+            sys.exit(1)
+
+        except AzureMLException as e:
+            message_dict = json.loads(e.message)
+            logging.error('The status code is {}, {}.'.format(
+                message_dict['status_code'], message_dict['error_details']['error']['code']))
+            logging.error('{}'.format(
+                message_dict['error_details']['error']['message']))
+            logging.error('Further info might be found on {}.'.format(
+                message_dict['url']))
+            sys.exit(1)
+        except AuthenticationError as e:
+            dict_mes = json.loads(str(e)[str(e).find("{"):str(e).find("}")+1])
+            logging.error('{}'.format(dict_mes['error_description']))
+            sys.exit(1)
+
+        # supressing the print from azureml.core.Model.register() method
+        class HiddenPrints:
+            def __enter__(self):
+                self._original_stdout = sys.stdout
+                sys.stdout = open(os.devnull, 'w')
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                sys.stdout.close()
+                sys.stdout = self._original_stdout
+
+        with HiddenPrints():
+            model = Model.register(workspace=ws,
+                                   model_path='/data/in/files/{}'.format(
+                                       self.MODEL_PATH),
+                                   model_name=self.MODEL_NAME,
+                                   description="")
+
+        logging.info('Model {} registered.'.format(self.MODEL_NAME))
+
+        DEPENDENCIES = [i.strip() for i in self.DEPS.split(',')]
+        PIP_YAML = [i.strip() for i in self.PY.split(',')]
+
+        # if there are no packages to be added to the YAML, the list must be empty
+        if PIP_YAML[0] == '':
+            PIP_YAML = []
+
+        # if there are no dependencies to be added to the YAML, the list must be empty
+        if DEPENDENCIES[0] == '':
+            DEPENDENCIES = []
+
+        # create the YAML file for Inference Config
+        with open('myenv.yml', mode='wt', encoding='utf-8') as out_file:
+            out_file.write('name: project_environment\ndependencies:\n')
+            for dep in DEPENDENCIES:
+                out_file.write('  - {}\n'.format(dep))
+            out_file.write('  - pip:')
+            for pckg in PIP_YAML:
+                out_file.write('\n    - {}'.format(pckg))
+
+        logging.info('YAML for InferenceConfig parsed.')
+
+        # Read in the score.py file
+        with open('/data/in/files/{}'.format(self.SCORE_PATH), 'r') as file:
+            filedata = file.read()
+
+        # Replace the target string
+        filedata = filedata.replace('MODEL_NAME_PLACEHOLDER', self.MODEL_NAME)
+
+        # Write the file out again
+        with open('/data/in/files/score.py', 'w') as file:
+            file.write(filedata)
+
+        inference_config = InferenceConfig(runtime="python",
+                                           entry_script="/data/in/files/score.py",
+                                           conda_file="myenv.yml")
+
+        deployment_config = AciWebservice.deploy_configuration(
+            cpu_cores=self.CPU_CORES, memory_gb=self.MEMORY_GB, auth_enabled=self.AUTH)
+
+        # we don't want the azureml.core.webservice to log anything under CRITICAL
+        logging.getLogger('azureml.core.webservice').setLevel(50)
+
+        logging.info("Inference and Deployment configs are ready.")
+
+        logging.info('Deploying webservice {}...'.format(self.WEBSERVICE_NAME))
+        try:
+            service = Model.deploy(ws, self.WEBSERVICE_NAME, [
+                model], inference_config, deployment_config)
+        except WebserviceException as e:
+            if e.message[0:43] == 'Error, there is already a service with name':
+                logging.error(
+                    'The name {} is already taken. Please choose a name that is not used yet\
+                         - a new webservice will be deployed then.'.format(self.WEBSERVICE_NAME))
+                sys.exit(1)
+            else:
+                logging.error('{}'.format(e.message))
+                sys.exit(1)
+
+        service.wait_for_deployment(show_output=False)
+        service.get_logs()
+
+        # outputting the information about the WebService
+        with open('/data/out/files/configuration_{}.txt'.format(self.WEBSERVICE_NAME),
+                  mode='wt',
+                  encoding='utf-8') as out_file:
+            out_file.write('Hello,\n\nthe API keys for your new service on ACI are:\
+        \nKey 1: {}\nKey 2: {}\nThe URI is: {}\nThe documentation is here: {}\n\nBest regards,\nKeboola'.format(
+                service.get_keys()[0], service.get_keys()[1], service.scoring_uri, service.swagger_uri))
+
+        data = {
+            "is_public": False,
+            "is_permanent": True,
+            "is_encrypted": True,
+            "notify": False,
+            "tags": [
+                "message_azureml_model"
+            ]
+        }
+
+        with open('/data/out/files/configuration_{}.txt.manifest'.format(self.WEBSERVICE_NAME),
+                  mode='wt',
+                  encoding='utf-8') as outfile:
+            json.dump(data, outfile)
+
+        '''
+        # send emails with the API tokens
+        with open('message.txt', mode='wt', encoding='utf-8') as out_file:
+            out_file.write('Hello,\n\nthe API keys for your new service on ACI are:\
+                \nKey 1: {}\nKey 2: {}\nThe URI is: {}\n\n\
+                Best regards,\nKeboola'.format(
+                service.get_keys()[0], service.get_keys()[1], service.scoring_uri))
+
+        bash_command = 'mail -s "API Keys" {} < message.txt'.format(
+            self.NOTIFICATION_EMAIL)
+        subprocess.call(bash_command, shell=True)
+        '''
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        debug = sys.argv[1]
+    else:
+        debug = False
+    try:
+        logging.info('Initializing component...')
+        comp = Component(debug)
+        logging.info('Running component...')
+        comp.run()
+    except Exception as e:
+        logging.exception(e)
+        exit(1)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+#          - echo 'Pushing test image to repo. [tag=test]'
+#          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+'''
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+
+================================================
+File: /myenv.yml
+================================================
+name: project_environment
+dependencies:
+  - python=3.6.2
+  - scikit-learn=0.19.1
+  - pip:
+    - azureml-defaults==1.0.79
+    - inference-schema[numpy-support]
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# Azure ML Model Deployment Tool
+
+This tool allows for deployment of trained Python models packaged via Pickle or Joblib to Azure Container Webservices via Azure ML platform. It creates an API for these models and outputs the Bearer tokens, the URI, and Swagger for the API.
+
+You need to have an active Azure ML account and an active workspace for using this component.
+
+This whole component mimics this workflow - [How to deploy and where](https://docs.microsoft.com/en-us/azure/machine-learning/service/how-to-deploy-and-where). It deploys the model to Azure Container Instances through an existing Workspace. The WebService then accepts and returns JSON data.
+
+### Adjustments
+
+This component will be further enhanced. In the future, there will be these improvements:  
+- The tokens will be sent to email  
+- The API will be accepting requests in a format that will allow for integration with PowerBI  
+- There will be a new component created that will be able to fetch metadata from the API
+- A functionality for updating a webservice - the idea is that if you will use a name of an existing webservice AND you'll check that you want to update a service (so the chance of this happening by accident is minimized), the component will only update an existing webservice
+
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+### Parameters
+
+**Tenant ID for authentication** - used for the ServicePrincipalAuthentication (Look for `Service Principal Authentication` [here](https://github.com/Azure/MachineLearningNotebooks/blob/master/how-to-use-azureml/manage-azureml-service/authentication-in-azureml/authentication-in-azureml.ipynb))
+
+**Service principal ID for authentication** - used for the ServicePrincipalAuthentication (Look for `Service Principal Authentication` [here](https://github.com/Azure/MachineLearningNotebooks/blob/master/how-to-use-azureml/manage-azureml-service/authentication-in-azureml/authentication-in-azureml.ipynb))
+
+**Service principal password for authentication** - used for the ServicePrincipalAuthentication (Look for `Service Principal Authentication` [here](https://github.com/Azure/MachineLearningNotebooks/blob/master/how-to-use-azureml/manage-azureml-service/authentication-in-azureml/authentication-in-azureml.ipynb))
+
+**Subscription ID** - your unique subscription ID (for more info click [here](https://docs.bitnami.com/azure/faq/administration/find-subscription-id/))
+
+**Resource Group** - the resource group your Workspace belongs to (can be found [here](https://portal.azure.com/#home))
+
+**Workspace Name** - the name of the workspace you want to use for the deployment
+
+**Model Name** - the name your model will be registered under
+
+**Dependencies in the Inference Config Yaml** - dependencies of your model and your score.py function (for more info click [here](https://docs.microsoft.com/en-us/azure/machine-learning/service/how-to-deploy-and-where#2-define-your-inferenceconfig)). The required format is a list delimited by commas (e.g. `pandas, numpy, scikit-learn=0.19.1`).
+
+**PIP command for the Inference Config Yaml** - pip commands that will be executed during deployment of your model as a Web Service (for more info click [here](https://docs.microsoft.com/en-us/azure/machine-learning/service/how-to-deploy-and-where#2-define-your-inferenceconfig)). The required format is a list delimited by commas (e.g. `azureml-defaults==1.0.79, inference-schema[numpy-support]`).
+
+**Name of the WebService** - the name under which your webservice will be deployed
+
+**Authorization** - BOOLEAN denoting whether the API will require authentication (it is strongly recommended to use Authentication, the component as of now does not allow for not using Authentication - please use only the default value `true` for now)
+
+**CPU CORES** - how many CPU cores will your model run on
+
+**MEMORY GB** - how much memory will your model have access to. Please use multiples of 0.1
+
+### Input mapping
+
+The input mapping requires two files:
+
+- **model** : this file needs to be a pickled python model (packaged vbia joblib or pickle) and needs to have `.pkl` suffix
+- **score.py**: this file is the entry function in the API. It takes what is sent to the API, runs the model, and returns the outputs back to the API. For more info read about `entry script` [here](https://docs.microsoft.com/en-us/azure/machine-learning/service/how-to-deploy-and-where#prepare-to-deploy)
+
+### Output
+
+There is only one file outputted, it contains info about the deployed Web Service. The name is always compiled as `configuration_` + `[Name of the WebService]` + `.txt` (e.g. is your webservice is called `test`, the output file is called `configuration_test.txt`).
+
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Deploy your trained model to Azure Container Instances and query it via an API
+
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "extractor configuration",
+  "required": [
+    "subscription_id",
+    "resource_group",
+    "workspace_name",
+    "model_name",
+    "dependencies",
+    "pip_yaml",
+    "cpu_cores",
+    "memory_gb",
+    "auth",
+    "webservice_name",
+    "tenant_id",
+    "service_principal_id",
+    "#service_principal_password"
+  ],
+  "properties": {
+    "subscription_id": {
+      "type": "string",
+      "title": "Subscription ID",
+      "propertyOrder": 200
+    },
+    "resource_group": {
+      "type": "string",
+      "title": "Resource Group",
+      "propertyOrder": 210
+    },
+    "workspace_name": {
+      "type": "string",
+      "title": "Workspace Name",
+      "propertyOrder": 220
+    },
+    "model_name": {
+      "type": "string",
+      "title": "Model Name",
+      "propertyOrder": 300
+    },
+    "dependencies": {
+      "type": "string",
+      "title": "Dependencies in the Inference Config Yaml",
+      "propertyOrder": 310
+      },
+    "pip_yaml": {
+      "type": "string",
+      "title": "PIP command for the Inference Config Yaml",
+      "propertyOrder": 320
+      },
+        "cpu_cores": {
+          "type": "number",
+          "title": "CPU CORES",
+          "propertyOrder": 420
+        },
+        "memory_gb": {
+          "type": "number",
+          "title": "MEMORY GB",
+          "propertyOrder": 430
+        },
+        "auth": {
+          "type": "boolean",
+          "title": "Authorization",
+          "propertyOrder": 410,
+          "default":"true"
+        },
+        "webservice_name": {
+          "type": "string",
+          "title": "Name of the WebService",
+          "propertyOrder": 400
+          },
+            "tenant_id": {
+              "type": "string",
+              "title": "Tenant ID for authentication",
+              "propertyOrder": 100
+              },
+              "service_principal_id": {
+                "type": "string",
+                "title": "Service principal ID for authentication",
+                "propertyOrder": 110
+                },
+                "#service_principal_password": {
+                  "type": "string",
+                  "format": "password",
+                  "title": "Service principal password for authentication",
+                  "propertyOrder": 120
+                  }
+    }
+  }
+
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": []
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+      "subscription_id": "",
+      "resource_group": "radim_test",
+      "workspace_name": "radim_test",
+      "workspace_id": "",
+      "model_name": "",
+      "dependencies": "",
+      "pip_yaml": "",
+      "cpu_cores": 1,
+      "memory_gb": 0.5,
+      "auth": true,
+      "webservice_name": "aci-webservice-17",
+      "notification_email": "radim.kasparek@keboola.com",
+      "tenant_id":"",
+      "service_principal_id":"",
+      "#service_principal_password":""
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/files/score.py
+================================================
+
+import numpy as np
+
+from sklearn.externals import joblib
+import pickle
+
+from inference_schema.schema_decorators import input_schema, output_schema
+from inference_schema.parameter_types.numpy_parameter_type import NumpyParameterType
+
+from azureml.core.model import Model
+import logging
+logging.basicConfig(level=logging.DEBUG)
+print(Model.get_model_path(model_name='MODEL_NAME_PLACEHOLDER'))
+
+
+def init():
+    global model
+    # AZUREML_MODEL_DIR is an environment variable created during deployment.
+    # Join this path with the filename of the model file.
+    # It holds the path to the directory that contains the deployed model
+    # (./azureml-models/$MODEL_NAME/$VERSION).
+    # If there are multiple models, this value is the path to the directory containing all deployed models
+    # (./azureml-models).
+    model_path = Model.get_model_path('MODEL_NAME_PLACEHOLDER')
+    # Deserialize the model file back into a sklearn model
+    try:
+        model = pickle.load(open(model_path, 'rb'))
+    except pickle.UnpicklingError:
+        model = joblib.load(model_path)
+
+
+input_sample = np.array([[10, 9, 8, 7, 6, 5, 4, 3, 2, 1]])
+output_sample = np.array([3726.995])
+
+
+@input_schema('data', NumpyParameterType(input_sample))
+@output_schema(NumpyParameterType(output_sample))
+def run(data):
+    try:
+        result = model.predict(data)
+        # You can return any data type, as long as it is JSON serializable.
+        return result.tolist()
+    except Exception as e:
+        error = str(e)
+        return error
+
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.7.zip#egg=kbc
+mock
+freezegun
+azureml.core
+msrest
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.7.2-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Azure ML Model Deployment Tool
+
+This tool allows for deployment of trained Python models packaged via Pickle or Joblib to Azure Container Webservices via Azure ML platform. It creates an API for these models and outputs the Bearer tokens, the URI, and Swagger for the API.
+
+You need to have an active Azure ML account and an active workspace for using this component.
+
+This whole component mimics this workflow - [How to deploy and where](https://docs.microsoft.com/en-us/azure/machine-learning/service/how-to-deploy-and-where). It deploys the model to Azure Container Instances through an existing Workspace. The WebService then accepts and returns JSON data.
+
+### Adjustments
+
+This component will be further enhanced. In the future, there will be these improvements:  
+- The tokens will be sent to email  
+- The API will be accepting requests in a format that will allow for integration with PowerBI  
+- There will be a new component created that will be able to fetch metadata from the API  
+- A functionality for updating a webservice  - the idea is that if you will use a name of an existing webservice AND you'll check that you want to update a service (so the chance of this happening by accident is minimized), the component will only update an existing webservice
+
+## Configuration description
+
+### Parameters
+
+**Subscription ID** - your unique subscription ID (for more info click [here](https://docs.bitnami.com/azure/faq/administration/find-subscription-id/))
+
+**Resource Group** - the resource group your Workspace belongs to (can be found [here](https://portal.azure.com/#home))
+
+**Workspace Name** - the name of the workspace you want to use for the deployment
+
+**Workspace ID** - the id of the workspace you want to use for the deployment
+
+**Model Name** - the name your model will be registered under
+
+**Dependencies in the Inference Config Yaml** - dependencies of your model and your score.py function (for more info click [here](https://docs.microsoft.com/en-us/azure/machine-learning/service/how-to-deploy-and-where#2-define-your-inferenceconfig))
+
+**PIP command for the Inference Config Yaml** - pip commands that will be executed during deployment of your model as a Web Service (for more info click [here](https://docs.microsoft.com/en-us/azure/machine-learning/service/how-to-deploy-and-where#2-define-your-inferenceconfig))
+
+**CPU CORES** - how many CPU cores will your model run on
+
+**MEMORY GB** - how much memory will your model have access to. Please use multiples of 0.1
+
+**Authorization** - BOOLEAN denoting whether the API will require authentication (it is strongly recommended to use Authentication, the component as of now does not allow for not using Authentication - please use only the value `true` for now)
+
+**Name of the WebService** - the name under which your webservice will be deployed
+
+**Email for sending the config** - NOT ACTIVE YET (you will get an email to this address with the URI, API keys and the link to documentation).
+
+**Tenant ID for authentication** - used for the ServicePrincipalAuthentication (read more [here](https://docs.microsoft.com/en-us/python/api/azureml-core/azureml.core.authentication.serviceprincipalauthentication?view=azure-ml-py))
+
+**Service principal ID for authentication** - used for the ServicePrincipalAuthentication (read more [here](https://docs.microsoft.com/en-us/python/api/azureml-core/azureml.core.authentication.serviceprincipalauthentication?view=azure-ml-py))
+
+**Service principal password for authentication** - used for the ServicePrincipalAuthentication (read more [here](https://docs.microsoft.com/en-us/python/api/azureml-core/azureml.core.authentication.serviceprincipalauthentication?view=azure-ml-py))
+
+### Input mapping
+
+The input mapping requires two files:
+
+- **model** : this file needs to be a pickled python model (packaged vbia joblib or pickle) and needs to have `.pkl` suffix
+- **score.py**: this file is the entry function in the API. It takes what is sent to the API, runs the model, and returns the outputs back to the API. For more info read about `entry script` [here](https://docs.microsoft.com/en-us/azure/machine-learning/service/how-to-deploy-and-where#prepare-to-deploy)
+
+### Output mapping
+
+There is only one file outputted, it contains info about the deployed Web Service. The name is always compiled as `configuration_` + `[Name of the WebService]` + `.txt` (e.g. is your webservice is called `test`, the output file is called `configuration_test.txt`).
+
+

@@ -1,0 +1,778 @@
+Directory structure:
+└── kds_consulting_team-kds-team.wr-simple-sftp-deprecated/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── src/
+    │   └── component.py
+    ├── bitbucket-pipelines.yml
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   └── configSchema.json
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/component.py
+================================================
+'''
+Created on 10. 10. 2018
+
+@author: david esner
+'''
+import glob
+import json
+import logging
+import os
+import sys
+from datetime import datetime
+from io import StringIO
+from pathlib import Path
+from typing import Callable
+
+import backoff
+import paramiko
+from kbc.env_handler import KBCEnvHandler
+
+MAX_RETRIES = 5
+
+KEY_USER = 'user'
+KEY_PASSWORD = '#pass'
+KEY_HOSTNAME = 'hostname'
+KEY_PORT = 'port'
+KEY_REMOTE_PATH = 'path'
+KEY_APPENDDATE = 'append_date'
+KEY_PRIVATE_KEY = '#private_key'
+
+KEY_DEBUG = 'debug'
+PASS_GROUP = [KEY_PRIVATE_KEY, KEY_PASSWORD]
+
+MANDATORY_PARS = [KEY_USER, PASS_GROUP,
+                  KEY_HOSTNAME, KEY_REMOTE_PATH, KEY_PORT]
+
+APP_VERSION = '0.0.3'
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, debug=False):
+        # for easier local project setup
+        default_data_dir = Path(__file__).resolve().parent.parent.joinpath('data').as_posix() \
+            if not os.environ.get('KBC_DATADIR') else None
+
+        KBCEnvHandler.__init__(self, MANDATORY_PARS, log_level=logging.DEBUG if debug else logging.INFO,
+                               data_path=default_data_dir)
+        # override debug from config
+        if self.cfg_params.get(KEY_DEBUG):
+            debug = True
+        if debug:
+            logging.getLogger().setLevel(logging.DEBUG)
+        logging.info('Running version %s', APP_VERSION)
+        logging.info('Loading configuration...')
+
+        try:
+            self.validate_config(MANDATORY_PARS)
+        except ValueError as e:
+            logging.exception(e)
+            exit(1)
+
+        self.files_in_path = os.path.join(self.data_path, 'in', 'files')
+
+    def run(self):
+        '''
+        Main execution code
+        '''
+        params = self.cfg_params  # noqa
+        pkey = None
+        if params[KEY_PRIVATE_KEY]:
+            keyfile = StringIO(params[KEY_PRIVATE_KEY])
+            pkey = self._parse_private_key(keyfile)
+        # ## SFTP Connection ###
+        port = params[KEY_PORT]
+        conn = paramiko.Transport((params[KEY_HOSTNAME], port))
+
+        conn.connect(username=params[KEY_USER], password=params[KEY_PASSWORD], pkey=pkey)
+        sftp = paramiko.SFTPClient.from_transport(conn)
+
+        in_tables = [os.path.join(self.tables_in_path, f) for f in os.listdir(self.tables_in_path)
+                     if os.path.isfile(os.path.join(self.tables_in_path, f))
+                     and not os.path.join(self.tables_in_path, f).endswith('.manifest') and not os.path.join(
+                self.tables_in_path, f).endswith('.DS_Store')]  # noqa
+
+        files_per_tag_groups = self.get_files_per_tag_groups(files=self.get_all_files())
+        latest_files = self.get_latest_files(files_per_tag_groups)
+        in_files = self._drop_id_from_filename(latest_files)
+
+        for fl in in_tables + in_files:
+
+            now = ''
+            if params.get(KEY_APPENDDATE):
+                now = "_" + str(datetime.utcnow().strftime('%Y%m%d%H%M%S'))
+            filename, file_extension = os.path.splitext(os.path.basename(fl))
+            destination = params[KEY_REMOTE_PATH] + filename + now + file_extension
+            logging.info("File Source: %s", fl)
+            logging.info("File Destination: %s", destination)
+            self._try_to_execute_sftp_operation(sftp.put, fl, destination)
+
+        sftp.close()
+        conn.close()
+        logging.info("Done.")
+
+    @backoff.on_exception(backoff.expo,
+                          IOError,
+                          max_tries=MAX_RETRIES)
+    def _try_to_execute_sftp_operation(self, operation: Callable, *args):
+        return operation(*args)
+
+    def _parse_private_key(self, keyfile):
+        # try all versions of encryption keys
+        pkey = None
+        failed = False
+        try:
+            pkey = paramiko.RSAKey.from_private_key(keyfile)
+        except paramiko.SSHException:
+            logging.warning("RSS Private key invalid, trying DSS.")
+            failed = True
+        # DSS
+        if failed:
+            try:
+                pkey = paramiko.DSSKey.from_private_key(keyfile)
+                failed = False
+            except paramiko.SSHException:
+                logging.warning("DSS Private key invalid, trying ECDSAKey.")
+                failed = True
+        # ECDSAKey
+        if failed:
+            try:
+                pkey = paramiko.ECDSAKey.from_private_key(keyfile)
+                failed = False
+            except paramiko.SSHException:
+                logging.warning("ECDSAKey Private key invalid, trying Ed25519Key.")
+                failed = True
+        # Ed25519Key
+        if failed:
+            try:
+                pkey = paramiko.Ed25519Key.from_private_key(keyfile)
+            except paramiko.SSHException as e:
+                logging.warning("Ed25519Key Private key invalid.")
+                raise e
+
+        return pkey
+
+    def get_all_files(self):
+        glob_files = os.path.join(self.files_in_path, '*')
+        return [path_name for path_name in glob.glob(glob_files) if
+                not (path_name.endswith('.manifest') | path_name.endswith('.DS_Store'))]
+
+    def get_files_per_tag_groups(self, files) -> dict:
+        files_per_tag = {}
+        for f in files:
+            manifest_path = f + '.manifest'
+            with open(manifest_path) as manFile:
+                tag_group_v1 = json.load(manFile)['tags']
+                tag_group_v1.sort()
+                tag_group_key = ','.join(tag_group_v1)
+                if not files_per_tag.get(tag_group_key):
+                    files_per_tag[tag_group_key] = []
+                files_per_tag[tag_group_key].append(f)
+        return files_per_tag
+
+    def get_latest_files(self, files_per_tag_groups):
+        files_to_process = list()
+        for tag_group in files_per_tag_groups:
+            max_filename = ''
+            max_id = ''
+            max_timestamp = '0'
+            for f in files_per_tag_groups[tag_group]:
+                manifest_path = f + '.manifest'
+                with open(manifest_path) as manFile:
+                    man_json = json.load(manFile)
+                    creation_date = man_json['created']
+                if creation_date > max_timestamp:
+                    max_timestamp = creation_date
+                    max_id = man_json['id']
+                    max_filename = f
+            files_to_process.append({"file_name": max_filename, "id": max_id})
+        return files_to_process
+
+    def _drop_id_from_filename(self, latest_files):
+        file_paths = []
+        for f in latest_files:
+            file_id = f"{f['id']}_"
+            file_name = Path(f['file_name']).name
+            if file_name.startswith(file_id):
+                old_file_name = f['file_name']
+                f['file_name'] = f"{os.path.join(os.path.dirname(f['file_name']), file_name.split(file_id)[1])}"
+                os.rename(old_file_name, f['file_name'])
+            file_paths.append(f['file_name'])
+        return file_paths
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        debug_arg = sys.argv[1]
+    else:
+        debug_arg = False
+    try:
+        comp = Component(debug_arg)
+        comp.run()
+    except Exception as exc:
+        logging.exception(exc)
+        exit(1)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+Transfer tables and files from the Storage to any SFTP repository.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+**NOTE** that when using file input mapping, only the latest files matching the specified tag will be uploaded.
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Transfer tables and files from the Storage to any SFTP repository.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+	"type": "object",
+	"title": "Simple SFTP writer",
+	"required": [
+		"hostname",
+		"port",
+		"user",
+		"#pass",
+		"#private_key",
+		"path",
+		"append_date"
+	],
+	"properties": {
+		"port": {
+			"type": "integer",
+			"default": 22,
+			"title": "SFTP host port",
+			"propertyOrder": 20
+		},
+		"user": {
+			"type": "string",
+			"title": "SFTP user name",
+			"propertyOrder": 30
+		},
+		"#pass": {
+			"type": "string",
+			"title": "SFTP password",
+			"format": "password",
+			"propertyOrder": 40
+		},
+		"#private_key": {
+			"type": "string",
+			"format": "textarea",
+			"description": "Your SSH private key, including the BEGIN RSA .. part. If used, the password is ignored.",
+			"title": "SSH private key",
+			"propertyOrder": 50
+		},
+		"hostname": {
+			"type": "string",
+			"title": "SFTP host URL",
+			"propertyOrder": 10
+		},
+		"path": {
+			"type": "string",
+			"title": "Remote destination path",
+			"description" : "e.g. /home/user/sftp/",
+			"propertyOrder": 60
+		},
+		"append_date": {
+						"type": "number",
+						"title": "Append timestamp",
+						"description": "Appends timestamp to result file name",
+						"propertyOrder": 5200,
+						"enum": [
+							0,
+							1
+						],
+						"default": 0,
+						"options": {
+							"enum_titles": [
+								"No",
+								"Yes"
+							]
+					}}
+	}
+}
+
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.9.zip#egg=kbc
+paramiko>=2.7.2
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.7.2-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Simple SFTP writer
+
+SFTP writer component allowing writing tables and files from KBC storage to SFTP repository. Pkey and password authentication 
+methods are supported.
+
+**Table of contents:**  
+  
+[TOC]
+
+# Functionality
+
+The components allows to write tables or files from the KBC Storage to any SFTP repository.
+
+**NOTE** that only the latest files matching the specified tag will be uploaded.
+
+# Configuration
+ 
+## SFTP host URL
+
+Your SFTP host URL
+
+## SFTP host port
+
+SFTP port - by default `22`.
+
+## SFTP user name
+
+Your SFTP user name.
+
+## SFTP password
+
+Password of the SFTP user. Use if you wan't to use the password authentication method.
+
+## SSH private key
+
+Your SSH private key, including the `BEGIN RSA ..` part. If used, the password is ignored.
+
+### Remote destination path
+
+Remote destination path. e.g. existing remote folder, where all files will be stored. ex. `/home/user/mysftpfolder/`
+
+### Append timestamp
+
+If set to true, a current timestamp will be appended to the resulting file, e.g. `test.csv` will be stored as 
+ `test_YYYYMMDDHHMiSS.csv`
+
+ 
+# Development
+ 
+This example contains runnable container with simple unittest. For local testing it is useful to include `data` folder in the root
+and use docker-compose commands to run the container or execute tests. 
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path:
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone https://bitbucket.org:kds_consulting_team/kds-team.wr-simple-sftp.git my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+

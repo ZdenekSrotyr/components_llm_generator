@@ -1,0 +1,968 @@
+Directory structure:
+└── kds_consulting_team-kds-team.wr-magento/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── magento/
+    │   │   ├── component.py
+    │   │   └── client.py
+    │   └── main.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   └── tables/
+    │       │       ├── test.csv
+    │       │       └── test.csv.manifest
+    │       └── out/
+    │           └── tables/
+    │               └── result.csv
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.1**
+
+- fix requirements
+- add src folder to path for tests
+
+**0.1.0**
+
+- src folder structure
+- remove dependency on handler lib - import the code directly to enable modifications until its released
+
+**0.0.2**
+
+- add dependency to base lib
+- basic tests
+
+**0.0.1**
+
+- add utils scripts
+- move kbc tests directly to pipelines file
+- use uptodate base docker image
+- add changelog
+
+
+================================================
+File: /src/magento/component.py
+================================================
+import csv
+import glob
+import json
+import logging
+import os
+import sys
+from kbc.env_handler import KBCEnvHandler
+from magento.client import MagentoClient
+
+KEY_APIURL = 'api_url'
+KEY_TOKEN = '#token'
+
+MANDATORY_PARAMETERS = [KEY_APIURL, KEY_TOKEN]
+MANDATORY_INPUTFIELDS = set(['endpoint', 'method', 'data'])
+REQUEST_STATUS_COLUMNS = set(['request_status', 'request_message', 'request_code'])
+SUPPORTED_METHODS = ['POST', 'PUT']
+
+
+class MagentoComponent(KBCEnvHandler):
+
+    def __init__(self):
+
+        super().__init__(mandatory_params=MANDATORY_PARAMETERS)
+        self.validate_config(mandatory_params=MANDATORY_PARAMETERS)
+
+        self.parApiUrl = self.cfg_params[KEY_APIURL]
+        self.parToken = self.cfg_params[KEY_TOKEN]
+
+        self.getAndCheckInputTable()
+        self.client = MagentoClient(apiUrl=self.parApiUrl, token=self.parToken)
+
+    def getAndCheckInputTable(self):
+
+        globString = os.path.join(self.tables_in_path, '*.csv')
+        inputTables = glob.glob(globString)
+
+        if len(inputTables) == 0:
+            logging.error("No input tables specified.")
+            sys.exit(1)
+
+        else:
+
+            _allColumns = set()
+            for tablePath in inputTables:
+
+                _tn = os.path.basename(tablePath)
+                _rdr = csv.DictReader(open(tablePath))
+
+                missFields = MANDATORY_INPUTFIELDS - set(_rdr.fieldnames)
+                if len(missFields) != 0:
+                    logging.error(f"Missing required fields {list(missFields)} in input table {_tn}.")
+                    sys.exit(1)
+
+                rsrvFields = REQUEST_STATUS_COLUMNS.intersection(set(_rdr.fieldnames))
+                if len(rsrvFields) != 0:
+                    logging.error(f"Reserved fields {rsrvFields} present in table {_tn}.")
+                    sys.exit(1)
+
+                _allColumns = _allColumns.union(_rdr.fieldnames)
+
+            _allColumns = list(_allColumns) + list(REQUEST_STATUS_COLUMNS)
+            outputPath = os.path.join(self.tables_out_path, 'result.csv')
+            self.writer = csv.DictWriter(open(outputPath, 'w'), fieldnames=_allColumns,
+                                         restval='', extrasaction='ignore',
+                                         quotechar='"', quoting=csv.QUOTE_ALL)
+            self.writer.writeheader()
+
+        self.varInputTablePaths = inputTables
+
+    def sendCall(self):
+
+        for path in self.varInputTablePaths:
+
+            logging.info(f"Writing data from table {os.path.basename(path)}.")
+            _rdr = csv.DictReader(open(path))
+
+            for row in _rdr:
+                # logging.debug(row)
+
+                reqEndpoint = row['endpoint']
+                if reqEndpoint.startswith('/'):
+                    reqEndpoint = reqEndpoint[1:]
+
+                reqMethod = row['method']
+
+                if reqMethod not in SUPPORTED_METHODS:
+                    self.writer.writerow({
+                        **row,
+                        **{
+                            'request_status': "METHOD_ERROR",
+                            'request_message': f"Unsupported method {reqMethod} detected. " +
+                            f"Supported methds: {SUPPORTED_METHODS}.",
+                            'request_code': ''
+                        }
+                    })
+
+                    continue
+
+                try:
+                    reqData = json.loads(row['data'])
+
+                except ValueError as e:
+
+                    self.writer.writerow({
+                        **row,
+                        **{
+                            'request_status': "JSON_ERROR",
+                            'request_message': f"Invalid JSON detected in data. {e}",
+                            'request_code': ''
+                        }
+                    })
+
+                    continue
+
+                if reqMethod == 'POST':
+                    request = self.client.sendPostRequest(reqEndpoint, reqMethod, reqData)
+                elif reqMethod == 'PUT':
+                    request = self.client.sendPutRequest(reqEndpoint, reqMethod, reqData)
+                else:
+                    pass
+
+                scRequest = request.status_code
+
+                try:
+                    jsRequest = request.json()
+
+                except ValueError:
+                    jsRequest = {'response': request.text}
+
+                if request.ok is not True:
+                    self.writer.writerow({
+                        **row,
+                        **{
+                            'request_status': "REQUEST_ERROR",
+                            'request_message': json.dumps(jsRequest),
+                            'request_code': scRequest
+                        }
+                    })
+
+                else:
+                    self.writer.writerow({
+                        **row,
+                        **{
+                            'request_status': "REQUEST_OK",
+                            'request_message': json.dumps(jsRequest),
+                            'request_code': scRequest
+                        }
+                    })
+
+    def run(self):
+        self.sendCall()
+
+
+================================================
+File: /src/magento/client.py
+================================================
+import logging
+import os
+import requests
+from urllib.parse import urljoin
+from kbc.client_base import HttpClientBase
+
+
+class MagentoClient(HttpClientBase):
+
+    def __init__(self, apiUrl, token):
+
+        self.parApiUrl = urljoin(apiUrl, 'rest')
+        self.parToken = token
+
+        _defaultHeader = {
+            'Authorization': f'Bearer {self.parToken}'
+        }
+
+        super().__init__(self.parApiUrl, default_http_header=_defaultHeader, max_retries=5)
+        logging.debug(self.base_url)
+
+    def put_raw(self, *args, **kwargs):
+
+        s = requests.Session()
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        s.headers.update(headers)
+        s.auth = self._auth
+
+        r = self.requests_retry_session(session=s).request('PUT', *args, **kwargs)
+        return r
+
+    def sendPostRequest(self, endpoint, method, data):
+
+        urlRequest = os.path.join(self.base_url, endpoint)
+        logging.debug(urlRequest)
+        headersRequest = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+
+        return self.post_raw(url=urlRequest, json=data, headers=headersRequest)
+
+    def sendPutRequest(self, endpoint, method, data):
+
+        urlRequest = os.path.join(self.base_url, endpoint)
+        logging.debug(urlRequest)
+        headersRequest = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+
+        return self.put_raw(url=urlRequest, json=data, headers=headersRequest)
+
+
+================================================
+File: /src/main.py
+================================================
+import logging
+import os
+import sys
+import logging_gelf.handlers
+import logging_gelf.formatters
+from magento.component import MagentoComponent
+
+# Environment setup
+sys.tracebacklimit = 0
+
+# Logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)-8s : [line:%(lineno)3s] %(message)s',
+    datefmt="%Y-%m-%d %H:%M:%S")
+
+if 'KBC_LOGGER_ADDR' in os.environ and 'KBC_LOGGER_PORT' in os.environ:
+
+    logger = logging.getLogger()
+    logging_gelf_handler = logging_gelf.handlers.GELFTCPSocketHandler(
+        host=os.getenv('KBC_LOGGER_ADDR'),
+        port=int(os.getenv('KBC_LOGGER_PORT'))
+    )
+    logging_gelf_handler.setFormatter(
+        logging_gelf.formatters.GELFFormatter(null_character=True))
+    logger.addHandler(logging_gelf_handler)
+
+    # removes the initial stdout logging
+    logger.removeHandler(logger.handlers[0])
+
+APP_VERSION = '0.1.0'
+
+if __name__ == '__main__':
+
+    logging.info("Running component version %s..." % APP_VERSION)
+
+    c = MagentoComponent()
+    c.run()
+
+    logging.info("Writing finished.")
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+#          - echo 'Pushing test image to repo. [tag=test]'
+#          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# Magento writer for Keboola
+
+Magento writer allows to write data from Keboola to a Magento instance. The configuration of the writer is done using input parameters and at least 1 input table. In case a 4xx HTTP error is encountered, **the writer does not fail but instead records this encounter in a status table** and in case of 5xx HTTP error, the request is retried.
+
+## Configuration
+
+The sample configuration of the extractor, including inputs and outputs, can be found in the [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.wr-magento/src/master/component_config/sample-config/).
+
+### Parameters
+
+The configuration of Magento writer requires 2 parameters.
+
+**Parameters**:
+
+- `api_url` - An URL to the Magento instance, with which the component will communicate. The URL **should not** include `rest` part of the URL, since that is added automatically.
+- `#token` - An API token, which will be used to authenticate against the API.
+
+Both of the parameters are required.
+
+### Input Table
+
+Input table specifies to which endpoint the data should be sent. The writer iterates over the table and for each row creates a new request to the API. The writer accepts 1 or more input tables which must contain the following columns:
+
+- `endpoint` - An endpoint, where the data will be written, exactly as shown in API's documentation. An example would be: `all/V1/company/product/update`.
+- `method` - One of `PUT` or `POST` based on what is required from the endpoint. If method is different than `PUT` or `POST`, the request will not be sent.
+- `data` - A valid JSON object, which should be sent along with the request.
+
+In addition, other columns can be provided in the input table as well and will be copied over to the status table. None of the input tables can contain reserved columns `request_status`, `request_message` and `request_code`.
+
+## Status table
+
+As mentioned in the first part of the documentation, for each request writer records its status and saves it in the status table `result`. The status table contains **exactly the same columns as input table(s)** with addition of 3 columns:
+
+- `request_code` - A HTTP response code for the request.
+- `request_status` - A short description of the status of the request. One of `REQUEST_OK` (successful request), `REQUEST_ERROR` (unsuccessful request), `METHOD_ERROR` (unsupported method) or `JSON_ERROR` (body of the request is not a valid JSON).
+- `request_message` - A long message, either from the API or the code itself, where the error was detected.
+
+The table is **not** loaded incrementally.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+The sample configuration of the extractor, including inputs and outputs, can be found in the [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.wr-magento/src/master/component_config/sample-config/).
+
+### Parameters
+
+The configuration of Magento writer requires 2 parameters.
+
+**Parameters**:
+
+- `api_url` - An URL to the Magento instance, with which the component will communicate. The URL **should not** include `rest` part of the URL, since that is added automatically.
+- `#token` - An API token, which will be used to authenticate against the API.
+
+Both of the parameters are required.
+
+### Input Table
+
+Input table specifies to which endpoint the data should be sent. The writer iterates over the table and for each row creates a new request to the API. The writer accepts 1 or more input tables which must contain the following columns:
+
+- `endpoint` - An endpoint, where the data will be written, exactly as shown in API's documentation. An example would be: `all/V1/company/product/update`.
+- `method` - One of `PUT` or `POST` based on what is required from the endpoint. If method is different than `PUT` or `POST`, the request will not be sent.
+- `data` - A valid JSON object, which should be sent along with the request.
+
+In addition, other columns can be provided in the input table as well and will be copied over to the status table. None of the input tables can contain reserved columns `request_status`, `request_message` and `request_code`.
+
+## Status table
+
+As mentioned in the first part of the documentation, for each request writer records its status and saves it in the status table `result`. The status table contains **exactly the same columns as input table(s)** with addition of 3 columns:
+
+- `request_code` - A HTTP response code for the request.
+- `request_status` - A short description of the status of the request. One of `REQUEST_OK` (successful request), `REQUEST_ERROR` (unsuccessful request), `METHOD_ERROR` (unsupported method) or `JSON_ERROR` (body of the request is not a valid JSON).
+- `request_message` - A long message, either from the API or the code itself, where the error was detected.
+
+The table is **not** loaded incrementally.
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Magento is an open-source e-commerce platform written in PHP. It is one of the most popular open e-commerce systems in the network.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Parameters",
+  "required": [
+    "api_url",
+    "#token"
+  ],
+  "properties": {
+    "api_url": {
+      "type": "string",
+      "title": "API URL",
+      "propertyOrder": 100,
+      "description": "The URL, where the Magento API is located. The URL should not contain the <strong>rest</strong> part of the URL."
+    },
+    "#token": {
+      "type": "string",
+      "format": "password",
+      "title": "Token",
+      "description": "Authorization token for the Magento API.",
+      "propertyOrder": 300
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {},
+  "parameters": {
+    "api_url": "https://sk.lab.company.dev",
+    "#token": "API_TOKEN"
+  },
+  "image_parameters": {},
+  "authorization": {}
+}
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"endpoint","data","method","id"
+"V1/products/base-prices","{""prices"":[{""price"":""123"",""store_id"":""0"",""sku"":""4233-1-435g-ovocny-punc"",""extension_attributes"":{}}]}","POST","123"
+"V1/products/base-prices","{""prices"":[{""price"":""123"",""store_id"":""0"",""sku"":""4231-1-435g-ovocny-punc"",""extension_attributes"":{}}]}","POST","345"
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "endpoint",
+        "data",
+        "method"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/out/tables/result.csv
+================================================
+"data","method","id","endpoint","request_message","request_status","request_code"
+"{""prices"":[{""price"":""123"",""store_id"":""0"",""sku"":""4233-1-435g-ovocny-punc"",""extension_attributes"":{}}]}","POST","123","V1/products/base-prices","{""message"": ""Consumer is not authorized to access %resources"", ""parameters"": {""resources"": ""Magento_Catalog::catalog""}}","REQUEST_ERROR","401"
+"{""prices"":[{""price"":""123"",""store_id"":""0"",""sku"":""4231-1-435g-ovocny-punc"",""extension_attributes"":{}}]}","POST","345","V1/products/base-prices","{""message"": ""Consumer is not authorized to access %resources"", ""parameters"": {""resources"": ""Magento_Catalog::catalog""}}","REQUEST_ERROR","401"
+
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.4.zip#egg=kbc
+logging_gelf
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.7.2-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+RUN pip install -r /code/requirements.txt
+WORKDIR /code/
+
+CMD ["python", "-u", "/code/src/main.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Magento writer for Keboola
+
+Magento writer allows to write data from Keboola to a Magento instance. The configuration of the writer is done using input parameters and at least 1 input table. In case a 4xx HTTP error is encountered, **the writer does not fail but instead records this encounter in a status table** and in case of 5xx HTTP error, the request is retried.
+
+## Configuration
+
+The sample configuration of the extractor, including inputs and outputs, can be found in the [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.wr-magento/src/master/component_config/sample-config/).
+
+### Parameters
+
+The configuration of Magento writer requires 2 parameters.
+
+**Parameters**:
+
+- `api_url` - An URL to the Magento instance, with which the component will communicate. The URL **should not** include `rest` part of the URL, since that is added automatically.
+- `#token` - An API token, which will be used to authenticate against the API.
+
+Both of the parameters are required.
+
+### Input Table
+
+Input table specifies to which endpoint the data should be sent. The writer iterates over the table and for each row creates a new request to the API. The writer accepts 1 or more input tables which must contain the following columns:
+
+- `endpoint` - An endpoint, where the data will be written, exactly as shown in API's documentation. An example would be: `all/V1/company/product/update`.
+- `method` - One of `PUT` or `POST` based on what is required from the endpoint. If method is different than `PUT` or `POST`, the request will not be sent.
+- `data` - A valid JSON object, which should be sent along with the request.
+
+In addition, other columns can be provided in the input table as well and will be copied over to the status table. None of the input tables can contain reserved columns `request_status`, `request_message` and `request_code`.
+
+## Status table
+
+As mentioned in the first part of the documentation, for each request writer records its status and saves it in the status table `result`. The status table contains **exactly the same columns as input table(s)** with addition of 3 columns:
+
+- `request_code` - A HTTP response code for the request.
+- `request_status` - A short description of the status of the request. One of `REQUEST_OK` (successful request), `REQUEST_ERROR` (unsuccessful request), `METHOD_ERROR` (unsupported method) or `JSON_ERROR` (body of the request is not a valid JSON).
+- `request_message` - A long message, either from the API or the code itself, where the error was detected.
+
+The table is **not** loaded incrementally.
+
+## Development
+
+To build and run a container, use following commands:
+
+```
+docker-compose build dev
+docker-compose run --rm dev
+```
+

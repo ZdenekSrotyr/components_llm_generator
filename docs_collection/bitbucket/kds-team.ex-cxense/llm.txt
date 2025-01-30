@@ -1,0 +1,2804 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-cxense/
+    ├── .travis.yml
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── component-config/
+    ├── src/
+    │   ├── cx.py
+    │   ├── kbc_lib/
+    │   │   ├── __init__.py
+    │   │   └── result.py
+    │   ├── traffic_data.py
+    │   ├── cx/
+    │   │   ├── cx_result.py
+    │   │   ├── cxense_client.py
+    │   │   └── __init__.py
+    │   └── main.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── requirements.txt
+    ├── .dockerignore
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /.travis.yml
+================================================
+sudo: required
+language: bash
+services:
+  - docker
+before_script:
+  - docker build . --tag=my-component
+after_success:
+  - docker images
+deploy:
+  provider: script
+  skip_cleanup: true
+  script: ./deploy.sh
+  on:
+    tags: true
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    mem_limit: 256m
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - python -m
+      - unittest
+
+================================================
+File: /src/cx.py
+================================================
+#!/usr/bin/env python
+"""\
+Execute API requests.
+
+Usage: cx.py <api path> <request object>
+
+    Authentication is done by generating the appropriate header after reading the
+    line 'authentication <username> <api key>' from ~/.cxrc.
+
+    JSON will be seralized according to the default encoding, or ascii safe if
+    in doubt.
+
+    Stdin will be used if request object is "-". If no request object, the
+    empty object "{}" is assumed.
+
+Wiki references and documentation:
+    API authentication: https://wiki.cxense.com/display/cust/API+authentication
+    Requests and responses: https://wiki.cxense.com/display/cust/Requests+and+responses
+
+Examples (for bash, please check the wiki pages for tips how to run this on Windows)
+
+    Version:
+        $ cx.py --version
+        VERSION cx.py : <version>
+
+    Absolute path:
+        $ cx.py https://api.cxense.com/public/date
+        {
+              "date": "2013-04-22T15:06:20.252Z"
+        }
+
+    Relative path, defaults to https://api.cxense.com unless apiserver is set in ~/.cxrc
+        $ cx.py /public/date
+        {
+              "date": "2013-04-22T15:06:20.252Z"
+        }
+
+    POST request with non-empty request object:
+        $ cx.py /site '{"siteId":"9222300742735526873"}'
+        {
+          "sites": [
+            {
+              "id": "9222300742735526873"
+              "name": "Example site",
+              "url": "http://www.example.com",
+              "country": "US",
+              "timeZone": "America/Los_Angeles",
+            }
+          ]
+        }
+
+    GET request with json parameter:
+        $ cx.py /profile/content/fetch?json=%7B%22url%22%3A%22http%3A%2F%2Fwww.example.com%22%7D
+        {
+          "url": "http://www.example.com",
+          "id": "0caaf24ab1a0c33440c06afe99df986365b0781f"
+        }
+
+"""
+
+import sys
+def isPython2():
+    return sys.version_info.major == 2
+
+if isPython2():
+    import httplib
+    import urlparse
+else:
+    import http.client as httplib
+    import urllib.parse as urlparse
+
+import os
+import hmac
+import json
+import locale
+import hashlib
+import datetime
+import traceback
+import collections
+
+#
+# please update the version
+#
+VERSION_TIMESTAMP = '2017-06-09'
+
+# Default configuration.
+username = None
+secret = None
+apiserver = 'https://api.cxense.com'
+
+# Locate and autoload configuration from ~/.cxrc
+rc = os.path.join(os.path.expanduser('~'), '.cxrc')
+if os.path.exists(rc):
+    for line in open(rc):
+        fields = line.split()
+        if fields[0] == 'authentication' and len(fields) == 3:
+            username = fields[1]
+            secret = fields[2]
+        elif fields[0] == 'apiserver' and len(fields) == 2:
+            apiserver = fields[1]
+
+def getDate(connection):
+    # If the computer's time can be trusted, the below condition can be changed to False
+    if True:
+        try:
+            connection.request("GET", "/public/date")
+            return json.load(connection.getresponse())['date']
+        except:
+            pass
+
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+def execute(url, content, username=username, secret=secret):
+    connection = (httplib.HTTPConnection if url.scheme == 'http' else httplib.HTTPSConnection)(url.netloc)
+
+    try:
+        date = getDate(connection)
+        signature = hmac.new(secret.encode('utf-8'), date.encode('utf-8'), digestmod=hashlib.sha256).hexdigest()
+        headers = {"X-cXense-Authentication": "username=%s date=%s hmac-sha256-hex=%s" % (username, date, signature)}
+        headers["Content-Type"] = "application/json; charset=utf-8"
+        connection.request("GET" if content is None else "POST", url.path + ("?" + url.query if url.query else ""), content, headers)
+        response = connection.getresponse()
+        return response.status, response.getheader('Content-Type', ''), response.read()
+
+    finally:
+        connection.close()
+
+if __name__ == "__main__":
+    # output the version number of this script
+    if ('-v' in sys.argv) or ('--version' in sys.argv):
+        print('VERSION cx.py : %r\n' % VERSION_TIMESTAMP)
+        sys.exit()
+
+    if len(sys.argv) < 2 or '--help' in sys.argv:
+        print('VERSION cx.py: %r\n' % VERSION_TIMESTAMP)
+        print(__doc__)
+        sys.exit(1)
+
+    elif len(sys.argv) > 3:
+        print("Too many arguments. Remember to quote the JSON.")
+        sys.exit(1)
+
+    if username is None or secret is None:
+        print("Please add the line 'authentication <username> <api key>' to %s" % rc)
+        sys.exit(3)
+
+    if '@' not in username:
+        print("Username is not an email address: %s" % username)
+        sys.exit(4)
+
+    if not secret.startswith('api&'):
+        print("Invalid API key: %s" % secret)
+        sys.exit(5)
+
+    # Load data from argument or stdin, hopefully with correct encoding.
+    argument = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if argument is None:
+        content = None
+
+    elif argument == '-':
+        content = sys.stdin.read()
+
+    else:
+        if isPython2():
+            content = unicode(argument, sys.stdin.encoding or locale.getpreferredencoding()).encode('UTF-8')
+        else:
+            content = argument.encode('UTF-8')
+
+    if len(sys.argv) == 2:
+        try:
+            # GET request: early integrity check of optional json query parameter
+            # if no json parameter exists (like for /public/date), make the test pass with "{}" as dummy instead
+            json.loads(urlparse.parse_qs(urlparse.urlparse(sys.argv[-1]).query).get('json',["{}"])[-1])
+
+        except ValueError as e:
+            print("Invalid JSON in \"json\" parameter: %s" % e)
+            sys.exit(3)
+
+    # Make sure piping works, which can have a undefined encoding.
+    ensure_ascii = sys.stdout.encoding != 'UTF-8'
+
+    # Default to apiserver, unless a full URL was given.
+    path = sys.argv[1]
+    if path.startswith('http'):
+        url = urlparse.urlparse(path)
+    else:
+        url = urlparse.urlparse(urlparse.urljoin(apiserver, path))
+
+    # Execute the API request and exit 0 only if it was successful.
+    try:
+        status, contentType, response = execute(url, content, username, secret)
+    except:
+        print("HTTP request to %s failed" % path)
+        traceback.print_exc()
+        sys.exit(6)
+
+    if contentType.startswith('application/json'):
+        print(json.dumps(json.loads(response.decode('utf-8'), object_pairs_hook=collections.OrderedDict), indent=2, ensure_ascii=ensure_ascii))
+    else:
+        if isPython2():
+            if sys.platform == "win32":
+                # On Windows, stdout is text mode by default. Set binary mode to prevent mangling. Not needed in
+                # Python 3, where sys.stdout.buffer.write ensures binary mode.
+                import os, msvcrt
+                msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+            sys.stdout.write(response)
+        else:
+            sys.stdout.buffer.write(response)
+    if status != 200:
+        sys.exit(1)
+
+================================================
+File: /src/kbc_lib/result.py
+================================================
+import csv
+import io
+import os
+
+"""
+Set of classes for standardized result processing, without use of Pandas library - more memory efficient.
+
+Defines three classes 
+- KBCResult - definition of a result that can be processed by other methods
+- KBCTableDef - definition of a KBC Storage table - column, pkeys, name and other metadata
+- ResultWriter - Class providing methods of generic parsing and writing JSON responses. Can be used to build more complex
+ writer based on this class as a parent.
+
+"""
+class KBCResult:
+
+    def __init__(self, file_name, full_path, table_def):
+        self.full_path = full_path
+        self.file_name = file_name
+        self.table_def = table_def
+
+
+class KBCTableDef:
+    def __init__(self, name, columns, pk, destination='', metadata=None, column_metadata=None):
+        self.pk = pk
+        self.columns = columns
+        self.name = name
+        self.destination = destination
+        self.metadata = metadata
+        self.column_metadata = column_metadata
+
+
+class ResultWriter:
+    def __init__(self, result_dir_path: str, table_def: KBCTableDef, fix_headers=False,
+                 exclude_fields=[], user_value_cols=[], flatten_objects=True, buffer_size=io.DEFAULT_BUFFER_SIZE):
+        """
+
+         :param write_header: asddas
+         :param write_header: object
+         :param table_def: KBCTableDef
+         :param result_dir_path: str
+         :param fix_headers: flag whether to use header specified in table definition or rather infer the header from
+         the result itself. A Value Exception is thrown if no columns are specified in the table_def object and this
+         option is set to True
+
+         Note that with this option off all responses processed by the write() method must contain same header columns,
+         otherwise invalid csv file is produced.
+
+         :param flatten_objects: Specifies whether to flatten the parsed object or write them as are.
+         If set to true all object hierarchies are flattened with `_` separator. Arrays are not parsed and stored as
+         normal values.
+
+         **Note:** If set to `True` and  used in combination with `fix_headers` field the columns specified include
+         all flattened objects, hierarchy separated by `_` e.g. cols = ['single_col', 'parent_child'] otherwise these
+         will not be included.
+
+         :param exclude_fields: List of col names to be excluded from parsing.
+         Usefull with `flatten_object` parameter on. This is applied before flattening.
+
+         :param user_value_cols: List of column names that will be added to the root object. Use this in cocnlusion with
+         `user_values` parameter in the write() method.
+
+
+         :rtype: object
+         """
+        self.result_dir_path = result_dir_path
+        self.table_def = table_def
+        if user_value_cols:
+            self.table_def.columns += user_value_cols
+        self.results = {}
+        self.fix_headers = fix_headers
+        self.exclude_fields = exclude_fields
+        self.flatten_objects = flatten_objects
+        self.user_value_cols = user_value_cols
+
+        # Cache open files, to limit expensive open operation count
+        self._res_file_cache = {}
+        self._buffer_size = buffer_size
+
+    def write_all(self, data_array, file_name=None, user_values=None, object_from_arrays=False, write_header=True):
+
+        for data in data_array:
+            self.write(data, file_name=file_name, user_values=user_values, object_from_arrays=object_from_arrays,
+                       write_header=write_header)
+
+    def write(self, data, file_name=None, user_values=None, object_from_arrays=False, write_header=True):
+        """
+
+        :param data:
+        :param file_name:
+        :param user_values: Optional dictionary of user values to be added to the root object. The keys must match the column
+        names specified during initialization in `user_value_cols` parameter, otherwise it will throw a ValueError.
+
+        If used with `fix_headers` option, `user_value` columns must be specified on the table def object.
+
+        :param object_from_arrays: Create additional tables from the array objects
+        The result tables are named like: `parent_array-colnam.csv' and generates PK values: [parent_key, row_number]
+
+        :param write_header: Optional flag specifying whether to write the header - only needed when creating sliced files.
+        :return:
+        """
+        if not data:
+            return {}
+
+        if not file_name:
+            file_name = self.table_def.name + '.csv'
+
+        res_file_path = os.path.join(self.result_dir_path, file_name)
+
+        # exclude columns
+        data = self._exclude_cols(data)
+
+        # flatten objects
+        if self.flatten_objects:
+            data = self.flatten_json(data)
+
+        # add user values
+        data = self._add_user_values(data, user_values)
+
+        # write array objects
+        if object_from_arrays:
+            res = self._write_array_object(data, write_header, user_values)
+            self.results = {**self.results, **res}
+
+        fieldnames = self._get_header(data)
+        # update columns in result if not specified
+        if not self.fix_headers:
+            self.table_def.columns = fieldnames
+
+        self._write_data_to_csv(data, res_file_path, write_header, fieldnames)
+
+        self.results[file_name] = (KBCResult(file_name, res_file_path, self.table_def))
+
+    def collect_results(self):
+
+        return [self.results[r] for r in self.results]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        """
+        Close all output streams / files. Has to be called at end of extraction, before result processing.
+
+        :return:
+        """
+        for res in self._res_file_cache:
+            self._res_file_cache[res].close()
+
+    def _write_array_object(self, data, write_header, user_values):
+        results = {}
+        for arr in [(key, data[key]) for key in data.keys() if isinstance(data[key], list)]:
+            res = [{"row_nr": idx, "parent_key": self._get_pkey_values(data, user_values), "value": val} for idx, val in
+                   enumerate(arr[1])]
+            tb_name = self.table_def.name + '_' + arr[0]
+            filename = tb_name + '.csv'
+            res_path = os.path.join(self.result_dir_path, filename)
+            columns = ["row_nr", "parent_key", "value"]
+            self._write_data_to_csv(res, res_path, write_header, columns)
+            res = KBCResult(filename, res_path,
+                            KBCTableDef(tb_name, columns, ["row_nr", "parent_key"]))
+            results[res.file_name] = res
+            # remove field from source
+            data.pop(arr[0])
+        return results
+
+    def _get_pkey_values(self, data, user_values):
+        pkeys = []
+        for k in self.table_def.pk:
+            if data.get(k):
+                pkeys.append(str(data[k]))
+            elif user_values.get(k):
+                pkeys.append(str(user_values[k]))
+
+        return '|'.join(pkeys)
+
+    def _write_data_to_csv(self, data, res_file_path, write_header, fieldnames):
+        # append if exists
+        if self._res_file_cache.get(res_file_path):
+            res_file = self._res_file_cache.get(res_file_path)
+            write_header = False
+        else:
+            res_file = open(res_file_path, 'w', encoding='utf-8', newline='', buffering=self._buffer_size)
+            self._res_file_cache[res_file_path] = res_file
+
+        writer = csv.DictWriter(res_file, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        if isinstance(data, list):
+            writer.writerows(data)
+        else:
+            writer.writerow(data)
+
+    def _get_header(self, data):
+        if self.fix_headers:
+            cols = self.table_def.columns
+        else:
+            cols = list(data.keys())
+        cols.sort()
+        return cols
+
+    def flatten_json(self, x, out={}, name=''):
+        if type(x) is dict:
+            for a in x:
+                self.flatten_json(x[a], out, name + a + '.')
+        else:
+            out[name[:-1]] = x
+
+        # self.flatten_json(y)
+        return out
+
+    def _exclude_cols(self, data):
+        for col in self.exclude_fields:
+            if col in data.keys():
+                data.pop(col)
+        return data
+
+    def _add_user_values(self, data, user_values):
+        if not user_values:
+            return data
+
+        # validate
+        if len(user_values) > 0 and not all(elem in user_values.keys() for elem in self.user_value_cols):
+            raise ValueError("Some user value keys (%s) were not set in user_value_cols (%s) during initialization!",
+                             user_values.keys(), self.user_value_cols)
+
+        data = {**data, **user_values}
+
+        for key in user_values:
+            data[key] = user_values[key]
+        return data
+
+
+================================================
+File: /src/traffic_data.py
+================================================
+import logging
+from typing import List
+
+from kbc.env_handler import KBCEnvHandler
+
+from cx.cx_result import CxTrafficDataResultWriter
+from cx.cx_result import CxTrafficResultWriter
+from cx.cxense_client import CxenseClient
+from kbc_lib.result import *
+
+# from memory_profiler import profile
+
+# configuration parameters
+PAR_TRAFFIC_REQUEST_METHOD = 'traffic_request_method'
+PAR_ORIGINS = 'origins'
+PAR_EXT_USER_TYPES = 'externalUserIdTypes'
+PAR_FIELDS = 'fields'
+PAR_SITE_IDS = 'site_ids_filter'
+PAR_SITE_GROUPS = 'traffic_request_groups'
+PAR_FILTERS = 'traffic_filters'
+PAR_DT_START = 'traffic_request_start'
+PAR_DT_STOP = 'traffic_request_stop'
+PAR_HISTORY_FIELDS = 'historyFields'
+PAR_HISTORY_BUCKETS = 'historyBuckets'
+PAR_HISTORY_RESOLUTION = 'historyResolution'
+
+PAR_API_SECRET = '#request_secret'
+PAR_USERNAME = 'request_username'
+
+DMP_TRAFFIC_FIELDS = ['events', 'uniqueUsers']
+
+# always included
+DMP_TRAFFIC_DATA_PK = ['eventId', 'userId']
+
+DMP_TRAFFIC_PK = []
+
+MANDATORY_PARS = [PAR_USERNAME, PAR_API_SECRET]
+
+MAX_RETRIES = 10
+RETRY_ON = [429, 502, 503, 504]
+
+ENDPOINT_DMP_TRAFFIC_DATA = '/dmp/traffic/data'
+ENDPOINT_DMP_TRAFFIC = '/dmp/traffic'
+ENDPOINT_TRAFFIC_DATA = '/traffic/data'
+
+
+class TrafficDataExtractor:
+    def __init__(self, env_handler: KBCEnvHandler, debug=False):
+        self.env_handler = env_handler
+        # override debug from config
+        if env_handler.cfg_params.get('debug'):
+            debug = True
+
+        env_handler.set_default_logger('DEBUG' if debug else 'INFO')
+
+        try:
+            env_handler.validate_config(MANDATORY_PARS)
+        except ValueError as e:
+            logging.error(e)
+            exit(1)
+        self.cfg_params = env_handler.cfg_params
+        # init client
+        self.client = CxenseClient(self.cfg_params[PAR_USERNAME], self.cfg_params[PAR_API_SECRET], MAX_RETRIES,
+                                   RETRY_ON)
+
+    # @profile
+    def run(self):
+
+        req_method = self.cfg_params.get(PAR_TRAFFIC_REQUEST_METHOD)
+
+        logging.info("Collecting %s results..", req_method)
+        if req_method in [ENDPOINT_TRAFFIC_DATA, ENDPOINT_DMP_TRAFFIC_DATA]:
+            results = self.get_traffic_event_data()
+        elif req_method == ENDPOINT_DMP_TRAFFIC:
+            results = self.get_traffic_data()
+
+        logging.info('Storing results...')
+        self.create_manifests(results)
+
+    def get_traffic_event_data(self):
+        """
+        Get event data. dmp/traffic/data or traffic/data endpoints.
+
+        :rtype: results
+        """
+        traffic_endpoint_type = ''
+        if self.cfg_params.get(PAR_TRAFFIC_REQUEST_METHOD) == ENDPOINT_TRAFFIC_DATA:
+            traffic_endpoint_type = 'standard'
+        elif self.cfg_params.get(PAR_TRAFFIC_REQUEST_METHOD) == ENDPOINT_DMP_TRAFFIC_DATA:
+            traffic_endpoint_type = 'dmp'
+        # validate params
+        params = self._validate_n_clean_traffic_params(traffic_endpoint_type)
+        # build request
+        request = self._build_traffic_data_request(params)
+        logging.info("Request parameters: %s", request)
+
+        with CxTrafficDataResultWriter(self.env_handler.tables_out_path, traffic_endpoint_type,
+                                       request['fields'].copy(),
+                                       buffer=8192) as event_writer:
+            for res in self.client.get_traffic_data_events_paged(traffic_endpoint_type, **request):
+                event_writer.write_all(res['events'], object_from_arrays=True)
+
+            results = event_writer.collect_results()
+
+        return results
+
+    def get_traffic_data(self):
+        params = self._validate_n_clean_dmp_traffic_params()
+
+        # build partial request, most of the parameters shared with */traffic/data
+        request = self._build_traffic_data_request(params)
+
+        if params.get(PAR_HISTORY_FIELDS):
+            request[PAR_HISTORY_FIELDS] = params[PAR_HISTORY_FIELDS]
+
+        if params.get(PAR_HISTORY_BUCKETS):
+            request[PAR_HISTORY_BUCKETS] = params[PAR_HISTORY_BUCKETS]
+
+        if params.get(PAR_HISTORY_RESOLUTION):
+            request[PAR_HISTORY_RESOLUTION] = params[PAR_HISTORY_RESOLUTION]
+
+        logging.info("Request parameters: %s", request)
+
+        traffic_res_table = KBCTableDef('dmp_traffic', params.get(PAR_FIELDS), DMP_TRAFFIC_PK)
+        with CxTrafficResultWriter(self.env_handler.tables_out_path, request['fields'].copy(),
+                                   request[PAR_HISTORY_FIELDS].copy(), buffer=8192) as event_writer:
+
+            res = self.client.get_dmp_traffic(request)
+            # remove unused params
+            request.pop(PAR_FIELDS, '')
+            request.pop(PAR_HISTORY_FIELDS, '')
+            event_writer.write(res, user_values={'req': str(request)}, object_from_arrays=False)
+
+            results = event_writer.collect_results()
+
+        return results
+
+    def _validate_n_clean_dmp_traffic_params(self):
+        params = self.cfg_params
+        fields = params.get(PAR_FIELDS, [])
+
+        if fields:
+            invalid_vals = [elem for elem in fields if elem not in DMP_TRAFFIC_FIELDS]
+            if invalid_vals:
+                logging.error('Some field values %s are unsupported. Valid values are %s', invalid_vals,
+                              DMP_TRAFFIC_FIELDS)
+                is_valid = False
+            self.cfg_params[PAR_FIELDS] = list(set(fields))
+        else:
+            # exclude externalUserIds => sometimes does not work for all user types
+            self.cfg_params[PAR_FIELDS] = DMP_TRAFFIC_FIELDS
+
+        return self.cfg_params
+
+    def _build_traffic_data_request(self, params):
+        req = {}
+        if params.get(PAR_DT_START):
+            req['start'] = params[PAR_DT_START]
+        if params.get(PAR_DT_STOP):
+            req['stop'] = params[PAR_DT_STOP]
+
+        if params.get(PAR_EXT_USER_TYPES):
+            req[PAR_EXT_USER_TYPES] = params[PAR_EXT_USER_TYPES]
+
+        if params.get(PAR_FILTERS):
+            req['filters'] = params[PAR_FILTERS]
+
+        if params.get(PAR_SITE_GROUPS):
+            req['siteGroupIds'] = params[PAR_SITE_GROUPS]
+
+        if params.get(PAR_ORIGINS):
+            req[PAR_ORIGINS] = params[PAR_ORIGINS]
+
+        if params.get(PAR_SITE_IDS):
+            req['siteIds'] = params[PAR_SITE_IDS]
+
+        req['fields'] = params[PAR_FIELDS]
+
+        return req
+
+    def _validate_n_clean_traffic_params(self, type):
+        """
+        Further param validation and cleanup
+        :param type: 'dmp' or 'standard' type
+        :return:
+        """
+
+        is_valid = True
+        params = self.cfg_params
+        if type == 'dmp':
+            end_desc = self.client.get_dmp_data_description()
+        else:
+            end_desc = self.client.get_traffic_data_description()
+
+        valid_types = end_desc['externalUserIdTypes']
+        valid_fields = end_desc['fields']
+        # fields (utype rule)
+        fields = params.get(PAR_FIELDS, [])
+
+        if fields:
+            invalid_vals = [elem for elem in fields if elem not in valid_fields]
+            if invalid_vals:
+                logging.error('Some field values %s are unsupported. Valid values are %s', invalid_vals, valid_fields)
+                is_valid = False
+            self.cfg_params[PAR_FIELDS] = list(set(fields + DMP_TRAFFIC_DATA_PK))
+        else:
+            # exclude externalUserIds => sometimes does not work for all user types
+            self.cfg_params[PAR_FIELDS] = [f for f in valid_fields if f != 'externalUserIds']
+
+        # uvalidate ser types
+
+        u_types = self.cfg_params.get(PAR_EXT_USER_TYPES, [])
+        if u_types:
+            invalid_vals = [elem for elem in u_types if elem not in valid_types]
+            if invalid_vals:
+                logging.error('Some externalUserIdType values %s are unsupported. Valid values are %s', invalid_vals,
+                              valid_types)
+                is_valid = False
+        elif 'externalUserIds' in self.cfg_params[PAR_FIELDS]:
+            self.cfg_params[PAR_EXT_USER_TYPES] = valid_types
+
+        if any(['externalUserIds' in self.cfg_params[PAR_FIELDS],
+                bool(self.cfg_params.get(PAR_EXT_USER_TYPES))]) and not (
+                'externalUserIds' in self.cfg_params[PAR_FIELDS] and self.cfg_params.get(PAR_EXT_USER_TYPES)):
+            logging.error(
+                'Either both field "externalUserIds" and parameter "externalUserIdType" must be specified or none.')
+            is_valid = False
+
+        if not is_valid:
+            exit(1)
+        return self.cfg_params
+
+    def create_manifests(self, results: List[KBCResult], headless=False, incremental=True):
+        for r in results:
+            if not headless:
+                self.env_handler.configuration.write_table_manifest(r.full_path, r.table_def.destination,
+                                                                    r.table_def.pk,
+                                                                    None, incremental, r.table_def.metadata,
+                                                                    r.table_def.column_metadata)
+            else:
+                self.env_handler.configuration.write_table_manifest(r.full_path, r.table_def.destination,
+                                                                    r.table_def.pk,
+                                                                    r.table_def.columns, incremental,
+                                                                    r.table_def.metadata,
+                                                                    r.table_def.column_metadata)
+
+
+================================================
+File: /src/cx/cx_result.py
+================================================
+from kbc_lib.result import *
+
+# from memory_profiler import profile
+# always included
+DMP_TRAFFIC_DATA_PK = ['eventId', 'userId']
+
+
+class CxTrafficDataResultWriter(ResultWriter):
+    """
+    Stores dmp/traffic/data and traffic/data result data in CSV.
+
+    """
+
+    def __init__(self, out_path, endpoint_type, cols, buffer=8192):
+        # specify result table
+        event_res_table = KBCTableDef(endpoint_type + '_traffic-events', cols, DMP_TRAFFIC_DATA_PK)
+        ResultWriter.__init__(self, out_path, event_res_table, fix_headers=True,
+                              exclude_fields=['externalUserIds', 'customParameters', 'userParameters',
+                                              'retargetingParameters'],
+                              user_value_cols=['pk'], buffer_size=buffer)
+
+        ext_user_table = KBCTableDef(endpoint_type + '_traffic-event-ext-users', ['id', 'type'], ['parent_pk', 'id'])
+        self.ext_user_writer = ResultWriter(out_path, ext_user_table, fix_headers=True, flatten_objects=False,
+                                            user_value_cols={'parent_pk'}, buffer_size=buffer)
+
+        cust_par_tb = KBCTableDef(endpoint_type + '_traffic-event-custom-pars', ['item', 'group'],
+                                  ['parent_pk', 'group', 'item'])
+        self.cust_par_writer = ResultWriter(out_path, cust_par_tb, fix_headers=True,
+                                            flatten_objects=False,
+                                            user_value_cols=['parent_pk'], buffer_size=buffer)
+
+        user_par_tb = KBCTableDef(endpoint_type + '_traffic-event-user-pars', ['item', 'group'],
+                                  ['parent_pk', 'group', 'item'])
+        self.user_par_writer = ResultWriter(out_path, user_par_tb, fix_headers=True,
+                                            flatten_objects=False,
+                                            user_value_cols=['parent_pk'], buffer_size=buffer)
+
+        retarget_par_tb = KBCTableDef(endpoint_type + '_traffic-retarget-custom-pars', ['item', 'group'],
+                                      ['parent_pk', 'group', 'item'])
+        self.retarget_par_writer = ResultWriter(out_path, retarget_par_tb, fix_headers=True,
+                                                flatten_objects=False,
+                                                user_value_cols=['parent_pk'], buffer_size=buffer)
+
+    # @profile
+    def write(self, data, file_name=None, user_values=None, object_from_arrays=False, write_header=True):
+
+        # write ext users
+        ext_ids = data.get('externalUserIds')
+        if ext_ids:
+            self.ext_user_writer.write_all(ext_ids, object_from_arrays=False,
+                                           user_values={'parent_pk': self._get_pkey_values(data, [])})
+            self.results = {**self.results, **self.ext_user_writer.results}
+
+        cust_pars = data.get('customParameters')
+        if cust_pars:
+            self.cust_par_writer.write_all(cust_pars, object_from_arrays=False,
+                                           user_values={'parent_pk': self._get_pkey_values(data, [])})
+            self.results = {**self.results, **self.cust_par_writer.results}
+
+        user_pars = data.get('userParameters')
+        if user_pars:
+            self.user_par_writer.write_all(user_pars, object_from_arrays=False,
+                                           user_values={'parent_pk': self._get_pkey_values(data, [])})
+            self.results = {**self.results, **self.user_par_writer.results}
+
+        retarget_pars = data.get('retargetingParameters')
+        if retarget_pars:
+            self.retarget_par_writer.write_all(retarget_pars, object_from_arrays=False,
+                                               user_values={'parent_pk': self._get_pkey_values(data, [])})
+            self.results = {**self.results, **self.retarget_par_writer.results}
+
+        super().write(data, object_from_arrays=False, user_values={'pk': self._get_pkey_values(data, [])})
+
+
+class CxTrafficResultWriter(ResultWriter):
+    """
+    Stores dmp/traffic/data and traffic/data result data in CSV.
+
+    """
+
+    def __init__(self, out_path, cols, history_cols, buffer=8192):
+        # specify result table
+        traffic_pk = cols + ['start', 'stop']
+        traffic_res_table = KBCTableDef('dmp_traffic', cols, traffic_pk)
+        ResultWriter.__init__(self, out_path, traffic_res_table, fix_headers=True,
+                              user_value_cols=['start', 'stop', 'req', 'pk'], buffer_size=buffer)
+
+        traff_hist_pk = history_cols + ['parent_pk', 'start_time', 'stop_time']
+        traffic_history_tbl = KBCTableDef('dmp_traffic_history', [], traff_hist_pk)
+        self.traffic_history_writer = ResultWriter(out_path, traffic_history_tbl, fix_headers=False,
+                                                   flatten_objects=False, user_value_cols={'parent_pk'},
+                                                   buffer_size=buffer)
+
+    # @profile
+    def write(self, data, file_name=None, user_values=None, object_from_arrays=False, write_header=True):
+
+        # write ext users
+        history = data.get('historyData')
+
+        if history:
+            hist_data = self._build_history_data(data.get('historyData'), data.get('history'))
+
+            self.traffic_history_writer.write_all(hist_data, object_from_arrays=False,
+                                                  user_values={'parent_pk': self._get_pkey_values(data, {})})
+            self.results = {**self.results, **self.traffic_history_writer.results}
+        user_values.update({'pk': self._get_pkey_values(data, {}), 'start': data['start'], 'stop': data['stop']})
+        super().write(data['data'], object_from_arrays=False, user_values=user_values)
+
+    def _build_history_data(self, hist_resp, history_dt_buckets):
+        history_data = []
+        # get size of historical data
+        hist_size = len(next(iter(hist_resp.values())))
+        history_fields = list(hist_resp.keys())
+        history_fields.sort()
+        dt_bucket_rows = self._build_history_bucket_rows(history_dt_buckets)
+        # build result array
+        for i in range(hist_size):
+            row = {}
+            # build row
+            for k in history_fields:
+                row.update({k: hist_resp[k][i]})
+                row.update({'start_time': dt_bucket_rows[i][0],
+                            'stop_time': dt_bucket_rows[i][1]})
+
+            history_data.append(row)
+
+        return history_data
+
+    def _build_history_bucket_rows(self, h_buckets):
+        bucket_rows = []
+        for i in range(len(h_buckets) - 1):
+            bucket_rows.append([h_buckets[i], h_buckets[i + 1]])
+        return bucket_rows
+
+
+================================================
+File: /src/cx/cxense_client.py
+================================================
+import datetime
+import hashlib
+import hmac
+import json
+
+from kbc.client_base import HttpClientBase
+
+DEFAULT_HOST = 'https://api.cxense.com'
+
+ENDPOINT_DMP_TRAFFIC = '/dmp/traffic'
+ENDPOINT_DMP_TRAFFIC_DATA = '/dmp/traffic/data'
+ENDPOINT_DMP_TRAFFIC_DATA_DESC = '/dmp/traffic/data/describe'
+ENDPOINT_TRAFFIC_DATA = '/traffic/data'
+ENDPOINT_TRAFFIC_DATA_DESC = '/traffic/data/describe'
+
+DEFAULT_COUNT_LIMIT = 100000
+
+
+class CxenseClient(HttpClientBase):
+    def __init__(self, username, api_secret, max_retries, retry_on, host=DEFAULT_HOST):
+        HttpClientBase.__init__(self, host, max_retries=max_retries, status_forcelist=retry_on,
+                                default_http_header={'Content-Type': 'application/json; charset=utf-8'})
+        self._username = username
+        self._api_secret = api_secret
+
+    def _get_auth_header(self):
+        date = datetime.datetime.utcnow().isoformat() + "Z"
+        signature = hmac.new(self._api_secret.encode('utf-8'), date.encode('utf-8'),
+                             digestmod=hashlib.sha256).hexdigest()
+        auth_header = {
+            "X-cXense-Authentication": "username=%s date=%s hmac-sha256-hex=%s" % (self._username, date, signature)}
+        return auth_header
+
+    def get_traffic_data_events_paged(self, type, **kwargs):
+        """
+
+        :param type: 'dmp' or 'standard'.
+            'dmp' -> returns data from dmp/traffic/data endpoint
+            'standard' -> returns data from traffic/data endpoint
+        :type externalUserIdTypes - Array of String
+        :type fields - Array of String
+        :type filters - Array of Object
+        :type origins - Array of String
+        :type siteGroupIds - Array of String
+        :type siteIds - Array of String
+        :type start - Integer or String
+        :type stop  - Integer or String
+
+        More info https://wiki.cxense.com/pages/viewpage.action?pageId=29547369
+
+        :return: Generator object to iterate through pages
+        """
+
+        if type == 'standard':
+            endpoint = ENDPOINT_TRAFFIC_DATA
+        elif type == 'dmp':
+            endpoint = ENDPOINT_DMP_TRAFFIC_DATA
+        else:
+            raise ValueError('Traffic data enpoint type not supported must be in [standard, dmp]')
+
+        return self._get_post_pages(endpoint, kwargs, DEFAULT_COUNT_LIMIT)
+
+    def get_dmp_traffic(self, request, **kwargs):
+        """
+
+        :type externalUserIdTypes - Array of String
+        :type fields - Array of String
+        :type filters - Array of Object
+        :type origins - Array of String
+        :type siteGroupIds - Array of String
+        :type siteIds - Array of String
+        :type start - Integer or String
+        :type stop  - Integer or String
+
+        More info https://wiki.cxense.com/pages/viewpage.action?pageId=29547369
+
+        :return: dist response
+        """
+
+        return self.post_request(ENDPOINT_DMP_TRAFFIC, request)
+
+    def get_dmp_data_description(self):
+        return self.post_request(ENDPOINT_DMP_TRAFFIC_DATA_DESC, {})
+
+    def get_traffic_data_description(self):
+        return self.post_request(ENDPOINT_TRAFFIC_DATA_DESC, {})
+
+    def _get_post_pages(self, url_path, data, count):
+        has_more = True
+
+        while has_more:
+            data['count'] = count
+            req_response = self.post_request(url_path, data)
+
+            if req_response.get('paginationStop', 0) != 0:
+                has_more = True
+                data['paginationStart'] = req_response['paginationStop']
+            else:
+                has_more = False
+
+            yield req_response
+
+    def post_request(self, url_path, body, query_params={}, **kwargs):
+        auth_header = self._get_auth_header()
+
+        headers = kwargs.pop('headers', {})
+        headers.update(auth_header)
+        headers["Content-Type"] = "application/json; charset=utf-8"
+
+        url = self.base_url + url_path
+        return self.post(url, data=json.dumps(body), params=query_params, headers=headers, **kwargs)
+
+    def _get_request(self, url_path, query_params, **kwargs):
+        auth_header = self._get_auth_header()
+
+        headers = kwargs.pop('headers', {})
+        headers.update(auth_header)
+        headers["Content-Type"] = "application/json; charset=utf-8"
+
+        url = self.base_url + url_path
+        return self.get_raw(url, params=query_params, headers=headers, **kwargs)
+
+
+================================================
+File: /src/main.py
+================================================
+'''
+Python 3
+
+Extractor can create 2 tables in one run:
+1) site table (always the same)
+2) traffic table (it is possible to choose a variant from several tables)
+
+'''
+import datetime
+import hashlib
+import hmac
+import http.client
+import itertools
+import json
+import os
+import socket
+import time
+from datetime import timedelta
+
+import pandas as pd
+from dateutil.relativedelta import *
+from kbc.env_handler import KBCEnvHandler
+
+import traffic_data
+from traffic_data import TrafficDataExtractor
+
+# connection timeout for http requests
+CONN_TIMEOUT = 10
+hdlr = KBCEnvHandler([])
+cfg = hdlr.configuration
+configuration = hdlr.cfg_params
+
+try:
+    debug = configuration.get('debug', False)
+except:
+    print("Please complete the missing part of the configuration")
+    exit(1)
+# --------------------------------------
+'''
+Running API Functions from within a Python 3.x Script: https://wiki.cxense.com/display/cust/The+Cxense+API+Tutorial
+
+'''
+if debug == "True":
+
+    def cx_api(path, obj, username, secret):
+        date = datetime.datetime.utcnow().isoformat() + "Z"
+        print("date: ", date)
+        signature = hmac.new(secret.encode('utf-8'), date.encode('utf-8'), digestmod=hashlib.sha256).hexdigest()
+        print("signature: ", signature)
+        headers = {"X-cXense-Authentication": "username=%s date=%s hmac-sha256-hex=%s" % (username, date, signature)}
+        headers["Content-Type"] = "application/json; charset=utf-8"
+        print("headers: ", headers)
+        connection = http.client.HTTPSConnection("api.cxense.com", 443, timeout=CONN_TIMEOUT)
+        connection.request("POST", path, json.dumps(obj), headers)
+        print("connection: ", connection)
+        response = connection.getresponse()
+        print("response: ", response)
+        status = response.status
+        print("status: ", status)
+        responseObj = json.loads(response.read().decode('utf-8'))
+        connection.close()
+        return status, responseObj
+
+else:
+
+    def cx_api(path, obj, username, secret):
+        date = datetime.datetime.utcnow().isoformat() + "Z"
+        signature = hmac.new(secret.encode('utf-8'), date.encode('utf-8'), digestmod=hashlib.sha256).hexdigest()
+        headers = {"X-cXense-Authentication": "username=%s date=%s hmac-sha256-hex=%s" % (username, date, signature)}
+        headers["Content-Type"] = "application/json; charset=utf-8"
+        connection = http.client.HTTPSConnection("api.cxense.com", 443, timeout=CONN_TIMEOUT)
+        connection.request("POST", path, json.dumps(obj), headers)
+        response = connection.getresponse()
+        status = response.status
+        responseObj = json.loads(response.read().decode('utf-8'))
+        connection.close()
+        return status, responseObj
+
+# --------------------------------------
+'''
+Error Handling and Retries: https://wiki.cxense.com/display/cust/The+Cxense+API+Tutorial
+
+'''
+
+
+def errorHandling(status, response, message):
+    if status != 200:
+        raise Exception("%s (http status = %s, error details: '%s')" % (message, status, response['error']))
+
+
+def pauseAndContinue(exceptionType, tries, e):
+    sleepTime = tries * tries * 5
+    print("Error of type '%s': %s. Trying again in %s seconds" % (exceptionType, e, sleepTime))
+    time.sleep(sleepTime)
+
+
+def execute(path, requestObj, username, secret, errorMsg="error", maxTries=2):
+    response = None
+    status = None
+    tries = 0
+    while (tries < maxTries):
+        tries += 1
+        try:
+            status, response = cx_api(path, requestObj, username, secret)
+        except socket.gaierror as e:
+            pauseAndContinue('socket.gaierror', tries, e)
+            print("socket.gaierror")
+            continue
+        except TimeoutError as e:
+            pauseAndContinue('TimeoutError', tries, e)
+            print("TimeoutError")
+            continue
+        except ConnectionAbortedError as e:
+            pauseAndContinue('ConnectionAbortedError', tries, e)
+            print("ConnectionAbortedError")
+            continue
+        except ConnectionResetError as e:
+            pauseAndContinue('ConnectionResetError', tries, e)
+            print("ConnectionResetError")
+            continue
+        except ResourceWarning as e:
+            pauseAndContinue('ResourceWarning', tries, e)
+            print("ResourceWarning")
+            continue
+        except Exception as e:
+            raise Exception('Unhandled connection error: "%s"' % str(e))
+            print("Unhandled connection error")
+        try:
+            errorHandling(status, response, errorMsg)
+            print("Status: ", status)
+            break
+        except Exception as e:
+            errorText = None
+            if status == 401:
+                errorText = 'Request expired'
+            elif status == 500:
+                errorText = 'Error while processing request'
+            elif status == 503:
+                errorText = 'Service Unavailable'
+            if errorText and errorText in str(e):
+                pauseAndContinue(errorText, tries, e)
+                continue
+            raise Exception(str(e))
+    # if not response:
+    # raise Exception(errorMsg)
+    return status, response
+
+
+# --------------------------------------
+'''
+Def valid for "traffic_request_stop" and "traffic_request_start". 
+It helps to convert for example "-1d" to datetime, which could use in api call.
+Datetime automatically convert to Prague tz (GMT+1).
+
+String could be for example:
+1) "-1d" - yesterday
+2) "-1w" - last week
+3) "-1M" - last mounth
+4) "-1y" - last year
+
+'''
+
+
+def new_date(string):
+    new_string = str(string)
+    numbers = new_string[1:-1]
+    if new_string == "now":
+        return (string)
+    elif new_string[-1:] == "d":
+        d = datetime.datetime.today() - timedelta(days=int(numbers))
+    elif new_string[-1:] == "w":
+        d = datetime.datetime.today() - timedelta(weeks=int(numbers))
+    elif new_string[-1:] == "M":
+        d = datetime.datetime.today() - relativedelta(months=+int(numbers))
+    elif new_string[-1:] == "y":
+        d = datetime.datetime.today() - relativedelta(years=+int(numbers))
+    else:
+        return (string)
+
+    day = d.strftime('%Y-%m-%d' + 'T00:00:00.000+01:00')
+    return (day)
+
+
+# --------------------------------------
+'''
+FULL REQUEST TEMPLATE
+
+Template, which is part of traffic api call request.
+It is full, because it returns all metrics as: "events", "sessionStarts", "sessionStops", "sessionBounces", "activeTime", "uniqueUsers", "urls".
+
+Used in the following defs:
+- traffic_tab_without_users
+- keyword_tab_without_users
+- traffic_tab_with_users
+- keyword_tab_with_users
+
+'''
+
+
+def full_traffic_request_template(siteId, traffic_request_stop, traffic_request_start,
+                                  traffic_request_historyResolution, traffic_request_groups):
+    if isinstance(siteId, list) == False:
+        siteId = [siteId]
+    else:
+        siteId = siteId
+
+    request_template = {"siteIds": siteId,
+                        "stop": traffic_request_stop,
+                        "start": traffic_request_start,
+                        "historyResolution": traffic_request_historyResolution,
+                        "groups": traffic_request_groups,
+                        "count": traffic_request_groups_limit,
+                        "fields": ["events",
+                                   "sessionStarts",
+                                   "sessionStops",
+                                   "sessionBounces",
+                                   "activeTime",
+                                   "uniqueUsers",
+                                   "urls"
+                                   ],
+                        "historyFields": ["events",
+                                          "sessionStarts",
+                                          "sessionStops",
+                                          "sessionBounces",
+                                          "activeTime",
+                                          "uniqueUsers",
+                                          "urls"
+                                          ]}
+    # print(request_template)
+    return (request_template)
+
+
+# --------------------------------------
+'''
+SHORT REQUEST TEMPLATE
+
+Template, which is part of traffic api call request.
+It is short, because it returns only metrics as: "events", "urls", "weight".
+
+Used in the following defs:
+- traffic_tab_without_users
+- traffic_tab_with_users
+
+'''
+
+
+def short_traffic_request_template(siteId, traffic_request_stop, traffic_request_start,
+                                   traffic_request_historyResolution, traffic_request_groups):
+    if isinstance(siteId, list) == False:
+        siteId = [siteId]
+    else:
+        siteId = siteId
+
+    request_template = {"siteIds": siteId,
+                        "stop": traffic_request_stop,
+                        "start": traffic_request_start,
+                        "historyResolution": traffic_request_historyResolution,
+                        "groups": traffic_request_groups,
+                        "count": traffic_request_groups_limit,
+                        "fields": ["events",
+                                   "urls",
+                                   "weight"
+                                   ],
+                        "historyFields": ["events",
+                                          "urls",
+                                          "weight"
+                                          ]}
+    # print(request_template)
+    return (request_template)
+
+
+# --------------------------------------
+'''
+DICTIONARY REQUEST
+
+Next part of traffic api call request. 
+
+It can be chosen using the method:
+1) t_method="event" - "/traffic/event" method (https://wiki.cxense.com/pages/viewpage.action?pageId=21169348)
+2) t_method="user" - "/traffic/user" method (https://wiki.cxense.com/pages/viewpage.action?pageId=28049834)
+
+'''
+
+
+def traffic_response_dict(siteId, traffic_request_stop, traffic_request_start, traffic_request_historyResolution,
+                          execute, t_method):
+    if isinstance(siteId, list) == False:
+        siteId = [siteId]
+    else:
+        siteId = siteId
+
+    if t_method == "event":
+        method = "/traffic/event"
+        limit = traffic_filters_limit
+    if (t_method == "event") and (not main_traffic_groups_list):
+        method = "/traffic/event"
+        limit = traffic_request_groups_limit
+    if t_method == "user":
+        method = "/traffic/user"
+        limit = user_ids_limit
+
+    traffic_template = {
+        "siteIds": siteId,
+        "stop": traffic_request_stop,
+        "start": traffic_request_start,
+        "historyResolution": traffic_request_historyResolution,
+        "count": limit
+    }
+
+    if t_method == "event":
+        traffic_template['groups'] = main_traffic_groups_list
+    if (t_method == "event") and (not main_traffic_groups_list):
+        traffic_template['groups'] = traffic_request_groups
+
+    if traffic_request_stop == "now":
+        del traffic_template['stop']
+
+    print("traffic_template: ", traffic_template)
+
+    traffic_response = (execute(method, traffic_template, username, secret))
+    if traffic_response == (None, None):
+        print("traffic_response: ", traffic_response)
+        return (traffic_response)
+
+    traffic_dict = {}  # dict with all groups and items
+
+    try:
+        for event_group in traffic_response[1]['groups']:
+            traffic_event_key = event_group['group']
+            for event_item in event_group['items']:
+                traffic_event_value = event_item['item']
+                traffic_dict.setdefault(traffic_event_key, []).append(traffic_event_value)
+    except:
+        print("Invalid credentials")
+        exit(1)
+
+    return (traffic_dict)
+
+
+# --------------------------------------
+'''
+KEYWORD - EVENT - CUSTOM RESPONSE; WITHOUT USERS
+
+One of four traffic api call responses.
+This def generate traffic table without user filter.
+
+'''
+
+
+def traffic_tab_without_users(traffic_request_method, main_traffic_groups_list, traffic_event_group_item_dict,
+                              site_ids_filter):
+    if (traffic_request_method == "/traffic/event") or (traffic_request_method == "/traffic/custom"):
+        traffic_request_template = full_traffic_request_template(siteId, traffic_request_stop, traffic_request_start,
+                                                                 traffic_request_historyResolution,
+                                                                 traffic_request_groups)
+    if traffic_request_method == "/traffic/keyword":
+        traffic_request_template = short_traffic_request_template(siteId, traffic_request_stop, traffic_request_start,
+                                                                  traffic_request_historyResolution,
+                                                                  traffic_request_groups)
+
+    '''
+    If "traffic_request_stop": "now" - the stop field is removed from the request, it means that the end time of the response will be this second. 
+    '''
+    if traffic_request_stop == "now":
+        del traffic_request_template['stop']
+
+    main_traffic_items_list = []  # list with items of chosen groups
+
+    for main_traffic_group in main_traffic_groups_list:
+        for traffic_event_item_key in traffic_event_group_item_dict:
+            if traffic_event_item_key == main_traffic_group:
+                main_traffic_items_list.append(traffic_event_group_item_dict[traffic_event_item_key])
+
+    if (traffic_request_method == "/traffic/event") or (traffic_request_method == "/traffic/custom"):
+        response_column_names = ['id', 'date', 'group', 'item', 'events', 'sessionStarts', 'sessionStops',
+                                 'sessionBounces', 'activeTime', 'uniqueUsers', 'urls', 'siteId']
+    if traffic_request_method == "/traffic/keyword":
+        response_column_names = ['id', 'date', 'group', 'item', 'siteId', 'events', 'urls', 'weight']
+
+    df_columns = []
+    for col in main_traffic_groups_list:
+        df_columns.append(col)
+    for col in response_column_names:
+        df_columns.append(col)
+
+    df = pd.DataFrame(columns=df_columns)
+
+    row_index = 1
+    # print("PRODUCTS,", main_traffic_items_list)
+    for combination in itertools.product(*main_traffic_items_list):
+        print("combination ,", combination)
+        filters = []
+
+        '''
+        event filter; used when the field "traffic_filters" in the configuration is not empty.
+        '''
+        for i in range(len(combination)):
+            column_filter = {"type": "event", "group": main_traffic_groups_list[i], "item": combination[i]}
+            filters.append(column_filter)
+
+        traffic_request_template["filters"] = filters
+
+        resp = execute(traffic_request_method, traffic_request_template, username, secret)
+        # print(resp)
+
+        try:
+            dates = resp[1]['history']
+        except:
+            print("Invalid credentials")
+            exit(1)
+
+        items_list = []
+        for i_group in resp[1]['groups']:
+            for i_item in i_group['items']:
+                i_item = i_item['item']
+                items_list.append(i_item)
+
+        for j in range(len(dates) - 1):
+            print("groups count,", dates[j], len(resp[1]['groups']))
+            for group in resp[1]['groups']:
+                print("group items count,", group['group'], len(group['items']))
+                for item in group['items']:
+                    # print("item,", item['item'])
+                    r_date = dates[j]
+                    r_group = group['group']
+                    r_item = item['item']
+                    r_events = item['historyData']['events'][j]
+                    r_urls = item['historyData']['urls'][j]
+
+                    if site_ids_filter == "All" and (request_for_set_of_sites == "True"):
+                        r_site = "All-" + str(len(siteId))
+                    else:
+                        r_site = str(siteId)
+
+                    if (traffic_request_method == "/traffic/event") or (traffic_request_method == "/traffic/custom"):
+                        r_sessionStarts = item['historyData']['sessionStarts'][j]
+                        r_sessionStops = item['historyData']['sessionStops'][j]
+                        r_sessionBounces = item['historyData']['sessionBounces'][j]
+                        r_activeTime = item['historyData']['activeTime'][j]
+                        r_uniqueUsers = item['historyData']['uniqueUsers'][j]
+                    if traffic_request_method == "/traffic/keyword":
+                        r_weight = item['historyData']['weight'][j]
+
+                    if ("site" in traffic_request_groups) and (traffic_request_method == "/traffic/event") and (
+                            request_for_set_of_sites == "True"):
+                        if combination:
+                            r_id = str(r_date) + '-' + str(r_group) + '-' + str(r_site) + '-' + str(combination)
+                        else:
+                            r_id = str(r_date) + '-' + str(r_group) + '-' + str(r_site)
+                    else:
+                        if combination:
+                            r_id = str(r_date) + '-' + str(r_group) + '-' + str(r_item) + '-' + str(r_site) + '-' + str(
+                                combination)
+                        else:
+                            r_id = str(r_date) + '-' + str(r_group) + '-' + str(r_item) + '-' + str(r_site)
+
+                    if ("site" in traffic_request_groups) and (traffic_request_method == "/traffic/event") and (
+                            request_for_set_of_sites == "True"):
+                        values = [r_id, r_date, r_group, r_site, r_events, r_sessionStarts, r_sessionStops,
+                                  r_sessionBounces, r_activeTime, r_uniqueUsers, r_urls, r_site]
+                    if (traffic_request_method == "/traffic/event") or (traffic_request_method == "/traffic/custom"):
+                        values = [r_id, r_date, r_group, r_item, r_events, r_sessionStarts, r_sessionStops,
+                                  r_sessionBounces, r_activeTime, r_uniqueUsers, r_urls, r_site]
+                    if traffic_request_method == "/traffic/keyword":
+                        values = [r_id, r_date, r_group, r_item, r_site, r_events, r_urls, r_weight]
+
+                    arr = []
+                    for val in combination:
+                        arr.append(val)
+                    for val in values:
+                        arr.append(val)
+
+                    df.loc[row_index] = arr
+                    row_index += 1
+
+    traffic_tab = df.set_index('id')
+
+    if ("site" in traffic_request_groups) and (traffic_request_method == "/traffic/event") and (
+            request_for_set_of_sites == "True"):
+        df['item'] = str(r_site)
+        df = df.set_index('id')
+        df1 = df.groupby(df.index)[
+            'events', 'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers', 'urls'].sum().reset_index()
+        df1 = df1.set_index('id')
+        df2 = df.drop(
+            ['events', 'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers', 'urls'], axis=1)
+        df2 = df2.drop_duplicates()
+
+        traffic_tab = pd.concat([df2, df1], axis=1, join_axes=[df2.index])
+
+    return (traffic_tab, resp)
+
+
+# --------------------------------------
+'''
+KEYWORD + KEYWORD RESPONSE; WITHOUT USERS
+
+One of four traffic api call responses.
+This def generate traffic table without user filter, but with keyword filter.
+
+'''
+
+
+def keyword_tab_without_users(traffic_request_method, main_traffic_groups_list, traffic_event_group_item_dict,
+                              site_ids_filter, keyword_dict):
+    traffic_request_groups = ["site"]
+
+    traffic_request_template = full_traffic_request_template(siteId, traffic_request_stop, traffic_request_start,
+                                                             traffic_request_historyResolution, traffic_request_groups)
+
+    '''
+    If "traffic_request_stop": "now" - the stop field is removed from the request, it means that the end time of the response will be this second. 
+    '''
+    if traffic_request_stop == "now":
+        del traffic_request_template['stop']
+
+    main_traffic_items_list = []  # list with items of chosen groups
+
+    for main_traffic_group in main_traffic_groups_list:
+        for traffic_event_item_key in traffic_event_group_item_dict:
+            if traffic_event_item_key == main_traffic_group:
+                main_traffic_items_list.append(traffic_event_group_item_dict[traffic_event_item_key])
+
+    response_column_names = ['id', 'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers',
+                             'siteId']
+
+    df_columns = []
+    for col in main_traffic_groups_list:
+        df_columns.append(col)
+    for col in response_column_names:
+        df_columns.append(col)
+
+    df = pd.DataFrame(columns=df_columns)
+    row_index = 1
+
+    '''
+    keyword filter; used to get missing metrics ("uniqueUsers","sessionStarts", "sessionStops", "sessionBounces", "activeTime"). Values are taken from the configuration field "traffic_request_groups".
+    '''
+    keyword_filters = []
+    for key, value in keyword_dict.items():
+        for v in value:
+            keyword_filter = {"type": "keyword", "group": key, "item": v}
+            keyword_filters.append(keyword_filter)
+    # print("keyword_filters: ", keyword_filters)
+
+    for k_filter in keyword_filters:
+
+        # print("PRODUCTS,", main_traffic_items_list)
+        for combination in itertools.product(*main_traffic_items_list):
+            print("combination ,", combination)
+            filters = []
+            filters.append(k_filter)
+
+            '''
+            event filter; used when the field "traffic_filters" in the configuration is not empty.
+            '''
+            for i in range(len(combination)):
+                column_filter = {"type": "event", "group": main_traffic_groups_list[i], "item": combination[i]}
+                filters.append(column_filter)
+
+            traffic_request_template["filters"] = filters
+
+            # print("filters: ", filters)
+            print("keyord_filter: ", k_filter)
+
+            traffic_request_method = "/traffic/event"
+            resp = execute(traffic_request_method, traffic_request_template, username, secret)
+            # print("resp: ",resp)
+            # print("traffic_request_template: ", traffic_request_template)
+
+            try:
+                dates = resp[1]['history']
+            except:
+                print("Invalid credentials")
+                exit(1)
+
+            for j in range(len(dates) - 1):
+                print("groups count,", dates[j], len(resp[1]['groups']))
+                for group in resp[1]['groups']:
+                    print("group items count,", group['group'], len(group['items']))
+                    for item in group['items']:
+                        # print("item,", item['item'])
+                        r_date = dates[j]
+                        r_keyword_group = k_filter['group']
+                        r_keyword_item = k_filter['item']
+                        if site_ids_filter == "All":
+                            r_site = "All-" + str(len(siteId))
+                        else:
+                            r_site = siteId
+
+                        r_sessionStarts = item['historyData']['sessionStarts'][j]
+                        r_sessionStops = item['historyData']['sessionStops'][j]
+                        r_sessionBounces = item['historyData']['sessionBounces'][j]
+                        r_activeTime = item['historyData']['activeTime'][j]
+                        r_uniqueUsers = item['historyData']['uniqueUsers'][j]
+
+                        if combination:
+                            r_id = str(r_date) + '-' + str(r_keyword_group) + '-' + str(r_keyword_item) + '-' + str(
+                                r_site) + '-' + str(combination)
+                        else:
+                            r_id = str(r_date) + '-' + str(r_keyword_group) + '-' + str(r_keyword_item) + '-' + str(
+                                r_site)
+
+                        values = [r_id, r_sessionStarts, r_sessionStops, r_sessionBounces, r_activeTime, r_uniqueUsers,
+                                  r_site]
+
+                        arr = []
+                        for val in combination:
+                            arr.append(val)
+                        for val in values:
+                            arr.append(val)
+
+                        df.loc[row_index] = arr
+                        row_index += 1
+
+    traffic_tab = df.set_index('id')
+
+    return (traffic_tab)
+
+
+# --------------------------------------
+'''
+KEYWORD - EVENT - CUSTOM RESPONSE; WITH USERS 
+
+One of four traffic api call responses.
+This def generate traffic table with user filter.
+
+'''
+
+
+def traffic_tab_with_users(traffic_request_method, main_traffic_groups_list, traffic_event_group_item_dict,
+                           site_ids_filter):
+    if (traffic_request_method == "/traffic/event") or (traffic_request_method == "/traffic/custom"):
+        traffic_request_template = full_traffic_request_template(siteId, traffic_request_stop, traffic_request_start,
+                                                                 traffic_request_historyResolution,
+                                                                 traffic_request_groups)
+    if traffic_request_method == "/traffic/keyword":
+        traffic_request_template = short_traffic_request_template(siteId, traffic_request_stop, traffic_request_start,
+                                                                  traffic_request_historyResolution,
+                                                                  traffic_request_groups)
+
+    '''
+    If "traffic_request_stop": "now" - the stop field is removed from the request, it means that the end time of the response will be this second. 
+    '''
+    if traffic_request_stop == "now":
+        del traffic_request_template['stop']
+
+    main_traffic_items_list = []  # list with items of chosen groups
+
+    for main_traffic_group in main_traffic_groups_list:
+        for traffic_event_item_key in traffic_event_group_item_dict:
+            if traffic_event_item_key == main_traffic_group:
+                main_traffic_items_list.append(traffic_event_group_item_dict[traffic_event_item_key])
+
+    if (traffic_request_method == "/traffic/event") or (traffic_request_method == "/traffic/custom"):
+        response_column_names = ['id', 'date', 'group', 'item', 'userGroup', 'userId', 'events', 'sessionStarts',
+                                 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers', 'urls', 'siteId']
+    if traffic_request_method == "/traffic/keyword":
+        response_column_names = ['id', 'date', 'group', 'item', 'userGroup', 'userId', 'siteId', 'events', 'urls',
+                                 'weight']
+
+    df_columns = []
+    for col in main_traffic_groups_list:
+        df_columns.append(col)
+    for col in response_column_names:
+        df_columns.append(col)
+
+    df = pd.DataFrame(columns=df_columns)
+    row_index = 1
+
+    '''
+    user filter; from traffic_response_dict(), t_method="user"
+    '''
+    user_filters = []
+    for key, value in traffic_user_dict.items():
+        for v in value:
+            user_filter = {"type": "user", "group": key, "item": v}
+            user_filters.append(user_filter)
+    # print("user_filters: ", user_filters)
+
+    for u_filter in user_filters:
+
+        # print("PRODUCTS,", main_traffic_items_list)
+        for combination in itertools.product(*main_traffic_items_list):
+            print("combination ,", combination)
+            filters = []
+            filters.append(u_filter)
+
+            '''
+            event filter; used when the field "traffic_filters" in the configuration is not empty.
+            '''
+            for i in range(len(combination)):
+                column_filter = {"type": "event", "group": main_traffic_groups_list[i], "item": combination[i]}
+                filters.append(column_filter)
+
+            # print("filters: ", filters)
+            print("user_filter: ", u_filter)
+
+            traffic_request_template["filters"] = filters
+
+            resp = execute(traffic_request_method, traffic_request_template, username, secret)
+            # print("resp: ", resp)
+
+            try:
+                dates = resp[1]['history']
+            except:
+                print("Invalid credentials")
+                exit(1)
+
+            for j in range(len(dates) - 1):
+                print("groups count,", dates[j], len(resp[1]['groups']))
+                for group in resp[1]['groups']:
+                    print("group items count,", group['group'], len(group['items']))
+                    for item in group['items']:
+                        # print("item,", item['item'])
+                        r_date = dates[j]
+                        r_group = group['group']
+                        r_item = item['item']
+                        r_user_group = u_filter['group']
+                        r_user_id = u_filter['item']
+                        r_events = item['historyData']['events'][j]
+                        r_urls = item['historyData']['urls'][j]
+
+                        if (site_ids_filter == "All") and (request_for_set_of_sites == "True"):
+                            r_site = "All-" + str(len(siteId))
+                        else:
+                            r_site = str(siteId)
+
+                        if (traffic_request_method == "/traffic/event") or (
+                                traffic_request_method == "/traffic/custom"):
+                            r_sessionStarts = item['historyData']['sessionStarts'][j]
+                            r_sessionStops = item['historyData']['sessionStops'][j]
+                            r_sessionBounces = item['historyData']['sessionBounces'][j]
+                            r_activeTime = item['historyData']['activeTime'][j]
+                            r_uniqueUsers = item['historyData']['uniqueUsers'][j]
+                        if traffic_request_method == "/traffic/keyword":
+                            r_weight = item['historyData']['weight'][j]
+
+                        if ("site" in traffic_request_groups) and (traffic_request_method == "/traffic/event") and (
+                                request_for_set_of_sites == "True"):
+                            if combination:
+                                r_id = str(r_date) + '-' + str(r_group) + '-' + str(r_site) + '-' + str(
+                                    r_user_group) + '-' + str(r_user_id) + '-' + str(combination)
+                            else:
+                                r_id = str(r_date) + '-' + str(r_group) + '-' + str(r_site) + '-' + str(
+                                    r_user_group) + '-' + str(r_user_id)
+                        else:
+                            if combination:
+                                r_id = str(r_date) + '-' + str(r_group) + '-' + str(r_item) + '-' + str(
+                                    r_user_group) + '-' + str(r_user_id) + '-' + str(r_site) + '-' + str(combination)
+                            else:
+                                r_id = str(r_date) + '-' + str(r_group) + '-' + str(r_item) + '-' + str(
+                                    r_user_group) + '-' + str(r_user_id) + '-' + str(r_site)
+
+                        if ("site" in traffic_request_groups) and (traffic_request_method == "/traffic/event") and (
+                                request_for_set_of_sites == "True"):
+                            values = [r_id, r_date, r_group, r_site, r_user_group, r_user_id, r_events, r_sessionStarts,
+                                      r_sessionStops, r_sessionBounces, r_activeTime, r_uniqueUsers, r_urls, r_site]
+                        if (traffic_request_method == "/traffic/event") or (
+                                traffic_request_method == "/traffic/custom"):
+                            values = [r_id, r_date, r_group, r_item, r_user_group, r_user_id, r_events, r_sessionStarts,
+                                      r_sessionStops, r_sessionBounces, r_activeTime, r_uniqueUsers, r_urls, r_site]
+                        if traffic_request_method == "/traffic/keyword":
+                            values = [r_id, r_date, r_group, r_item, r_user_group, r_user_id, r_site, r_events, r_urls,
+                                      r_weight]
+
+                        arr = []
+                        for val in combination:
+                            arr.append(val)
+                        for val in values:
+                            arr.append(val)
+
+                        df.loc[row_index] = arr
+                        row_index += 1
+
+    traffic_tab = df.set_index('id')
+
+    if ("site" in traffic_request_groups) and (traffic_request_method == "/traffic/event") and (
+            request_for_set_of_sites == "True") and (df.empty == False):
+        df['item'] = str(r_site)
+        df = df.set_index('id')
+        df1 = df.groupby(df.index)[
+            'events', 'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers', 'urls'].sum().reset_index()
+        df1 = df1.set_index('id')
+        df2 = df.drop(
+            ['events', 'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers', 'urls'], axis=1)
+        df2 = df2.drop_duplicates()
+
+        traffic_tab = pd.concat([df2, df1], axis=1, join_axes=[df2.index])
+
+    return (traffic_tab, resp)
+
+
+# --------------------------------------
+'''
+KEYWORD + KEYWORD; WITH USERS
+
+One of four traffic api call responses.
+This def generate traffic table with user filter and with keyword filtr.
+
+'''
+
+
+def keyword_tab_with_users(traffic_request_method, main_traffic_groups_list, traffic_event_group_item_dict,
+                           site_ids_filter, keyword_dict):
+    traffic_request_groups = ["site"]
+
+    traffic_request_template = full_traffic_request_template(siteId, traffic_request_stop, traffic_request_start,
+                                                             traffic_request_historyResolution, traffic_request_groups)
+
+    '''
+    If "traffic_request_stop": "now" - the stop field is removed from the request, it means that the end time of the response will be this second. 
+    '''
+    if traffic_request_stop == "now":
+        del traffic_request_template['stop']
+
+    main_traffic_items_list = []  # list with items of chosen groups
+
+    for main_traffic_group in main_traffic_groups_list:
+        for traffic_event_item_key in traffic_event_group_item_dict:
+            if traffic_event_item_key == main_traffic_group:
+                main_traffic_items_list.append(traffic_event_group_item_dict[traffic_event_item_key])
+
+    response_column_names = ['id', 'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers',
+                             'siteId']
+
+    df_columns = []
+    for col in main_traffic_groups_list:
+        df_columns.append(col)
+    for col in response_column_names:
+        df_columns.append(col)
+
+    df = pd.DataFrame(columns=df_columns)
+    row_index = 1
+
+    '''
+    keyword filter; used to get missing metrics ("uniqueUsers","sessionStarts", "sessionStops", "sessionBounces", "activeTime"). Values are taken from the configuration field "traffic_request_groups".
+    '''
+    keyword_filters = []
+    for key, value in keyword_dict.items():
+        for v in value:
+            keyword_filter = {"type": "keyword", "group": key, "item": v}
+            keyword_filters.append(keyword_filter)
+    # print("keyword_filters: ", keyword_filters)
+
+    for k_filter in keyword_filters:
+
+        '''
+        user filter; from traffic_response_dict(), t_method="user"
+        '''
+        user_filters = []
+        for key, value in traffic_user_dict.items():
+            for v in value:
+                user_filter = {"type": "user", "group": key, "item": v}
+                user_filters.append(user_filter)
+        # print("user_filters: ", user_filters)
+
+        for u_filter in user_filters:
+
+            # print("PRODUCTS,", main_traffic_items_list)
+            for combination in itertools.product(*main_traffic_items_list):
+                print("combination ,", combination)
+                filters = []
+                filters.append(u_filter)
+                filters.append(k_filter)
+
+                '''
+                event filter; used when the field "traffic_filters" in the configuration is not empty.
+                '''
+                for i in range(len(combination)):
+                    column_filter = {"type": "event", "group": main_traffic_groups_list[i], "item": combination[i]}
+                    filters.append(column_filter)
+
+                traffic_request_template["filters"] = filters
+
+                # print("filters: ", filters)
+                print("user_filter: ", u_filter)
+                print("keyword_filter: ", k_filter)
+
+                traffic_request_method = "/traffic/event"
+                resp = execute(traffic_request_method, traffic_request_template, username, secret)
+                # print("resp: ",resp)
+                # print("traffic_request_template: ", traffic_request_template)
+
+                try:
+                    dates = resp[1]['history']
+                except:
+                    print("Invalid credentials")
+                    exit(1)
+
+                for j in range(len(dates) - 1):
+                    print("groups count,", dates[j], len(resp[1]['groups']))
+                    for group in resp[1]['groups']:
+                        print("group items count,", group['group'], len(group['items']))
+                        for item in group['items']:
+                            print("item,", item['item'])
+                            r_date = dates[j]
+                            r_keyword_group = k_filter['group']
+                            r_keyword_item = k_filter['item']
+                            r_user_group = u_filter['group']
+                            r_user_id = u_filter['item']
+                            if site_ids_filter == "All":
+                                r_site = "All" + str(len(siteId))
+                            else:
+                                r_site = siteId
+
+                            r_sessionStarts = item['historyData']['sessionStarts'][j]
+                            r_sessionStops = item['historyData']['sessionStops'][j]
+                            r_sessionBounces = item['historyData']['sessionBounces'][j]
+                            r_activeTime = item['historyData']['activeTime'][j]
+                            r_uniqueUsers = item['historyData']['uniqueUsers'][j]
+
+                            if combination:
+                                r_id = str(r_date) + '-' + str(r_keyword_group) + '-' + str(r_keyword_item) + '-' + str(
+                                    r_user_group) + '-' + str(r_user_id) + '-' + str(r_site) + '-' + str(combination)
+                            else:
+                                r_id = str(r_date) + '-' + str(r_keyword_group) + '-' + str(r_keyword_item) + '-' + str(
+                                    r_user_group) + '-' + str(r_user_id) + '-' + str(r_site)
+
+                            values = [r_id, r_sessionStarts, r_sessionStops, r_sessionBounces, r_activeTime,
+                                      r_uniqueUsers, r_site]
+
+                            arr = []
+                            for val in combination:
+                                arr.append(val)
+                            for val in values:
+                                arr.append(val)
+
+                            df.loc[row_index] = arr
+                            row_index += 1
+
+    traffic_tab = df.set_index('id')
+
+    return (traffic_tab)
+
+
+# --------------------------------------------------------------------------------------------------------
+'''
+MAIN PART 
+
+(main script starts here)
+
+'''
+
+
+    # site table
+traffic_request_method = configuration.get('traffic_request_method')
+if traffic_request_method in [traffic_data.ENDPOINT_DMP_TRAFFIC_DATA, traffic_data.ENDPOINT_TRAFFIC_DATA,
+                              traffic_data.ENDPOINT_DMP_TRAFFIC]:
+    # quickly, get outta here!
+    traffic_extractor = TrafficDataExtractor(hdlr)
+    traffic_extractor.run()
+    exit(0)
+try:
+    site_table = configuration['site_table']
+    outSiteFullName = os.path.join(hdlr.tables_out_path, 'site' + '.csv')
+    outDestinationSite = 'site'
+
+    # traffic table
+    traffic_table = configuration.get('traffic_table')
+    trafficTableName = configuration.get('traffic_table_name')
+    outTrafficFullName = os.path.join(hdlr.tables_out_path, trafficTableName + '.csv')
+    outDestinationTraffic = trafficTableName
+
+    request_username = configuration.get('request_username')
+    request_secret = configuration.get('#request_secret')
+    traffic_request_stop = configuration.get('traffic_request_stop')
+    traffic_request_start = configuration.get('traffic_request_start')
+    traffic_request_historyResolution = configuration.get('traffic_request_history_resolution')
+    main_traffic_groups_list = configuration.get('traffic_filters')
+    traffic_request_groups = configuration.get('traffic_request_groups')
+    site_ids_filter = configuration.get('site_ids_filter')
+    user_ids = configuration.get('user_ids')
+    request_for_set_of_sites = configuration.get('request_for_set_of_sites')
+    traffic_filters_limit = configuration.get('traffic_filters_limit', 10)
+    user_ids_limit = configuration.get('user_ids_limit', 10)
+    traffic_request_groups_limit = configuration.get('traffic_request_groups_limit', 10)
+
+except:
+    print("Please complete the missing part of the configuration")
+    exit(1)
+
+if (site_ids_filter == "All") and (request_for_set_of_sites == "False"):
+    print("Invalid credentials")
+    exit(1)
+
+if user_ids_limit == "False":
+    user_ids_limit = 10
+if traffic_filters_limit == "False":
+    traffic_filters_limit = 10
+if traffic_request_groups_limit == "False":
+    traffic_request_groups_limit = 10
+
+if __name__ == "__main__":
+    username = request_username
+    secret = request_secret
+
+    '''
+    SITE API CALL 
+
+    (site table creates here)
+
+    '''
+    site_request = (execute("/site", {
+    }, username, secret))
+    site_ids = []  # array of site_ids
+
+    site_response_column_names = ['site_id', 'name', 'url', 'country']
+    site_df_columns = []
+    try:
+        for site_col in site_response_column_names:
+            site_df_columns.append(site_col)
+    except:
+        print("Invalid credentials")
+        exit(1)
+
+    site_df_list = []
+
+    try:
+        site_request[1]['sites']
+    except:
+        print("Invalid request_username or request_secret")
+        exit(1)
+
+    for site in site_request[1]['sites']:
+        site_id = site['id']
+        site_name = site['name']
+        site_url = site['url']
+        site_country = site['country']
+        site_values = [site_id, site_name, site_url, site_country]
+        site_df_list.append(site_values)
+
+        site_ids.append(site_id)
+
+    site_df = pd.DataFrame(site_df_list, columns=site_df_columns)
+    site_df = site_df.set_index('site_id')
+
+    '''
+    out site table
+    '''
+    if site_table == "True":
+        cfg.write_table_manifest(outSiteFullName, destination=outDestinationSite, primary_key=['site_id'],
+                                 incremental=True)
+        site_df.to_csv(path_or_buf=outSiteFullName)
+
+    '''
+    TRAFFIC EVENT API CALLs 
+
+    (traffic table creates here)
+
+    '''
+    if traffic_table == "True":
+
+        if isinstance(site_ids_filter, list) == True:
+            main_site_ids = site_ids_filter
+        if (site_ids_filter == "False") or (site_ids_filter == "All"):
+            main_site_ids = site_ids
+
+        try:
+            main_site_ids
+        except:
+            print("Invalid credentials")
+            exit(1)
+
+        # traffic_request_stop
+        if traffic_request_stop == "today":
+            traffic_request_stop = datetime.datetime.today().strftime('%Y-%m-%d' + 'T00:00:00.000+01:00')
+        else:
+            traffic_request_stop = new_date(traffic_request_stop)
+        # traffic_request_start
+        traffic_request_start = new_date(traffic_request_start)
+
+        '''
+        checking site ids for user ids
+        '''
+        if user_ids == "True":
+            new_site_ids = []
+            for site_for_test in main_site_ids:
+                dict_for_test = traffic_response_dict(site_for_test, traffic_request_stop, traffic_request_start,
+                                                      traffic_request_historyResolution, execute, t_method="user")
+                if bool(dict_for_test) == False:
+                    continue
+                else:
+                    new_site_ids.append(site_for_test)
+                    print(site_for_test)
+
+            main_site_ids = new_site_ids
+            if len(main_site_ids) == 0:
+                print("This site contains no user ids")
+                exit()
+
+        list_tables = []
+        control_api_list = []
+        failed_api_site_list = []
+        '''
+        Separate response for all chosen sites.
+        '''
+        if request_for_set_of_sites == "False":
+
+            for siteId in main_site_ids:
+                print("SITE ID", siteId)
+
+                traffic_event_group_item_dict = traffic_response_dict(siteId, traffic_request_stop,
+                                                                      traffic_request_start,
+                                                                      traffic_request_historyResolution, execute,
+                                                                      t_method="event")
+
+                if traffic_event_group_item_dict != (None, None):
+                    control_api_list.append(siteId)
+
+                if traffic_event_group_item_dict == (None, None):
+                    print("API call failed, siteId: ", siteId, ".", "Skipping this site")
+                    failed_api_site_list.append(siteId)
+                    if not len(control_api_list):
+                        traffic_tables = None
+                    continue
+
+                '''
+                Separate response for all chosen sites without user filter.
+                '''
+                if user_ids == "False":
+
+                    traffic_tab, resp = traffic_tab_without_users(traffic_request_method, main_traffic_groups_list,
+                                                                  traffic_event_group_item_dict, site_ids_filter)
+
+                    '''
+                    If traffic request method "/traffic/keyword"(https://wiki.cxense.com/pages/viewpage.action?pageId=21169352), we are using "/traffic/event" method with keyword filter to response 
+                    metrics as 'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers'. Then we are join traffic_tab and keyword_tab.
+                    '''
+                    if traffic_request_method == "/traffic/keyword":
+                        keyword_dict = {}
+                        for k_group in resp[1]['groups']:
+                            k_key = k_group['group']
+                            for k_item in k_group['items']:
+                                k_value = k_item['item']
+                                keyword_dict.setdefault(k_key, []).append(k_value)
+
+                        traffic_tables_2 = keyword_tab_without_users(traffic_request_method, main_traffic_groups_list,
+                                                                     traffic_event_group_item_dict, site_ids_filter,
+                                                                     keyword_dict)
+                        keyword_tab = traffic_tables_2[
+                            ['sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers']]
+
+                        traffic_tab = pd.concat([traffic_tab, keyword_tab], axis=1, join_axes=[traffic_tab.index])
+
+                    list_tables.append(traffic_tab)
+                    traffic_tables = pd.concat(list_tables)
+
+                '''
+                Separate response for all chosen sites with user filter.
+                '''
+                if user_ids == "True":
+
+                    traffic_user_dict = traffic_response_dict(siteId, traffic_request_stop, traffic_request_start,
+                                                              traffic_request_historyResolution, execute,
+                                                              t_method="user")
+                    print("users: ", traffic_user_dict)
+
+                    traffic_tab, resp = traffic_tab_with_users(traffic_request_method, main_traffic_groups_list,
+                                                               traffic_event_group_item_dict, site_ids_filter)
+
+                    '''
+                    If traffic request method "/traffic/keyword"(https://wiki.cxense.com/pages/viewpage.action?pageId=21169352), we are using "/traffic/event" method with keyword filter to response 
+                    metrics as 'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers'. Then we are join traffic_tab and keyword_tab.
+                    '''
+                    if traffic_request_method == "/traffic/keyword":
+                        keyword_dict = {}
+                        for k_group in resp[1]['groups']:
+                            k_key = k_group['group']
+                            for k_item in k_group['items']:
+                                k_value = k_item['item']
+                                keyword_dict.setdefault(k_key, []).append(k_value)
+
+                        traffic_tables_2 = keyword_tab_with_users(traffic_request_method, main_traffic_groups_list,
+                                                                  traffic_event_group_item_dict, site_ids_filter,
+                                                                  keyword_dict)
+                        keyword_tab = traffic_tables_2[
+                            ['sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers']]
+
+                        traffic_tab = pd.concat([traffic_tab, keyword_tab], axis=1, join_axes=[traffic_tab.index])
+
+                    list_tables.append(traffic_tab)
+                    traffic_tables = pd.concat(list_tables)
+
+        '''
+        One response for all chosen sites.
+        '''
+        if request_for_set_of_sites == "True":
+            siteId = main_site_ids
+            print("SITE IDs", siteId, len(siteId))
+
+            traffic_event_group_item_dict = traffic_response_dict(siteId, traffic_request_stop, traffic_request_start,
+                                                                  traffic_request_historyResolution, execute,
+                                                                  t_method="event")
+
+            if traffic_event_group_item_dict == (None, None):
+                print("API call failed, siteId: ", siteId, ".", "Skipping these sites")
+                print("Exit the program")
+                exit()
+
+            '''
+            One response for all chosen sites without user filter.
+            '''
+            if user_ids == "False":
+
+                traffic_tab, resp = traffic_tab_without_users(traffic_request_method, main_traffic_groups_list,
+                                                              traffic_event_group_item_dict, site_ids_filter)
+
+                '''
+                If traffic request method "/traffic/keyword"(https://wiki.cxense.com/pages/viewpage.action?pageId=21169352), we are using "/traffic/event" method with keyword filter to response 
+                metrics as 'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers'. Then we are join traffic_tab and keyword_tab.
+                '''
+                if traffic_request_method == "/traffic/keyword":
+                    keyword_dict = {}
+                    for k_group in resp[1]['groups']:
+                        k_key = k_group['group']
+                        for k_item in k_group['items']:
+                            k_value = k_item['item']
+                            keyword_dict.setdefault(k_key, []).append(k_value)
+
+                    traffic_tables_2 = keyword_tab_without_users(traffic_request_method, main_traffic_groups_list,
+                                                                 traffic_event_group_item_dict, site_ids_filter,
+                                                                 keyword_dict)
+                    keyword_tab = traffic_tables_2[
+                        ['sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers']]
+                    keyword_tab = keyword_tab.groupby(keyword_tab.index)[
+                        'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers'].sum().reset_index()
+                    keyword_tab = keyword_tab.set_index('id')
+
+                    traffic_tab = pd.concat([traffic_tab, keyword_tab], axis=1, join_axes=[traffic_tab.index])
+
+                list_tables.append(traffic_tab)
+                traffic_tables = pd.concat(list_tables)
+
+            '''
+            One response for all chosen sites with user filter.
+            '''
+            if user_ids == "True":
+
+                traffic_user_dict = traffic_response_dict(siteId, traffic_request_stop, traffic_request_start,
+                                                          traffic_request_historyResolution, execute, t_method="user")
+                print("users: ", traffic_user_dict)
+
+                traffic_tab, resp = traffic_tab_with_users(traffic_request_method, main_traffic_groups_list,
+                                                           traffic_event_group_item_dict, site_ids_filter)
+
+                '''
+                If traffic request method "/traffic/keyword"(https://wiki.cxense.com/pages/viewpage.action?pageId=21169352), we are using "/traffic/event" method with keyword filter to response 
+                metrics as 'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers'. Then we are join traffic_tab and keyword_tab.
+                '''
+                if traffic_request_method == "/traffic/keyword":
+                    keyword_dict = {}
+                    for k_group in resp[1]['groups']:
+                        k_key = k_group['group']
+                        for k_item in k_group['items']:
+                            k_value = k_item['item']
+                            keyword_dict.setdefault(k_key, []).append(k_value)
+
+                    traffic_tables_2 = keyword_tab_with_users(traffic_request_method, main_traffic_groups_list,
+                                                              traffic_event_group_item_dict, site_ids_filter,
+                                                              keyword_dict)
+                    keyword_tab = traffic_tables_2[
+                        ['sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers']]
+                    keyword_tab = keyword_tab.groupby(keyword_tab.index)[
+                        'sessionStarts', 'sessionStops', 'sessionBounces', 'activeTime', 'uniqueUsers'].sum().reset_index()
+                    keyword_tab = keyword_tab.set_index('id')
+
+                    traffic_tab = pd.concat([traffic_tab, keyword_tab], axis=1, join_axes=[traffic_tab.index])
+
+                list_tables.append(traffic_tab)
+                traffic_tables = pd.concat(list_tables)
+
+        if (traffic_tables is None) and (not len(control_api_list)):
+            print("Exit the program")
+            exit()
+
+        print("SiteIds with failed API calls: ", failed_api_site_list, len(failed_api_site_list))
+        print("SiteIds with successful API calls: ", control_api_list, len(control_api_list))
+        '''
+        out traffic table
+        '''
+        traffic_tables = traffic_tables.fillna("Null")
+        cfg.write_table_manifest(outTrafficFullName, destination=outDestinationTraffic, primary_key=['id'],
+                                 incremental=True)
+        traffic_tables.to_csv(path_or_buf=outTrafficFullName)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          #- docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          #- docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          - echo "Preparing KBC test image"
+          - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+          # push test image to ECR - uncomment when initialised
+          # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          # - docker push $REPOSITORY:test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+          - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+
+
+# TODO: tests
+class TestComponent(unittest.TestCase):
+    def empty_test(self):
+        print('')
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /requirements.txt
+================================================
+https://github.com/keboola/python-docker-application/zipball/master#egg=keboola
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.1.7.zip#egg=kbc
+dateparser
+pandas
+
+
+================================================
+File: /.dockerignore
+================================================
+vendor
+.git
+
+
+================================================
+File: /Dockerfile
+================================================
+FROM quay.io/keboola/docker-custom-python:latest
+COPY . /code/
+
+RUN pip install flake8
+RUN pip3 install -r /code/requirements.txt
+
+WORKDIR /code/
+CMD ["python", "-u", "/code/src/main.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files, to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# ex-cxense
+Cxense extractor (Keboola Connection)
+
+API documentation: https://wiki.cxense.com/display/cust/Cxense+Insight+API
+
+This extractor is not public, to find it just put /kds.ex-cxense to the end of url (for example: https://connection.eu-central-1.keboola.com/..../extractors/kds.ex-cxense)
+
+* sometimes results may vary:
+Our systems are designed for high availability and will sometime return numbers that can be slightly different when executed several times. Realtime requests for recent data for periods of seconds or minutes can sometimes see incomplete data, due to the nature of the internet and that events will enter our systems out-of-order. All data sent to our systems will eventually be counted, usually within 1 second, but can sometimes lag a little behind.We also keep several redundant clusters of servers in a shared-nothing setup, where historic data can differ slightly over time. The difference is usually less than 0.001% and is usually only seen on high traffic sites. This should be negligible error margin, and much smaller than other factors on the internet. This has usually to do with our de-duplication algorithm of events, which can miss when two duplicates arrive at different points in time. (https://wiki.cxense.com/pages/viewpage.action?pageId=21169346)
+
+* !!!! Now the extractor is able to return results only for Prague time zone (GMT+1)
+
+## Configuration:
+{
+- "request_username": "", 
+- "#request_secret": "",
+- "site_table": "",
+- "traffic_table": "",
+- "traffic_table_name": "",
+- "request_for_set_of_sites": "",
+- "site_ids_filter": [ ],
+- "user_ids": "",
+- "user_ids_limit": ""
+- “traffic_request_start": "",
+- “traffic_request_stop”: "",
+- "traffic_request_history_resolution": "",
+- "traffic_request_method": "",
+- "traffic_filters": [ ],
+- "traffic_request_groups": [ ],
+- "traffic_filters_limit": "",
+- "traffic_request_groups_limit": ""
+}
+
+## Configuration description:
+* “request_username”, “#request_secret" - Cxense username and secret;
+
+* Using this extractor, it is possible to obtain two types of tables:
+  1. “Site” table, which describes all sites (columns: site_id, name, url, country). To get it, just write "site_table": “True”, If it is not necessary to obtain - "site_table": “False”.
+
+  2. Another type - “Traffic” table, just write "traffic_table": “True" to get it or "traffic_table": “False” - if it not needed (other fields can be empty). This type of table can be modified depending on which methods, groups and filters will be selected.
+
+	  a) A table showing the values (“events”, "sessionStarts","sessionStops", "sessionBounces", "activeTime", 	"uniqueUsers", "urls") of groups separately. 
+	  (* groups: 
+	   * "deviceType", 
+	   * “mobileBrand”, 
+	   * “browser", 
+	   * "connectionSpeed", 
+	   * “resolution", 
+	   * “colorDepth", 
+	   * "site",  			
+	   * "exitLinkHost", 
+	   * "exitLinkUrl", 
+	   * "postalCode", 
+	   * "city", 
+	   * “url", 
+	   * "referrerUrl", 
+	   * "referrerHost", 
+	   * "referrerHostClass", 	
+	   * "referrerSocialNetwork", 
+	   * “referrerSearchEngine”). 
+
+	groups description: https://wiki.cxense.com/display/cust/Event+groups (all of these groups is possible to use)
+	values description: https://wiki.cxense.com/display/cust/Cxense+Insight+Metrics
+
+ 	- “traffic_request_method": "/traffic/event",
+ 	- "traffic_filters": [ ],   (field is empty)
+ 	- "traffic_request_groups": [ "deviceType", “mobileBrand”, ...]     ( names of the necessary groups are enough to 			insert here)
+
+
+	 b) A table showing the values (the same as table a) of groups mix (the same groups as table a)
+
+	 documentation: https://wiki.cxense.com/pages/viewpage.action?pageId=21169348 
+	 - “traffic_request_method": "/traffic/event",
+  	 - "traffic_filters": ["deviceType", “mobileBrand”, ...],(names of the necessary groups are enough to insert here; at the same time it is better to take a small number of groups)
+	 - "traffic_request_groups": ["site”] 
+
+
+	 c) A table showing the values (the same as table a) of groups mix (the same groups as table a + “template” and/or selected custom dimensions, which it is possible to find in "Custom Parameters") 
+	
+	 documentation: https://wiki.cxense.com/pages/viewpage.action?pageId=21169350
+
+	 - “traffic_request_method": "/traffic/custom",
+  	 - "traffic_filters": ["deviceType", “mobileBrand”, ...],   (names of the necessary groups are enough to insert here; at 		the same time it is better to take a small number of groups)
+  	 - "traffic_request_groups": ["template”, ...]  (custom dimensions)
+
+
+	 d) A table showing the values (the same as table a + “weight”) of groups mix (the same groups as table a + 	"category" and/or "taxonomy" and/or selected custom dimensions, which it is possible to find in "Site Content") 
+
+	 documentation: https://wiki.cxense.com/pages/viewpage.action?pageId=21169352
+
+	 - “traffic_request_method": "/traffic/keyword",
+  	 - "traffic_filters": ["deviceType", “mobileBrand”, ...],    ( names of the necessary groups are enough to insert here; at 		the same time it is better to take a small number of groups)
+  	 - "traffic_request_groups": ["category", ...] (custom dimensions)
+	 - warning: metrics as "uniqueUsers","sessionStarts", "sessionStops", "sessionBounces", "activeTime" sometimes is "Null". Тhis is due to the fact that to recover these metrics is used another method "/traffic/event" as a backend (which is less powerfull than "/traffic/keyword")
+
+* "request_for_set_of_sites" - returns metrics for selected set of sites;
+	2 options:
+	+ "True" - table with set of sites
+	+ "False" - table with separate sites 
+	 
+* "site_ids_filter" - filter for specific sitе ids;
+	3 options:
+	+ "site_ids_filter": [“”, “”, ….] - opportunity to specify the interesting site ids
+	+ ”site_ids_filter": “False” - (without parentheses) which allows to download data for all site ids
+	+ ”site_ids_filter": “All” - can use only with "request_for_set_of_sites": "True". (out table will be labeled as ALL + number of sites participating in the queries).
+	
+* "user_ids" - for writing of user ids;
+	2 options:
+	+ "True" - table with user ids
+	+ "False" - table without user ids
+
+* "user_ids_limit" - limit for "user_ids". It works only with "user_ids": "True" (for "user_ids": "False" - "user_ids_limit" may contain anything, but it is important leave it in the configuration).
+	2 options:
+	+ "your_number" (for example "100") - max limit = 1000
+	+ "False" - limit by default = 10
+	+ warning: 
+	+ if the limit is greater than 100, the extractor will run for a longer period of time.
+
+* “traffic_request_start”, “traffic_request_stop” - start and stop period
+Time specification: https://wiki.cxense.com/display/cust/Traffic+time+specification; 
+	+ a) Terms of use:
+	+ it is possible to use "today" and "now" in “traffic_request_stop”;
+	+ "today": used when downloading data for days, weeks, months, and years (for example “-1d”, “-1w”, “-1M”, “-1y”) --> the data will be downloaded from the beginning of the day
+	+ "now": used when downloading data for seconds, hours or minutes(for example “-1s”, “-1m”, “-1h”) --> the data will be downloaded from the current time
+	+ everything else works the same as written in the documentation	
+	+ b) warning:
+	+ it is not possible to use the same date in “traffic_request_start”, “traffic_request_stop”
+	+ c) Example of “traffic_request_start”, “traffic_request_stop” uses:
+	+ "traffic_request_start": “-1d“
+	+ "traffic_request_stop": “today”
+	+ if today is 2018-10-31 --> the table will show the start date of the period, which is 2018-10-30 00:00
+	+ timestamp for Prague '2018-10-31T00:00:00.000+01:00'
+
+* “traffic_request_history_resolution” ("month", "week", "day", "hour" and “minute")
+
+* "traffic_filters_limit" - limit for "traffic_filters". 
+	2 options:
+	+ "your_number" (for example "100") - max limit = 1000
+	+ "False" - limit by default = 10
+	+ warning: 
+	+ if the limit is greater than 100, the extractor will run for a longer period of time.
+	
+* "traffic_request_groups_limit" - limit for "traffic_request_groups". 
+	2 options:
+	+ "your_number" (for example "100") - max limit = 1000
+	+ "False" - limit by default = 10
+	+ warning : 
+	+ if the limit is greater than 100, the extractor will run for a longer period of time.
+
+
+## DMP traffic data
+Extractor now supports retrieval of raw event data from the `dmp/trafic/data` endpoint. 
+
+To set this up the `traffic_request_method` should be set to `/dmp/traffic/data` value.
+
+### Supported parameters
+- **traffic_request_start** - start period specification in [supported format](https://wiki.cxense.com/display/cust/Traffic+time+specification).
+- **traffic_request_end** - end period specification in [supported format](https://wiki.cxense.com/display/cust/Traffic+time+specification).
+- **fields** - The event fields to export. If left empty, all available [fields](https://wiki.cxense.com/pages/viewpage.action?pageId=29547369) 
+will be downloaded. Except for `externalUserIds` which needs to be specified manually in combination 
+with `externalUserIdTypes` parameter. Supported fields [`time`, `userId`, `externalUserIds`, `eventId`, `pageViewEventId`, `site`, 
+`origin`, `type`, `segments`, `customParameters`] For more details please refer to the [API documentation](https://wiki.cxense.com/pages/viewpage.action?pageId=29547369).
+- **externalUserIdTypes** - The external user identifier types to return. Must be specified whenever externalUserIds field is requested. Use /dmp/traffic/data/describe to list available identity types. 
+Only the found, specified types will be included in the response.
+- **origins**  - 	The specific origins to filter and aggregate over. If not specified for these requests, all available/permitted origins are used.
+- **site_ids_filter** - (Array of String) The set of sites to aggregate over.
+- **siteGroupIds** - (Array of String) The set of site groups to aggregate over.
+- **traffic_filters** - [Traffic filters](https://wiki.cxense.com/display/cust/Traffic+filters) to be applied. Conjunctive semantics (and) are assumed for the top-level filters.
+
+**Sample configuration**
+```json
+{
+  "request_username": "user@domain.com",
+  "#request_secret": "XXX",
+  "site_table": "True",
+  "traffic_table": "",
+  "traffic_table_name": "",
+  "request_for_set_of_sites": "",
+  "site_ids_filter": [],
+  "user_ids": "",
+  "traffic_request_start": "-5d",
+  "traffic_request_stop": "-1h",
+  "traffic_request_history_resolution": "",
+  "traffic_request_method": "/dmp/traffic/data",
+  "traffic_filters": [
+    {
+      "type": "event",
+      "group": "deviceType",
+      "item": "Mobile"
+    }
+    ],
+  "traffic_request_groups": []
+}
+```
+
+## Traffic data
+Extractor now supports retrieval of raw page view event data from the `/trafic/data` endpoint.
+
+To set this up the `traffic_request_method` should be set to `/traffic/data` value.
+
+### Supported parameters
+- **traffic_request_start** - start period specification in [supported format](https://wiki.cxense.com/display/cust/Traffic+time+specification).
+- **traffic_request_end** - end period specification in [supported format](https://wiki.cxense.com/display/cust/Traffic+time+specification).
+- **fields** - The event fields to export. If left empty, all available [fields](https://wiki.cxense.com/pages/viewpage.action?pageId=29547352) 
+will be downloaded. Except for `externalUserIds` which needs to be specified manually in combination 
+with `externalUserIdTypes` parameter. Supported fields are: 
+
+```json
+["time", "userId", "userCorrelationId", "externalUserIds", "eventId", "site", "sessionStart",
+"sessionStop", "sessionBounce", "activeTime", "browser", "browserVersion", "browserLanguage",
+"browserTimezone", "os", "mobileBrand", "deviceType", "url", "host", "query", "referrerUrl",
+"referrerHost", "referrerHostClass", "referrerSearchEngine", "referrerSocialNetwork",
+"referrerQuery", "resolution", "colorDepth", "country", "region", "city", "metrocode",
+"postalCode", "company", "connectionSpeed", "isoRegion", "exitLinkUrl", "exitLinkHost",
+"exitLinkQuery", "capabilities", "adspaces", "intents", "customParameters", "userParameters",
+"retargetingParameters", "scrollDepth"]
+```
+ For more details please refer to the [API documentation](https://wiki.cxense.com/pages/viewpage.action?pageId=29547352).
+- **externalUserIdTypes** - The external user identifier types to return. Must be specified whenever externalUserIds field is requested. Use /dmp/traffic/data/describe to list available identity types. 
+Only the found, specified types will be included in the response.
+- **origins**  - 	The specific origins to filter and aggregate over. If not specified for these requests, all available/permitted origins are used.
+- **site_ids_filter** - (Array of String) The set of sites to aggregate over.
+- **siteGroupIds** - (Array of String) The set of site groups to aggregate over.
+- **traffic_filters** - [Traffic filters](https://wiki.cxense.com/display/cust/Traffic+filters) to be applied. Conjunctive semantics (and) are assumed for the top-level filters.
+
+**Sample configuration**
+```json
+{
+  "request_username": "user@domain.com",
+  "#request_secret": "XXX",
+  "site_table": "True",
+  "traffic_table": "",
+  "traffic_table_name": "",
+  "request_for_set_of_sites": "",
+  "site_ids_filter": [],
+  "user_ids": "",
+  "traffic_request_start": "-5d",
+  "traffic_request_stop": "-1h",
+  "traffic_request_history_resolution": "",
+  "traffic_request_method": "/traffic/data",
+  "traffic_filters": [
+    {
+      "type": "event",
+      "group": "deviceType",
+      "item": "Mobile"
+    }
+    ],
+  "traffic_request_groups": []
+}
+```
+
+## DMP Traffic
+Extractor now supports retrieval of aggregated data from the `/dmp/trafic` endpoint.
+
+To set this up the `traffic_request_method` should be set to `/dmp/traffic` value.
+
+The result outputs two datasets:
+ - `dmp_traffic` - aggregated values as specified by configuration
+ - `dmp_traffic_history` - historical values as described in [API documentation](https://wiki.cxense.com/pages/viewpage.action?pageId=29528183)
+
+### Supported parameters
+- **traffic_request_start** - start period specification in [supported format](https://wiki.cxense.com/display/cust/Traffic+time+specification).
+- **traffic_request_end** - end period specification in [supported format](https://wiki.cxense.com/display/cust/Traffic+time+specification).
+- **fields** - The event fields to export. If left empty, all available fields will be downloaded.
+Supported fields are: 
+
+```json
+['events', 'uniqueUsers']
+```
+ For more details please refer to the [API documentation](https://wiki.cxense.com/pages/viewpage.action?pageId=29528183).
+- **externalUserIdTypes** - The external user identifier types to return. Must be specified whenever externalUserIds field is requested. Use /dmp/traffic/data/describe to list available identity types. 
+Only the found, specified types will be included in the response.
+- **origins**  - 	The specific origins to filter and aggregate over. If not specified for these requests, all available/permitted origins are used.
+- **site_ids_filter** - (Array of String) The set of sites to aggregate over.
+- **siteGroupIds** - (Array of String) The set of site groups to aggregate over.
+- **traffic_filters** - [Traffic filters](https://wiki.cxense.com/display/cust/Traffic+filters) to be applied. Conjunctive semantics (and) are assumed for the top-level filters.
+- **historyFields** - The fields to aggregate a history for. Must be a subset of `fields`. Empty by default, i.e., no history data will be returned. While fields will only return a single value for the full period, history will return an array of values for intervals within the period. Useful when creating tables or graphs.
+- **historyBuckets** - The number of intervals for history aggregation. The time between start and stop will be divided into this many buckets or intervals. The default value is `10`, the maximum value is `2160`. Has effect only in combination with `historyFields`.
+- **historyResolution** - 	If defined, overrides historyBuckets and divides the time between start and stop into intervals of the given length. The acceptable values are "month", "week", "day", "hour" and "minute". The resulting number of buckets has to be between 2 and 2160. The resolution "minute" is not supported for data older than 31 days.
+
+**Sample configuration**
+
+```json
+{
+  "request_username": "user@domain.com",
+  "#request_secret": "XXX",
+  "site_table": "True",
+  "traffic_table": "",
+  "traffic_table_name": "",
+  "request_for_set_of_sites": "",
+  "site_ids_filter": [],
+  "user_ids": "",
+  "traffic_request_start": "-5d",
+  "traffic_request_stop": "-1h",
+  "traffic_request_history_resolution": "",
+  "traffic_request_method": "/dmp/traffic",
+  "historyFields" : [],
+  "historyBuckets": "",
+  "historyResolution": "",
+  ,
+  "traffic_filters": [
+    {
+      "type": "event",
+      "group": "deviceType",
+      "item": "Mobile"
+    }
+    ],
+  "traffic_request_groups": []
+}
+```
+

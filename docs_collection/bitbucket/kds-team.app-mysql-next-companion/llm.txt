@@ -1,0 +1,3447 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-mysql-next-companion/
+    ├── .travis.yml
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── keboola_api.py
+    │   ├── component.py
+    │   └── run.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── configSchema_test.json
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /.travis.yml
+================================================
+sudo: false
+
+services:
+  - docker
+
+jobs:
+  include:
+    - stage: tests
+      script:
+        - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+        - docker run $APP_IMAGE python -m unittest discover
+      # push test image to ECR - uncomment for testing before deployment
+      #  - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+      #  - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+      #  - docker tag $APP_IMAGE:latest $REPOSITORY:test
+      #  - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+      #  - docker push $REPOSITORY:test
+      #  - docker pull quay.io/keboola/syrup-cli:latest
+    - stage: deploy_dev_portal
+      if: branch = master
+      script: "./scripts/update_dev_portal_properties.sh"
+
+before_script:
+  - export APP_IMAGE=keboola-component
+  - docker -v
+  - docker build -t $APP_IMAGE .
+  - chmod +x ./scripts/update_dev_portal_properties.sh
+  - chmod +x ./deploy.sh
+
+after_success:
+  - docker images
+
+deploy:
+  provider: script
+  skip_cleanup: true
+  script: ./deploy.sh
+  on:
+    tags: true
+    branch: master
+
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    example
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "asigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "asigning travis tag"
+	export TAG="$TRAVIS_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+      - KBC_STACKID=connection.keboola.com
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/keboola_api.py
+================================================
+import json
+import requests
+import time
+from urllib.parse import urljoin
+
+from keboola.http_client import HttpClient
+from typing import Union
+
+
+REGION_SPECIFIERS = {
+    'AWS_us-east-1': '',
+    'AWS_eu-central-1': 'eu-central-1',
+    'AZ_north-europe': 'north-europe.azure'
+}
+
+API_PREFIXES = {
+    'storage': 'connection',
+    'encryption': 'encryption',
+    'syrup': 'syrup'
+}
+
+
+def build_api_url(api: str, region: str, url: str = None):
+
+    api_prefix = API_PREFIXES.get(api)
+    region_infix = REGION_SPECIFIERS.get(region)
+
+    if api_prefix is None:
+        raise ValueError(f'Unsupported API prefix {api} provided; must be one of {list(API_PREFIXES.keys())}.')
+
+    elif url is not None:
+        return f'https://{api_prefix}.{url}'
+
+    elif region_infix is None:
+        raise ValueError(f"Region specifier {region_infix} not supported "
+                         f"must be one of {list(REGION_SPECIFIERS.keys())}.")
+
+    else:
+        if region_infix == '':
+            return f'https://{api_prefix}.keboola.com/'
+
+        else:
+            return f'https://{api_prefix}.{region_infix}.keboola.com/'
+
+
+class StorageApi(HttpClient):
+
+    API_IDENTIFIER = 'storage'
+    API_SUFFIX = '/v2/storage/'
+
+    def __init__(self, region_specifier: str, sapi_token: str, url: str = None) -> None:
+
+        _base_url = urljoin(build_api_url(self.API_IDENTIFIER, region_specifier, url), self.API_SUFFIX)
+        _base_hdr = {'x-storageapi-token': sapi_token}
+
+        super().__init__(base_url=_base_url, auth_header=_base_hdr)
+
+    def get_tables_in_bucket(self, bucket: str, include: str = None) -> requests.Response:
+
+        return self.get_raw(f"buckets/{bucket}/tables", params={'include': include})
+
+    def drop_table(self, table: str, force: bool = True) -> requests.Response:
+
+        par_table = {'force': force}
+        return self.delete_raw(f"tables/{table}", params=par_table)
+
+    def truncate_table(self, table: str) -> requests.Response:
+
+        return self.delete_raw(f"tables/{table}/rows")
+
+    def get_all_configurations(self, component_id: str) -> requests.Response:
+
+        return self.get_raw(f'components/{component_id}/configs')
+
+    def get_configuration_detail(self, component_id: str, configuration_id: str) -> requests.Response:
+
+        return self.get_raw(f'components/{component_id}/configs/{configuration_id}')
+
+    def create_new_configuration(self, component_id: str, config_json: dict) -> requests.Response:
+
+        configs_hdr = {'content-type': 'application/x-www-form-urlencoded'}
+        return self.post_raw(f'components/{component_id}/configs', headers=configs_hdr, data=config_json)
+
+    def update_configuration(self, component_id: str, config_id: str, config_json: dict) -> requests.Response:
+
+        configs_hdr = {'content-type': 'application/x-www-form-urlencoded'}
+        return self.put_raw(f'components/{component_id}/configs/{config_id}', headers=configs_hdr, data=config_json)
+
+    def delete_configuration(self, component_id: str, configuration_id: str) -> requests.Response:
+
+        return self.delete_raw(f'components/{component_id}/configs/{configuration_id}')
+
+    def create_new_configuration_row(self, component_id: str, configuration_id: str,
+                                     row_config_json: dict) -> requests.Response:
+
+        rows_hdr = {'content-type': 'application/x-www-form-urlencoded'}
+        return self.post_raw(f'components/{component_id}/configs/{configuration_id}/rows',
+                             headers=rows_hdr, data=row_config_json)
+
+    def update_configuration_row(self, component_id: str, configuration_id: str, row_id: str,
+                                 row_config_json: dict) -> requests.Response:
+
+        rows_hdr = {'content-type': 'application/x-www-form-urlencoded'}
+        return self.put_raw(f'components/{component_id}/configs/{configuration_id}/rows/{row_id}',
+                            headers=rows_hdr, data=row_config_json)
+
+    def create_table_snaphot(self, table_id: str, description: str = None) -> requests.Response:
+
+        snapshot_hdr = {'Content-Type': 'application/x-www-form-urlencoded'}
+        snapshot_body = {'description': description}
+
+        return self.post_raw(f'tables/{table_id}/snapshots', headers=snapshot_hdr, data=snapshot_body)
+
+    def create_table_metadata(self, table_id: str, metadata_provider: str,
+                              metadata_list: list) -> requests.Response:
+
+        metadata_hdr = {'Content-Type': 'application/x-www-form-urlencoded'}
+        metadata_dict = {}
+
+        for idx in range(len(metadata_list)):
+            try:
+                metadata_dict[f'metadata[{idx}][key]'] = metadata_list[idx]['key']
+                metadata_dict[f'metadata[{idx}][value]'] = metadata_list[idx]['value']
+            except KeyError as e:
+                KeyError(f"Key {e} missing at index {idx}.")
+
+        metadata_body = {**{'provider': metadata_provider}, **metadata_dict}
+
+        return self.post_raw(f'tables/{table_id}/metadata', headers=metadata_hdr, data=metadata_body)
+
+    def create_column_metadata(self, column_id: str, metadata_provider: str, metadata_list: list) -> requests.Response:
+
+        metadata_hdr = {'Content-Type': 'application/x-www-form-urlencoded'}
+
+        metadata_dict = dict()
+
+        for idx in range(len(metadata_list)):
+            try:
+                metadata_dict[f'metadata[{idx}][key]'] = metadata_list[idx]['key']
+                metadata_dict[f'metadata[{idx}][value]'] = metadata_list[idx]['value']
+            except KeyError as e:
+                KeyError(f"Key {e} missing at index {idx}.")
+
+        metadata_body = {**{'provider': metadata_provider}, **metadata_dict}
+
+        return self.post_raw(f'columns/{column_id}/metadata', headers=metadata_hdr, data=metadata_body)
+
+    def remove_primary_key(self, table_id: str) -> requests.Response:
+        return self.delete_raw(f'tables/{table_id}/primary-key/')
+
+    def create_column(self, table_id: str, column_name: str) -> requests.Response:
+
+        column_data = {'name': column_name}
+        return self.post_raw(f'tables/{table_id}/columns', data=column_data)
+
+    def drop_column(self, table_id: str, column_name: str, force: bool = True) -> requests.Response:
+
+        parameters = {'force': force}
+        return self.delete_raw(f'tables/{table_id}/columns/{column_name}', params=parameters)
+
+    def get_column_metadata(self, column_id: str) -> requests.Response:
+
+        return self.get_raw(f'columns/{column_id}/metadata')
+
+
+class EncryptionApi(HttpClient):
+
+    API_IDENTIFIER = 'encryption'
+
+    def __init__(self, region_specifier: str, component_id: str, project_id: str = None,
+                 config_id: str = None, url: str = None) -> None:
+
+        _base_url = build_api_url(self.API_IDENTIFIER, region_specifier, url)
+        _default_par = {
+            'componentId': component_id,
+            'projectId': project_id,
+            'configId': config_id
+        }
+
+        super().__init__(base_url=_base_url, default_params=_default_par)
+
+    def encrypt_data(self, data: Union[str, dict], is_json: bool = True) -> Union[str, dict]:
+
+        encrypt_hdr = {
+            'content-type': 'application/json' if is_json is True else 'text/plain'
+        }
+
+        _rsp = self.post_raw('encrypt', headers=encrypt_hdr, data=json.dumps(data) if is_json is True else data)
+
+        if _rsp.ok is True:
+            if is_json is True:
+                return _rsp.json()
+            else:
+                return _rsp.text
+
+        else:
+            raise ValueError(f"Could not complete Encryption API request. {_rsp.status_code} - {_rsp.text}.")
+
+
+class OrchestratorApi(HttpClient):
+
+    API_IDENTIFIER = 'syrup'
+    API_SUFFIX = 'orchestrator/'
+
+    def __init__(self, region_specifier: str, sapi_token: str, url: str = None) -> None:
+
+        _base_url = urljoin(build_api_url(self.API_IDENTIFIER, region_specifier, url), self.API_SUFFIX)
+        _base_hdr = {'x-storageapi-token': sapi_token}
+
+        super().__init__(base_url=_base_url, auth_header=_base_hdr)
+
+    def update_orchestration(self, orchestration_id: str, **kwargs) -> requests.Response:
+
+        return self.put_raw(f'orchestrations/{orchestration_id}', json=kwargs)
+
+    def get_orchestration(self, orchestration_id: str) -> requests.Response:
+
+        return self.get_raw(f'orchestrations/{orchestration_id}')
+
+    def get_orchestration_last_job(self, orchestration_id: str):
+
+        return self.get_raw(f'orchestrations/{orchestration_id}/jobs', params={'limit': 1})
+
+    def update_orchestration_tasks(self, orchestration_id: str, tasks: list) -> requests.Response:
+
+        return self.put_raw(f'orchestrations/{orchestration_id}/tasks', json=tasks)
+
+
+class DockerRunnerApi(HttpClient):
+
+    API_IDENTIFIER = 'syrup'
+    API_SUFFIX = 'docker'
+
+    def __init__(self, region_specifier: str, sapi_token: str, url: str = None) -> None:
+
+        _base_url = urljoin(build_api_url(self.API_IDENTIFIER, region_specifier, url), self.API_SUFFIX)
+        _base_hdr = {'x-storageapi-token': sapi_token}
+
+        super().__init__(base_url=_base_url, auth_header=_base_hdr)
+
+    def create_job(self, component_id: str, configuration_id: str, configuration_row_id: str = None,
+                   config_data: dict = None, variable_value_id: str = None,
+                   variable_values_data: dict = None) -> requests.Response:
+
+        job_data = {}
+        job_data['config'] = configuration_id
+
+        if configuration_row_id is not None:
+            job_data['row'] = configuration_row_id
+
+        if config_data is not None:
+            job_data['configData'] = config_data
+
+        if variable_value_id is not None:
+            job_data['variableValuesId'] = variable_value_id
+
+        if variable_values_data is not None:
+            job_data['variableValuesData'] = variable_values_data
+
+        return self.post_raw(f'{component_id}/run', json=job_data)
+
+    def pool_job(self, job_url: str, wait_time: int = None):
+
+        WAIT_TIME = 60 if not wait_time else wait_time
+        job_is_finished = False
+        counter = 0
+
+        while job_is_finished is False:
+
+            job_rsp = self.get_raw(job_url, is_absolute_path=True)
+            job_rsp_js = job_rsp.json()
+
+            job_status = job_rsp_js['status']
+
+            if counter % 10 == 0:
+                print(f'Pool #{counter} for job {job_url.split("/")[-1]} - status: {job_status}.')
+
+            if job_status not in ['success', 'error', 'terminated']:
+                time.sleep(WAIT_TIME)
+                counter += 1
+            else:
+                print(f'Job {job_url} finished - status {job_status}.')
+                return job_status, job_rsp_js
+
+
+================================================
+File: /src/component.py
+================================================
+import copy
+import csv
+import dataclasses
+import json
+import logging
+import operator
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import pymysql.cursors
+import snowflake.connector
+from deprecated import deprecated
+from kbcstorage.client import Client
+from keboola.component import CommonInterface
+from keboola.component.base import UserException
+
+from keboola_api import DockerRunnerApi, EncryptionApi, StorageApi, OrchestratorApi
+
+# Basic mode setting
+KEY_MODE = 'mode'
+KEY_MYSQL = 'mysql'
+KEY_SNFK = 'snowflake'
+KEY_PARS = 'parameters'
+
+# Database settings present in KEY_MYSQL and KEY_SNFK
+KEY_HOST = 'host'
+KEY_ACCT = 'account'
+KEY_PORT = 'port'
+KEY_USER = 'username'
+KEY_PASS = '#password'
+KEY_WRHS = 'warehouse'
+KEY_ROLE = 'role'
+
+# Fetch Tables
+KEY_CDC_CONFIG = 'cdc_configuration'
+KEY_TABLES_IN_CONFIG = 'tables_in_configuration'
+KEY_INDEX_CONFIGURATIONS = 'index_configurations'
+KEY_ORCHESTRATION_ADD = 'add_to_orchestration'
+KEY_ORCHESTRATION_ID = 'add_to_orchestration_id'
+KEY_ORCHESTRATION_PHASE = 'add_to_orchestration_phase'
+KEY_SCHEMAS = 'schemas'
+
+KEY_SIDE_BACKFILL = 'side_backfill'
+KEY_SIDE_BACKFILL_USE = 'use'
+KEY_SIDE_BACKFILL_ROWS = 'rows'
+KEY_SIDE_BACKFILL_SIZE = 'size'
+
+# Sync Tables
+KEY_SOURCE_BUCKET = 'source_bucket'
+KEY_DESTINATION_BUCKET = 'destination_bucket'
+
+# Historize Tables
+KEY_QUERY = 'query'
+KEY_SCHEMA_RAW = 'schema_raw'
+KEY_SCHEMA_VIEW = 'schema_view'
+KEY_SCHEMA_HISTORY = 'schema_history'
+KEY_SCHEMA_BACKUP = 'schema_backup'
+KEY_SCHEMA_INACTIVE = 'schema_inactive'
+KEY_SCHEMA_TMP = 'schema_tmp'
+KEY_CDC_ORCHESTRATION_ID = 'cdc_orchestration_id'
+KEY_HISTORIZE_IN_STORAGE = 'historize_in_storage'
+
+# Both
+KEY_EXCLUDE_TABLES = 'exclude_tables'
+KEY_SAPI_TOKEN = '#sapi_token'
+
+MANDATORY_PARS_FETCH_TABLES = [KEY_SCHEMAS, KEY_CDC_CONFIG, KEY_INDEX_CONFIGURATIONS,
+                               KEY_TABLES_IN_CONFIG, KEY_SAPI_TOKEN]
+MANDATORY_PARS_SYNC_TABLES = [KEY_SCHEMAS, KEY_SOURCE_BUCKET, KEY_DESTINATION_BUCKET, KEY_SAPI_TOKEN]
+MANDATORY_PARS_HISTORIZE_TABLES = [KEY_QUERY, KEY_SAPI_TOKEN, KEY_SCHEMA_RAW, KEY_SCHEMA_VIEW, KEY_SCHEMA_HISTORY,
+                                   KEY_SCHEMA_BACKUP, KEY_SCHEMA_INACTIVE, KEY_SCHEMA_TMP, KEY_CDC_ORCHESTRATION_ID]
+MANDATORY_PARS_REMOVE_TABLES = [KEY_SCHEMAS, KEY_EXCLUDE_TABLES, KEY_SAPI_TOKEN]
+
+MANDATORY_PARS_SNFK = [KEY_ACCT, KEY_USER, KEY_PASS, KEY_WRHS]
+MANDATORY_PARS_MYSQL = [KEY_HOST, KEY_PORT, KEY_USER, KEY_PASS]
+
+MYSQL_MODES = ['fetch_new_tables', 'sync_tables', 'remove_obsolete_tables']
+SNFK_MODES = ['sync_tables', 'historize_tables']
+
+KEY_STACKID = 'KBC_STACKID'
+KEY_TOKEN = 'KBC_TOKEN'
+KEY_PROJECT = 'KBC_PROJECTID'
+KEY_RUNID = 'KBC_RUNID'
+
+# configuration variables
+KEY_DEBUG = 'debug'
+
+# list of mandatory parameters => if some is missing, component will fail with readable message on initialization.
+MANDATORY_PARS = [KEY_MODE, KEY_PARS]
+MANDATORY_IMAGE_PARS = []
+
+APP_VERSION = '0.4.11'
+# sys.tracebacklimit = 3
+
+COMPONENT_ID = 'kds-team.ex-mysql-next'
+
+
+@dataclass
+class SnowflakeCredentials:
+    host: str
+    warehouse: str
+    username: str
+    password: str
+    role: str
+    cursor: snowflake.connector.cursor = snowflake.connector.DictCursor
+
+
+@dataclass
+class MySQLCredentials:
+    host: str
+    port: int
+    username: str
+    password: str
+
+
+@dataclass
+class KBCEnvironment:
+    stack_id: str
+    project_id: str
+    run_id: str
+
+
+@dataclass
+class SideLoadParameters:
+    use: bool
+    rows: int
+    size: float
+
+
+@dataclass
+class FetchTablesParameters:
+    index_configs: bool
+    nr_tables_in_config: int
+    exclude_tables: list
+    cdc_config: dict
+    orchestration_add: bool
+    orchestration_add_id: str
+    orchestration_add_phase: str
+    schemas: list
+    sapi_token: str
+    side_load: SideLoadParameters
+
+
+@dataclass
+class SyncTablesParameters:
+    exclude_tables: list
+    source_bucket: str
+    destination_bucket: str
+    schemas: list
+    sapi_token: str
+
+
+@dataclass
+class HistorizeTablesParameters:
+    query: str
+    schema_raw: str
+    schema_view: str
+    schema_history: str
+    schema_backup: str
+    schema_inactive: str
+    schema_tmp: str
+    sapi_token: str
+    orchestration_id: str
+    historize_in_storage: bool
+
+
+@dataclass
+class RemoveObsoleteTablesParameters:
+    schemas: list
+    exclude_tables: list
+    sapi_token: str
+    index_configs: bool
+
+
+@dataclass
+class MySQLTable:
+    name: str
+    schema: str
+    full_name: str
+    state_name: str
+    rows: str
+    size_mb: str
+
+
+class Component(CommonInterface):
+    SNFK_CURSOR_TYPE = snowflake.connector.DictCursor
+    DATATYPES_MAPPING = {
+        'datetime': 'datetime',
+        'smallint': 'smallint',
+        'tinyint': 'tinyint',
+        'int': 'integer',
+        'text': 'text',
+        'date': 'date',
+        'double': 'double',
+        'integer': 'integer',
+        'json': 'variant',
+        'longtext': 'text',
+        'timestamp': 'timestamp',
+        'varchar': 'varchar',
+        'char': 'text',
+        'bigint': 'bigint'
+    }
+
+    def __init__(self):
+        default_data_dir = Path(__file__).resolve().parent.parent.joinpath('data').as_posix() \
+            if not os.environ.get('KBC_DATADIR') else None
+
+        super().__init__(data_folder_path=default_data_dir)
+
+        logging.info(f'Running version {APP_VERSION}...')
+
+        if self.configuration.parameters.get(KEY_DEBUG, False) is True:
+            logging.getLogger().setLevel(logging.DEBUG)
+            sys.tracebacklimit = 3
+
+        try:
+            # validation of mandatory parameters. Produces ValueError
+            self.validate_configuration(MANDATORY_PARS)
+        except ValueError as e:
+            logging.exception(e)
+            exit(1)
+
+        self.mode = self.configuration.parameters[KEY_MODE]
+        self.kbc = KBCEnvironment(os.environ.get(KEY_STACKID, 'connection.keboola.com'), os.environ.get(KEY_PROJECT),
+                                  os.environ.get(KEY_RUNID, '@@@123'))
+
+        if self.mode in MYSQL_MODES:
+
+            try:
+                self.validate_parameters(self.configuration.parameters.get(KEY_MYSQL, {}),
+                                         MANDATORY_PARS_MYSQL, 'mysql parameters')
+            except ValueError as e:
+                logging.exception(e)
+                exit(1)
+
+            self.mysql = MySQLCredentials(self.configuration.parameters[KEY_MYSQL][KEY_HOST],
+                                          self.configuration.parameters[KEY_MYSQL][KEY_PORT],
+                                          self.configuration.parameters[KEY_MYSQL][KEY_USER],
+                                          self.configuration.parameters[KEY_MYSQL][KEY_PASS])
+
+        else:
+            self.mysql = None
+
+        if self.mode in SNFK_MODES:
+
+            try:
+                self.validate_parameters(self.configuration.parameters.get(KEY_SNFK, {}),
+                                         MANDATORY_PARS_SNFK, 'snowflake parameters')
+            except ValueError as e:
+                logging.exception(e)
+                exit(1)
+
+            self.snfk = SnowflakeCredentials(self.configuration.parameters[KEY_SNFK][KEY_ACCT],
+                                             self.configuration.parameters[KEY_SNFK][KEY_WRHS],
+                                             self.configuration.parameters[KEY_SNFK][KEY_USER],
+                                             self.configuration.parameters[KEY_SNFK][KEY_PASS],
+                                             self.configuration.parameters[KEY_SNFK].get(KEY_ROLE),
+                                             snowflake.connector.DictCursor)
+
+        else:
+            self.snfk = None
+
+        companion_parameters = self.configuration.parameters.get(KEY_PARS, {})
+
+        if self.mode == 'fetch_new_tables':
+            try:
+                self.validate_parameters(companion_parameters, MANDATORY_PARS_FETCH_TABLES, 'config parameters')
+            except ValueError as e:
+                logging.exception(e)
+                exit(1)
+
+            side_backfill_params = companion_parameters.get(KEY_SIDE_BACKFILL, {})
+
+            side_load = SideLoadParameters(side_backfill_params.get(KEY_SIDE_BACKFILL_USE, False),
+                                           side_backfill_params.get(KEY_SIDE_BACKFILL_ROWS),
+                                           side_backfill_params.get(KEY_SIDE_BACKFILL_SIZE))
+
+            self.parameters = FetchTablesParameters(companion_parameters[KEY_INDEX_CONFIGURATIONS],
+                                                    companion_parameters[KEY_TABLES_IN_CONFIG],
+                                                    companion_parameters.get(KEY_EXCLUDE_TABLES, []),
+                                                    companion_parameters[KEY_CDC_CONFIG],
+                                                    companion_parameters.get(KEY_ORCHESTRATION_ADD, False),
+                                                    companion_parameters.get(KEY_ORCHESTRATION_ID),
+                                                    companion_parameters.get(KEY_ORCHESTRATION_PHASE, 'New phase'),
+                                                    companion_parameters[KEY_SCHEMAS],
+                                                    companion_parameters[KEY_SAPI_TOKEN],
+                                                    side_load)
+
+            if self.parameters.orchestration_add is True and self.parameters.orchestration_add_id is None:
+                logging.error("Orchestration ID must be specified, when \"add_to_orchestration\" is set to true.")
+                sys.exit(1)
+
+        elif self.mode == 'sync_tables':
+
+            try:
+                self.validate_parameters(companion_parameters, MANDATORY_PARS_SYNC_TABLES, 'config parameters')
+            except ValueError as e:
+                logging.exception(e)
+                exit(1)
+
+            self.parameters = SyncTablesParameters(companion_parameters.get(KEY_EXCLUDE_TABLES, []),
+                                                   companion_parameters[KEY_SOURCE_BUCKET],
+                                                   companion_parameters[KEY_DESTINATION_BUCKET],
+                                                   companion_parameters[KEY_SCHEMAS],
+                                                   companion_parameters[KEY_SAPI_TOKEN])
+
+        elif self.mode == 'historize_tables':
+
+            try:
+                self.validate_parameters(companion_parameters, MANDATORY_PARS_HISTORIZE_TABLES, 'config parameters')
+            except ValueError as e:
+                logging.exception(e)
+                exit(1)
+
+            self.parameters = HistorizeTablesParameters(
+                companion_parameters[KEY_QUERY],
+                companion_parameters[KEY_SCHEMA_RAW],
+                companion_parameters[KEY_SCHEMA_VIEW],
+                companion_parameters[KEY_SCHEMA_HISTORY],
+                companion_parameters[KEY_SCHEMA_BACKUP],
+                companion_parameters[KEY_SCHEMA_INACTIVE],
+                companion_parameters[KEY_SCHEMA_TMP],
+                companion_parameters[KEY_SAPI_TOKEN],
+                companion_parameters[KEY_CDC_ORCHESTRATION_ID],
+                companion_parameters.get(KEY_HISTORIZE_IN_STORAGE, False))
+
+        elif self.mode == 'remove_obsolete_tables':
+
+            try:
+                self.validate_parameters(companion_parameters, MANDATORY_PARS_REMOVE_TABLES, 'config parameters')
+
+            except ValueError as e:
+                logging.exception(e)
+                exit(1)
+
+            self.parameters = RemoveObsoleteTablesParameters(
+                companion_parameters[KEY_SCHEMAS],
+                companion_parameters[KEY_EXCLUDE_TABLES],
+                companion_parameters[KEY_SAPI_TOKEN],
+                True
+            )
+
+        else:
+            logging.error(f"Mode {self.mode} not supported.")
+            exit(1)
+
+    def _log_query(self, query):
+        logging.info(f"Running query: {query}", extra={"full_message": query})
+
+    def _mysql_create_cursor(self):
+        self.mysql_conn = pymysql.connect(host=self.mysql.host,
+                                          user=self.mysql.username,
+                                          password=self.mysql.password,
+                                          port=self.mysql.port,
+                                          cursorclass=pymysql.cursors.DictCursor)
+
+    def mysql_fetch_all_tables(self, cursor):
+
+        all_tables = {}
+        if len(self.parameters.schemas) == 0:
+            logging.error("No schema provided.")
+            exit(1)
+
+        elif len(self.parameters.schemas) > 1:
+            logging.error("Only 1 schema can be provided at the moment.")
+            exit(1)
+
+        else:
+            pass
+
+        schemas_str = ','.join([f'\'{x}\'' for x in self.parameters.schemas])
+
+        sql = 'SELECT *, round(((data_length + index_length) / 1024 / 1024), 2) AS TABLE_SIZE ' + \
+              f'FROM information_schema.tables WHERE table_schema IN ({schemas_str});'
+        cursor.execute(sql)
+
+        result = cursor.fetchall()
+
+        if list(result) == []:
+            logging.warning(f"No tables found in schemas: {self.parameters.schemas}.")
+            exit(1)
+
+        else:
+            for table in result:
+                schema = table['TABLE_SCHEMA']
+                name = table['TABLE_NAME']
+                if schema not in all_tables:
+                    all_tables[schema] = []
+
+                table_dao = MySQLTable(name, schema, f'{schema}.{name}', f'{schema}-{name}',
+                                       table['TABLE_ROWS'], float(table['TABLE_SIZE']))
+
+                all_tables[schema] += [table_dao]
+
+            return all_tables
+
+    def _mysql_get_primary_key_of_table(self, cursor, schema, table_name):
+        sql = f'SHOW KEYS FROM {schema}.{table_name} WHERE key_name = \'PRIMARY\';'
+        cursor.execute(sql)
+
+        result = cursor.fetchall()
+
+        return [c['Column_name'] for c in result]
+
+    def get_all_configurations(self, sapi_client):
+        all_configs_rsp = sapi_client.get_all_configurations(COMPONENT_ID)
+
+        if all_configs_rsp.status_code == 200:
+            return all_configs_rsp.json()
+
+        else:
+            logging.error(f"Could not download configurations of {COMPONENT_ID}. Received: {all_configs_rsp.json()}")
+            exit(1)
+
+    def parse_configurations(self, configurations, skip_index=False):
+
+        max_index = 0
+        all_configurations = {}
+        for configuration in configurations:
+            configuration_id = configuration['id']
+            configuration_config = configuration['configuration']
+            configuration_name = configuration['name']
+            configuration_state = configuration['state']
+
+            if configuration_name.startswith('00 -') or 'TMP' in configuration_name:
+                continue
+
+            if configuration_config.get('parameters') is None:
+                continue
+
+            _tables_json = json.loads(configuration_config['parameters'].get('inputMappingsJson', '{}'))
+            schemas = list(_tables_json.keys())
+
+            tables = []
+            for key, values in _tables_json.items():
+                tables += [f'{key}.{table}' for table in [list(x.keys())[0] for x in values['tables']]]
+
+            _result_dict = {}
+            _result_dict['id'] = configuration_id
+            _result_dict['name'] = configuration_name
+            _result_dict['api'] = configuration
+            _result_dict['tables_json'] = _tables_json
+            _result_dict['tables_json_str'] = configuration_config['parameters'].get('inputMappingsJson', '{}')
+            _result_dict['tables'] = tables
+            _result_dict['schemas'] = schemas
+            _result_dict['state'] = configuration_state
+
+            if not skip_index:
+                if self.parameters.index_configs is True:
+                    try:
+                        index = int(configuration_name.split('-')[0])
+                        _result_dict['index'] = index
+                        if index > max_index:
+                            max_index = index
+                    except ValueError as e:
+                        logging.exception(f"Could not get index of configuration from name {configuration_name}. "
+                                          f"Turn off \"index_configurations\" option or fix name of the confgiuration."
+                                          f"\n{e}")
+                        sys.exit(1)
+                else:
+                    _result_dict['index'] = None
+
+            else:
+                _result_dict['index'] = None
+
+            all_configurations[configuration_id] = _result_dict
+
+        return all_configurations, max_index
+
+    def get_and_parse_configurations(self, sapi_client, skip_index=False):
+        configs = self.get_all_configurations(sapi_client)
+        return self.parse_configurations(configs, skip_index)
+
+    def _parse_update_response(self, update_response):
+        tables_input_mapping = update_response['configuration']['parameters']['inputMappingsJson']
+        tables_json = json.loads(tables_input_mapping)
+
+        total_tables = 0
+
+        for _, item in tables_json.items():
+            total_tables += len(item['tables'])
+
+        return total_tables, update_response['name']
+
+    def get_free_configurations(self, configurations, desired_tables_in_config):
+
+        schema = self.parameters.schemas
+
+        free_space = []
+        for id, config in configurations.items():
+            if len(config['tables']) < desired_tables_in_config and config['schemas'] == schema:
+                free_space += [id]
+
+        return free_space
+
+    def add_tables_to_configuration(self, configuration, desired_tables_in_config):
+
+        tables_in_config = configuration.get('tables', [])
+        tables_json = configuration.get('tables_json', {})
+        room_left = desired_tables_in_config - len(tables_in_config)
+        tables_to_add = self.to_sync[0:room_left]
+
+        for db_table in tables_to_add:
+            # db_table_split = db_table.split('.')
+            db, table = db_table.schema, db_table.name
+
+            if db not in tables_json:
+                tables_json[db] = {'tables': []}
+
+            tables_json[db]['tables'] += [{table: {'selected': True,
+                                                   'replication-method': 'log_based', 'columns': {}}}]
+            tables_in_config += [db_table.full_name]
+            self.to_sync.remove(db_table)
+
+        return tables_json, {'tables': tables_in_config, 'new': [t.full_name for t in tables_to_add]}
+
+    def create_configuration_name(self, index, tables):
+        if self.parameters.index_configs is True:
+            config_name = f"{str(index).zfill(2)} - {', '.join(tables)}"
+        else:
+            config_name = ', '.join(tables)
+
+        return config_name
+
+    def update_configurations_with_new_tables(self, sapi_client: StorageApi, configurations,
+                                              free_configurations, states=None):
+
+        for configuration_id in free_configurations:
+
+            if len(self.to_sync) == 0:
+                logging.info("All tables synced.")
+                return
+
+            config = configurations[configuration_id]
+            config_config = config['api']['configuration']
+            config_index = config['index']
+
+            tables_json, tables_configuration = self.add_tables_to_configuration(
+                config, self.parameters.nr_tables_in_config)
+            tables_in_config, added_tables = tables_configuration['tables'], tables_configuration['new']
+            config_config['parameters']['inputMappingsJson'] = json.dumps(tables_json, indent=2)
+
+            config_name = self.create_configuration_name(config_index, tables_in_config)
+
+            updated_config = {'name': config_name,
+                              'configuration': json.dumps(config_config),
+                              'changeDescription': f"Added tables {', '.join(added_tables)}"}
+
+            if states:
+                current_state = copy.deepcopy(config['state'])
+
+                if 'component' not in current_state:
+                    current_state['component'] = {
+                        'currently_syncing': None,
+                        'bookmarks': {}
+                    }
+
+                for table in added_tables:
+                    table_state_name = self.state_map[table]
+                    if table_state_name not in states:
+                        continue
+                    else:
+                        current_state['component']['bookmarks'][table_state_name] = states[table_state_name]
+
+                updated_config['state'] = json.dumps(current_state)
+
+            update_config_rsp = sapi_client.update_configuration(COMPONENT_ID, configuration_id,
+                                                                 config_json=updated_config)
+
+            if update_config_rsp.status_code == 200:
+                new_tables_len, new_name = self._parse_update_response(update_config_rsp.json())
+
+                if new_tables_len != len(tables_in_config) or new_name != config_name:
+                    logging.error(f"Update for {configuration_id} was not succesful.")
+                    exit(1)
+
+                logging.info(
+                    f"Successfully updated configuration {configuration_id} with new "
+                    f"tables {', '.join(added_tables)}.")
+
+            else:
+                logging.error(f"Could not update configuration {configuration_id}. "
+                              f"Received: {update_config_rsp.status_code} - {update_config_rsp.json()}")
+                exit(1)
+
+    def create_configurations_with_new_tables(self, sapi_client: StorageApi, encrypt_client: EncryptionApi,
+                                              orchestrator_client: OrchestratorApi, index, states=None):
+
+        while len(self.to_sync) > 0:
+            tables_json, tables = self.add_tables_to_configuration({}, self.parameters.nr_tables_in_config)
+
+            index += 1
+
+            configuration = self.parameters.cdc_config
+            configuration['inputMappingsJson'] = json.dumps(tables_json, indent=2)
+            configuration['host'] = self.mysql.host
+            configuration['port'] = self.mysql.port
+            configuration['username'] = self.mysql.username
+            configuration['#password'] = self.mysql.password
+
+            configuration_encrypted = encrypt_client.encrypt_data(configuration)
+            config_name = self.create_configuration_name(index, tables['tables'])
+
+            config = {'name': config_name, 'configuration': json.dumps({'parameters': configuration_encrypted})}
+            if states:
+                current_state = {
+                    'component': {
+                        'currently_syncing': None,
+                        'bookmarks': {}
+                    }
+                }
+
+                for table in tables['tables']:
+                    table_state_name = self.state_map[table]
+                    if table_state_name not in states:
+                        continue
+                    else:
+                        current_state['component']['bookmarks'][table_state_name] = states[table_state_name]
+
+                config['state'] = json.dumps(current_state)
+
+            new_config_rsp = sapi_client.create_new_configuration(COMPONENT_ID, config)
+
+            if new_config_rsp.status_code == 201:
+                logging.info(f"Created new configuration for tables {', '.join(tables['tables'])}.")
+                new_config_id = new_config_rsp.json()['id']
+
+                if self.parameters.orchestration_add is True:
+                    self.update_orchestration_tasks(
+                        orchestrator_client, self.parameters.orchestration_add_id, new_config_id)
+            else:
+                logging.error("Could not create new configuration."
+                              f"Received: {new_config_rsp.status_code} - {new_config_rsp.json()}.")
+                exit(1)
+
+    def update_orchestration_tasks(self, orchestrator_client: OrchestratorApi, orchestration_id, configuration_id):
+
+        orch_rsp = orchestrator_client.get_orchestration(orchestration_id)
+
+        if orch_rsp.ok is not True:
+            logging.exception(f"Could not retrieve orchestration {orchestration_id}. "
+                              f"Received: {orch_rsp.status_code} - {orch_rsp.json()}.")
+            exit(1)
+
+        tasks = orch_rsp.json()['tasks']
+
+        new_cfg_task = {
+            "component": COMPONENT_ID,
+            "action": "run",
+            "actionParameters": {
+                "config": str(configuration_id)
+            },
+            "continueOnFailure": False,
+            "timeoutMinutes": None,
+            "active": True,
+            "phase": self.parameters.orchestration_add_phase
+        }
+
+        new_tasks = []
+        encountered = False
+        written = False
+
+        for task in tasks:
+            if encountered is False or (encountered is True and written is True) or \
+                    (encountered is True and written is False and task['phase'] ==
+                     self.parameters.orchestration_add_phase):
+                if task['phase'] == self.parameters.orchestration_add_phase and encountered is False:
+                    encountered = True
+                new_tasks += [task]
+            elif encountered is True and written is False and task['phase'] != self.parameters.orchestration_add_phase:
+                new_tasks += [new_cfg_task]
+                new_tasks += [task]
+                written = True
+            else:
+                raise ValueError("Logic missing.")
+
+        if written is False:
+            new_tasks += [new_cfg_task]
+
+        update_orch_rsp = orchestrator_client.update_orchestration_tasks(orchestration_id, tasks=new_tasks)
+
+        if update_orch_rsp.ok is True:
+            logging.info(f"Updated orchestration {orchestration_id} with new configuration {configuration_id}.")
+        else:
+            logging.error(f"Could not update {orchestration_id}. "
+                          f"Received: {update_orch_rsp.status_code} - {update_orch_rsp.json()}.")
+            exit(1)
+
+    def enable_orchestration(self, orchestrator_client: OrchestratorApi, orchestration_id):
+
+        enable_orch_rsp = orchestrator_client.update_orchestration(orchestration_id, active=True)
+
+        if enable_orch_rsp.ok is True:
+            logging.info(f"Orchestration {orchestration_id} enabled successfully.")
+        else:
+            logging.error(f"Could not enable orchestration {orchestration_id}.")
+            sys.exit(1)
+
+    def disable_orchestration(self, orchestrator_client: OrchestratorApi, orchestration_id):
+
+        disable_orch_rsp = orchestrator_client.update_orchestration(orchestration_id, active=False)
+
+        if disable_orch_rsp.ok is True:
+            logging.info(f"Orchestration {orchestration_id} disabled successfully.")
+        else:
+            logging.error(f"Could not disable orchestration {orchestration_id}.")
+            sys.exit(1)
+
+    def create_api_clients(self, sapi_token: str):
+
+        self.sapi = StorageApi('', sapi_token, url=self.kbc.stack_id.replace('connection.', ''))
+        self.encr = EncryptionApi('', COMPONENT_ID, self.kbc.project_id,
+                                  url=self.kbc.stack_id.replace('connection.', ''))
+        self.orch = OrchestratorApi('', sapi_token, url=self.kbc.stack_id.replace('connection.', ''))
+        self.kbc_storage = Client(f'https://{self.kbc.stack_id}', sapi_token)
+        self.docker = DockerRunnerApi('', sapi_token, url=self.kbc.stack_id.replace('connection.', ''))
+
+    def get_and_parse_bucket(self, bucket_id: str, include_metadata: bool = True):
+
+        out = dict()
+        bucket_rsp = self.sapi.get_tables_in_bucket(bucket_id, include='columns,columnMetadata')
+
+        if bucket_rsp.ok is True:
+            bucket_data = bucket_rsp.json()
+        else:
+            logging.error(f"Could not download data about bucket {bucket_id}: {bucket_rsp.json()}")
+            sys.exit(1)
+
+        try:
+            skip_tables = self.parameters.exclude_tables
+        except AttributeError:
+            skip_tables = []
+
+        for table in bucket_data:
+            name = table['name']
+            columns = table['columns']
+            metadata = table['columnMetadata']
+
+            if name in skip_tables:
+                continue
+
+            column_datatypes = dict()
+
+            if include_metadata is True:
+
+                if not metadata:
+                    raise UserException(
+                        f'The source table {table["id"]} does not have column metadata defined. '
+                        f'Please set the metadata first')
+
+                for column, md in metadata.items():
+                    for md_item in md:
+                        if md_item['key'] == 'KBC.datatype.type' and md_item['provider'] == COMPONENT_ID:
+                            column_datatypes[column] = md_item['value']
+                        else:
+                            continue
+
+            out[name] = {'columns': columns, 'dt': column_datatypes, 'md': metadata}
+
+        return out
+
+    def determine_tables_to_sync(self, source_bucket, destination_bucket):
+
+        new_tables = []
+        table_changes = {}
+
+        for table in source_bucket:
+            if table in self.parameters.exclude_tables:
+                continue
+            else:
+                if table not in destination_bucket:
+                    new_tables += [table]
+                    continue
+
+                missing_cols = []
+                extra_cols = []
+                wrong_dt = []
+
+                src_cols = source_bucket[table]['columns']
+                dst_cols = destination_bucket[table]['columns']
+
+                for col in src_cols:
+                    if col not in dst_cols:
+                        missing_cols += [col]
+                        continue
+
+                    col_src_dt = source_bucket[table]['dt'][col]
+                    col_dst_dt = destination_bucket[table]['dt'][col]
+
+                    if col_src_dt != col_dst_dt:
+                        wrong_dt += [col]
+
+                for col in dst_cols:
+                    if col not in src_cols:
+                        extra_cols += [col]
+
+                create_record = any([(ms := len(missing_cols)) > 0, (es := len(extra_cols)) > 0,
+                                     (wdt := len(wrong_dt)) > 0])
+
+                if create_record:
+                    table_changes[table] = dict()
+
+                if ms > 0:
+                    table_changes[table]['add_columns'] = missing_cols
+
+                if es > 0:
+                    table_changes[table]['drop_columns'] = extra_cols
+
+                if wdt > 0:
+                    table_changes[table]['sync_datatypes'] = wrong_dt
+
+        return new_tables, table_changes
+
+    def _snfk_create_cursor(self):
+
+        self.snfk_conn = snowflake.connector.connect(user=self.snfk.username, password=self.snfk.password,
+                                                     account=self.snfk.host,
+                                                     database=f'SAPI_{self.kbc.project_id}',
+                                                     warehouse=self.snfk.warehouse,
+                                                     session_parameters={
+                                                         'QUERY_TAG': f'{{"runId":"{self.kbc.run_id}"}}'
+                                                     })
+
+    def snfk_drop_view_and_recreate_table(self, cursor: snowflake.connector.cursor, schema: str,
+                                          object: str, columns: list, empty_table: bool = False):
+
+        columns_string = ",".join([f'"{c}" VARCHAR' if empty_table else f'"{c}"' for c in columns])
+
+        if empty_table:
+            create_tmp_table_sql = f'CREATE OR REPLACE TABLE "{schema}"."__{object}_tmp__" ({columns_string});'
+
+        else:
+            create_tmp_table_sql = f'CREATE OR REPLACE TABLE "{schema}"."__{object}_tmp__" AS ' + \
+                                   f'SELECT {columns_string} FROM "{schema}"."{object}";'
+
+        self._log_query(create_tmp_table_sql)
+
+        cursor.execute(create_tmp_table_sql)
+        grants = self.snfk_generate_grant_commands(cursor, schema, object)
+
+        drop_view_sql = f'DROP VIEW "{schema}"."{object}";'
+        create_table_sql = f'CREATE TABLE "{schema}"."{object}" CLONE "{schema}"."__{object}_tmp__";'
+        drop_tmp_table_sql = f'DROP TABLE IF EXISTS "{schema}"."__{object}_tmp__";'
+
+        self._log_query(drop_view_sql)
+        cursor.execute(drop_view_sql)
+
+        self._log_query(create_table_sql)
+        cursor.execute(create_table_sql)
+
+        self._log_query(drop_tmp_table_sql)
+        cursor.execute(drop_tmp_table_sql)
+
+        for g in grants:
+            self._log_query(g)
+            cursor.execute(g)
+
+    def snfk_drop_table_and_recreate_view(self, cursor: snowflake.connector.cursor, schema: str,
+                                          object: str, view_query: str):
+
+        grants = self.snfk_generate_grant_commands(cursor, schema, object)
+
+        drop_table_sql = f'DROP TABLE "{schema}"."{object}";'
+        self._log_query(drop_table_sql)
+        cursor.execute(drop_table_sql)
+
+        self._log_query(view_query)
+        cursor.execute(view_query)
+
+        for g in grants:
+            self._log_query(g)
+            cursor.execute(g)
+
+    def snfk_generate_grant_commands(self, cursor, schema, object, dst_schema=None):
+
+        if dst_schema is None:
+            dst_schema = schema
+
+        get_grants_sql = f'SHOW GRANTS ON "{schema}"."{object}";'
+        cursor.execute(get_grants_sql)
+
+        grants = cursor.fetchall()
+
+        grant_sql = 'GRANT {privilege} ON "{schema}"."{object}" TO {granted_to} {grantee_name} {revoke};'
+
+        grant_ownership = [grant_sql.format(**x, schema=dst_schema,
+                                            object=object, revoke='REVOKE CURRENT GRANTS')
+                           for x in grants if x['privilege'] == 'OWNERSHIP']
+        grant_other = [grant_sql.format(**x, schema=dst_schema,
+                                        object=object, revoke='') for x in grants if x['privilege'] != 'OWNERSHIP']
+
+        return grant_ownership + grant_other
+
+    def map_snfk_table_to_mysql(self, mysql_tables, snfk_table_name):
+
+        tables = [t.name for t in mysql_tables[self.parameters.schemas[0]]]
+
+        for table in tables:
+            if table.upper() == snfk_table_name.upper():
+                return table
+
+    def create_csv(self, columns):
+
+        if os.path.exists(self.data_folder_path) is False:
+            os.makedirs(self.data_folder_path)
+
+        tmp_dir = os.path.join(self.data_folder_path, 'tmp')
+
+        if os.path.exists(tmp_dir) is False:
+            os.makedirs(tmp_dir)
+
+        csv_path = os.path.join(tmp_dir, 'tmp.csv')
+
+        with open(csv_path, 'w') as csv_io:
+            wrt = csv.DictWriter(csv_io, fieldnames=columns, quoting=csv.QUOTE_ALL)
+            wrt.writeheader()
+
+        return csv_path
+
+    def create_view_query(self, destination_bucket, source_bucket, name, columns_string, primary_key):
+
+        VIEW_STATEMENT = '''
+        CREATE OR REPLACE VIEW "{dst}"."{name}" AS
+        WITH view AS (
+        SELECT {cols}, "_timestamp"
+        FROM "{src}"."{name}"
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY {pk} ORDER BY
+        "BINLOG_CHANGE_AT"::INT DESC, "BINLOG_READ_AT"::INT DESC) = 1)
+        SELECT *
+        FROM view
+        WHERE KBC_DELETED_AT IS NULL;'''.format(dst=destination_bucket, src=source_bucket, name=name,
+                                                cols=columns_string, pk=primary_key)
+
+        return VIEW_STATEMENT
+
+    def create_new_tables(self, mysql_cursor, snowflake_cursor, keboola_tables, mysql_tables, new_tables):
+
+        for new in new_tables:
+
+            logging.info(f"Creating new table {new}...")
+
+            table_in_mysql = self.map_snfk_table_to_mysql(mysql_tables, new)
+
+            if table_in_mysql is None:
+                logging.error(f"Could not find table {new} in MySQL. Could not obtain primary key.")
+                exit(1)
+
+            table_pk = self._mysql_get_primary_key_of_table(mysql_cursor, self.parameters.schemas[0], table_in_mysql)
+
+            if table_pk == [] or table_pk is None:
+                logging.error(f"Table {table_in_mysql} in MySQL has no primary key.")
+                exit(1)
+
+            table_columns = keboola_tables[new]['columns']
+            table_metadata = keboola_tables[new]['md']
+            table_datatypes = keboola_tables[new]['dt']
+
+            column_queries = []
+
+            for column in table_columns:
+                datatype = re.sub(r'\(\d*\)', '', table_datatypes[column])
+                snfk_datatype = self.DATATYPES_MAPPING.get(datatype.lower(), datatype.lower())
+                column_queries += [f"IFF(\"{column}\" = '', NULL, "
+                                   f"\"{column}\"::{snfk_datatype}) "
+                                   f" AS \"{column}\""]
+
+            columns_string = ',\n'.join(column_queries)
+            view_query = self.create_view_query(self.parameters.destination_bucket, self.parameters.source_bucket, new,
+                                                columns_string, ','.join(table_pk))
+
+            csv_path = self.create_csv(table_columns)
+
+            logging.info(f"Creating table {new} in bucket {self.parameters.destination_bucket}.")
+            table_id = self.kbc_storage.tables.create(self.parameters.destination_bucket, new, csv_path)
+
+            logging.debug(f"Created table {table_id}. Creating view...")
+
+            self.snfk_drop_table_and_recreate_view(snowflake_cursor, self.parameters.destination_bucket,
+                                                   new, view_query)
+
+            # logging.info("Backfilling metadata...")
+            # for column, md in table_metadata.items():
+            #     column_id = f'{self.parameters.destination_bucket}.{new}.{column}'
+
+            #     md_new = []
+            #     for mdi in md:
+            #         if mdi['key'] == 'KBC.datatype.nullable':
+            #             mdi['value'] = 0
+            #         md_new += [mdi]
+
+            #     _rsp = self.sapi.create_column_metadata(column_id, COMPONENT_ID, md_new)
+
+            #     if _rsp.ok is not True:
+            #         logging.warn(column_id, _rsp.json())
+
+            # logging.debug(f"Backfilled metadata for table {new} in bucket {self.parameters.destination_bucket}.")
+
+            self.create_column_metadata(self.parameters.destination_bucket, new, table_metadata)
+
+    def sync_columns(self, mysql_cursor, snowflake_cursor, mysql_tables: dict, table_changes: dict,
+                     kbc_tables_src: dict, kbc_tables_dst: dict):
+
+        for table, column_sync in table_changes.items():
+            add_columns = column_sync.get('add_columns', [])
+            drop_columns = column_sync.get('drop_columns', [])
+            sync_datatypes = column_sync.get('sync_datatypes', [])
+
+            to_sync_md = list(set(add_columns + sync_datatypes))
+
+            logging.info(f"Syncing column settings for table {self.parameters.destination_bucket}.{table}.")
+
+            table_in_mysql = self.map_snfk_table_to_mysql(mysql_tables, table)
+
+            if not table_in_mysql:
+                logging.error(f"Could not find table {table} in MySQL. Could not obtain primary key.")
+                exit(1)
+
+            table_pk = self._mysql_get_primary_key_of_table(mysql_cursor, self.parameters.schemas[0], table_in_mysql)
+
+            if not table_pk:
+                logging.error(f"Table {table_in_mysql} in MySQL has no primary key.")
+                exit(1)
+
+            table_columns = kbc_tables_src[table]['columns']
+            table_metadata = kbc_tables_src[table]['md']
+            table_datatypes = kbc_tables_src[table]['dt']
+
+            # table_id_src = f"{self.parameters.source_bucket}.{table}"
+            table_id_dst = f"{self.parameters.destination_bucket}.{table}"
+
+            column_queries = []
+
+            for column in table_columns:
+                column_dt = table_datatypes.get(column)
+                if not column_dt:
+                    logging.error(f"Column {column} in table {table} has no metadata set.")
+                    sys.exit(1)
+                datatype = re.sub(r'\(\d*\)', '', table_datatypes[column])
+                snfk_datatype = self.DATATYPES_MAPPING.get(datatype.lower(), datatype.lower())
+                column_queries += [f"IFF(\"{column}\" = '', NULL, "
+                                   f"\"{column}\"::{snfk_datatype}) "
+                                   f"AS \"{column}\""]
+
+            columns_string = ',\n'.join(column_queries)
+            view_query = self.create_view_query(self.parameters.destination_bucket, self.parameters.source_bucket,
+                                                table, columns_string, ','.join(table_pk))
+
+            dst_columns = kbc_tables_dst[table]['columns']
+            if len(drop_columns) == 0:
+                empty_table = False
+            else:
+                empty_table = True
+            self.snfk_drop_view_and_recreate_table(snowflake_cursor, self.parameters.destination_bucket,
+                                                   table, dst_columns, empty_table=empty_table)
+
+            for c in add_columns:
+                self.add_table_column(table_id_dst, c)
+
+            for c in drop_columns:
+                self.drop_table_column(table_id_dst, c)
+
+            logging.info("Recreating view...")
+            self.snfk_drop_table_and_recreate_view(snowflake_cursor, self.parameters.destination_bucket,
+                                                   table, view_query)
+
+            self.create_column_metadata(self.parameters.destination_bucket, table, table_metadata, to_sync_md)
+
+    def add_table_column(self, table_id, column_name):
+
+        add_column_rsp = self.sapi.create_column(table_id, column_name)
+
+        if add_column_rsp.ok:
+            is_success = self.kbc_storage.jobs.block_for_success(add_column_rsp.json()['id'])
+
+            if is_success:
+                logging.info(f"Created column {column_name} in table {table_id}.")
+            else:
+                logging.error(f"Could not create column {column_name} in table {table_id}.\n"
+                              f"{add_column_rsp.json()}")
+                sys.exit(1)
+
+        else:
+            logging.error(f"Could not create column {column_name} for table {table_id}.\n"
+                          f"{add_column_rsp.json()}")
+            sys.exit(1)
+
+    def drop_table_column(self, table_id, column_name):
+
+        drop_column_rsp = self.sapi.drop_column(table_id, column_name)
+
+        if drop_column_rsp.ok:
+            is_success = self.kbc_storage.jobs.block_for_success(drop_column_rsp.json()['id'])
+
+            if is_success:
+                logging.info(f"Dropped column {column_name} in table {table_id}.")
+            else:
+                logging.error(f"Could not drop column {column_name} in table {table_id}.\n"
+                              f"{drop_column_rsp.json()}")
+                sys.exit(1)
+
+        else:
+            logging.error(f"Could not drop column {column_name} for table {table_id}.\n"
+                          f"{drop_column_rsp.json()}")
+            sys.exit(1)
+
+    @deprecated
+    def add_missing_columns(self, mysql_cursor, snowflake_cursor, keboola_tables, mysql_tables, missing_tables,
+                            keboola_tables_dst):
+
+        for table, missing_columns in missing_tables.items():
+
+            logging.info(f"Adding missing columns in table {table}...")
+
+            table_in_mysql = self.map_snfk_table_to_mysql(mysql_tables, table)
+
+            if table_in_mysql is None:
+                logging.error(f"Could not find table {table} in MySQL. Could not obtain primary key.")
+                exit(1)
+
+            table_pk = self._mysql_get_primary_key_of_table(mysql_cursor, self.parameters.schemas[0], table_in_mysql)
+
+            if table_pk == [] or table_pk is None:
+                logging.error(f"Table {table_in_mysql} in MySQL has no primary key.")
+                exit(1)
+
+            table_columns = keboola_tables[table]['columns']
+            table_metadata = keboola_tables[table]['md']
+            table_datatypes = keboola_tables[table]['dt']
+
+            column_queries = []
+
+            for column in table_columns:
+                datatype = re.sub(r'\(\d*\)', '', table_datatypes[column])
+                snfk_datatype = self.DATATYPES_MAPPING.get(datatype.lower(), datatype.lower())
+                column_queries += [f"IFF({column} = '', NULL, {column}::{snfk_datatype}) "
+                                   f"AS {column}"]
+
+            columns_string = ',\n'.join(column_queries)
+            view_query = self.create_view_query(self.parameters.destination_bucket, self.parameters.source_bucket,
+                                                table, columns_string, ','.join(table_pk))
+
+            dst_columns = keboola_tables_dst[table]['columns']
+            self.snfk_drop_view_and_recreate_table(snowflake_cursor, self.parameters.destination_bucket,
+                                                   table, dst_columns)
+
+            for c in missing_columns:
+                column_rsp = self.sapi.create_column(f"{self.parameters.destination_bucket}.{table}", c)
+
+                if column_rsp.ok is True:
+                    is_success = self.kbc_storage.jobs.block_for_success(column_rsp.json()['id'])
+
+                    if is_success is True:
+                        logging.info(f"Created column {c} in table {table}.")
+                    else:
+                        logging.error(f"Could not create column {c} for table {table}.")
+                        sys.exit(1)
+
+                else:
+                    logging.error(f"Could not create column {c} for table {table}.\n{column_rsp.json()}")
+                    sys.exit(1)
+
+            logging.info("Recreating view...")
+            self.snfk_drop_table_and_recreate_view(snowflake_cursor, self.parameters.destination_bucket,
+                                                   table, view_query)
+
+            # logging.info("Backfilling metadata...")
+            # for column, md in table_metadata.items():
+            #     if column not in missing_columns:
+            #         continue
+            #     column_id = f'{self.parameters.destination_bucket}.{table}.{column}'
+
+            #     md_new = []
+            #     for mdi in md:
+            #         if mdi['key'] == 'KBC.datatype.nullable':
+            #             mdi['value'] = 0
+            #         md_new += [mdi]
+
+            #     _rsp = self.sapi.create_column_metadata(column_id, COMPONENT_ID, md_new)
+
+            #     if _rsp.ok is not True:
+            #         logging.warn(column_id, _rsp.json())
+
+            self.create_column_metadata(self.parameters.destination_bucket, table, table_metadata, missing_columns)
+
+    def create_column_metadata(self, bucket: str, table_name: str, table_metadata: dict, columns_to_sync: list = None):
+
+        logging.info("Backfilling metadata...")
+        for column, md in table_metadata.items():
+            if columns_to_sync:
+                if column not in columns_to_sync:
+                    continue
+            column_id = f'{bucket}.{table_name}.{column}'
+
+            md_new = []
+            for mdi in md:
+                if mdi['key'] == 'KBC.datatype.nullable':
+                    mdi['value'] = 0
+                md_new += [mdi]
+
+            _rsp = self.sapi.create_column_metadata(column_id, COMPONENT_ID, md_new)
+
+            if _rsp.ok is False:
+                logging.warn(f"Could not create metadata for column {column_id}.\n{_rsp.json()}")
+
+        logging.debug(f"Backfilled column metadata for table {bucket}.{table_name}.")
+
+    def snfk_get_tables_to_historize(self, cursor: snowflake.connector.cursor):
+
+        self._log_query(self.parameters.query)
+        cursor.execute(self.parameters.query)
+
+        tables_to_historize = [t["TABLE_NAME"] for t in cursor.fetchall()]
+
+        logging.info(f"Following tables will be historized: {tables_to_historize}.")
+        return tables_to_historize
+
+    def snfk_get_table_columns(self, cursor: snowflake.connector.cursor, schema: str,
+                               table_name: str, clean: bool = False):
+
+        get_columns_sql = f'''
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = '{schema}'
+            and table_name = '{table_name}'
+        ORDER BY ordinal_position;
+        '''
+
+        self._log_query(get_columns_sql)
+        cursor.execute(get_columns_sql)
+
+        if clean is False:
+            return [f"\"{c['COLUMN_NAME']}\"" for c in cursor.fetchall()]
+        else:
+            return [c['COLUMN_NAME'] for c in cursor.fetchall()]
+
+    def snfk_create_history_table(self, cursor: snowflake.connector.cursor, table_name: str):
+
+        create_history_table_sql = f'create table if not exists "{self.parameters.schema_history}".{table_name} as' + \
+                                   f'\nselect *\nfrom "{self.parameters.schema_raw}"."{table_name}"\nlimit 0;'
+
+        self._log_query(create_history_table_sql)
+        cursor.execute(create_history_table_sql)
+
+    def snfk_create_backup_table(self, cursor: snowflake.connector.cursor, table_name: str):
+        create_backup_table_sql = f'create or replace table "{self.parameters.schema_backup}".{table_name}\n' + \
+                                  f'clone "{self.parameters.schema_raw}".{table_name};'
+
+        self._log_query(create_backup_table_sql)
+        cursor.execute(create_backup_table_sql)
+
+    def snfk_create_tmp_table(self, cursor: snowflake.connector.cursor, table_name: str):
+        create_tmp_table_sql = f'create or replace table "{self.parameters.schema_tmp}".{table_name} as\n' + \
+                               f'select *\nfrom "{self.parameters.schema_raw}"."{table_name}"\nlimit 0;'
+
+        self._log_query(create_tmp_table_sql)
+        cursor.execute(create_tmp_table_sql)
+
+    def snfk_fill_tmp_table_sql(self, cursor: snowflake.connector.cursor, table_name: str, columns: list):
+
+        table_columns_str = ',\n  '.join(columns)
+        table_columns_nonnull = ',\n  '.join([f'IFNULL({c}::VARCHAR, \'\') AS {c}' if c != '"_timestamp"'
+                                              else c for c in columns])
+
+        fill_tmp_table_sql = f'insert into "{self.parameters.schema_tmp}".{table_name}\n(\n  {table_columns_str}\n)' + \
+                             f'\nselect {table_columns_nonnull}\nfrom "{self.parameters.schema_view}".{table_name};'
+
+        self._log_query(fill_tmp_table_sql)
+        cursor.execute(fill_tmp_table_sql)
+
+    def snfk_get_ddl(self, cursor: snowflake.connector.cursor, table_name: str):
+
+        get_ddl_sql = f'SELECT GET_DDL(\'view\', \'"{self.parameters.schema_view}".{table_name}\') as ddl;'
+        self._log_query(get_ddl_sql)
+        cursor.execute(get_ddl_sql)
+
+        return cursor.fetchone()
+
+    def get_pk_from_dll(self, ddl_query: str) -> str:
+
+        pk_match = re.search(r'PARTITION BY .+ ORDER BY', ddl_query['DDL'])
+        return re.sub(r'PARTITION BY | ORDER BY', '', pk_match[0])
+
+    def snfk_create_inactive_view_sql(self, cursor: snowflake.connector.cursor, table_name: str,
+                                      columns: list, pk: str):
+
+        # columns_query = ',\n'.join([f'IFF({c} = \'\', NULL, {c}) AS {c}' if c != '"_timestamp"'
+        #                             else c for c in columns])
+
+        columns_query = ',\n'.join([f'IFNULL({c}::VARCHAR, \'\') AS {c}' if c != '"_timestamp"'
+                                    else c for c in columns])
+
+        # columns_query = ',\n'.join(columns)
+
+        create_inactive_view_sql = f'''
+        CREATE OR REPLACE VIEW "{self.parameters.schema_inactive}"."{table_name}" AS
+        WITH view AS (
+        SELECT {columns_query}
+        FROM "{self.parameters.schema_raw}"."{table_name}"
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY {pk} ORDER BY
+        "BINLOG_CHANGE_AT"::INT DESC, "BINLOG_READ_AT"::INT DESC) <> 1 or KBC_DELETED_AT IS NOT NULL)
+        SELECT *
+        FROM view;'''
+
+        self._log_query(create_inactive_view_sql)
+        cursor.execute(create_inactive_view_sql)
+
+    def snfk_insert_inactive_rows_sql(self, cursor: snowflake.connector.cursor, table_name: str, columns: str):
+
+        inactive_rows_sql = f'insert into "{self.parameters.schema_history}".{table_name}\n(\n  {columns}\n)\n' + \
+                            f'select {columns}\nfrom "{self.parameters.schema_inactive}".{table_name};'
+
+        self._log_query(inactive_rows_sql)
+        cursor.execute(inactive_rows_sql)
+
+    def snfk_create_grants(self, cursor: snowflake.connector.cursor, table_name: str):
+
+        grants = self.snfk_generate_grant_commands(cursor, self.parameters.schema_raw,
+                                                   table_name, self.parameters.schema_tmp)
+
+        for g in grants:
+            self._log_query(g)
+            cursor.execute(g)
+
+    def snfk_swap_tmp_table(self, cursor: snowflake.connector.cursor, table_name: str):
+
+        swap_sql = f'alter table "{self.parameters.schema_raw}".{table_name}\n' + \
+                   f'swap with "{self.parameters.schema_tmp}".{table_name};'
+
+        self._log_query(swap_sql)
+        cursor.execute(swap_sql)
+
+    def snfk_add_missing_columns(self, cursor: snowflake.connector.cursor, schema: str, table_name: str,
+                                 columns_src: list, columns_dst: list):
+
+        for column in columns_src:
+            if column not in columns_dst:
+                create_columns_sql = f'ALTER TABLE "{schema}"."{table_name}"\n    ADD COLUMN {column} VARCHAR;'
+                self._log_query(create_columns_sql)
+                cursor.execute(create_columns_sql)
+
+    def snfk_drop_tmp_table(self, cursor: snowflake.connector.cursor, table_name: str):
+
+        drop_table_sql = f'DROP TABLE "{self.parameters.schema_tmp}".{table_name};'
+        self._log_query(drop_table_sql)
+        cursor.execute(drop_table_sql)
+
+    def historize_table(self, cursor: snowflake.connector.cursor, table_name: str):
+
+        table_columns = self.snfk_get_table_columns(cursor, self.parameters.schema_raw, table_name)
+        self.snfk_create_history_table(cursor, table_name)
+        self.snfk_create_backup_table(cursor, table_name)
+        self.snfk_create_tmp_table(cursor, table_name)
+        table_columns_history = self.snfk_get_table_columns(cursor, self.parameters.schema_history, table_name)
+        self.snfk_add_missing_columns(cursor, self.parameters.schema_history, table_name,
+                                      table_columns, table_columns_history)
+
+        table_columns_str = ',\n  '.join(table_columns)
+        self.snfk_fill_tmp_table_sql(cursor, table_name, table_columns)
+        ddl = self.snfk_get_ddl(cursor, table_name)
+        table_pk = self.get_pk_from_dll(ddl)
+
+        self.snfk_create_inactive_view_sql(cursor, table_name, table_columns, table_pk)
+
+        self.snfk_insert_inactive_rows_sql(cursor, table_name, table_columns_str)
+        self.snfk_create_grants(cursor, table_name)
+        self.snfk_swap_tmp_table(cursor, table_name)
+        self.snfk_drop_tmp_table(cursor, table_name)
+
+        logging.info(f"Historization for table {table_name} finished.")
+
+    def historize_table_storage(self, cursor: snowflake.connector.cursor, table_name: str, tables_in_bucket: dict):
+        table_columns = self.snfk_get_table_columns(cursor, self.parameters.schema_raw, table_name, clean=True)
+        table_columns_no_ts = [t for t in table_columns if t != '_timestamp']
+        table_columns_quoted = [f'\"{c}\"' for c in table_columns]
+
+        if table_name not in tables_in_bucket:
+            csv_path = self.create_csv(table_columns_no_ts)
+            table_id = self.kbc_storage.tables.create(self.parameters.schema_history, table_name, csv_path)
+            logging.info(f"Created new table {table_id}.")
+        else:
+            columns_in_storage = tables_in_bucket[table_name]['columns']
+            for column in table_columns_no_ts:
+                if column not in columns_in_storage:
+                    logging.info(f"Creating new column {column} in {self.parameters.schema_history}.{table_name}.")
+                    create_column_rsp = self.sapi.create_column(f'{self.parameters.schema_history}.{table_name}',
+                                                                column)
+
+                    if create_column_rsp.ok is True:
+                        is_success = self.kbc_storage.jobs.block_for_success(create_column_rsp.json()['id'])
+
+                        if is_success is True:
+                            logging.info(f"Created column {column} in table {table_name}.")
+                        else:
+                            logging.error(f"Could not create column {column} for table {table_name}.")
+                            sys.exit(1)
+
+                    else:
+                        logging.error(f"Could not create column {column} for table {table_name}.\n"
+                                      f"{create_column_rsp.json()}")
+                        sys.exit(1)
+
+        self.snfk_create_backup_table(cursor, table_name)
+        self.snfk_create_tmp_table(cursor, table_name)
+
+        table_columns_str = ',\n  '.join(table_columns_quoted)
+        self.snfk_fill_tmp_table_sql(cursor, table_name, table_columns_quoted)
+        ddl = self.snfk_get_ddl(cursor, table_name)
+        table_pk = self.get_pk_from_dll(ddl)
+
+        self.snfk_create_inactive_view_sql(cursor, table_name, table_columns_quoted, table_pk)
+
+        self.snfk_insert_inactive_rows_sql(cursor, table_name, table_columns_str)
+        self.snfk_create_grants(cursor, table_name)
+        self.snfk_swap_tmp_table(cursor, table_name)
+        self.snfk_drop_tmp_table(cursor, table_name)
+
+    def disable_orchestration_and_wait_for_job(self, orchestration_id):
+
+        logging.info(f"Disabling orchestration {orchestration_id}.")
+        self.disable_orchestration(self.orch, orchestration_id)
+
+        last_job_running = True
+
+        while last_job_running is True:
+            job_rsp = self.orch.get_orchestration_last_job(orchestration_id)
+
+            if job_rsp.ok is True:
+                job_js = job_rsp.json()
+                job_is_finished = job_js[0]['isFinished']
+                job_id = job_js[0]['id']
+
+                if job_is_finished is True:
+                    last_job_running = False
+                else:
+                    logging.info(f'Last job {job_id} of orchestration is still running. Waiting 15s...')
+                    time.sleep(15)
+
+    def snfk_use_role(self, snfk_cursor):
+
+        snfk_cursor.execute(f'USE ROLE {self.snfk.role};')
+
+    def run_historize_tables(self):
+
+        sapi_token = self.parameters.sapi_token
+        self.create_api_clients(sapi_token)
+        self._snfk_create_cursor()
+
+        if self.parameters.historize_in_storage is True:
+            all_tables = self.get_and_parse_bucket(self.parameters.schema_history, include_metadata=False)
+
+        with self.snfk_conn:
+            with self.snfk_conn.cursor(self.snfk.cursor) as snfk_cursor:
+                if self.snfk.role:
+                    self.snfk_use_role(snfk_cursor)
+                tables_to_historize = self.snfk_get_tables_to_historize(snfk_cursor)
+
+                if len(tables_to_historize) == 0:
+                    logging.info("No tables to historize.")
+                    return
+
+                try:
+                    self.disable_orchestration_and_wait_for_job(self.parameters.orchestration_id)
+
+                    for table in tables_to_historize:
+                        logging.info(f"Processing table {table}...")
+                        if self.parameters.historize_in_storage is False:
+                            self.historize_table(snfk_cursor, table)
+                        else:
+                            self.historize_table_storage(snfk_cursor, table, all_tables)
+
+                finally:
+                    logging.info(f"Enabling orchestration {self.parameters.orchestration_id}...")
+                    self.enable_orchestration(self.orch, self.parameters.orchestration_id)
+
+    def run_sync_tables(self):
+
+        sapi_token = self.parameters.sapi_token
+        self.create_api_clients(sapi_token)
+
+        source_bucket = self.get_and_parse_bucket(self.parameters.source_bucket)
+        destination_bucket = self.get_and_parse_bucket(self.parameters.destination_bucket)
+
+        new_tables, table_changes = self.determine_tables_to_sync(source_bucket, destination_bucket)
+
+        if len(new_tables) == 0 and len(table_changes) == 0:
+            logging.info("No new tables detected. No tables need to be updated.")
+            sys.exit(0)
+        else:
+            self._mysql_create_cursor()
+            self._snfk_create_cursor()
+
+        with self.mysql_conn, self.snfk_conn:
+            with self.mysql_conn.cursor() as mysql_cursor, self.snfk_conn.cursor(self.snfk.cursor) as snfk_cursor:
+                if self.snfk.role:
+                    self.snfk_use_role(snfk_cursor)
+
+                mysql_tables = self.mysql_fetch_all_tables(mysql_cursor)
+
+                self.create_new_tables(mysql_cursor, snfk_cursor, source_bucket, mysql_tables, new_tables)
+                # self.add_missing_columns(mysql_cursor, snfk_cursor, source_bucket, mysql_tables, table_changes,
+                #                          destination_bucket)
+                self.sync_columns(mysql_cursor, snfk_cursor, mysql_tables, table_changes,
+                                  source_bucket, destination_bucket)
+
+        logging.info("All tables synced.")
+
+    def run_fetch_tables(self):
+
+        sapi_token = self.parameters.sapi_token
+        self.create_api_clients(sapi_token)
+        configs_parsed, max_index = self.get_and_parse_configurations(self.sapi)
+
+        already_synced_tables = []
+
+        for _, items in configs_parsed.items():
+            already_synced_tables += items['tables']
+
+        self._mysql_create_cursor()
+
+        with self.mysql_conn:
+            with self.mysql_conn.cursor() as cursor:
+                mysql_tables = self.mysql_fetch_all_tables(cursor)
+
+        mysql_tables_names = []
+        for _, tables in mysql_tables.items():
+            mysql_tables_names += [t.full_name for t in tables]
+
+        self.to_sync = []
+
+        for table in mysql_tables[self.parameters.schemas[0]]:
+            if table.full_name not in self.parameters.exclude_tables and table.full_name not in already_synced_tables:
+                self.to_sync += [table]
+
+        self.to_sync.sort(key=operator.attrgetter('name'))
+        self.state_map = {}
+        for table in self.to_sync:
+            self.state_map[table.full_name] = table.state_name
+
+        if len(self.to_sync) == 0:
+            logging.info("No new tables found to sync.")
+            exit(0)
+
+        self.to_sync_sep = []
+
+        if self.parameters.side_load.use and (self.parameters.side_load.rows or self.parameters.side_load.size):
+            logging.debug("Evaluating tables for side loading with parameters: "
+                          f"{dataclasses.asdict(self.parameters.side_load)}")
+
+            if self.parameters.orchestration_add:
+
+                for table in self.to_sync:
+                    if self.is_table_separate_sync(table, self.parameters.side_load):
+                        self.to_sync_sep += [table]
+
+                for table in self.to_sync_sep:
+                    self.to_sync.remove(table)
+
+        logging.info(f"{len(self.to_sync)} tables will be added to configurations directly.")
+
+        free_spaces = self.get_free_configurations(configs_parsed, self.parameters.nr_tables_in_config)
+        self.update_configurations_with_new_tables(self.sapi, configs_parsed, free_spaces)
+
+        if len(self.to_sync) != 0:
+            logging.info(f"No free configurations left with less than {self.parameters.nr_tables_in_config} tables. "
+                         "Creating new configurations.")
+
+            self.create_configurations_with_new_tables(self.sapi, self.encr, self.orch, max_index)
+
+        if len(self.to_sync_sep) != 0:
+            logging.info("Following tables will be backfilled separately: "
+                         f"{', '.join([t.full_name for t in self.to_sync_sep])}")
+            new_config_id = self.create_temporary_backfill_configuration(self.sapi, self.encr)
+
+            try:
+                self.run_temporary_backfill_configuration(new_config_id)
+                new_state = self.get_state_of_backfill_configuration(new_config_id)
+
+                configs_parsed, max_index = self.get_and_parse_configurations(self.sapi)
+                free_spaces = self.get_free_configurations(configs_parsed, self.parameters.nr_tables_in_config)
+
+                self.to_sync = self.to_sync_sep
+                self.disable_orchestration_and_wait_for_job(self.parameters.orchestration_add_id)
+                self.update_configurations_with_new_tables(self.sapi, configs_parsed, free_spaces, new_state)
+
+                if len(self.to_sync) != 0:
+                    logging.info(f"No free configurations left with less than {self.parameters.nr_tables_in_config} "
+                                 "tables. Creating new configurations.")
+
+                    self.create_configurations_with_new_tables(self.sapi, self.encr, self.orch, max_index, new_state)
+            finally:
+                self.sapi.delete_configuration(COMPONENT_ID, new_config_id)
+                self.enable_orchestration(self.orch, self.parameters.orchestration_add_id)
+
+        logging.info("Fetching of new tables finished.")
+
+    def get_state_of_backfill_configuration(self, configuration_id: int):
+
+        cfg_rsp = self.sapi.get_configuration_detail(COMPONENT_ID, configuration_id)
+        state = {}
+
+        if cfg_rsp.ok:
+            bookmarks = cfg_rsp.json()['state']['component']['bookmarks']
+
+            for table, table_state in bookmarks.items():
+                state[table] = table_state
+
+            return state
+
+        else:
+            raise Exception("Could not obtain state of temporary configuration")
+
+    def run_temporary_backfill_configuration(self, configuration_id: int):
+
+        job_rsp = self.docker.create_job(COMPONENT_ID, configuration_id)
+
+        if job_rsp.ok:
+            job_id = job_rsp.json()['id']
+            job_url = job_rsp.json()['url']
+            logging.info(f"Created job {job_id} for temporary backfill configuration {configuration_id}.")
+        else:
+            logging.error(f"Could not create job for temporary configuration.\n{job_rsp.json()}")
+            exit(1)
+
+        job_status, job_json = self.docker.pool_job(job_url, 15)
+
+        if job_status != 'success':
+            raise Exception(f"Temporary configuration job #1 ended with error.\n{job_json}")
+
+        job2_rsp = self.docker.create_job(COMPONENT_ID, configuration_id)
+
+        if job2_rsp.ok:
+            job2_id = job2_rsp.json()['id']
+            job2_url = job2_rsp.json()['url']
+            logging.info(f"Created job {job2_id} for temporary backfill configuration {configuration_id}.")
+        else:
+            logging.error(f"Could not create job for temporary configuration.\n{job2_rsp.json()}")
+            exit(1)
+
+        job2_status, job2_json = self.docker.pool_job(job2_url, 15)
+
+        if job2_status != 'success':
+            raise Exception(f"Temporary configuration job ended with error.\n{job2_json}")
+
+    def create_temporary_backfill_configuration(self, sapi_client: StorageApi, encrypt_client: EncryptionApi):
+
+        tables_json, tables = self.create_json_for_temporary_backfill_configuration()
+
+        configuration = copy.deepcopy(self.parameters.cdc_config)
+        configuration['inputMappingsJson'] = json.dumps(tables_json, indent=2)
+        configuration['host'] = self.mysql.host
+        configuration['port'] = self.mysql.port
+        configuration['username'] = self.mysql.username
+        configuration['#password'] = self.mysql.password
+
+        configuration_encrypted = encrypt_client.encrypt_data(configuration)
+        config_name = self.create_configuration_name(0, tables['tables'])
+
+        config = {'name': config_name, 'configuration': json.dumps({'parameters': configuration_encrypted})}
+        new_config_rsp = sapi_client.create_new_configuration(COMPONENT_ID, config)
+
+        if new_config_rsp.status_code == 201:
+            logging.info(f"Created new configuration for tables {', '.join(tables['tables'])}.")
+            new_config_id = new_config_rsp.json()['id']
+
+        else:
+            logging.error("Could not create new configuration."
+                          f"Received: {new_config_rsp.status_code} - {new_config_rsp.json()}.")
+            exit(1)
+
+        return new_config_id
+
+    def create_json_for_temporary_backfill_configuration(self):
+
+        tables_in_config = []
+        tables_json = {}
+
+        for table in self.to_sync_sep:
+            if table.schema not in tables_json:
+                tables_json[table.schema] = {'tables': []}
+
+            tables_json[table.schema]['tables'] += [{table.name: {
+                'selected': True,
+                'replication-method': 'log_based'
+            }}]
+
+            tables_in_config += [table.full_name]
+
+        return tables_json, {'tables': tables_in_config, 'new': tables_in_config}
+
+    def is_table_separate_sync(self, table: MySQLTable, side_load_parameters: SideLoadParameters):
+
+        rows_limit = table.rows if not side_load_parameters.rows else side_load_parameters.rows
+        size_limit = table.size_mb if not side_load_parameters.size else side_load_parameters.size
+
+        if table.rows >= rows_limit and table.size_mb >= size_limit:
+            return True
+        else:
+            False
+
+    def run_fetch_tables_old(self):
+
+        sapi_token = self.parameters.sapi_token
+        self.create_api_clients(sapi_token)
+        configs_parsed, max_index = self.get_and_parse_configurations(self.sapi)
+
+        already_synced_tables = []
+
+        for _, items in configs_parsed.items():
+            already_synced_tables += items['tables']
+
+        self._mysql_create_cursor()
+
+        with self.mysql_conn:
+            with self.mysql_conn.cursor() as cursor:
+                mysql_tables_raw = self.mysql_fetch_all_tables(cursor)
+
+        mysql_tables = []
+        for _, tables in mysql_tables_raw.items():
+            mysql_tables += [t.full_name for t in tables]
+
+        self.to_sync = list(set(mysql_tables) - set(self.parameters.exclude_tables) - set(already_synced_tables))
+        self.to_sync.sort()
+
+        if len(self.to_sync) == 0:
+            logging.info("No new tables found to sync.")
+            exit(0)
+
+        free_spaces = self.get_free_configurations(configs_parsed, self.parameters.nr_tables_in_config)
+        self.update_configurations_with_new_tables(self.sapi, configs_parsed, free_spaces)
+
+        if len(self.to_sync) != 0:
+            logging.info(f"No free configurations left with less than {self.parameters.nr_tables_in_config} tables. "
+                         "Creating new configurations.")
+
+            self.create_configurations_with_new_tables(self.sapi, self.encr, self.orch, max_index)
+
+        logging.info("Fetching of new tables finished.")
+
+    def run_remove_obsolete_tables(self):
+
+        self.create_api_clients(self.parameters.sapi_token)
+        self._mysql_create_cursor()
+
+        with self.mysql_conn:
+            with self.mysql_conn.cursor() as mysql_cursor:
+                mysql_tables = self.mysql_fetch_all_tables(mysql_cursor)
+
+        configs, _ = self.get_and_parse_configurations(self.sapi)
+        schema_to_watch = self.parameters.schemas[0]
+
+        current_tables = []
+        for _, cfg in configs.items():
+            for t in cfg['tables']:
+                if t.startswith(f'{schema_to_watch}.'):
+                    current_tables += [t]
+
+        try:
+            mysql_available_tables = [t.full_name for t in mysql_tables[schema_to_watch]]
+        except KeyError:
+            logging.error(f"Schema {schema_to_watch} is not available in MySQL.")
+            raise
+
+        inactive_tables = set(current_tables) - set(mysql_available_tables)
+
+        for cfg_id, cfg in configs.items():
+
+            cfg_name = cfg['name']
+            tables_in_cfg = set(cfg['tables'])
+            remove_tables = inactive_tables.intersection(tables_in_cfg)
+            active_tables = tables_in_cfg - remove_tables
+
+            if len(remove_tables) > 0:
+                logging.info(f"Removing inactive tables from configuration {cfg_id} - {cfg_name}: {remove_tables}.")
+
+                old_table_cfg = json.loads(cfg['tables_json_str'])
+                new_table_cfg = dict()
+
+                for schema, tables in old_table_cfg.items():
+
+                    if schema == schema_to_watch:
+                        new_table_cfg[schema_to_watch] = {'tables': []}
+
+                        for table in tables['tables']:
+                            if f'{schema_to_watch}.{list(table.keys())[0]}' in remove_tables:
+                                continue
+                            else:
+                                new_table_cfg[schema_to_watch]['tables'] += [table]
+                    else:
+                        new_table_cfg[schema] = tables
+
+                cfg_parameters = copy.deepcopy(cfg['api']['configuration'])
+                cfg_parameters['parameters']['inputMappingsJson'] = json.dumps(new_table_cfg, indent=2)
+
+                active_tables_list = list(active_tables)
+                active_tables_list.sort()
+
+                new_name = f"{cfg['index']:02} - {', '.join(active_tables_list)}"
+
+                cfg_json = {
+                    'configuration': json.dumps(cfg_parameters),
+                    'name': new_name,
+                    'changeDescription': f'Removed inactive tables from configuration: {remove_tables}.'
+                }
+                update_rsp = self.sapi.update_configuration(COMPONENT_ID, cfg_id, cfg_json)
+
+                if update_rsp.ok:
+                    logging.info(f"Removed tables {remove_tables} from configuration {cfg_id} - {new_name}.")
+
+    def run(self):
+
+        if self.mode == 'fetch_new_tables':
+            self.run_fetch_tables()
+
+        if self.mode == 'sync_tables':
+            self.run_sync_tables()
+
+        if self.mode == 'historize_tables':
+            self.run_historize_tables()
+
+        if self.mode == 'remove_obsolete_tables':
+            self.run_remove_obsolete_tables()
+
+
+================================================
+File: /src/run.py
+================================================
+from component import Component
+from keboola.component.base import UserException
+
+import logging
+
+if __name__ == '__main__':
+    c = Component()
+    try:
+        c.run()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(1)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+#          - echo 'Pushing test image to repo. [tag=test]'
+#          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# MySQL BINLOG Companion App
+
+This application serves as a companion app to the `kds-team.ex-mysql-next`, an extractor that is able to replicate the data from binary logs and include:
+
+- inserted rows
+- updated rows
+- deleted rows
+
+The application serves as an automation tool for a fully automated CDC sync.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+All 4 modes share the same configuration parameter `mode`, which must have a value of one of the 4 modes mentioned above, namely:
+
+- `sync_tables`
+- `fetch_new_tables`
+- `historize_tables`
+- `remove_obsolete_tables`
+
+Each of the 4 modes then take their own set of parameters, which will be described in more detail below. Alternatively, some modes share connection settings to Snowflake and MySQL instances to operate.
+
+### Shared Parameters
+
+`mysql` and `snowflake` are the only two parameters (besides `mode` and mode `parameters`), which are shared between different modes. In all modes, the configuration of these parameters looks the same.
+
+For MySQL connection setup, you need to include the host, port, username and password (encrypted), which will be used to connect. The sample configuration then looks as follows:
+
+```json
+{
+  "mysql": {
+    "host": "<HOST>",
+    "port": "<PORT>",
+    "username": "<USER>",
+    "#password": "<PASS>"
+  }
+}
+```
+
+For Snowflake connection, account, warehouse, username and password need to be included. The account can be [obtained from the URL of your instance](https://docs.snowflake.com/en/user-guide/connecting.html#your-snowflake-account-identifier); [the warehouse](https://docs.snowflake.com/en/user-guide/warehouses.html) needs to be created directly in the instance. Optionally, the role parameter can be provided as well, to use specified role; if not provided, default role will be used. The sample configuration then looks as follows:
+
+```json
+{
+  "snowflake": {
+    "account": "<ACCOUNT_IDENTIFIER>",
+    "warehouse": "<WAREHOUSE>",
+    "username": "<USER>",
+    "#password": "<PASS>",
+    "role": "<ROLE"
+  }
+}
+```
+
+All parameters setting up the modes, are grouped under `parameters` attribute.
+
+### `sync_tables` mode
+
+The `sync_tables` mode syncs the tables and columns from the source bucket into the destination bucket. This mode is only useful, if you're using `append_mode` in your MySQL BINLOG extractor. If the table does not exist in the destination bucket, it will be created as a view from the source bucket, containing only the non-deleted rows and latest changes. If a column is missing/remaining the destination bucket over the source bucket, the column will be added/dropped and view regenerated.
+
+The `sync_tables` mode sample configuration looks like this:
+
+```json
+{
+  "mode": "sync_tables",
+  "mysql": {
+    ...
+  },
+  "snowflake": {
+    ...
+  },
+  "parameters": {
+    "schemas": [
+      "cdc"
+    ],
+    "exclude_tables": [
+      "test_table"
+    ],
+    "#sapi_token": "<SAPI_TOKEN>",
+    "source_bucket": "in.c-cdc-keboola-test",
+    "destination_bucket": "in.c-cdc-keboola-test-view"
+  }
+}
+```
+
+The `mode`, `mysql` and `snowflake` parameters were described above. Mode related parameters are stored under `parameters`. Allowed parameters are:
+
+- `schemas` - a schema, from which the tables are synced into KBC;
+- `exclude_tables` - a list of tables in storage to exclude from syncing between source and destination bucket;
+- `#sapi_token` - the Keboola Storage API token, which has full access to both `source_bucket` and `destination_bucket`;
+- `source_bucket` - a bucket containing tables with raw data (`append_mode=True`);
+- `destination_bucket` - a bucket, where views with latest data will be created.
+
+### `fetch_new_tables` mode
+
+The `fetch_new_tables` mode connects to the MySQL instance, detects tables, which are not in the replication and automatically adds them to the replication.
+
+The sample configuration is:
+
+```json
+{
+  "mode": "fetch_new_tables",
+  "mysql": {
+    ...
+  },
+  "parameters": {
+    "schemas": [
+      "cdc"
+    ],
+    "exclude_tables": [
+      "cdc.test_table"
+    ],
+    "add_to_orchestration": true,
+    "add_to_orchestration_id": "722301664",
+    "add_to_orchestration_phase": "Replicate",
+    "tables_in_configuration": 3,
+    "index_configurations": true,
+    "side_backfill": {
+      "use": true,
+      "rows": 5000,
+      "columns": 3
+    },
+    "#sapi_token": "<SAPI_TOKEN>",
+    "cdc_configuration": {
+      "appendMode": true,
+      "outputBucket": "cdc-keboola-test",
+      "sshTunnel": false,
+      "verifyCert": true,
+      "ssl": false,
+      "storageMappingsFile": "mappings",
+      "fetchObjectsOnly": false,
+      "runIncrementalSync": true,
+      "databases": [
+        "cdc"
+      ]
+    }
+  }
+}
+```
+
+The `mode` and `mysql` parameters were described above. Mode related parameters are stored under `parameters`. Allowed parameters are:
+
+- `schemas` - a schema, from which the tables are synced into KBC;
+- `exclude_tables` - a list of tables in MySQK to exclude from being added to the replication, must be specified in full_form (`<schema>.<table>`);
+- `#sapi_token` - the Keboola Storage API token, which needs to have access to CDC configurations;
+- `add_to_orchestration` - a boolean whether to add new configurations with tables to sync orchestration;
+- `add_to_orchestration_id` - if `add_to_orchestration` is `true`, specify the id of the orchestration, to which new tasks will be added;
+- `add_to_orchestration_phase` - specify a phase in the orchestration, to which new tasks will be added;
+- `tables_in_configuration` - limits the number of tables, which can be in a single configuration, before a new one is created, allows for grouping of multiple tables into a single configuration;
+- `index_configurations` - a boolean marking, whether new configurations should be prefixed with numeric index;
+- `side_backfill.use` - whether to use a side backfill. If all conditions are met (row or size or both), new tables exceeding the specified limits will be backfilled in a separate configuration, before being added to the production orchestration, in order to not slow down the process;
+- `side_backfill.rows` - specifies the number of rows above which a table is considered for separate syncing on the side;
+- `side_backfill.size` - specifies the size of the table in MB above which a table is considered for separate syncing on the side;
+- `cdc_configuration` - a valid JSON configuration of the `kds-team.ex-mysql-next` component, which will be used to create new configurations.
+
+### `historize_tables` mode
+
+The `historize_tables` mode connects to the Snowflake instance, detects changes, which are no longer needed in view generation and saves aside these changes to speed up view execution from `sync_tables` mode. This mode is only useful, if you're using `append_mode=True` mode.
+
+The sample configuration is this:
+
+```json
+{
+  "mode": "historize_tables",
+  "snowflake": {
+    ...
+  },
+  "parameters": {
+    "query": "SELECT 'ACCOUNT' AS table_name;",
+    "schema_raw": "<SCHEMA_RAW>",
+    "schema_view": "<SCHEMA_VIEW>",
+    "schema_history": "<SCHEMA_HISTORY>",
+    "schema_backup": "<SCHEMA_BACKUP>",
+    "schema_inactive": "<SCHEMA_INACTIVE>",
+    "schema_tmp": "<SCHEMA_TMP>",
+    "#sapi_token": "<SAPI_TOKEN>",
+    "cdc_orchestration_id": "734363761",
+    "historize_in_storage": true
+  }
+}
+```
+
+The `mode` and `snowflake` parameters were described above. Mode related parameters are stored under `parameters`. Allowed parameters are:
+
+- `query` - A query, which will be executed in the Snowflake instance to get tables to historize. All tables to historize must be in returned in column `TABLE_NAME`;
+- `schema_raw` - a schema in Snowflake, which contains the raw data (`append_mode=True`);
+- `schema_view` - a schema in Snowflake, which contains the data with views;
+- `schema_history` - a schema in Snowflake, which should contain historized data;
+- `schema_backup` - a schema in Snowflake, which will contain backed up data, in case of application failure;
+- `schema_inactive` - a schema in Snowflake, which will be used to generate views, with inactive data;
+- `schema_tmp` - a schema in Snowflake, which will be used for temporary data storage. All tables are removed from this schema after successful run;
+- `#sapi_token` - the Keboola Storage API token, which needs to have access to CDC configurations and orchestration;
+- `cdc_orchestration_id` - the id of the orchestration, which is used for syncing the data. This orchestration will be stopped during historization process and re-enabled after finish;
+- `historize_in_storage` - create tables with historical data in storage as well. All tables will be created as a bucket with name of `schema_history`.
+
+### `remove_obsolete_tables` mode
+
+The `remove_obsolete_tables` mode connects to the MySQL instance, detects active tables and removes from the replication all the tables, which can no longer be replicated and thus frees up spaces in the replication.
+
+The sample configuration is this:
+
+```json
+{
+  "mode": "remove_obsolete_tables",
+  "mysql": {
+    ...
+  },
+  "parameters": {
+    "schemas": [
+      "cdc"
+    ],
+    "exclude_tables": [
+      "cdc.customers_60M"
+    ],
+    "#sapi_token": "<SAPI_TOKEN>"
+  }
+}
+```
+
+The `mode` and `mysql` parameters were described above. Mode related parameters are stored under `parameters`. Allowed parameters are:
+
+- `schemas` - a schema, from which to read current_tables;
+- `exclude_tables` - tables, which to keep in the replication, even though they no longer exist in the MySQL instance;
+- `#sapi_token` - the Keboola Storage API token, which needs to have access to CDC configurations.
+
+================================================
+File: /component_config/configSchema_test.json
+================================================
+{
+    "title": "Parameters",
+    "type": "object",
+    "required": [
+        "mode"
+    ],
+    "properties": {
+        "mode": {
+            "type": "string",
+            "enum": [
+                "fetch",
+                "historize",
+                "sync"
+            ]
+        },
+        "mysql": {
+            "type": "object",
+            "title": "MySQL setup",
+            "description": "MySQL credentials.",
+            "options": {
+                "dependencies": {
+                    "mode": ["fetch", "sync"]
+                }
+            },
+            "required": [
+                "host"
+            ],
+            "properties": {
+                "host": {
+                    "type": "string"
+                }
+            }
+        },
+        "snowflake": {
+            "type": "object",
+            "title": "Snowflake setup",
+            "options": {
+                "dependencies": {
+                    "mode": ["sync", "historize"]
+                }
+            },
+            "required": [
+                "host"
+            ],
+            "properties": {
+                "host": {
+                    "type": "string"
+                }
+            }
+        },
+        "properties": {
+            "type": "object",
+            "required": [],
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "template": "{{watch_mode}}",
+                    "watch": {
+                        "watch_mode": "mode"
+                    }
+                },
+                "orchestration_id": {
+                    "type": "string",
+                    "options": {
+                        "dependencies": {
+                            "mode": "fetch"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+A companion app for CDC MySQL replication.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{}
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.component==1.1.2
+keboola.http_client
+pymysql==1.0.2
+snowflake-connector-python==2.3.10
+git+https://github.com/keboola/sapi-python-client.git
+deprecated
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.5-slim
+ENV PYTHONIOENCODING utf-8
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN apt-get install -y git
+RUN pip install flake8
+
+COPY requirements.txt ./code/requirements.txt
+COPY flake8.cfg ./code/flake8.cfg
+
+RUN pip install -r /code/requirements.txt
+
+COPY ./src ./code/src/
+
+WORKDIR /code/
+
+CMD ["python", "-u", "/code/src/run.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# MySQL BINLOG Companion App
+
+This application serves as a companion app to the `kds-team.ex-mysql-next`, an extractor that is able to replicate the data from binary logs and include:
+
+- inserted rows
+- updated rows
+- deleted rows
+
+The application serves as an automation tool for a fully automated CDC sync.
+
+**Table of contents:**  
+  
+[TOC]
+
+
+# Functionality notes
+
+The application operates in 4 different modes:
+
+- `sync_tables`
+- `fetch_new_tables`
+- `historize_tables`
+- `remove_obsolete_tables`
+
+The mode to fetch new tables automatically adds newly detected tables from MySQL into the replication process. The mode to remove obsolete tables removes tables, which are no longer in the MySQL and thus frees up space in configurations.
+The sync tables mode is useful when you're using `append_mode=True` in your binlog extractor configuration, as it creates a view in the destination bucket with current data only, meaning all deleted rows are excluded and only the latest changes are kept. The historize tables mode can speed up the execution of these views, as it historizes (puts aside) old changes captured by the CDC and only keeps the latest, leading to faster view execution.
+
+# Configuration
+
+All 4 modes share the same configuration parameter `mode`, which must have a value of one of the 4 modes mentioned above, namely:
+
+- `sync_tables`
+- `fetch_new_tables`
+- `historize_tables`
+- `remove_obsolete_tables`
+
+Each of the 4 modes then take their own set of parameters, which will be described in more detail below. Alternatively, some modes share connection settings to Snowflake and MySQL instances to operate.
+
+## Shared Parameters
+
+`mysql` and `snowflake` are the only two parameters (besides `mode` and mode `parameters`), which are shared between different modes. In all modes, the configuration of these parameters looks the same.
+
+For MySQL connection setup, you need to include the host, port, username and password (encrypted), which will be used to connect. The sample configuration then looks as follows:
+
+```json
+{
+  "mysql": {
+    "host": "<HOST>",
+    "port": "<PORT>",
+    "username": "<USER>",
+    "#password": "<PASS>"
+  }
+}
+```
+
+For Snowflake connection, account, warehouse, username and password need to be included. The account can be [obtained from the URL of your instance](https://docs.snowflake.com/en/user-guide/connecting.html#your-snowflake-account-identifier); [the warehouse](https://docs.snowflake.com/en/user-guide/warehouses.html) needs to be created directly in the instance. Optionally, the role parameter can be provided as well, to use specified role; if not provided, default role will be used. The sample configuration then looks as follows:
+
+```json
+{
+  "snowflake": {
+    "account": "<ACCOUNT_IDENTIFIER>",
+    "warehouse": "<WAREHOUSE>",
+    "username": "<USER>",
+    "#password": "<PASS>",
+    "role": "<ROLE"
+  }
+}
+```
+
+All parameters setting up the modes, are grouped under `parameters` attribute.
+
+## `sync_tables` mode
+
+The `sync_tables` mode syncs the tables and columns from the source bucket into the destination bucket. This mode is only useful, if you're using `append_mode` in your MySQL BINLOG extractor. If the table does not exist in the destination bucket, it will be created as a view from the source bucket, containing only the non-deleted rows and latest changes. If a column is missing/remaining the destination bucket over the source bucket, the column will be added/dropped and view regenerated.
+
+The `sync_tables` mode sample configuration looks like this:
+
+```json
+{
+  "mode": "sync_tables",
+  "mysql": {
+    ...
+  },
+  "snowflake": {
+    ...
+  },
+  "parameters": {
+    "schemas": [
+      "cdc"
+    ],
+    "exclude_tables": [
+      "test_table"
+    ],
+    "#sapi_token": "<SAPI_TOKEN>",
+    "source_bucket": "in.c-cdc-keboola-test",
+    "destination_bucket": "in.c-cdc-keboola-test-view"
+  }
+}
+```
+
+The `mode`, `mysql` and `snowflake` parameters were described above. Mode related parameters are stored under `parameters`. Allowed parameters are:
+
+- `schemas` - a schema, from which the tables are synced into KBC;
+- `exclude_tables` - a list of tables in storage to exclude from syncing between source and destination bucket;
+- `#sapi_token` - the Keboola Storage API token, which has full access to both `source_bucket` and `destination_bucket`;
+- `source_bucket` - a bucket containing tables with raw data (`append_mode=True`);
+- `destination_bucket` - a bucket, where views with latest data will be created.
+
+## `fetch_new_tables` mode
+
+The `fetch_new_tables` mode connects to the MySQL instance, detects tables, which are not in the replication and automatically adds them to the replication.
+
+The sample configuration is:
+
+```json
+{
+  "mode": "fetch_new_tables",
+  "mysql": {
+    ...
+  },
+  "parameters": {
+    "schemas": [
+      "cdc"
+    ],
+    "exclude_tables": [
+      "cdc.test_table"
+    ],
+    "add_to_orchestration": true,
+    "add_to_orchestration_id": "722301664",
+    "add_to_orchestration_phase": "Replicate",
+    "tables_in_configuration": 3,
+    "index_configurations": true,
+    "side_backfill": {
+      "use": true,
+      "rows": 5000,
+      "columns": 3
+    },
+    "#sapi_token": "<SAPI_TOKEN>",
+    "cdc_configuration": {
+      "appendMode": true,
+      "outputBucket": "cdc-keboola-test",
+      "sshTunnel": false,
+      "verifyCert": true,
+      "ssl": false,
+      "storageMappingsFile": "mappings",
+      "fetchObjectsOnly": false,
+      "runIncrementalSync": true,
+      "databases": [
+        "cdc"
+      ]
+    }
+  }
+}
+```
+
+The `mode` and `mysql` parameters were described above. Mode related parameters are stored under `parameters`. Allowed parameters are:
+
+- `schemas` - a schema, from which the tables are synced into KBC;
+- `exclude_tables` - a list of tables in MySQK to exclude from being added to the replication, must be specified in full_form (`<schema>.<table>`);
+- `#sapi_token` - the Keboola Storage API token, which needs to have access to CDC configurations;
+- `add_to_orchestration` - a boolean whether to add new configurations with tables to sync orchestration;
+- `add_to_orchestration_id` - if `add_to_orchestration` is `true`, specify the id of the orchestration, to which new tasks will be added;
+- `add_to_orchestration_phase` - specify a phase in the orchestration, to which new tasks will be added;
+- `tables_in_configuration` - limits the number of tables, which can be in a single configuration, before a new one is created, allows for grouping of multiple tables into a single configuration;
+- `index_configurations` - a boolean marking, whether new configurations should be prefixed with numeric index;
+- `side_backfill.use` - whether to use a side backfill. If all conditions are met (row or size or both), new tables exceeding the specified limits will be backfilled in a separate configuration, before being added to the production orchestration, in order to not slow down the process;
+- `side_backfill.rows` - specifies the number of rows above which a table is considered for separate syncing on the side;
+- `side_backfill.size` - specifies the size of the table in MB above which a table is considered for separate syncing on the side;
+- `cdc_configuration` - a valid JSON configuration of the `kds-team.ex-mysql-next` component, which will be used to create new configurations.
+
+## `historize_tables` mode
+
+The `historize_tables` mode connects to the Snowflake instance, detects changes, which are no longer needed in view generation and saves aside these changes to speed up view execution from `sync_tables` mode. This mode is only useful, if you're using `append_mode=True` mode.
+
+The sample configuration is this:
+
+```json
+{
+  "mode": "historize_tables",
+  "snowflake": {
+    ...
+  },
+  "parameters": {
+    "query": "SELECT 'ACCOUNT' AS table_name;",
+    "schema_raw": "<SCHEMA_RAW>",
+    "schema_view": "<SCHEMA_VIEW>",
+    "schema_history": "<SCHEMA_HISTORY>",
+    "schema_backup": "<SCHEMA_BACKUP>",
+    "schema_inactive": "<SCHEMA_INACTIVE>",
+    "schema_tmp": "<SCHEMA_TMP>",
+    "#sapi_token": "<SAPI_TOKEN>",
+    "cdc_orchestration_id": "734363761",
+    "historize_in_storage": true
+  }
+}
+```
+
+The `mode` and `snowflake` parameters were described above. Mode related parameters are stored under `parameters`. Allowed parameters are:
+
+- `query` - A query, which will be executed in the Snowflake instance to get tables to historize. All tables to historize must be in returned in column `TABLE_NAME`;
+- `schema_raw` - a schema in Snowflake, which contains the raw data (`append_mode=True`);
+- `schema_view` - a schema in Snowflake, which contains the data with views;
+- `schema_history` - a schema in Snowflake, which should contain historized data;
+- `schema_backup` - a schema in Snowflake, which will contain backed up data, in case of application failure;
+- `schema_inactive` - a schema in Snowflake, which will be used to generate views, with inactive data;
+- `schema_tmp` - a schema in Snowflake, which will be used for temporary data storage. All tables are removed from this schema after successful run;
+- `#sapi_token` - the Keboola Storage API token, which needs to have access to CDC configurations and orchestration;
+- `cdc_orchestration_id` - the id of the orchestration, which is used for syncing the data. This orchestration will be stopped during historization process and re-enabled after finish;
+- `historize_in_storage` - create tables with historical data in storage as well. All tables will be created as a bucket with name of `schema_history`.
+
+## `remove_obsolete_tables` mode
+
+The `remove_obsolete_tables` mode connects to the MySQL instance, detects active tables and removes from the replication all the tables, which can no longer be replicated and thus frees up spaces in the replication.
+
+The sample configuration is this:
+
+```json
+{
+  "mode": "remove_obsolete_tables",
+  "mysql": {
+    ...
+  },
+  "parameters": {
+    "schemas": [
+      "cdc"
+    ],
+    "exclude_tables": [
+      "cdc.customers_60M"
+    ],
+    "#sapi_token": "<SAPI_TOKEN>"
+  }
+}
+```
+
+The `mode` and `mysql` parameters were described above. Mode related parameters are stored under `parameters`. Allowed parameters are:
+
+- `schemas` - a schema, from which to read current_tables;
+- `exclude_tables` - tables, which to keep in the replication, even though they no longer exist in the MySQL instance;
+- `#sapi_token` - the Keboola Storage API token, which needs to have access to CDC configurations.
+
+## Development
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path in the docker-compose file:
+
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone repo_path my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+

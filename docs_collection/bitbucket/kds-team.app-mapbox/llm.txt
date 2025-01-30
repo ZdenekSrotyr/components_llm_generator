@@ -1,0 +1,1569 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-mapbox/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── src/
+    │   ├── component.py
+    │   ├── configuration.py
+    │   └── mapbox_client.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── logger
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── loggerConfiguration.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       └── in/
+    │           ├── state.json
+    │           └── tables/
+    │               └── isochrones_sample_input.csv
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── TEMPLATE_README.md
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    example
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/component.py
+================================================
+"""
+Template Component main class.
+
+"""
+import logging
+
+from keboola.component.base import ComponentBase
+from keboola.component.exceptions import UserException
+
+from configuration import Configuration, Endpoint
+from mapbox_client import MapboxClient
+
+
+class Component(ComponentBase):
+    def __init__(self):
+        super().__init__()
+
+    def _init_configuration(self) -> None:
+        self.validate_configuration_parameters(Configuration.get_dataclass_required_parameters())
+        self._configuration: Configuration = Configuration.load_from_dict(self.configuration.parameters)
+
+    def _init_client(self):
+
+        token = self._configuration.credentials.pswd_api_token
+        self.__client = MapboxClient(api_key=token)
+
+    def run(self):
+        """
+        Main execution code
+        """
+
+        self._init_configuration()
+
+        self._init_client()
+
+        try:
+            input_table = self.get_input_tables_definitions()[0]
+        except Exception:
+            raise UserException("No input table specified. Please provide one input table in the input mapping!")
+
+        if self._configuration.endpoint == Endpoint.ISOCHRONE:
+
+            if self._configuration.destination.table_name:
+                out_table = self.create_out_table_definition(self._configuration.destination.table_name)
+            else:
+                out_table = self.create_out_table_definition(
+                    self.environment_variables.config_row_id + '_isochrones.csv')
+
+            self.__client.get_isochrone(in_file_name=input_table.full_path,
+                                        out_file_name=out_table.full_path,
+                                        lat_col=self._configuration.coordinates.latitude_column,
+                                        long_col=self._configuration.coordinates.longitude_column,
+                                        routing_profile=self._configuration.routing_profile.value,
+                                        contours_type=self._configuration.isochrone_parameters.contours_type,
+                                        contours=self._configuration.isochrone_parameters.contours_value
+                                        )
+
+            self.write_manifest(out_table)
+
+        elif self._configuration.endpoint == Endpoint.DIRECTIONS_MATRIX:
+
+            if self._configuration.destination.table_name:
+                out_table = self.create_out_table_definition(self._configuration.destination.table_name)
+            else:
+                out_table = self.create_out_table_definition(
+                    self.environment_variables.config_row_id + '_matrices.csv')
+
+            self.__client.get_matrix(in_file_name=input_table.full_path,
+                                     out_file_name=out_table.full_path,
+                                     lat_col=self._configuration.coordinates.latitude_column,
+                                     long_col=self._configuration.coordinates.longitude_column,
+                                     routing_profile=self._configuration.routing_profile.value,
+                                     destination_coordinates=self._configuration.destination_coordinates.destination_coordinates_column, # noqa
+                                     annotations=self._configuration.matrix_parameters.annotations
+                                     )
+
+            self.write_manifest(out_table)
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        # this triggers the run method by default and is controlled by the configuration.action parameter
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /src/configuration.py
+================================================
+import dataclasses
+import json
+from dataclasses import dataclass, field
+from typing import List
+from enum import Enum
+
+import dataconf
+
+from pyhocon.config_tree import ConfigTree
+
+
+class ConfigurationBase:
+    @staticmethod
+    def _convert_private_value(value: str):
+        return value.replace('"#', '"pswd_')
+
+    @staticmethod
+    def _convert_private_value_inv(value: str):
+        if value and value.startswith("pswd_"):
+            return value.replace("pswd_", "#", 1)
+        else:
+            return value
+
+    @classmethod
+    def load_from_dict(cls, configuration: dict):
+        """
+        Initialize the configuration dataclass object from dictionary.
+        Args:
+            configuration: Dictionary loaded from json configuration.
+
+        Returns:
+
+        """
+        json_conf = json.dumps(configuration)
+        json_conf = ConfigurationBase._convert_private_value(json_conf)
+        return dataconf.loads(json_conf, cls, ignore_unexpected=True)
+
+    @classmethod
+    def get_dataclass_required_parameters(cls) -> List[str]:
+        """
+        Return list of required parameters based on the dataclass definition (no default value)
+        Returns: List[str]
+
+        """
+        return [cls._convert_private_value_inv(f.name)
+                for f in dataclasses.fields(cls)
+                if f.default == dataclasses.MISSING
+                and f.default_factory == dataclasses.MISSING
+                ]
+
+
+@dataclass
+class Credentials(ConfigurationBase):
+    pswd_api_token: str = ""
+
+
+@dataclass
+class Coordinates(ConfigurationBase):
+    latitude_column: str = ""
+    longitude_column: str = ""
+
+
+@dataclass
+class IsochroneParameters(ConfigurationBase):
+    polygons: bool = True
+    generalize: int = 50
+    contours_type: str = ""
+    contours_value: str = ""
+
+
+@dataclass
+class MatrixParameters(ConfigurationBase):
+    annotations: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DestinationCoordinates(ConfigurationBase):
+    destination_coordinates_column: str = ""
+
+
+@dataclass
+class Destination(ConfigurationBase):
+    table_name: str = ""
+
+
+class Endpoint(str, Enum):
+    ISOCHRONE = "isochrone"
+    DIRECTIONS_MATRIX = "directions-matrix"
+
+
+class RoutingProfile(str, Enum):
+    DRIVING = "driving"
+    WALKING = "walking"
+    CYCLING = "cycling"
+
+
+@dataclass
+class Configuration(ConfigurationBase):
+    credentials: Credentials
+    endpoint: Endpoint
+    routing_profile: RoutingProfile
+    coordinates: Coordinates
+    destination: Destination = field(default_factory=lambda: ConfigTree({}))
+    isochrone_parameters: IsochroneParameters = field(default_factory=lambda: ConfigTree({}))
+    destination_coordinates: DestinationCoordinates = field(default_factory=lambda: ConfigTree({}))
+    matrix_parameters: MatrixParameters = field(default_factory=lambda: ConfigTree({}))
+
+
+================================================
+File: /src/mapbox_client.py
+================================================
+from keboola.component import UserException
+from keboola.http_client import HttpClient
+
+from csv import DictReader, DictWriter
+
+from requests.exceptions import HTTPError
+
+BASE_URL = 'https://api.mapbox.com/'
+
+
+class MapboxClient(HttpClient):
+
+    def __init__(self,
+                 api_key: str,
+                 base_url: str = BASE_URL
+                 ):
+        super().__init__(base_url=base_url)
+        self._api_key = api_key
+
+    def _build_request(self, mapbox_token, endpoint,
+                       routing_profile=None,
+                       coordinates=None,
+                       contours_type="meters",
+                       contours=1000,
+                       polygons="true",
+                       generalize=50.0,
+                       source_coordinates=None,
+                       destination_coordinates=None,
+                       annotations="duration",
+                       base_url=BASE_URL) -> str:
+        """
+
+        Args:
+            mapbox_token:
+            endpoint:
+            routing_profile:
+            coordinates:
+            contours_type:
+            contours:
+            polygons:
+            generalize:
+            source_coordinates:
+            destination_coordinates:
+            annotations:
+            base_url:
+
+        Returns:
+
+        """
+
+        if endpoint == "isochrone":
+            request_str = f'{base_url}{endpoint}/v1/mapbox/{routing_profile}/{coordinates}?contours_{contours_type}={contours}&generalize={generalize}&polygons={polygons}&access_token={mapbox_token}'  # noqa
+
+        elif endpoint == "directions-matrix":
+            request_str = f'{base_url}{endpoint}/v1/mapbox/{routing_profile}/{source_coordinates};{destination_coordinates}?annotations={annotations}&sources=0&access_token={mapbox_token}'  # noqa
+
+        else:
+            raise UserException("Invalid endpoint, please select isochrone or directions-matrix")
+
+        return request_str
+
+    def _handle_response(self, response: dict):
+        if response.get("response", {}).get('success') == "N":
+            raise UserException(f"The request failed: {response.get('response', {}).get('errors')} ")
+
+    def get_isochrone(self,
+                      in_file_name: str,
+                      out_file_name: str,
+                      lat_col: str,
+                      long_col: str,
+                      routing_profile: str,
+                      contours_type: str,
+                      contours: str,
+                      ) -> None:
+        """
+
+        Args:
+            in_file_name:
+            out_file_name:
+            routing_profile:
+            contours_type:
+            contours:
+
+        Returns:
+
+        """
+
+        contours = contours.split(',')
+
+        with open(in_file_name, newline='') as in_file:
+            reader = DictReader(in_file)
+            with open(out_file_name, 'w') as out_file:
+                out_col_names = reader.fieldnames + ["routing_profile"] + ["res_" + str(x) for x in contours]
+                writer = DictWriter(out_file, fieldnames=out_col_names)
+                writer.writeheader()
+
+                for row in reader:
+                    result_row = row
+                    result_row["routing_profile"] = routing_profile
+                    for contour in contours:
+                        try:
+                            response = self.get(
+                                self._build_request(self._api_key, endpoint="isochrone",
+                                                    routing_profile=routing_profile,
+                                                    coordinates=f'{row[long_col]},{row[lat_col]}',
+                                                    contours=int(contour),
+                                                    contours_type=contours_type))
+
+                            result = response.get("features", {})[0].get("geometry", {}).get("coordinates", {})
+                        except HTTPError:
+                            result = None
+
+                        result_row["res_" + str(contour)] = result
+
+                    writer.writerow(result_row)
+
+        return
+
+    def get_matrix(self,
+                   in_file_name: str,
+                   out_file_name: str,
+                   lat_col: str,
+                   long_col: str,
+                   routing_profile: str,
+                   destination_coordinates: str,
+                   annotations
+                   ) -> None:
+        """
+
+        Args:
+            in_file_name:
+            out_file_name:
+            lat_col:
+            long_col:
+            routing_profile:
+            destination_coordinates:
+            annotations:
+
+        Returns:
+
+        """
+
+        with open(in_file_name, newline='') as in_file:
+            reader = DictReader(in_file)
+            with open(out_file_name, 'w') as out_file:
+                out_col_names = reader.fieldnames + ["routing_profile"] + ["result_" + str(x) for x in annotations]
+                writer = DictWriter(out_file, fieldnames=out_col_names)
+                writer.writeheader()
+
+                for row in reader:
+                    result_row = row
+                    result_row["routing_profile"] = routing_profile
+                    for annotation in annotations:
+                        try:
+                            response = self.get(
+                                self._build_request(self._api_key, endpoint="directions-matrix",
+                                                    routing_profile=routing_profile,
+                                                    source_coordinates=f'{row[long_col]},{row[lat_col]}',
+                                                    destination_coordinates=row[destination_coordinates],
+                                                    annotations=annotation))
+
+                            result = response.get(annotation + "s", {})
+
+                        except HTTPError:
+                            result = None
+
+                        result_row["result_" + str(annotation)] = result
+
+                    writer.writerow(result_row)
+
+        return
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - echo 'Pushing test image to repo. [tag=test]'
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/logger
+================================================
+gelf
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+This application is a tool that enhances your data with [Mapbox API](https://docs.mapbox.com/api/overview/) capabilities. It currently supports two endpoints: 
+
+[Isochrone](https://docs.mapbox.com/api/navigation/isochrone/): computes areas accessible within the same travel time or distance.
+
+[Matrix](https://docs.mapbox.com/api/navigation/matrix/):  provides travel times or distances between source and destination.
+
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+To use the Mapbox application, you first need to provide a Mapbox API token in the Configuration tab.
+
+Then, you can create one or more row configurations where you set the table input, specify the endpoint to use ([Isochrone API](https://docs.mapbox.com/api/navigation/isochrone/) or [Matrix API](https://docs.mapbox.com/api/navigation/matrix/)), and set the parameters for the API call. Optionally, you can also specify the name of the output table.
+
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Mapbox is a platform providing customizable mapping solutions and location-based services for developers and businesses.
+
+================================================
+File: /component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Data source configuration",
+  "required": [
+    "credentials"
+  ],
+  "properties": {
+    "credentials": {
+      "type": "object",
+      "title": "Authorization",
+      "required": [
+        "#api_token"
+      ],
+      "properties": {
+        "#api_token": {
+          "type": "string",
+          "format": "password",
+          "title": "API token",
+          "propertyOrder": 1
+        }
+      },
+      "propertyOrder": 1
+    }
+  }
+}
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Configuration Parameters",
+  "required": [
+    "endpoint",
+    "isochrone_parameters",
+    "matrix_parameters"
+  ],
+  "properties": {
+    "endpoint": {
+      "title": "Endpoint",
+      "description": "Select the endpoint you want to use.",
+      "type": "string",
+      "required": true,
+      "enum": [
+        "isochrone",
+        "directions-matrix"
+      ],
+      "options": {
+        "enum_titles": [
+          "Isochrone",
+          "Directions matrix"
+        ]
+      },
+      "propertyOrder": 1
+    },
+    "routing_profile": {
+      "type": "string",
+      "title": "Routing profile",
+      "default": "driving",
+      "description": "Routing profile used to calculate results",
+      "enum": [
+        "driving",
+        "walking",
+        "cycling"
+      ],
+      "propertyOrder": 2
+    },
+    "coordinates": {
+      "type": "object",
+      "title": "Source coordinates columns",
+      "format": "grid",
+      "description": "Columns in the input table with coordinates in <a href=\"https://en.wikipedia.org/wiki/Decimal_degrees\">decimal degrees</a> format",
+      "required": [
+            "longitude_column",
+            "latitude_column"
+          ],
+      "properties": {
+        "longitude_column": {
+          "type": "string",
+          "title": "Longitude column name",
+          "watch": {
+                "columns": "_metadata_.table.columns"
+              },
+          "enumSource": "columns",
+          "required": true,
+          "propertyOrder": 2
+        },
+        "latitude_column": {
+          "type": "string",
+          "title": "Latitude column name",
+          "watch": {
+                "columns": "_metadata_.table.columns"
+              },
+          "enumSource": "columns",
+          "required": true,
+          "propertyOrder": 1
+        }
+      },
+
+      "propertyOrder": 3
+    },
+
+    "destination_coordinates": {
+      "type": "object",
+      "title": "Destination coordinates column",
+      "description": "Column containing up to 24 coordinates: longitude, latitude separated by semicolon; e.g., 14.538, 50.053; 13.538, 49.053;",
+      "properties": {
+        "destination_coordinates_column": {
+          "type": "string",
+          "title": "Destination coordinates column name",
+          "propertyOrder": 1
+        }
+      },
+      "options": {
+        "dependencies": {
+          "endpoint": "directions-matrix"
+        }
+      },
+      "propertyOrder": 4
+    },
+
+    "isochrone_parameters": {
+      "type": "object",
+      "title": "Isochrone parameters",
+      "properties": {
+        "contours_type": {
+          "type": "string",
+          "title": "Contour type",
+          "default": "meters",
+          "enum": [
+            "meters",
+            "minutes"
+          ],
+          "description": "Type used for each isochrone contour",
+          "propertyOrder": 4
+        },
+        "contours_value": {
+          "type": "string",
+          "title": "Contour value or values separated by comma",
+          "default": "1000, 2000",
+          "description": "Maximum is 60 minutes or 100,000 meters",
+          "propertyOrder": 5
+        },
+        "generalize": {
+          "type": "number",
+          "title": "Generalize",
+          "default": "50.0",
+          "description": "A positive floating point value, in meters, used as the tolerance for Douglas-Peucker generalization",
+          "propertyOrder": 6
+        },
+        "polygons": {
+          "type": "boolean",
+          "title": "Polygons",
+          "default": false,
+          "required": true,
+          "description": "Return GeoJSON polygons (true) or linestrings (false)",
+          "propertyOrder": 7
+        }
+      },
+      "options": {
+        "dependencies": {
+          "endpoint": "isochrone"
+        }
+      },
+      "propertyOrder": 5
+    },
+    "matrix_parameters": {
+      "type": "object",
+      "title": "Matrix parameters",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "format": "select",
+          "uniqueItems": true,
+          "title": "Annotations",
+          "description": "Annotation of the resulting table",
+          "items": {
+            "enum": [
+              "duration",
+              "distance"
+            ],
+            "type": "string"
+          },
+          "default": "duration",
+          "propertyOrder": 5
+        }
+      },
+      "options": {
+        "dependencies": {
+          "endpoint": "directions-matrix"
+        }
+      },
+      "propertyOrder": 5
+    },
+    "destination": {
+      "title": "Destination",
+      "type": "object",
+      "propertyOrder": 9,
+      "properties": {
+        "table_name": {
+          "type": "string",
+          "title": "Table name (optional)",
+          "description": "The name of the output table; if empty, it defaults to the row configuration ID and the endpoint name.",
+          "propertyOrder": 1
+        }
+      }
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "credentials": {
+     "#api_token": "MAPBOX_TOKEN"
+    },
+
+    "endpoint": "isochrone",
+    "coordinates": {
+      "latitude_column": "lat",
+      "longitude_column": "lng"
+    },
+    "routing_profile": "driving",
+    "isochrone_parameters": {
+      "polygons": false,
+      "generalize": 50,
+      "contours_type": "meters",
+      "contours_value": "1000, 2000"
+    },
+    "destination": {
+      "table_name": ""
+    }
+  },
+  "storage": {
+    "input": {
+      "tables": [
+        {
+          "source": "in.c-mapbox-test.isochrones_sample_input",
+          "destination": "isochrones_sample_input.csv",
+          "where_column": "",
+          "where_values": [],
+          "where_operator": "eq",
+          "columns": [
+            "id",
+            "lat",
+            "lng"
+          ],
+          "keep_internal_timestamp_column": false
+        }
+      ]
+    }
+  },
+
+  "action":"run",
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/isochrones_sample_input.csv
+================================================
+"id","lat","lng"
+"1","50.0835494","12.4341414"
+"2","49.2002211","16.6078411"
+"3","invalid","16.6078411"
+
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+fi
+
+echo "Updating logger settings"
+
+value=`cat component_config/logger`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} logger --value="$value"
+else
+    echo "logger type is empty!"
+fi
+
+echo "Updating logger configuration"
+value=`cat component_config/loggerConfiguration.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} loggerConfiguration --value="$value"
+else
+    echo "loggerConfiguration is empty!"
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.component==1.4.4
+keboola.utils==1.1.0
+keboola.http-client==1.0.0
+mock==5.1.0
+freezegun==1.3.1
+dataconf~=2.3.0
+
+pyhocon==0.3.60
+requests==2.31.0
+
+================================================
+File: /TEMPLATE_README.md
+================================================
+# KBC Component Python template
+
+Python template for KBC Component creation. Defines the default structure and all Bitbucket pipeline CI scripts for automatic deployment.
+
+Use as a starting point when creating a new component.
+
+Example uses [keboola.component](https://pypi.org/project/keboola.component) library providing useful methods for KBC related tasks 
+and boilerplate methods often needed by components, for more details see [documentation](https://github.com/keboola/python-component/blob/main/README.md)
+
+*NOTE: Previously the template was based on top of the deprecated [keboola-python-util-lib library](https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/src/master/)*
+
+**Table of contents:**  
+  
+[TOC]
+
+# Recommended component architecture
+It is recommended to use the [keboola.component library](https://pypi.org/project/keboola.component), 
+for each component. Major advantage is that it reduces the boilerplate code replication, the developer can focus on core component logic 
+and not on boilerplate tasks. If anything is missing in the library, please fork and create a pull request with additional changes, 
+so we can all benefit from it
+
+**Base components on [CommonInterface](https://htmlpreview.github.io/?https://raw.githubusercontent.com/keboola/python-component/main/docs/api-html/component/interface.html#keboola.component.interface.CommonInterface)**
+
+- No need to write configuration processing and validation code each time
+- No need to setup logging environment manually
+- No need to write code to store manifests, write statefile, retrieve dates based on relative period, and many more.
+- The main focus can be the core component logic, which increases the code readability for new comers.
+
+**Base Client on [HtttpClient](https://pypi.org/project/keboola.http-client/)**
+
+- No need to write HTTP request handling over and over again
+- Covers basic authentication, retry strategy, headers, default parameters
+
+
+## Architecture using the template
+
+![picture](docs/imgs/architecture.png)
+
+## Example component
+This template contains functional example of an [hello-world component](https://bitbucket.org/kds_consulting_team/kbc-python-template/src/master/src/component.py), 
+it can be run with [sample configuration](https://bitbucket.org/kds_consulting_team/kbc-python-template/src/master/data/) and it produces valid results. 
+It is advisable to use this structure as a base for new components. Especially the `component.py` module, which should only 
+contain the base logic necessary for communication with KBC interface, processing parameters, collecting results
+ and calling targeted API service methods. 
+
+
+# Creating a new component
+Clone this repository into new folder and remove git history
+```bash
+git clone https://bitbucket.org/kds_consulting_team/kbc-python-template.git my-new-component
+cd my-new-component
+rm -rf .git
+git init
+git remote add origin PATH_TO_YOUR_BB_REPO
+git add .
+git commit -m 'initial'
+git push -u origin master
+```
+
+**Method #2:**
+
+Copy the contents of the template folder into your clone empty repository
+
+```bash
+git clone PATH_TO_YOUR_BB_REPO my-new-component
+# now copy the contents of the template into the my-new-component dir
+cd my-new-component
+git add .
+git commit -m 'initial'
+git push -u origin master
+```
+
+# Setting up the CI
+ - Bitbucket: Enable [pipelines](https://confluence.atlassian.com/bitbucket/get-started-with-bitbucket-pipelines-792298921.html) in the repository.
+    - For Github: Check that the [workflows are enabled](https://docs.github.com/en/actions/managing-workflow-runs/disabling-and-enabling-a-workflow).
+    The actions are present in `.github/workflows/` folder. 
+ - Set `KBC_DEVELOPERPORTAL_APP` env variable (dev portal app id)
+ 
+ In case it is not set on the account level, set also other required dev portal env variables:
+ 
+ - `KBC_DEVELOPERPORTAL_PASSWORD` - service account password
+ - `KBC_DEVELOPERPORTAL_USERNAME` - service account username
+ - `KBC_DEVELOPERPORTAL_VENDOR` - dev portal vendor
+ - `KBC_STORAGE_TOKEN` - (optional) in case you wish to run KBC automated tests
+  
+ 
+ ![picture](docs/imgs/ci_variable.png)
+ 
+The script execution is defined in three stages:
+
+## Default stage
+This script is executed on push to any branch except the master branch. It executes basic build and code quality steps. Following steps are performed:
+Build docker image
+Execute flake8 lint tests
+Execute python unittest
+(Optional) Push image with tag :test into the AWS repository for manual testing in KBC
+If any of the above steps results in non 0 status, the build will fail. It is impossible to merge branches that fail to build into the master branch.
+
+## Master stage
+This script is executed on any push or change in the master branch. It performs every step as the default stage. Additionally, 
+the `./scripts/update_dev_portal_properties.sh` script is executed. 
+This script propagates all changes in the Component configuration files (component_config folder) to the Developer portal.
+Currently these Dev Portal configuration parameters are supported:
+
+ - `configSchema.json`
+ - `configRowSchema.json`
+ - `component_short_description.md`
+ - `component_long_description.md`    
+
+The choice to include this script directly in the master branch was made to simplify ad-hoc changes of the component configuration parameters. For instance if you wish to slightly modify the configuration schema without affecting the code itself, it is possible to simply push the changes directly into the master and these will be automatically propagated to the production without rebuilding the image itself. Solely Developer Portal configuration metadata is deployed at this stage.
+
+## Tagged commit stage
+Whenever a tagged commit is added, or tag created this script gets executed. This is a deployment phase, so a successful build results in new code being deployed in KBC production.
+At this stage all steps present in the default and master stage are executed. Additionally, 
+`deploy.sh` script that pushes the newly built image / tag into the ECR repository and KBC production is executed.
+The deploy script is executed only after all tests and proper build steps passed. 
+Moreover, the `deploy.sh` script will be executed **only in the master branch**. In other words if you create a tagged commit in another branch, the pipeline gets triggered but deployment script will fail, because it is not triggered within a master branch. This is to prevent accidental deployment from a feature branch.
+
+ 
+# GELF logging
+
+The template automatically chooses between STDOUT and GELF logger based on the Developer Portal configuration.
+
+To fully leverage the benefits such as outputting the `Stack Trace` into the log event detail (available by clicking on the log event) 
+log exceptions using `logger.exception(ex)`.
+
+**TIP:** When the logger verbosity is set to `verbose` you may leverage `extra` fields to log the detailed message in the detail of the log event by adding extra fields to you messages:
+
+```python
+logging.error(f'{error}. See log detail for full query. ',
+                         extra={"failed_query": json.dumps(query)})
+```
+
+Recommended [GELF logger setup](https://developers.keboola.com/extend/common-interface/logging/#setting-up) (Developer Portal) to allow debug mode logging:
+
+```json
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+``` 
+ 
+# Development
+ 
+This example contains runnable container with simple unittest. For local testing it is useful to include `data` folder in the root
+and use docker-compose commands to run the container or execute tests. 
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path:
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone https://bitbucket.org:kds_consulting_team/kbc-python-template.git my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+## Testing
+
+The preset pipeline scripts contain sections allowing pushing testing image into the ECR repository and automatic 
+testing in a dedicated project. These sections are by default commented out. 
+
+**Running KBC tests on deploy step, before deployment**
+
+Uncomment following section in the deployment step in `bitbucket-pipelines.yml` file:
+
+```yaml
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+```
+
+Make sure that you have `KBC_STORAGE_TOKEN` env. variable set, containing appropriate storage token with access 
+to your KBC project. Also make sure to create a functional testing configuration and replace the `BASE_KBC_CONFIG` placeholder with its id.
+
+**Pushing testing image for manual KBC tests**
+
+In some cases you may wish to execute a testing version of your component manually prior to publishing. For instance to test various
+configurations on it. For that it may be convenient to push the `test` image on every push either to master, or any branch.
+
+To achieve that simply uncomment appropriate sections in `bitbucket-pipelines.yml` file, either in master branch step or in `default` step.
+
+```yaml
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+```
+ 
+ Once the build is finished, you may run such configuration in any KBC project as many times as you want by using [run-job](https://kebooladocker.docs.apiary.io/#reference/run/create-a-job-with-image/run-job) API call, using the `test` image tag.
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.11-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+Mapbox
+======
+
+This data source connector enriches input data using outputs from the Mapbox API and currently supports two endpoints: Isochrones and Matrix.
+The first computes areas accessible within the same travel time and distance; the latter endpoint provides travel times or distances between numerous points.
+
+Prerequisites
+=============
+
+Before configuring the connector, you must get a [Mapbox API token](https://docs.mapbox.com/help/getting-started/access-tokens/).
+
+Supported Endpoints
+===================
+
+| **Feature**       | **Description**                                                                      |
+|-------------------|--------------------------------------------------------------------------------------|
+| Isochrones        | Coordinates reachable from a central point within the same travel time or distance   |
+| Matrix            | Travel times or distances between source and destination coordinates                 |
+
+Configuration
+=============
+
+First, enter the Mapbox API token in the connector configuration tab. Then, create one or more row configurations. 
+Set a table input mapping, select the endpoint, and define specific parameters for that endpoint. 
+Optionally, specify the output table name.
+
+Isochrone Parameters
+---------------------
+
+For more information on the Isochrone API, see the official [Isochrone API documentation](https://docs.mapbox.com/api/navigation/isochrone/).
+
+To define the parameters, use the [Isochrone API Playground](https://docs.mapbox.com/playground/isochrone/).
+
+| **Parameter**                     | **Description**                                                                                                                                                                                                 |
+|-----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Routing profile                   | Profile used for calculating travel time or distance.                                                                                                             |
+| Source coordinates columns        | Names of columns in the input table with [decimal degree](https://en.wikipedia.org/wiki/Decimal_degrees) coordinates.                                             |
+| Contours type                     | Choose time or distance for isochrone calculations.                                                                                                               | 
+| Contours value                    | Specify one or multiple values and separate them by commas (in minutes for time, meters for distance). Maximum values are 60 minutes or 100,000 meters, respectively.|
+| Generalize                        | A positive floating point value in meters for Douglas-Peucker generalization.                                                                                     |
+| Polygons                          | Choose true for GeoJSON polygons or false for lines.                                                                                                              |
+| Destination table name (optional) | Name of the output table, defaults to configuration ID + endpoint name if not specified.                                                                          | 
+
+Matrix Parameters
+-----------------
+
+For more information on the Matrix API, see the official [Matrix API documentation](https://docs.mapbox.com/api/navigation/matrix/).
+
+| **Parameter**                     | **Description**                                                                                                                |
+|-----------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
+| Routing profile                   | Profile for calculating duration or distance.                                                                                  |
+| Source coordinates columns        | Names of columns with in the input table with [decimal degree](https://en.wikipedia.org/wiki/Decimal_degrees) coordinates.     |
+| Destination coordinates column    | Column containing up to 24 longitude, latitude coordinates separated by semicolons, e.g., 14.538, 50.053; 13.538, 49.053.      |
+| Annotations                       | Choose duration, distance, or both.                                                                                            |
+| Destination table name (optional) | Name of the output table, defaults to configuration ID + endpoint name if not specified.                                       | 
+
+Output
+======
+
+The output is a table with columns from the input mapping and additional columns for:
+
+- Each contour value in GeoJSON polygons or lines for the Isochrone endpoint.
+- A list of travel times or distances for the Matrix endpoint.
+
+Development
+-----------
+
+Modify the local data folder path in the `docker-compose.yml` file if necessary:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clone this repository, initialize the workspace, and run the component with the following
+command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+git clone https://bitbucket.org/kds_consulting_team/kds-team.app-mapbox/ kds-team.app-mapbox
+cd kds-team.app-mapbox
+docker-compose build
+docker-compose run --rm dev
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run tests and lint checks using this command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose run --rm test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Integration
+===========
+
+For information about deployment and integration with Keboola, please refer to the
+[deployment section in the developer's
+documentation](https://developers.keboola.com/extend/component/deployment/).
+
+

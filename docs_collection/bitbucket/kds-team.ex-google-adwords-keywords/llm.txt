@@ -1,0 +1,1204 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-google-adwords-keywords/
+    ├── .travis.yml
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   ├── run.py
+    │   ├── client.py
+    │   └── result.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /.travis.yml
+================================================
+sudo: false
+
+services:
+  - docker
+
+jobs:
+  include:
+    - stage: tests
+      script:
+        - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+        - docker run $APP_IMAGE python -m unittest discover
+      # push test image to ECR - uncomment for testing before deployment
+      #  - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+      #  - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+      #  - docker tag $APP_IMAGE:latest $REPOSITORY:test
+      #  - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+      #  - docker push $REPOSITORY:test
+      #  - docker pull quay.io/keboola/syrup-cli:latest
+    - stage: deploy_dev_portal
+      if: branch = master
+      script: "./scripts/update_dev_portal_properties.sh"
+    - stage: deploy
+      if: tag IS present AND  branch = master
+      script: "./deploy.sh"
+
+
+before_script:
+  - export APP_IMAGE=keboola-component
+  - docker -v
+  - docker build -t $APP_IMAGE .
+
+
+after_success:
+  - docker images
+
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    example
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "asigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "asigning travis tag"
+	export TAG="$TRAVIS_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/component.py
+================================================
+import csv
+import glob
+import json
+import logging
+import os
+import sys
+import yaml
+from pathlib import Path
+
+from client import GoogleAdwordsClient
+from result import GoogleAdwordsWriter
+from googleads.adwords import AdWordsClient
+from kbc.env_handler import KBCEnvHandler
+
+# configuration variables
+KEY_DEBUG = 'debug'
+KEY_CUSTOMER_IDS = 'customer_ids'
+KEY_REQUEST_TYPE = 'request_type'
+KEY_REQUEST_ATTRIBUTES = 'requested_attributes'
+KEY_NETWORK_SETTINGS = 'network_settings'
+KEY_LOCATIONS_SETTINGS = 'locations'
+KEY_OTHER_SETTINGS = 'other_parameters'
+KEY_INCREMENTAL = 'incremental'
+KEY_DEVELOPER_TOKEN = '#developer_token'
+
+MANDATORY_PARS = [KEY_CUSTOMER_IDS, KEY_REQUEST_TYPE]
+MANDATORY_IMAGE_PARS = [KEY_DEVELOPER_TOKEN]
+
+SUPPORTED_REQUEST_TYPE = ['STATS', 'IDEAS']
+KEYWORD_COLUMN = 'keyword'
+
+APP_VERSION = '0.0.9'
+
+
+class GoogleAdwordsComponent(KBCEnvHandler):
+
+    def __init__(self, debug=False):
+        # for easier local project setup
+        default_data_dir = Path(__file__).resolve().parent.parent.joinpath('data').as_posix() \
+            if not os.environ.get('KBC_DATADIR') else None
+
+        KBCEnvHandler.__init__(self, MANDATORY_PARS, log_level=logging.DEBUG if debug else logging.INFO,
+                               data_path=default_data_dir)
+
+        # override debug from config
+        if self.cfg_params.get(KEY_DEBUG) is True:
+            logging.getLogger().setLevel(logging.DEBUG)
+
+        logging.info(f'Running version {APP_VERSION}.')
+
+        try:
+            self.validate_config(MANDATORY_PARS)
+            self.validate_image_parameters(MANDATORY_IMAGE_PARS)
+        except ValueError as e:
+            logging.exception(e)
+            exit(1)
+
+        self.validate_and_get_parameters()
+        self.client = GoogleAdwordsClient(AdWordsClient.LoadFromString(yaml.dump({
+            'adwords': {
+                'developer_token': self.par_developer_token,
+                'client_id': self.par_client_id,
+                'client_secret': self.par_client_secret,
+                'refresh_token': self.par_refresh_token
+            }
+        })))
+
+        self.writer = GoogleAdwordsWriter(self.tables_out_path, self.par_incremental)
+
+    def _get_developer_token(self):
+
+        try:
+            _dev_token = self.configuration.config_data['image_parameters'][KEY_DEVELOPER_TOKEN]
+        except KeyError:
+            logging.error("Developer token missing in stack parameters.")
+            sys.exit(2)
+
+        return _dev_token
+
+    def validate_and_get_parameters(self):
+
+        # Developer token
+        self.par_developer_token = self._get_developer_token()
+
+        # Authorization
+        _auth = self.get_authorization()
+        self.par_client_id = _auth['appKey']
+        self.par_client_secret = _auth['#appSecret']
+        self.par_refresh_token = json.loads(_auth['#data'])['refresh_token']
+
+        # Validate customer IDs
+        self.par_customer_ids = self.cfg_params['customer_ids']
+        if len(self.par_customer_ids) == 0:
+            logging.error("No customer IDS provided.")
+            sys.exit(1)
+
+        # Request type
+        self.par_request_type = self.cfg_params[KEY_REQUEST_TYPE]
+        if self.par_request_type not in SUPPORTED_REQUEST_TYPE:
+            logging.error(f"Unsupported request type {self.par_request_type}. Must be one of {SUPPORTED_REQUEST_TYPE}.")
+            sys.exit(1)
+
+        # Locations
+        _locations = self.cfg_params.get(KEY_LOCATIONS_SETTINGS, [])
+        if _locations == []:
+            self.par_locations = None
+        else:
+            try:
+                _locations_object = [{'id': int(loc_id)} for loc_id in _locations]
+                self.par_locations = _locations_object
+            except ValueError as e:
+                logging.error(f"Location IDs must be provided as integers. Provided: {e}.")
+                sys.exit(1)
+
+        # Network settings
+        _network = self.cfg_params.get(KEY_NETWORK_SETTINGS, {})
+
+        if isinstance(_network, dict):
+            if _network == {}:
+                self.par_network_settings = None
+            else:
+                self.par_network_settings = _network
+
+        else:
+            if str(_network).strip() == '':
+                self.par_network_settings = None
+            else:
+                logging.error(f"Network settings must be provided as a valid JSON object. Provided value: {_network}.")
+                sys.exit(1)
+
+        # Keywords
+        _keywords = self.get_keywords()
+        if len(_keywords) == 0:
+            logging.warn("No keywords provided.")
+            sys.exit(0)
+
+        else:
+            kw_len = sum([len(_list) for _list in _keywords])
+            logging.info(f"{kw_len} keyword(s) provided.")
+            logging.debug(f"Keywords: {_keywords}.")
+            self.keywords = _keywords
+
+        # Incremental
+        self.par_incremental = self.cfg_params.get(KEY_INCREMENTAL, False)
+
+    def get_keywords(self):
+
+        input_tables = glob.glob(os.path.join(self.tables_in_path, '*.csv'))
+
+        if len(input_tables) == 0:
+            logging.error("No input tables provided.")
+            sys.exit(1)
+
+        all_keywords = []
+
+        for table in input_tables:
+            with open(table) as input:
+                _rdr = csv.DictReader(input)
+                if KEYWORD_COLUMN not in _rdr.fieldnames:
+                    logging.error(f"Column \"{KEYWORD_COLUMN}\" is missing in table \"{os.path.basename(table)}\".")
+                    sys.exit(1)
+
+                else:
+                    for row in _rdr:
+                        all_keywords.append(row[KEYWORD_COLUMN].strip())
+
+        keywords_collection_length = 100
+        keywords_collections = [all_keywords[i:i+keywords_collection_length] for i in
+                                range(0, len(all_keywords), keywords_collection_length)]
+
+        return keywords_collections
+
+    def run(self):
+
+        for customer_id in self.par_customer_ids:
+
+            logging.info(f"Downloading data for customer {customer_id}.")
+            self.client.set_customer_id(customer_id)
+
+            for collection in self.keywords:
+
+                _selector = self.client.build_selector(keywords=collection,
+                                                       locations=self.par_locations,
+                                                       networks=self.par_network_settings,
+                                                       request_type=self.par_request_type)
+                logging.debug(f"Created selector: {_selector}.")
+
+                keywords_results = self.client.download_keywords(_selector)
+                self.writer.parse_gad_response(keywords_results, self.par_request_type)
+
+        logging.info("Extraction finished.")
+
+
+================================================
+File: /src/run.py
+================================================
+import sys
+from component import GoogleAdwordsComponent
+
+sys.tracebacklimit = 0
+
+if __name__ == '__main__':
+    c = GoogleAdwordsComponent()
+    c.run()
+
+
+================================================
+File: /src/client.py
+================================================
+import googleads
+import logging
+import sys
+import time
+
+
+class GoogleAdwordsClient(googleads.adwords.AdWordsClient):
+
+    PAGE_SIZE = 100
+    REQUESTED_ATTRIBUTES = ['KEYWORD_TEXT', 'COMPETITION', 'EXTRACTED_FROM_WEBPAGE', 'IDEA_TYPE',
+                            'SEARCH_VOLUME', 'AVERAGE_CPC', 'TARGETED_MONTHLY_SEARCHES']
+    MAX_RETRIES = 5
+    EXPONENTIAL_BACKOFF = [0, 1.1, 1.2, 1.4, 1.7, 2]
+
+    def __init__(self, adwords):
+
+        self.adwords_client = adwords
+
+    def set_customer_id(self, customer_id):
+
+        self.adwords_client.SetClientCustomerId(customer_id)
+
+    def get_customers(self):
+
+        customer_service = self.adwords_client.GetService(service_name='CustomerService')
+
+        try:
+            return customer_service.getCustomers()
+
+        except googleads.errors.GoogleAdsServerFault as e:
+            logging.error(f"Could not list customers: {e}")
+            sys.exit(1)
+
+    def build_selector(self, keywords, locations, networks, request_type):
+
+        selector = dict()
+        selector['ideaType'] = 'KEYWORD'
+        selector['requestType'] = request_type
+        selector['requestedAttributeTypes'] = self.REQUESTED_ATTRIBUTES
+
+        _search_params = []
+        _search_params.append({
+            'xsi_type': 'RelatedToQuerySearchParameter',
+            'queries': keywords
+        })
+
+        if locations is not None:
+            _search_params.append({
+                'xsi_type': 'LocationSearchParameter',
+                'locations': locations
+            })
+
+        if networks is not None:
+            _search_params.append({
+                'xsi_type': 'NetworkSearchParameter',
+                'networkSetting': networks
+            })
+
+        selector['searchParameters'] = _search_params
+
+        return selector
+
+    def _download_keywords_page(self, selector, targeting_service):
+        pass
+
+    def download_keywords(self, selector):
+
+        targeting_service = self.adwords_client.GetService(service_name='TargetingIdeaService')
+        offset = 0
+        is_complete = False
+        results = []
+
+        while is_complete is False:
+
+            retry_count = 1
+
+            selector['paging'] = {
+                'numberResults': str(self.PAGE_SIZE),
+                'startIndex': str(offset)
+            }
+
+            try:
+                page = targeting_service.get(selector)
+                results += (_res := page['entries'])
+
+                if len(_res) < self.PAGE_SIZE:
+                    is_complete = True
+                else:
+                    offset += self.PAGE_SIZE
+
+            except googleads.errors.GoogleAdsServerFault as e:
+
+                _error = e.errors[0]
+                _success_repeat = False
+
+                if _error['ApiError.Type'] == 'RateExceededError':
+
+                    _retry_after = int(_error['retryAfterSeconds'])
+
+                    while retry_count < self.MAX_RETRIES + 1 and _success_repeat is False:
+
+                        _wait = _retry_after * self.EXPONENTIAL_BACKOFF[retry_count]
+                        logging.warn(f"Rate exceeded. Retrying (attempt #{retry_count}) in {_wait} seconds.")
+                        time.sleep(_wait)
+
+                        try:
+                            page = targeting_service.get(selector)
+                            _success_repeat = True
+
+                        except googleads.errors.GoogleAdsServerFault as e:
+                            _error = e.errors[0]
+                            _retry_after = int(_error['retryAfterSeconds'])
+                            retry_count += 1
+
+                    if _success_repeat is False:
+                        logging.error("Could not download keywords ideas/stats - reached max retries.")
+                        sys.exit(1)
+
+                else:
+                    logging.error(f"An error occurred while downloading data: {e}.")
+                    sys.exit(1)
+
+            except Exception as e:
+                logging.error(f"An error occurred while downloading data: {e}.")
+                sys.exit(1)
+
+        return results
+
+
+================================================
+File: /src/result.py
+================================================
+import csv
+import json
+import os
+
+KEYWORDS_FIELDS = ['KEYWORD_TEXT', 'COMPETITION', 'EXTRACTED_FROM_WEBPAGE', 'IDEA_TYPE',
+                   'SEARCH_VOLUME', 'AVERAGE_CPC', 'REQUEST_TYPE']
+KEYWORDS_PK = ['KEYWORD_TEXT']
+
+KEYWORDS_STATS_FIELDS = ['KEYWORD_TEXT', 'YEAR', 'MONTH', 'COUNT']
+KEYWORDS_STATS_PK = ['KEYWORD_TEXT', 'YEAR', 'MONTH']
+
+
+class GoogleAdwordsWriter:
+
+    KEYWORDS_FILE_NAME = 'keywords.csv'
+    KEYWORDS_STATS_FILE_NAME = 'keywords-stats.csv'
+
+    def __init__(self, table_path, incremental):
+
+        _keywords_path = os.path.join(table_path, self.KEYWORDS_FILE_NAME)
+        _stats_path = os.path.join(table_path, self.KEYWORDS_STATS_FILE_NAME)
+
+        self.keywords = csv.DictWriter(open(_keywords_path, 'w'), fieldnames=KEYWORDS_FIELDS,
+                                       restval='', extrasaction='ignore', quotechar='\"',
+                                       quoting=csv.QUOTE_ALL)
+
+        self.stats = csv.DictWriter(open(_stats_path, 'w'), fieldnames=KEYWORDS_STATS_FIELDS,
+                                    restval='', extrasaction='ignore',
+                                    quotechar='\"', quoting=csv.QUOTE_ALL)
+
+        self.keywords.writeheader()
+        self.stats.writeheader()
+
+        self.create_manifest(_keywords_path, incremental, KEYWORDS_PK)
+        self.create_manifest(_stats_path, incremental, KEYWORDS_STATS_PK)
+
+    def create_manifest(self, table_path, incremental, primary_key=[]):
+
+        _manifest = {
+            'incremental': incremental,
+            'primary_key': primary_key
+        }
+
+        with open(table_path + '.manifest', 'w') as _man:
+            json.dump(_manifest, _man)
+
+    def parse_gad_response(self, response, request_type):
+
+        for _row in response:
+
+            # Convert to dict using a workaround
+            row = eval(str(_row))
+            data = row['data']
+
+            _kword = None
+            kword_dict = {}
+            stats_list = []
+
+            for result in data:
+
+                _attr = result['key']
+                _value = result['value']['value']
+
+                if _attr == 'AVERAGE_CPC':
+                    _value = _value['microAmount'] if _value is not None else None
+
+                if _attr == 'KEYWORD_TEXT':
+                    _kword = _value
+
+                if _attr == 'TARGETED_MONTHLY_SEARCHES':
+                    stats_list = [{
+                        'YEAR': s['year'],
+                        'MONTH': s['month'],
+                        'COUNT': s['count']
+                    } for s in _value]
+                    continue
+
+                kword_dict[_attr] = _value
+
+            kword_dict['REQUEST_TYPE'] = request_type
+
+            self.keywords.writerow(kword_dict)
+            self.stats.writerows([{**{'KEYWORD_TEXT': _kword, **stat}} for stat in stats_list])
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+#          - echo 'Pushing test image to repo. [tag=test]'
+#          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+Testing functional sample extractor for purposes of the python component template. 
+Implements partial Hubspot extractor using the public sandbox token.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+Testing configuration description.
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Testing functional sample extractor for purposes of the python component template. 
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+    "title": "Parameters",
+    "type": "object",
+    "required": [
+        "request_type",
+        "customer_ids",
+        "locations",
+        "network_settings",
+        "incremental"
+    ],
+    "properties": {
+        "request_type": {
+            "type": "string",
+            "description": "Specifies, whether to use endpoint for generating new targeting ideas, or endpoint for fetching historical statistics for keywords.",
+            "enum": [
+                "IDEAS",
+                "STATS"
+            ],
+            "default": "STATS",
+            "title": "Request Type",
+            "propertyOrder": 1000
+        },
+        "customer_ids": {
+            "type": "array",
+            "title": "Customer IDs",
+            "description": "An array of Google Ads customer IDs. You can find you customer ID:<ul><li>in the top right corner in Google Ads,</li><li>or by <a target='_blank' href='https://support.google.com/google-ads/answer/1704344'>following this guide</a>.</li></ul>",
+            "items": {
+                "title": "Customer ID",
+                "type": "string"
+            },
+            "propertyOrder": 2000
+        },
+        "locations": {
+            "type": "array",
+            "title": "Locations",
+            "format": "table",
+            "description": "An array of location IDs, for which the filter should be set.</br>A complete list of all available geotargets can be found in <a target='_blank' href='https://developers.google.com/adwords/api/docs/appendix/geotargeting'>Google Ads developers documentation</a>.",
+            "items": {
+                "title": "Location IDs",
+                "type": "number",
+                "default": ""
+            },
+            "propertyOrder": 3000
+        },
+        "network_settings": {
+            "title": "Network Settings",
+            "description": "Network filters for generating keywords or fetching statistics. This option specifies the <a target='_blank' href='https://developers.google.com/adwords/api/docs/reference/v201809/TargetingIdeaService.NetworkSearchParameter'>NetworkSearchParameter</a>.",
+            "type": "object",
+            "format": "grid-strict",
+            "propertyOrder": 4000,
+            "required": [
+                "targetGoogleSearch",
+                "targetSearchNetwork",
+                "targetContentNetwork",
+                "targetPartnerSearchNetwork"
+            ],
+            "properties": {
+                "targetGoogleSearch": {
+                    "title": "Target Google Search",
+                    "type": "boolean",
+                    "default": true,
+                    "options": {
+                        "grid_columns": 6
+                    }
+                },
+                "targetSearchNetwork": {
+                    "title": "Target Search Network",
+                    "type": "boolean",
+                    "default": false,
+                    "options": {
+                        "grid_columns": 6
+                    }
+                },
+                "targetContentNetwork": {
+                    "title": "Target Content Network",
+                    "type": "boolean",
+                    "default": false,
+                    "options": {
+                        "grid_columns": 6
+                    }
+                },
+                "targetPartnerSearchNetwork": {
+                    "title": "Target Partner Search Network",
+                    "type": "boolean",
+                    "default": false,
+                    "options": {
+                        "grid_columns": 6
+                    }
+                }
+            }
+        },
+        "incremental": {
+            "title": "Load Type",
+            "description": "Whether to load data into storage incrementally, or utilizing the full load.",
+            "type": "boolean",
+            "default": true,
+            "propertyOrder": 5000,
+            "options": {
+                "enum_titles":[
+                    "Incremental Load",
+                    "Full Load"
+                ]
+            }
+        }
+    }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.4.4.zip#egg=kbc
+googleads==25.0.0
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.5-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+RUN pip install --no-cache-dir -r /code/requirements.txt
+RUN mkdir -p /var/www && chmod a+rw /var/www -R
+
+WORKDIR /code/
+
+CMD ["python", "-u", "/code/src/run.py"]
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Google Adwords Keywords
+

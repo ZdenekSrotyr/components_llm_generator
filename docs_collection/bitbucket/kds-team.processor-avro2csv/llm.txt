@@ -1,0 +1,843 @@
+Directory structure:
+└── kds_consulting_team-kds-team.processor-avro2csv/
+    ├── .travis.yml
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   └── component.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   └── files/
+    │       │       ├── some-file.avro0
+    │       │       └── twitter.avro
+    │       └── out/
+    │           └── tables/
+    │               ├── twitter.avro.csv
+    │               └── some-file.avro0.csv
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /.travis.yml
+================================================
+sudo: false
+
+services:
+  - docker
+
+jobs:
+  include:
+    - stage: tests
+      script:
+        - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+        - docker run $APP_IMAGE python -m unittest discover
+      # push test image to ECR - uncomment for testing before deployment
+      #  - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+      #  - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+      #  - docker tag $APP_IMAGE:latest $REPOSITORY:test
+      #  - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+      #  - docker push $REPOSITORY:test
+      #  - docker pull quay.io/keboola/syrup-cli:latest
+    - stage: deploy_dev_portal
+      if: branch = master
+      script: "./scripts/update_dev_portal_properties.sh"
+    - stage: deploy
+      if: tag IS present AND  branch = master
+      script: "./deploy.sh"
+
+
+before_script:
+  - export APP_IMAGE=keboola-component
+  - docker -v
+  - docker build -t $APP_IMAGE .
+
+
+after_success:
+  - docker images
+
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.0.1**
+First version of the processor allowing to convert AVRO to csv, or json csv.
+
+================================================
+File: /src/component.py
+================================================
+import csv
+import fastavro
+import glob
+import simplejson as json
+import logging
+import os
+import sys
+from kbc.env_handler import KBCEnvHandler
+
+KEY_DEBUG = 'debug'
+KEY_COLUMNS = 'columns'
+KEY_RAW = 'raw_mode'
+KEY_MASK = 'extension_mask'
+MANDATORY_PARAMS = []
+
+sys.tracebacklimit = 0
+
+# Disable logical readers, which can incorrectly convert data
+fastavro._read.LOGICAL_READERS['long-timestamp-millis'] = lambda d, w, r: d
+fastavro._read.LOGICAL_READERS['long-timestamp-micros'] = lambda d, w, r: d
+# fastavro._read.LOGICAL_READERS['int-date'] = lambda d, w, r: d
+# fastavro._read.LOGICAL_READERS['bytes-decimal'] = lambda d, w, r: d
+# fastavro._read.LOGICAL_READERS['fixed-decimal'] = lambda d, w, r: d
+fastavro._read.LOGICAL_READERS['string-uuid'] = lambda d, w, r: d
+fastavro._read.LOGICAL_READERS['int-time-millis'] = lambda d, w, r: d
+fastavro._read.LOGICAL_READERS['long-time-micros'] = lambda d, w, r: d
+
+
+class AvroProcessor(KBCEnvHandler):
+
+    def __init__(self):
+
+        super().__init__(MANDATORY_PARAMS, log_level='INFO')
+
+        if self.cfg_params.get(KEY_DEBUG, False) is True:
+            logger = logging.getLogger()
+            logger.setLevel(level='DEBUG')
+
+        self.files_in_path = os.path.join(self.data_path, 'in', 'files')
+        self.files_out_path = os.path.join(self.data_path, 'out', 'files')
+        self.param_columns = self.cfg_params.get(KEY_COLUMNS, [])
+        self.param_mask = self.cfg_params.get(KEY_MASK, '*')
+        self.param_raw = self.cfg_params.get(KEY_RAW, False)
+        self.avro_files = self.get_avro_files()
+
+    def get_avro_files(self):
+
+        _pattern = os.path.join(self.files_in_path, self.param_mask)
+        _avro_files = glob.glob(_pattern)
+
+        _len_avro_files = len(_avro_files)
+        if _len_avro_files == 0:
+            logging.info("No AVRO files found.")
+
+        else:
+            logging.info(f"Processing {_len_avro_files} AVRO files.")
+            logging.debug(f"List of files: {_avro_files}.")
+
+        return _avro_files
+
+    def get_schema_from_files(self):
+
+        schema = []
+
+        for avro_path in self.avro_files:
+            try:
+                with open(avro_path, 'rb') as avro_file:
+                    _rdr = fastavro.reader(avro_file)
+                    _schema = _rdr.writer_schema
+                    schema += [c['name'] for c in _schema['fields']]
+
+            except ValueError as e:
+                logging.exception(f"Error reading AVRO file at path {avro_path} - {e}.")
+                sys.exit(1)
+
+        result_schema = []
+        duplicate_columns = []
+        for column in schema:
+            if column not in result_schema:
+                result_schema += [column]
+            else:
+                duplicate_columns += [column]
+
+        if (_dups := len(duplicate_columns)) != 0:
+            logging.warn(f"{_dups} duplicate columns detected. Duplicates: {list(set(result_schema))}.")
+
+        return result_schema
+
+    def process_simple_avro_files(self, avro_path, file_path, schema):
+
+        writer = csv.DictWriter(open(file_path, 'w', newline=''), fieldnames=schema, restval='', extrasaction='ignore',
+                                quotechar='\"', quoting=csv.QUOTE_ALL, lineterminator='\n')
+        writer.writeheader()
+
+        try:
+            _rn = 0
+            with open(avro_path, 'rb') as avro_file:
+                _rdr = fastavro.reader(avro_file)
+
+                for row in _rdr:
+                    writer.writerow(row)
+                    _rn += 1
+
+                    if _rn % 100000 == 0:
+                        logging.debug(f"Processed {_rn} rows.")
+
+                # writer.writerows(_rdr)
+
+            logging.info(f"Converted {avro_path} to csv. Number of rows: {_rn}")
+
+        except ValueError as e:
+            logging.exception(f"Error reading AVRO file at path {avro_path} - {e}.")
+            sys.exit(1)
+
+    def process_raw_mode(self, avro_path, file_path):
+
+        writer = csv.DictWriter(open(file_path, 'w', newline=''), fieldnames=['data'],
+                                quotechar='\"', quoting=csv.QUOTE_ALL, lineterminator='\n')
+        writer.writeheader()
+
+        try:
+            with open(avro_path, 'rb') as avro_file:
+                _rdr = fastavro.reader(avro_file)
+                _rn = 0
+                for row in _rdr:
+                    writer.writerow({'data': json.dumps(row)})
+                    _rn += 1
+
+                    if _rn % 100000 == 0:
+                        logging.debug(f"Processed {_rn} rows.")
+
+            logging.info(f"Converted {avro_path} to csv. Number of rows: {_rn}")
+
+        except ValueError as e:
+            logging.exception(f"Error reading AVRO file at path {avro_path} - {e}.")
+            sys.exit(1)
+
+    def run(self):
+
+        if self.param_columns == [] or isinstance(self.param_columns, list) is False:
+            _schema = self.get_schema_from_files()
+
+        else:
+            _schema = self.param_columns
+
+        for avro_path in self.avro_files:
+            logging.debug(f"Processing file {avro_path}.")
+            file_name = os.path.basename(avro_path)
+            file_path = os.path.join(self.files_out_path, file_name + '.csv')
+
+            if self.param_raw is True:
+                self.process_raw_mode(avro_path, file_path)
+
+            else:
+                self.process_simple_avro_files(avro_path, file_path, _schema)
+
+
+if __name__ == '__main__':
+    c = AvroProcessor()
+    c.run()
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+#          - echo 'Pushing test image to repo. [tag=test]'
+#          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# Avro2CSV processor
+
+The avro2csv processor allows for conversion of binary AVRO files to flat files. 
+
+[Avro](https://avro.apache.org/) is a row-oriented data serialization framework develop by Apache and allows for storing arbitrarily complex schemas. Conversion of such complex schemas to flat files may not be arbitrary and that's why the extractor also supports a `raw_mode`, where the schema is converted to a new-line delimited JSON, stored in a csv.
+
+**The processor currently supports only avro files with attached schema.**
+
+The complete sample configuration can be found the [component repository](https://bitbucket.org/kds_consulting_team/kds-team.processor-avro2csv/src/master/component_config/sample-config/).
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+The complete sample configuration can be found the [component repository](https://bitbucket.org/kds_consulting_team/kds-team.processor-avro2csv/src/master/component_config/sample-config/).
+
+The processor processes all files in `/data/in/files` folder, which match specified extension mask and outputs them to `/data/out/files` folder.
+
+The processor configuration accepts following parameters:
+
+- `raw_mode`
+    - **description:** A boolean value specifying whether the avro should be converted to a csv or a json-like csv. If set to `true`, processor will create a csv and store each row of the avro file as a json inside. If set to `false`, the processor will try flatten structure and produce a valid csv.
+    - **type:** optional
+    - **values:** `true` or `false`
+- `columns`
+    - **description:** Allows to specify columns which should be present in the resulting csv file. If any of the columns is not present in the avro file, it will be automatically added. If the parameter is not specified, schema is automatically determined from matched avro files. **This parameter is ignored, if `raw_mode` is enabled.**
+    - **type:** optional
+    - **values:** an array of columns, e.g. `["col1", "col2"]`
+- `extension_mask`
+    - **description:** Allows to specify a mask for extensions, which should be processed. The parameter follows a glob syntax and defaults to `*`, i.e. all files are processed.
+    - **type:** optional
+
+### Sample configurations
+
+Processing avro files in raw format, where result is a flat file with one json per row of avro file.
+
+```json
+{
+    "definition": {
+        "component": "kds-team.processor-avro2csv"
+    },
+    "parameters": {
+        "raw_mode": true
+    }
+}
+```
+
+Processing avro files without any schema enforcement.
+
+```json
+{
+    "definition": {
+        "component": "kds-team.processor-avro2csv"
+    }
+}
+```
+
+Processing avro files with enforced schema and extension mask for filtering only wanted extensions.
+
+```json
+{
+    "definition": {
+        "component": "kds-team.processor-avro2csv"
+    },
+    "parameters": {
+        "columns": ["order_id", "order_name", "customer_id"],
+        "extension_mask": "*.avro"
+    }
+}
+```
+
+### Sample use-case
+
+An avro file `data.avro0` was download using from Azure Blob storage. The following processors configuration can be used to convert the avro file to a csv (using this processor), move the file to `./tables` folder (using a [processor for moving files](https://components.keboola.com/components/keboola.processor-move-files)) and create a manifest for the table (using [processor for creating manifests](https://components.keboola.com/components/keboola.processor-create-manifest)).
+
+```json
+{
+    "parameters": {
+        "file": {
+            "file_name": "/data/data.avro0",
+            "primary_key": [],
+            "incremental": false,
+            "storage": "data_from_blob"
+        }
+    },
+    "processors": {
+        "after": [
+            {
+                "definition": {
+                    "component": "kds-team.processor-avro2csv"
+                }
+            },
+            {
+                "definition": {
+                    "component": "keboola.processor-move-files"
+                },
+                "parameters": {
+                    "direction": "tables",
+                    "addCsvSuffix": true,
+                    "folder": "data_from_blob"
+                }
+            },
+            {
+                "definition": {
+                    "component": "keboola.processor-create-manifest"
+                },
+                "parameters": {
+                    "delimiter": ",",
+                    "enclosure": "\"",
+                    "incremental": false,
+                    "primary_key": [
+                        "id"
+                    ]
+                }
+            }
+        ]
+    }
+}
+```
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Avro is a row-oriented remote procedure call and data serialization framework developed within Apache's Hadoop project. It uses JSON for defining data types and protocols, and serializes data in a compact binary format.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "debug": false,
+    "columns": [],
+    "raw_mode": true,
+    "extension_masK": "*.avro"
+  },
+  "image_parameters": {}
+}
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/out/tables/twitter.avro.csv
+================================================
+"data"
+"{""username"": ""miguno"", ""tweet"": ""Rock: Nerf paper, scissors is fine."", ""timestamp"": 1366150681}"
+"{""username"": ""BlizzardCS"", ""tweet"": ""Works as intended.  Terran is IMBA."", ""timestamp"": 1366154481}"
+
+
+================================================
+File: /component_config/sample-config/out/tables/some-file.avro0.csv
+================================================
+"data"
+"{""station"": ""011990-99999"", ""time"": 1433269388, ""temp"": 0, ""temp2"": 123}"
+"{""station"": ""011990-99999"", ""time"": 1433270389, ""temp"": 22, ""temp2"": 0}"
+"{""station"": ""011990-99999"", ""time"": 1433273379, ""temp"": -11, ""temp2"": 0}"
+"{""station"": ""012650-99999"", ""time"": 1433275478, ""temp"": 111, ""temp2"": 0}"
+
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.9.zip#egg=kbc
+fastavro
+python-snappy
+simplejson
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.5-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential libsnappy-dev
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Avro2CSV processor
+
+The avro2csv processor allows for conversion of binary AVRO files to flat files. 
+
+[Avro](https://avro.apache.org/) is a row-oriented data serialization framework develop by Apache and allows for storing arbitrarily complex schemas. Conversion of such complex schemas to flat files may not be arbitrary and that's why the extractor also supports a `raw_mode`, where the schema is converted to a new-line delimited JSON, stored in a csv.
+
+**The processor currently supports only avro files with attached schema.**
+
+The complete sample configuration can be found the [component repository](https://bitbucket.org/kds_consulting_team/kds-team.processor-avro2csv/src/master/component_config/sample-config/).
+
+## Configuration
+
+The processor processes all files in `/data/in/files` folder, which match specified extension mask and outputs them to `/data/out/files` folder.
+
+The processor configuration accepts following parameters:
+
+- `raw_mode`
+    - **description:** A boolean value specifying whether the avro should be converted to a csv or a json-like csv. If set to `true`, processor will create a csv and store each row of the avro file as a json inside. If set to `false`, the processor will try flatten structure and produce a valid csv.
+    - **type:** optional
+    - **values:** `true` or `false`
+- `columns`
+    - **description:** Allows to specify columns which should be present in the resulting csv file. If any of the columns is not present in the avro file, it will be automatically added. If the parameter is not specified, schema is automatically determined from matched avro files. **This parameter is ignored, if `raw_mode` is enabled.**
+    - **type:** optional
+    - **values:** an array of columns, e.g. `["col1", "col2"]`
+- `extension_mask`
+    - **description:** Allows to specify a mask for extensions, which should be processed. The parameter follows a glob syntax and defaults to `*`, i.e. all files are processed.
+    - **type:** optional
+
+### Sample configurations
+
+Processing avro files in raw format, where result is a flat file with one json per row of avro file.
+
+```json
+{
+    "definition": {
+        "component": "kds-team.processor-avro2csv"
+    },
+    "parameters": {
+        "raw_mode": true
+    }
+}
+```
+
+Processing avro files without any schema enforcement.
+
+```json
+{
+    "definition": {
+        "component": "kds-team.processor-avro2csv"
+    }
+}
+```
+
+Processing avro files with enforced schema and extension mask for filtering only wanted extensions.
+
+```json
+{
+    "definition": {
+        "component": "kds-team.processor-avro2csv"
+    },
+    "parameters": {
+        "columns": ["order_id", "order_name", "customer_id"],
+        "extension_mask": "*.avro"
+    }
+}
+```
+
+### Sample use-case
+
+An avro file `data.avro0` was download using from Azure Blob storage. The following processors configuration can be used to convert the avro file to a csv (using this processor), move the file to `./tables` folder (using a [processor for moving files](https://components.keboola.com/components/keboola.processor-move-files)) and create a manifest for the table (using [processor for creating manifests](https://components.keboola.com/components/keboola.processor-create-manifest)).
+
+```json
+{
+    "parameters": {
+        "file": {
+            "file_name": "/data/data.avro0",
+            "primary_key": [],
+            "incremental": false,
+            "storage": "data_from_blob"
+        }
+    },
+    "processors": {
+        "after": [
+            {
+                "definition": {
+                    "component": "kds-team.processor-avro2csv"
+                }
+            },
+            {
+                "definition": {
+                    "component": "keboola.processor-move-files"
+                },
+                "parameters": {
+                    "direction": "tables",
+                    "addCsvSuffix": true,
+                    "folder": "data_from_blob"
+                }
+            },
+            {
+                "definition": {
+                    "component": "keboola.processor-create-manifest"
+                },
+                "parameters": {
+                    "delimiter": ",",
+                    "enclosure": "\"",
+                    "incremental": false,
+                    "primary_key": [
+                        "id"
+                    ]
+                }
+            }
+        ]
+    }
+}
+```
+
+## Development
+
+To build and run the image, use following commands.
+
+```
+docker-compose build dev
+docker-compose run --rm dev
+```
+

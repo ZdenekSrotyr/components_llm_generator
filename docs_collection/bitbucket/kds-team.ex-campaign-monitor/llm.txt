@@ -1,0 +1,507 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-campaign-monitor/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   └── component.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── stack_parameters.json
+    │   └── configSchema.json
+    ├── requirements.txt
+    ├── Dockerfile
+    └── LICENSE.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+
+================================================
+File: /change_log.md
+================================================
+**0.1.3**
+Added endpoint, that obtains information about subscribers.
+
+**0.1.1**
+FLake8 compliance
+
+**0.1.0**
+Initial version of the component. Automatically fetches campaigns, clicks,
+bounces and opens.
+
+================================================
+File: /src/component.py
+================================================
+import os
+import sys
+import csv
+import logging
+import requests
+# import json
+# import pandas as pd
+from pandas.io.json import json_normalize
+# import logging_gelf.handlers
+# import logging_gelf.formatters
+from keboola import docker
+
+
+# Environment setup
+abspath = os.path.abspath(__file__)
+script_path = os.path.dirname(abspath)
+os.chdir(script_path)
+sys.tracebacklimit = 0
+
+DEFAULT_TABLE_INPUT = '/data/in/tables/'
+DEFAULT_TABLE_OUTPUT = '/data/out/tables/'
+ENDPOINT = 'https://api.createsend.com/api/v3.2/'
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)-8s : [line:%(lineno)3s] %(message)s',
+    datefmt="%Y-%m-%d %H:%M:%S")
+
+"""
+logger = logging.getLogger()
+logging_gelf_handler = logging_gelf.handlers.GELFTCPSocketHandler(
+    host=os.getenv('KBC_LOGGER_ADDR'),
+    port=int(os.getenv('KBC_LOGGER_PORT'))
+)
+logging_gelf_handler.setFormatter(
+    logging_gelf.formatters.GELFFormatter(null_character=True))
+logger.addHandler(logging_gelf_handler)
+
+# removes the initial stdout logging
+logger.removeHandler(logger.handlers[0])
+"""
+
+# Access the supplied rules
+cfg = docker.Config('/data/')
+
+try:
+    params = cfg.get_parameters()
+    token = params['#token']
+except KeyError as e:
+    logging.error("Unable to load parameter %s" % e)
+    sys.exit(2)
+
+auth_tuple = (token, '')
+# Authentication function
+
+
+def authenticate():
+    """
+    A dummy function testing the connectivity by downloading
+    a clients table.
+
+    Args:
+        token (str): a string API token for Campaign Monitor API
+
+    Returns:
+        Information on authentication status.
+        clients (dict): If authentication returns 200, a dict of clients is returned.
+    """
+    _endpoint = ENDPOINT + 'clients.json'
+    logging.info("Authenticating...")
+    client_request = requests.get(_endpoint, auth=auth_tuple)
+
+    if client_request.status_code == 200:
+        logging.info("Log in successful. Clients data downloaded.")
+        clients = json_normalize(client_request.json())
+
+        if clients.shape[0] == 0:
+            logging.warn(
+                "Client list is empty, no further data can be downloaded.")
+            sys.exit(1)
+        else:
+            clients.to_csv(DEFAULT_TABLE_OUTPUT + 'clients.csv', index=False)
+            return clients
+    elif client_request.status_code == 401:
+        logging.info(
+            "Unable to log in. Please check, whether API token provided is correct.")
+        sys.exit(1)
+    else:
+        logging.info("Unable to log in. Exited with error %s: %s" % (client_request.status_code,
+                                                                     client_request.json()['Message']))
+        sys.exit(2)
+
+
+def clients_endpoint(client_list):
+    _client_endpoint = ENDPOINT + 'clients/'
+
+    for _, row in client_list.iterrows():
+        cid = row['ClientID']
+        campaigns_request = requests.get(
+            _client_endpoint + cid + '/campaigns.json', auth=auth_tuple)
+        list_request = requests.get(
+            _client_endpoint + cid + '/lists.json', auth=auth_tuple)
+
+        if len(campaigns_request.json()) == 0:
+            logging.warn("No campaigns present for client %s." % row['Name'])
+            continue
+
+        tmp_campaigns = json_normalize(campaigns_request.json())
+        tmp_campaigns['ClientID'] = [cid] * tmp_campaigns.shape[0]
+        if 'campaigns' not in locals():
+            campaigns = tmp_campaigns
+        else:
+            campaigns = campaigns.append(tmp_campaigns, ignore_index=True)
+
+    if campaigns.shape[0] == 0:
+        logging.warn(
+            "No campaigns could be downloaded for any client. No further data is present. Exiting.")
+        sys.exit(1)
+    else:
+        campaigns.to_csv(DEFAULT_TABLE_OUTPUT + 'campaigns.csv', index=False)
+        return campaigns
+
+
+def campaigns_summary(campaigns_list):
+    _campaign_endpoint = ENDPOINT + 'campaigns/'
+
+    for _, row in campaigns_list.iterrows():
+        cid = row['CampaignID']
+
+        summary_request = requests.get(_campaign_endpoint + cid + '/summary.json',
+                                       auth=auth_tuple)
+
+        tmp_summary_campaigns = json_normalize(summary_request.json())
+        tmp_summary_campaigns['CampaignID'] = [cid]
+
+        if 'campaign_summary' not in locals():
+            campaign_summary = tmp_summary_campaigns
+        else:
+            campaign_summary = campaign_summary.append(
+                tmp_summary_campaigns, ignore_index=True)
+
+    campaign_summary.to_csv(DEFAULT_TABLE_OUTPUT +
+                            'campaigns_summary.csv', index=False)
+
+
+def campaign_stats(campaigns_list):
+    _campaign_endpoint = ENDPOINT + 'campaigns/'
+
+    for _, row in campaigns_list.iterrows():
+        cid = row['CampaignID']
+        logging.debug("Getting info for campaign %s" % cid)
+        bounces_request = requests.get(
+            _campaign_endpoint + cid + '/bounces.json', auth=auth_tuple)
+        opens_request = requests.get(
+            _campaign_endpoint + cid + '/opens.json', auth=auth_tuple)
+        clicks_request = requests.get(
+            _campaign_endpoint + cid + '/clicks.json', auth=auth_tuple)
+        # unsubscribes_request = requests.get(_campaign_endpoint + cid + '/unsubscribes.json', auth=auth_tuple)
+        # spam_request = requests.get(_campaign_endpoint + cid + '/spam.json', auth=auth_tuple)
+        logging.debug("Data for campaign %s downloaded." % cid)
+
+        if len(bounces_request.json()['Results']) != 0:
+            tmp_bounces = json_normalize(bounces_request.json()['Results'])
+            tmp_bounces['CampaignID'] = [cid] * tmp_bounces.shape[0]
+
+            if 'bounces' not in locals():
+                bounces = tmp_bounces
+            else:
+                bounces = bounces.append(tmp_bounces, ignore_index=True)
+        logging.info("Bpunces saved.")
+        if len(opens_request.json()['Results']) != 0:
+            tmp_opens = json_normalize(opens_request.json()['Results'])
+            tmp_opens['CampaignID'] = [cid] * tmp_opens.shape[0]
+
+            if 'opens' not in locals():
+                opens = tmp_opens
+            else:
+                opens = opens.append(tmp_opens, ignore_index=True)
+        logging.info("Opens saved.")
+        if len(clicks_request.json()['Results']) != 0:
+            tmp_clicks = json_normalize(clicks_request.json()['Results'])
+            tmp_clicks['CampaignID'] = [cid] * tmp_clicks.shape[0]
+
+            if 'clicks' not in locals():
+                clicks = tmp_clicks
+            else:
+                clicks = clicks.append(tmp_clicks, ignore_index=True)
+
+    if 'opens' in locals():
+        opens.to_csv(DEFAULT_TABLE_OUTPUT + 'opens.csv', index=False)
+
+    if 'bounces' in locals():
+        bounces.to_csv(DEFAULT_TABLE_OUTPUT + 'bounces.csv', index=False)
+
+    if 'clicks' in locals():
+        clicks.to_csv(DEFAULT_TABLE_OUTPUT + 'clicks.csv', index=False)
+
+
+def campaigns_ListAndSegments(campaigns_list):
+    _listsegments_endpoint = ENDPOINT + 'campaigns/%s/listsandsegments.json'
+
+    with open('/data/out/tables/lists.csv', 'w') as campaigns_lists:
+        fieldnames = ['CampaignID', 'ListID', 'Name']
+
+        writer = csv.DictWriter(campaigns_lists, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for _, row in campaigns_list.iterrows():
+            cid = row['CampaignID']
+            logging.info("Getting segments and lists for CampaignID %s." % cid)
+
+            lists_request = requests.get(_listsegments_endpoint % cid, auth=auth_tuple)
+
+            lists = lists_request.json()['Lists']
+
+            for l in lists:
+                l['CampaignID'] = cid
+                writer.writerow(l)
+
+
+def lists():
+    _active_endpoint = ENDPOINT + 'lists/%s/' + 'active.json'
+    _unsubb_endpoint = ENDPOINT + 'lists/%s/' + 'unsubscribed.json'
+    _unconf_endpoint = ENDPOINT + 'lists/%s/' + 'unconfirmed.json'
+    _bouncd_endpoint = ENDPOINT + 'lists/%s/' + 'bounced.json'
+
+    with open('/data/out/tables/lists.csv', 'r') as lists, open('/data/out/tables/subscribers.csv', 'w') as subscribers:
+        reader = csv.DictReader(lists)
+        fieldnames = ['ListID',
+                      'EmailAddress',
+                      'Name',
+                      'Date',
+                      'State',
+                      'CustomFields',
+                      'ReadsEmailWith',
+                      'ConsentToTrack']
+        writer = csv.DictWriter(subscribers, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in reader:
+            list_id = row['ListID']
+
+            logging.info("Getting subscriber information for list %s." % list_id)
+            active_request = requests.get(_active_endpoint % list_id, auth=auth_tuple)
+            unsubb_request = requests.get(_unsubb_endpoint % list_id, auth=auth_tuple)
+            unconf_request = requests.get(_unconf_endpoint % list_id, auth=auth_tuple)
+            bouncd_request = requests.get(_bouncd_endpoint % list_id, auth=auth_tuple)
+
+            for sub in active_request.json()['Results']:
+                sub['ListID'] = list_id
+                writer.writerow(sub)
+
+            logging.info("Active subscribers saved.")
+
+            for sub in unsubb_request.json()['Results']:
+                sub['ListID'] = list_id
+                writer.writerow(sub)
+
+            logging.info("Usubscribed subscribers saved.")
+
+            for sub in unconf_request.json()['Results']:
+                sub['ListID'] = list_id
+                writer.writerow(sub)
+
+            logging.info("Unconfirmed subscribers saved.")
+
+            for sub in bouncd_request.json()['Results']:
+                sub['ListID'] = list_id
+                writer.writerow(sub)
+
+            logging.info("Bounced subscribers saved.")
+
+
+def main():
+    clients = authenticate()
+    campaigns = clients_endpoint(clients)
+    campaign_stats(campaigns)
+    campaigns_ListAndSegments(campaigns)
+    lists()
+
+
+if __name__ == '__main__':
+    main()
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          #- echo 'Pushing test image to repo. [tag=test]'
+          #- export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          #- docker tag $APP_IMAGE:latest $REPOSITORY:test
+          #- eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          #- docker push $REPOSITORY:test
+
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          - echo "Preparing KBC test image"
+          - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+          # push test image to ECR - uncomment when initialised
+          # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          # - docker push $REPOSITORY:test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+          - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+
+
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /requirements.txt
+================================================
+logging_gelf
+
+================================================
+File: /Dockerfile
+================================================
+FROM quay.io/keboola/docker-custom-python:latest
+
+COPY . /code/
+#COPY /data/ /data/
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+Copyright (c) 2018 Keboola DS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
