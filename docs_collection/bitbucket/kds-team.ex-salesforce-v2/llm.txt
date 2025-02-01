@@ -59,13 +59,14 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-mock = "*"
-freezegun = "*"
 "keboola.component" = "*"
+"keboola.http-client" = "*"
 "keboola.utils" = "*"
-salesforce-bulk = "==2.2.0"
 backoff = "*"
+freezegun = "*"
+mock = "*"
 retry = "*"
+salesforce-bulk = "==2.2.0"
 
 [dev-packages]
 
@@ -219,32 +220,25 @@ File: /change_log.md
 ================================================
 File: /src/component.py
 ================================================
+import csv
+import logging
 import os
 import shutil
-from datetime import datetime, timezone
-from os import path, mkdir
 from collections import OrderedDict
-from typing import Dict, Iterator, List
-import logging
-
-import csv
-from retry import retry
+from datetime import datetime, timezone
 from enum import Enum
+from os import mkdir, path
 
 from keboola.component.base import ComponentBase, sync_action
-from keboola.component.dao import TableMetadata, SupportedDataTypes
+from keboola.component.dao import SupportedDataTypes, TableMetadata
 from keboola.component.exceptions import UserException
-from keboola.component.sync_actions import SelectElement, ValidationResult, MessageType
-from keboola.utils.header_normalizer import get_normalizer, NormalizerStrategy
+from keboola.component.sync_actions import MessageType, SelectElement, ValidationResult
+from keboola.utils.header_normalizer import NormalizerStrategy, get_normalizer
+from retry import retry
+from simple_salesforce.exceptions import SalesforceAuthenticationFailed, SalesforceError, SalesforceResourceNotFound
 
-from salesforce_bulk.salesforce_bulk import BulkApiError, BulkBatchFailed
-from simple_salesforce.exceptions import SalesforceAuthenticationFailed, SalesforceResourceNotFound, SalesforceError
-from salesforce.client import SalesforceClient, SalesforceClientException
+from salesforce.client import DEFAULT_API_VERSION, SalesforceClient, SalesforceClientException
 from salesforce.soql_query import SoqlQuery
-
-
-# default as previous versions of this component ex-salesforce-v2 had 40.0
-DEFAULT_API_VERSION = "42.0"
 
 KEY_LOGIN_METHOD = "login_method"
 KEY_CONSUMER_KEY = "#consumer_key"
@@ -259,11 +253,7 @@ KEY_OBJECT = "object"
 KEY_QUERY_TYPE = "query_type_selector"
 KEY_SOQL_QUERY = "soql_query"
 KEY_IS_DELETED = "is_deleted"
-KEY_FIELDS = 'fields'
-
-KEY_ADVANCED_FETCHING_OPTIONS = "advanced_fetching_options"
-KEY_FETCH_IN_CHUNKS = "fetch_in_chunks"
-KEY_CHUNK_SIZE = "chunk_size"
+KEY_FIELDS = "fields"
 
 KEY_BUCKET_NAME = "bucket_name"
 KEY_OUTPUT_TABLE_NAME = "output_table_name"
@@ -283,7 +273,7 @@ KEY_PROXY_USERNAME = "username"
 KEY_PROXY_PASSWORD = "#password"
 KEY_USE_HTTP_PROXY_AS_HTTPS = "use_http_proxy_as_https"
 
-RECORDS_NOT_FOUND = ['Records not found for this query']
+RECORDS_NOT_FOUND = ["Records not found for this query"]
 
 # list of mandatory parameters => if some is missing,
 # component will fail with readable message on initialization.
@@ -330,13 +320,13 @@ class Component(ComponentBase):
         bucket_name = params.get(KEY_BUCKET_NAME, self.get_bucket_name())
         bucket_name = f"in.c-{bucket_name}"
 
-        statefile = self.get_state_file()
+        state_file = self.get_state_file()
 
-        last_run = statefile.get("last_run")
+        last_run = state_file.get("last_run")
         if not last_run:
             last_run = str(datetime(2000, 1, 1).strftime('%Y-%m-%dT%H:%M:%S.000Z'))
 
-        prev_output_columns = statefile.get("prev_output_columns")
+        prev_output_columns = state_file.get("prev_output_columns")
 
         pkey = loading_options.get(KEY_LOADING_OPTIONS_PKEY, [])
         incremental = bool(loading_options.get(KEY_LOADING_OPTIONS_INCREMENTAL))
@@ -356,22 +346,17 @@ class Component(ComponentBase):
                                                  destination=f'{bucket_name}.{table_name}')
         self.create_sliced_directory(table.full_path)
 
-        advanced_fetching_options = params.get(KEY_ADVANCED_FETCHING_OPTIONS, {})
-        fetch_in_chunks = advanced_fetching_options.get(KEY_FETCH_IN_CHUNKS, False)
-        output_columns = []
+        self._test_query(salesforce_client, soql_query, True)
 
-        if fetch_in_chunks:
-            self._test_query(salesforce_client, soql_query, True)
+        results = salesforce_client.download(soql_query, table.full_path)
+        logging.info(f'Downloaded {len(results)} files')
+        total_records = sum(result.get('number_of_records', 0) for result in results)
+        logging.debug([result for result in results])
+        logging.info(f'Downloaded {total_records} records in total')
 
-            job_id, batch_ids = self.run_chunked_query(salesforce_client, soql_query)
-            for index, result in enumerate(self.fetch_chunked_result(salesforce_client, job_id, batch_ids)):
-                output_columns = self.write_results(result, table.full_path, index)
-                output_columns = self.normalize_column_names(output_columns)
-        else:
-            batch_results = self.run_query(salesforce_client, soql_query)
-            for index, result in enumerate(self.fetch_result(batch_results)):
-                output_columns = self.write_results(result, table.full_path, index)
-                output_columns = self.normalize_column_names(output_columns)
+        # remove headers and get columns
+        output_columns = self._fix_header_from_csv(results)
+        output_columns = self.normalize_column_names(output_columns)
 
         if not output_columns:
             if prev_output_columns:
@@ -379,7 +364,7 @@ class Component(ComponentBase):
             elif params.get(KEY_QUERY_TYPE) == "Object":
                 output_columns = soql_query.sf_object_fields
 
-        table.columns = output_columns
+        table.schema = output_columns
 
         if output_columns:
 
@@ -392,6 +377,29 @@ class Component(ComponentBase):
                                    "prev_output_columns": output_columns})
         else:
             shutil.rmtree(table.full_path)
+
+    @staticmethod
+    def _fix_header_from_csv(results: list[dict]) -> list[str]:
+        expected_header = None
+        for result in results:
+            result_file_path = result.get('file')
+            temp_file_path = f"{result_file_path}.tmp"
+            with open(result_file_path, 'r', encoding='utf-8') as infile, open(temp_file_path, 'w', newline='',
+                                                                               encoding='utf-8') as outfile:
+                reader = csv.reader(infile)
+                writer = csv.writer(outfile)
+                # check if header is same as in other files
+                actual_header = next(reader)  # Also skip the header
+                if expected_header:
+                    if actual_header != expected_header:
+                        raise UserException(f"Header in file {result_file_path} is different from expected. "
+                                            f"Expected: {expected_header}, Actual: {actual_header}")
+                else:
+                    expected_header = actual_header
+                for row in reader:
+                    writer.writerow(row)
+            os.replace(temp_file_path, result_file_path)
+        return expected_header
 
     def set_proxy(self) -> None:
         """Sets proxy if defined"""
@@ -489,9 +497,6 @@ class Component(ComponentBase):
 
         if description:
             self._add_columns_to_table_metadata(tm, description, output_columns)
-            # TODO IMPLEMENT IN KCOFAC-2110
-            # self.add_table_metadata(tm, description)
-
         return tm
 
     @staticmethod
@@ -521,20 +526,20 @@ class Component(ComponentBase):
             return SupportedDataTypes["STRING"].value
 
     @staticmethod
-    def validate_incremental_settings(incremental: bool, pkey: List[str]) -> None:
+    def validate_incremental_settings(incremental: bool, pkey: list[str]) -> None:
         if incremental and not pkey:
             raise UserException("Incremental load is set but no private key. Specify a private key in the "
                                 "configuration parameters")
 
     @staticmethod
-    def validate_soql_query(soql_query: SoqlQuery, pkey: List[str]) -> None:
+    def validate_soql_query(soql_query: SoqlQuery, pkey: list[str]) -> None:
         logging.info("Validating SOQL query")
         missing_keys = soql_query.check_pkey_in_query(pkey)
         if missing_keys:
             raise UserException(f"Private Keys {missing_keys} not in query, Add to SOQL query or check that it exists"
                                 f" in the Salesforce object.")
 
-    def get_salesforce_client(self, params: Dict) -> SalesforceClient:
+    def get_salesforce_client(self, params: dict) -> SalesforceClient:
         self.set_proxy()
         try:
             logging.info("Logging in to Salesforce")
@@ -543,10 +548,8 @@ class Component(ComponentBase):
             raise UserException(f"Authentication Failed : recheck your authorization parameters : {e}") from e
 
     @retry(SalesforceAuthenticationFailed, tries=3, delay=5)
-    def _login_to_salesforce(self, params: Dict) -> SalesforceClient:
+    def _login_to_salesforce(self, params: dict) -> SalesforceClient:
         login_method = self._get_login_method()
-
-        advanced_fetching_options = params.get(KEY_ADVANCED_FETCHING_OPTIONS, {})
 
         if login_method == LoginType.SECURITY_TOKEN_LOGIN:
             if not params.get(KEY_SECURITY_TOKEN):
@@ -561,8 +564,7 @@ class Component(ComponentBase):
                                                         password=params.get(KEY_PASSWORD),
                                                         security_token=params.get(KEY_SECURITY_TOKEN),
                                                         sandbox=params.get(KEY_SANDBOX),
-                                                        api_version=params.get(KEY_API_VERSION, DEFAULT_API_VERSION),
-                                                        pk_chunking_size=advanced_fetching_options.get(KEY_CHUNK_SIZE))
+                                                        api_version=params.get(KEY_API_VERSION, DEFAULT_API_VERSION))
 
         elif login_method == LoginType.CONNECTED_APP_LOGIN:
             if not params.get(KEY_CONSUMER_KEY) or not params.get(KEY_CONSUMER_SECRET):
@@ -578,8 +580,7 @@ class Component(ComponentBase):
                                                        consumer_key=params.get(KEY_CONSUMER_KEY),
                                                        consumer_secret=params.get(KEY_CONSUMER_SECRET),
                                                        sandbox=params.get(KEY_SANDBOX),
-                                                       api_version=params.get(KEY_API_VERSION, DEFAULT_API_VERSION),
-                                                       pk_chunking_size=advanced_fetching_options.get(KEY_CHUNK_SIZE))
+                                                       api_version=params.get(KEY_API_VERSION, DEFAULT_API_VERSION))
 
         elif login_method == LoginType.CONNECTED_APP_OAUTH_CC:
             if not params.get(KEY_CONSUMER_KEY) or not params.get(KEY_CONSUMER_SECRET):
@@ -619,44 +620,11 @@ class Component(ComponentBase):
 
     @staticmethod
     def create_sliced_directory(table_path: str) -> None:
-        logging.info("Creating sliced file")
+        logging.info("Creating sliced directory")
         if not path.isdir(table_path):
             mkdir(table_path)
 
-    @retry(tries=3, delay=5)
-    def fetch_chunked_result(self, salesforce_client, job_id, batch_ids) -> Iterator:
-        try:
-            yield from salesforce_client.fetch_batch_results(job_id, batch_ids)
-        except BulkBatchFailed as bulk_err:
-            raise UserException(
-                "Invalid Query: Failed to process query. Check syntax, objects, and fields") from bulk_err
-        except SalesforceClientException as sf_err:
-            raise UserException() from sf_err
-
-    @retry(tries=3, delay=5)
-    def fetch_result(self, batch_results: Iterator) -> Iterator:
-        try:
-            yield from batch_results
-        except BulkBatchFailed as bulk_err:
-            raise UserException("Invalid Query: Failed to process query. "
-                                "Check syntax, objects, and fields") from bulk_err
-
-        except SalesforceClientException as sf_err:
-            raise UserException() from sf_err
-
-    @staticmethod
-    def write_results(result: Iterator, table: str, index: int) -> List[str]:
-        slice_path = path.join(table, str(index))
-        fieldnames = []
-        with open(slice_path, 'w+', newline='') as out:
-            reader = csv.DictReader((b.decode() for b in result))
-            if reader.fieldnames != RECORDS_NOT_FOUND:
-                fieldnames = reader.fieldnames
-                writer = csv.DictWriter(out, fieldnames=reader.fieldnames)
-                writer.writerows(reader)
-        return fieldnames
-
-    def build_soql_query(self, salesforce_client: SalesforceClient, params: Dict, last_run: str) -> SoqlQuery:
+    def build_soql_query(self, salesforce_client: SalesforceClient, params: dict, last_run: str = "") -> SoqlQuery:
         try:
             logging.info("Building SOQL query")
             return self._build_soql_query(salesforce_client, params, last_run)
@@ -664,7 +632,7 @@ class Component(ComponentBase):
             raise UserException(query_error) from query_error
 
     @staticmethod
-    def _build_soql_query(salesforce_client: SalesforceClient, params: Dict, last_run: str) -> SoqlQuery:
+    def _build_soql_query(salesforce_client: SalesforceClient, params: dict, last_run: str) -> SoqlQuery:
         loading_options = params.get(KEY_LOADING_OPTIONS, {})
         salesforce_object = params.get(KEY_OBJECT)
         soql_query_string = params.get(KEY_SOQL_QUERY)
@@ -719,7 +687,7 @@ class Component(ComponentBase):
         return soql_query
 
     @staticmethod
-    def normalize_column_names(output_columns: List[str]) -> List[str]:
+    def normalize_column_names(output_columns: list[str]) -> list[str]:
         header_normalizer = get_normalizer(strategy=NormalizerStrategy.DEFAULT, forbidden_sub="_")
         return header_normalizer.normalize_header(output_columns)
 
@@ -730,15 +698,6 @@ class Component(ComponentBase):
         bucket_name = f"kds-team-ex-salesforce-v2-{config_id}"
         return bucket_name
 
-    @staticmethod
-    def run_chunked_query(salesforce_client: SalesforceClient, soql_query: SoqlQuery) -> Iterator:
-        try:
-            return salesforce_client.run_chunked_query(soql_query)
-        except SalesforceClientException as sf_exc:
-            raise UserException(sf_exc) from sf_exc
-        except BulkApiError as sf_exc:
-            raise UserException(sf_exc) from sf_exc
-
     @sync_action('testConnection')
     def test_connection(self):
         """
@@ -748,7 +707,8 @@ class Component(ComponentBase):
         params = self.configuration.parameters
         self.get_salesforce_client(params)
 
-    def create_markdown_table(self, data):
+    @staticmethod
+    def create_markdown_table(data):
         if not data:
             return ""
         headers = list(data[0].keys())
@@ -758,6 +718,10 @@ class Component(ComponentBase):
             row_values = [str(row[header]) for header in headers]
             table += "| " + " | ".join(row_values) + " |\n"
         return table
+
+    @staticmethod
+    def parse_result(data: OrderedDict) -> dict:
+        return dict((k, v) for k, v in data.items() if k != "attributes")
 
     @sync_action('testQuery')
     def test_query(self):
@@ -771,17 +735,15 @@ class Component(ComponentBase):
             result = self._test_query(salesforce_client, soql_query, False)
             if not result:
                 return ValidationResult("Query returned no results", MessageType.WARNING)
-            for _, result in enumerate(self.fetch_result(result)):
-                reader = csv.DictReader((b.decode() for b in result))
-                for row in reader:
-                    data.append(row)
+            for _, result in enumerate(result.get("records", [])):
+                data.append(self.parse_result(result))
             markdown = self.create_markdown_table(data)
             return ValidationResult(markdown, "table")
         except UserException as e:
             return ValidationResult(f"Query Failed: {e}", MessageType.WARNING)
 
     @sync_action('loadObjects')
-    def load_possible_objects(self) -> List[SelectElement]:
+    def load_possible_objects(self) -> list[SelectElement]:
         """
         Finds all possible objects in Salesforce that can be fetched by the Bulk API
 
@@ -794,7 +756,7 @@ class Component(ComponentBase):
         return [SelectElement(**c) for c in salesforce_client.get_bulk_fetchable_objects()]
 
     @sync_action("loadFields")
-    def load_fields(self) -> List[SelectElement]:
+    def load_fields(self) -> list[SelectElement]:
         """Returns fields available for selected object."""
         params = self.configuration.parameters
         object_name = params.get("object")
@@ -803,7 +765,7 @@ class Component(ComponentBase):
         return [SelectElement(label=f'{field[0]} ({field[1]})', value=field[0]) for field in descriptions]
 
     @sync_action("loadPossibleIncrementalField")
-    def load_possible_incremental_field(self) -> List[SelectElement]:
+    def load_possible_incremental_field(self) -> list[SelectElement]:
         """
         Gets all possible fields of a Salesforce object. It determines the name of the SF object either from the input
         object name or from the SOQL query. This data is used to select an incremental field
@@ -821,7 +783,7 @@ class Component(ComponentBase):
         return self._get_object_fields_names_and_values(object_name)
 
     @sync_action("loadPossiblePrimaryKeys")
-    def load_possible_primary_keys(self) -> List[SelectElement]:
+    def load_possible_primary_keys(self) -> list[SelectElement]:
         """
         Gets all possible primary keys of the data returned of a saleforce object. If the exact object is specified,
         each field is returned, if a query is specified, it is run with LIMIT 1 and the returned data is analyzed to
@@ -844,10 +806,10 @@ class Component(ComponentBase):
     def _get_object_name_from_custom_query(self) -> str:
         params = self.configuration.parameters
         salesforce_client = self.get_salesforce_client(params)
-        query = self.build_soql_query(salesforce_client, params, None)
+        query = self.build_soql_query(salesforce_client, params)
         return query.sf_object
 
-    def _get_object_fields_names_and_normalized_values(self, object_name: str) -> List[SelectElement]:
+    def _get_object_fields_names_and_normalized_values(self, object_name: str) -> list[SelectElement]:
         """
         Return object fields for sync action
 
@@ -861,16 +823,16 @@ class Component(ComponentBase):
         column_values = self.normalize_column_names(columns)
         return [SelectElement(label=column, value=column_values[i]) for i, column in enumerate(columns)]
 
-    def _get_object_fields_names_and_values(self, object_name: str) -> List[SelectElement]:
+    def _get_object_fields_names_and_values(self, object_name: str) -> list[SelectElement]:
         columns = self._get_fields_of_object_by_name(object_name)
         return [SelectElement(label=column, value=column) for column in columns]
 
-    def _get_fields_of_object_by_name(self, object_name: str) -> List[str]:
+    def _get_fields_of_object_by_name(self, object_name: str) -> list[str]:
         params = self.configuration.parameters
         salesforce_client = self.get_salesforce_client(params)
         return salesforce_client.describe_object(object_name)
 
-    def _get_object_fields_from_query(self) -> List[SelectElement]:
+    def _get_object_fields_from_query(self) -> list[SelectElement]:
         """
         Return object fields for sync action
         Returns:
@@ -889,7 +851,7 @@ class Component(ComponentBase):
 
         return [SelectElement(label=column, value=column_values[i]) for i, column in enumerate(columns)]
 
-    def _get_first_result_from_custom_soql(self) -> Dict:
+    def _get_first_result_from_custom_soql(self) -> dict:
         params = self.configuration.parameters
         salesforce_client = self.get_salesforce_client(params)
         query = params.get(KEY_SOQL_QUERY)
@@ -905,13 +867,6 @@ class Component(ComponentBase):
             raise UserException("Failed to determine fields from SOQL query, make sure the SOQL query is valid") from e
 
         return result.get("records")[0] if result.get("totalSize") == 1 else None
-
-    @staticmethod
-    def run_query(salesforce_client: SalesforceClient, soql_query: SoqlQuery) -> Iterator:
-        try:
-            return salesforce_client.run_query(soql_query)
-        except SalesforceClientException as sf_exc:
-            raise UserException(sf_exc) from sf_exc
 
 
 if __name__ == "__main__":
@@ -932,7 +887,7 @@ File: /src/salesforce/soql_query.py
 import logging
 import re
 from enum import Enum
-from typing import List, Callable
+from typing import Callable
 
 
 class QueryType(Enum):
@@ -940,7 +895,7 @@ class QueryType(Enum):
 
 
 class SoqlQuery:
-    def __init__(self, query: str, sf_object: str, sf_object_fields: List[str], query_type="get"):
+    def __init__(self, query: str, sf_object: str, sf_object_fields: list[str], query_type="get"):
         self.sf_object_fields = sf_object_fields
         self.sf_object = sf_object
         self.query = query
@@ -973,11 +928,11 @@ class SoqlQuery:
         return SoqlQuery(query_string, sf_object, sf_object_fields, query_type)
 
     @staticmethod
-    def _list_to_lower(str_list: List[str]) -> List[str]:
+    def _list_to_lower(str_list: list[str]) -> list[str]:
         return [x.lower() for x in str_list]
 
     @staticmethod
-    def _construct_soql_from_fields(sf_object: str, sf_object_fields: List[str]) -> str:
+    def _construct_soql_from_fields(sf_object: str, sf_object_fields: list[str]) -> str:
         soql_query = f"SELECT {','.join(sf_object_fields)} FROM {sf_object}"
         return soql_query
 
@@ -1041,7 +996,7 @@ class SoqlQuery:
             new_query = "".join([soql, new_where_string])
         return new_query
 
-    def check_pkey_in_query(self, pkeys: List[str]) -> List:
+    def check_pkey_in_query(self, pkeys: list[str]) -> list:
         missing_keys = []
         # split a string by space, comma, and period characters
         query_words = re.split("\\s|(?<!\\d)[,.](?!\\d)", self.query.lower())
@@ -1063,22 +1018,20 @@ class SoqlQuery:
 ================================================
 File: /src/salesforce/client.py
 ================================================
-import logging
-from time import sleep
-from urllib.parse import urlparse, urljoin
 import copy
-import backoff
-import requests
-
-from salesforce_bulk import SalesforceBulk
-from salesforce_bulk.salesforce_bulk import BulkBatchFailed
-from simple_salesforce.exceptions import SalesforceExpiredSession, SalesforceMalformedRequest
-from salesforce_bulk.salesforce_bulk import DEFAULT_API_VERSION
-from simple_salesforce.api import SFType, Salesforce
-
+import logging
+import os
 from collections import OrderedDict
+from typing import Any, Iterator
+from urllib.parse import urlparse
+
+import backoff
+from keboola.http_client import HttpClient
+from simple_salesforce.api import Salesforce, SFType
+from simple_salesforce.bulk2 import ColumnDelimiter, LineEnding, Operation, QueryResult, SFBulk2Type
+from simple_salesforce.exceptions import SalesforceBulkV2LoadError, SalesforceExpiredSession, SalesforceMalformedRequest
+
 from .soql_query import SoqlQuery
-from typing import List, Tuple, Iterator, Any, Dict
 
 NON_SUPPORTED_BULK_FIELD_TYPES = ["address", "location", "base64"]
 
@@ -1094,60 +1047,91 @@ OBJECTS_NOT_SUPPORTED_BY_BULK = ["AccountFeed", "AssetFeed", "AccountHistory", "
                                  "ServiceAppointmentStatus", "SolutionStatus", "TaskPriority", "TaskStatus",
                                  "TaskWhoRelation", "UserRecordAccess", "WorkOrderLineItemStatus", "WorkOrderStatus"]
 
-DEFAULT_CHUNK_SIZE = 100000
+DEFAULT_QUERY_PAGE_SIZE = 50000
+
+# default as previous versions of this component ex-salesforce-v2 had 40.0
+DEFAULT_API_VERSION = "52.0"
+MAX_RETRIES = 3
 
 
 class SalesforceClientException(Exception):
     pass
 
 
-class SalesforceClient(SalesforceBulk):
-    def __init__(self, simple_client: Salesforce, api_version: str, pk_chunking_size: int = DEFAULT_CHUNK_SIZE,
+class SalesforceBulk2(SFBulk2Type):
+    def __init__(self, sf_client, object_name: str):
+        super().__init__(object_name, sf_client.bulk2_url, sf_client.headers, sf_client.session)
+
+    def download(self,
+                 query: str,
+                 path: str,
+                 max_records: int = DEFAULT_QUERY_PAGE_SIZE,
+                 column_delimiter: ColumnDelimiter = ColumnDelimiter.COMMA,
+                 line_ending: LineEnding = LineEnding.LF,
+                 wait: int = 5, ) -> list[QueryResult]:
+
+        if not os.path.exists(path):
+            raise SalesforceBulkV2LoadError(f"Path does not exist: {path}")
+
+        res = self._client.create_job(Operation.query_all, query, column_delimiter, line_ending)
+        job_id = res["id"]
+        self._client.wait_for_job(job_id, True, wait)
+
+        results = []
+        locator = "INIT"
+        while locator:
+            if locator == "INIT":
+                locator = ""
+            result = self._client.download_job_data(path, job_id, locator, max_records)
+            locator = result["locator"]
+            results.append(result)
+        return results
+
+
+class SalesforceClient(HttpClient):
+    def __init__(self, simple_client: Salesforce, api_version: str,
                  consumer_key: str = None, consumer_secret: str = None) -> None:
         # Initialize the client with from_connected_app or from_security_token, this creates a login with the
         # simple salesforce client. The simple_client sessionId is a Bearer token that is result of the login.
-        super().__init__(sessionId=simple_client.session_id,
-                         host=simple_client.sf_instance,
-                         API_version=api_version)
+        super().__init__('NONE', max_retries=MAX_RETRIES)
+        self._consumer_key = consumer_key
+        self._consumer_secret = consumer_secret
         self.simple_client = simple_client
-        self.pk_chunking_size = pk_chunking_size
         self.api_version = api_version
-        self.host = urlparse(self.endpoint).hostname
+        self.host = urlparse(self.simple_client.base_url).hostname
+        self.sessionId = self.simple_client.session_id
 
     @classmethod
     def from_connected_app(cls, username: str, password: str, consumer_key: str, consumer_secret: str, sandbox: str,
-                           api_version: str = DEFAULT_API_VERSION, pk_chunking_size: int = DEFAULT_CHUNK_SIZE,
-                           domain: str = None):
+                           api_version: str = DEFAULT_API_VERSION, domain: str = None):
         domain = 'test' if sandbox else domain
 
         simple_client = Salesforce(username=username, password=password, consumer_secret=consumer_secret,
                                    consumer_key=consumer_key,
                                    domain=domain, version=api_version)
 
-        return cls(simple_client=simple_client, api_version=api_version, pk_chunking_size=pk_chunking_size)
+        return cls(simple_client=simple_client, api_version=api_version)
 
     @classmethod
     def from_security_token(cls, username: str, password: str, security_token: str, sandbox: str, api_version: str,
-                            pk_chunking_size: int = DEFAULT_CHUNK_SIZE,
                             domain: str = None):
 
         domain = 'test' if sandbox else domain
         simple_client = Salesforce(username=username, password=password, security_token=security_token,
                                    domain=domain, version=api_version)
 
-        return cls(simple_client=simple_client, api_version=api_version, pk_chunking_size=pk_chunking_size)
+        return cls(simple_client=simple_client, api_version=api_version)
 
     @classmethod
-    def from_connected_app_oauth_cc(cls, consumer_key: str, consumer_secret: str, domain: str, api_version: str,
-                                    pk_chunking_size: int = DEFAULT_CHUNK_SIZE):
+    def from_connected_app_oauth_cc(cls, consumer_key: str, consumer_secret: str, domain: str, api_version: str):
 
         simple_client = Salesforce(consumer_key=consumer_key, consumer_secret=consumer_secret, domain=domain,
                                    version=api_version)
 
-        return cls(simple_client=simple_client, api_version=api_version, pk_chunking_size=pk_chunking_size)
+        return cls(simple_client=simple_client, api_version=api_version)
 
     @backoff.on_exception(backoff.expo, SalesforceClientException, max_tries=3)
-    def describe_object(self, sf_object: str) -> List[str]:
+    def describe_object(self, sf_object: str) -> list[str]:
         salesforce_type = SFType(sf_object, self.sessionId, self.host, sf_version=self.api_version)
 
         try:
@@ -1158,7 +1142,7 @@ class SalesforceClient(SalesforceBulk):
         return [field['name'] for field in object_desc['fields'] if self.is_bulk_supported_field(field)]
 
     @backoff.on_exception(backoff.expo, SalesforceClientException, max_tries=3)
-    def describe_object_w_metadata(self, sf_object: str) -> List[Tuple[str, str]]:
+    def describe_object_w_metadata(self, sf_object: str) -> list[tuple[str, str]]:
         salesforce_type = SFType(sf_object, self.sessionId, self.host, sf_version=self.api_version)
 
         try:
@@ -1170,7 +1154,7 @@ class SalesforceClient(SalesforceBulk):
                 if self.is_bulk_supported_field(field)]
 
     @backoff.on_exception(backoff.expo, SalesforceClientException, max_tries=3)
-    def describe_object_w_complete_metadata(self, sf_object: str) -> Dict[str, Any]:
+    def describe_object_w_complete_metadata(self, sf_object: str) -> dict[str, Any]:
         salesforce_type = SFType(sf_object, self.sessionId, self.host, sf_version=self.api_version)
 
         try:
@@ -1184,109 +1168,34 @@ class SalesforceClient(SalesforceBulk):
     def is_bulk_supported_field(field: OrderedDict) -> bool:
         return field["type"] not in NON_SUPPORTED_BULK_FIELD_TYPES
 
-    @backoff.on_exception(backoff.expo, SalesforceClientException, max_tries=3)
-    def run_query(self, soql_query: SoqlQuery, fail_on_error: bool = False) -> Iterator:
-        job = self.create_queryall_job(soql_query.sf_object, contentType='CSV', concurrency='Parallel')
-        batch = self.query(job, soql_query.query)
-        self.close_job(job)
-        logging.info(f"Running SOQL : {soql_query.query}")
-
+    def download(self, soql_query: SoqlQuery, path: str, fail_on_error: bool = False,
+                 query_page_size: int = DEFAULT_QUERY_PAGE_SIZE) -> list[QueryResult]:
         try:
-            while not self.is_batch_done(batch):
-                sleep(10)
-        except BulkBatchFailed as batch_fail:
-            if fail_on_error:
-                raise SalesforceClientException(batch_fail.state_message)
-            logging.exception(batch_fail.state_message)
-        except ConnectionError as e:
-            raise SalesforceClientException(f"Encountered error when running query: {e}") from e
-        except SalesforceExpiredSession as e:
-            raise SalesforceClientException(f"Encountered Expired Session error when running query: {e}") from e
+            bulk2 = SalesforceBulk2(self.simple_client, soql_query.sf_object)
 
-        logging.info("SOQL ran successfully, fetching results")
-        batch_result = self.get_all_results_from_query_batch(batch)
-        return batch_result
+            logging.info(f"Running SOQL : {soql_query.query}")
+            query_results = bulk2.download(soql_query.query, path, max_records=query_page_size)
+            logging.info("SOQL ran successfully")
+
+            return query_results
+        except SalesforceBulkV2LoadError as e:
+            if fail_on_error:
+                raise SalesforceClientException(e)
+            logging.exception(e)
 
     def test_query(self, soql_query: SoqlQuery, add_limit: bool = False) -> Iterator:
         """Test query has been implemented to prevent long timeouts of batched queries."""
         test_query = copy.deepcopy(soql_query)
         if add_limit:
             test_query.add_limit()
-
         try:
             logging.info("Running test SOQL.")
-            result = self.run_query(test_query, fail_on_error=True)
+            result = self.simple_client.query(test_query.query)
         except (SalesforceMalformedRequest, SalesforceClientException):
             raise SalesforceClientException(f"Test Query {test_query.query} failed, please re-check the query.")
 
         logging.info("Test query has been successful.")
         return result
-
-    @backoff.on_exception(backoff.expo, SalesforceClientException, max_tries=3)
-    def run_chunked_query(self, soql_query):
-        job = self.create_queryall_job(soql_query.sf_object, contentType='CSV', concurrency='Parallel',
-                                       pk_chunking=self.pk_chunking_size)
-        self.query(job, soql_query.query)
-        logging.info(f"Running SOQL : {soql_query.query}")
-        try:
-            while self.job_status(job)['numberBatchesTotal'] != self.job_status(job)['numberBatchesCompleted']:
-                sleep(10)
-        except BulkBatchFailed as batch_fail:
-            logging.exception(batch_fail.state_message)
-        logging.info("SOQL ran successfully, fetching results")
-        batch_id_list = [batch['id'] for batch in self.get_batch_list(job) if batch['state'] == 'Completed']
-        return job, batch_id_list
-
-    def fetch_batch_results(self, job: str, batch_id_list: List[str]) -> Iterator:
-        for i, batch_id in enumerate(batch_id_list):
-            logging.info(f"Fetching batch results for batch {i + 1}/{len(batch_id_list)}, id : {batch_id}")
-            yield from self.get_all_results_from_query_batch(batch_id, job)
-        self.close_job(job)
-
-    def get_all_results_from_query_batch(self, batch_id: str, job_id: str = None, chunk_size: int = 8196) -> Iterator:
-        """
-        Gets result ids and generates each result set from the batch and returns it
-        as a generator fetching the next result set when needed
-
-        Args:
-            batch_id: id of batch
-            job_id: id of job, if not provided, it will be looked up
-            chunk_size : size of chunks for stream
-        """
-        result_ids = self.get_query_batch_result_ids(batch_id, job_id=job_id)
-        if not result_ids:
-            raise RuntimeError('Batch is not complete')
-        for result_id in result_ids:
-            yield self.get_query_batch_result(
-                batch_id,
-                result_id,
-                job_id=job_id,
-                chunk_size=chunk_size
-            )
-
-    @backoff.on_exception(backoff.expo, SalesforceClientException, max_tries=3)
-    def get_query_batch_result(self, batch_id: str, result_id: str, job_id: str = None,
-                               chunk_size: int = 8196) -> Iterator:
-        job_id = job_id or self.lookup_job_id(batch_id)
-        uri = urljoin(
-            self.endpoint + "/",
-            "job/{0}/batch/{1}/result/{2}".format(
-                job_id, batch_id, result_id),
-        )
-
-        try:
-            resp = requests.get(uri, headers=self.headers(), stream=True)
-        except ConnectionError as e:
-            raise SalesforceClientException(f"Cannot get query batch results, error: {e}") from e
-
-        self.check_status(resp)
-
-        # Read the content in chunks and join them
-        content = b''.join(resp.iter_content(chunk_size=chunk_size))
-        # Split the content into lines, keeping the line endings
-        lines = content.splitlines(keepends=True)
-        # Convert bytes to strings and yield each line
-        return (line.replace(b'\0', b'') for line in lines)
 
     def build_query_from_string(self, soql_query_string: str) -> SoqlQuery:
         try:
@@ -1311,8 +1220,8 @@ class SalesforceClient(SalesforceBulk):
         # Only objects with the 'queryable' set to True and ones that are not in the OBJECTS_NOT_SUPPORTED_BY_BULK are
         # queryable by the Bulk API. This list might not be exact, and some edge-cases might have to be addressed.
         for sf_object in all_s_objects:
-            if sf_object.get('queryable') and not sf_object.get('name') in OBJECTS_NOT_SUPPORTED_BY_BULK:
-                to_fetch.append({"label": sf_object.get('label'), 'value': sf_object.get('name')})
+            if sf_object.get("queryable") and sf_object.get("name") not in OBJECTS_NOT_SUPPORTED_BY_BULK:
+                to_fetch.append({"label": sf_object.get("label"), "value": sf_object.get("name")})
         return to_fetch
 
 
@@ -1601,44 +1510,19 @@ File: /component_config/configSchema.json
       "title": "API version",
       "type": "string",
       "enum": [
-        "21.0",
-        "22.0",
-        "23.0",
-        "24.0",
-        "25.0",
-        "26.0",
-        "27.0",
-        "28.0",
-        "29.0",
-        "30.0",
-        "31.0",
-        "32.0",
-        "34.0",
-        "35.0",
-        "36.0",
-        "37.0",
-        "38.0",
-        "39.0",
-        "40.0",
-        "41.0",
-        "42.0",
-        "43.0",
-        "44.0",
-        "45.0",
-        "46.0",
-        "47.0",
-        "48.0",
-        "49.0",
-        "50.0",
-        "51.0",
         "52.0",
         "53.0",
         "54.0",
         "55.0",
         "56.0",
-        "57.0"
+        "57.0",
+        "58.0",
+        "59.0",
+        "60.0",
+        "61.0",
+        "62.0"
       ],
-      "default": "57.0",
+      "default": "62.0",
       "description": "Specify the version of API you want to extract data from",
       "propertyOrder": 50
     },
@@ -1829,34 +1713,6 @@ File: /component_config/configRowSchema.json
       "default": false,
       "description": "Fetch records that have been deleted",
       "propertyOrder": 6
-    },
-    "advanced_fetching_options": {
-      "type": "object",
-      "title": "Advanced Fetching Options",
-      "propertyOrder": 50,
-      "properties": {
-        "fetch_in_chunks": {
-          "title": "Fetch Data in chunks",
-          "type": "boolean",
-          "format": "checkbox",
-          "default": false,
-          "description": "If set to true, the object will be fetched in chunks based on primary keys, use for objects that support pk_chunking when data sizes are above 900MB",
-          "propertyOrder": 10
-        },
-        "chunk_size": {
-          "title": "Chunk Size",
-          "type": "integer",
-          "default": 100000,
-          "minimum": 100,
-          "options": {
-            "dependencies": {
-              "fetch_in_chunks": true
-            }
-          },
-          "description": "Size of chunks for each batch",
-          "propertyOrder": 20
-        }
-      }
     },
     "loading_options": {
       "type": "object",
@@ -2394,7 +2250,8 @@ File: /requirements.txt
 ================================================
 backoff==2.2.1; python_version >= '3.7' and python_version < '4.0'
 freezegun==1.5.1; python_version >= '3.7'
-keboola.component==1.6.9; python_version >= '3.7'
+keboola.component==1.6.10; python_version >= '3.7'
+keboola.http-client==1.0.1; python_version >= '3.7'
 keboola.utils==1.1.0; python_version >= '3.7'
 mock==5.1.0; python_version >= '3.6'
 retry==0.9.2
@@ -2405,10 +2262,7 @@ salesforce-bulk==2.2.0
 File: /Dockerfile
 ================================================
 FROM python:3.13-slim
-ENV PYTHONIOENCODING utf-8
 
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
 RUN pip install flake8
 
 COPY requirements.txt /code/requirements.txt
@@ -2572,7 +2426,7 @@ the component. This is done by specifying an incremental field in the object tha
     "#password": "password",
     "#security_token": "token_here",
     "sandbox": false,
-    "api_version" : "39.0",
+    "api_version" : "52.0",
     "object": "Contact",
     "soql_query": "select Id, FirstName,LastName,isdeleted,lastmodifieddate from Contact",
     "is_deleted": false,
