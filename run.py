@@ -7,7 +7,7 @@ import requests
 from dotenv import load_dotenv
 
 # Constants
-GITHUB_ALLOWED_PREFIXES = ('ex-', 'wr-', 'components-', 'generic-')
+GITHUB_ALLOWED_PREFIXES = ('ex-', 'wr-','component-', 'components-', 'generic-')
 GITHUB_ONLY_PUBLIC_REPOS = True  # True = process only public repos, False = process all repos
 
 BITBUCKET_ALLOWED_PREFIXES = ('kds-team.')
