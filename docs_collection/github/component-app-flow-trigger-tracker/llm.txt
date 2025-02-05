@@ -1,0 +1,1634 @@
+Directory structure:
+└── keboola-component-app-flow-trigger-tracker/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── src/
+    │   ├── keboolaApi/
+    │   │   └── client.py
+    │   └── component.py
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── logger
+    │   ├── component_long_description.md
+    │   ├── licenseUrl.md
+    │   ├── sourceCodeUrl.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── loggerConfiguration.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   ├── sample-config/
+    │   │   ├── config.json
+    │   │   ├── in/
+    │   │   │   ├── state.json
+    │   │   │   ├── tables/
+    │   │   │   │   ├── test.csv
+    │   │   │   │   └── test.csv.manifest
+    │   │   │   └── files/
+    │   │   │       └── order1.xml
+    │   │   └── out/
+    │   │       ├── tables/
+    │   │       │   └── test.csv
+    │   │       └── files/
+    │   │           └── order1.xml
+    │   └── documentationUrl.md
+    ├── scripts/
+    │   ├── run_kbc_tests.ps1
+    │   ├── developer_portal/
+    │   │   ├── update_properties.sh
+    │   │   └── fn_actions_md_update.sh
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── .github/
+    │   └── workflows/
+    │       └── push.yml
+    ├── docs/
+    │   └── imgs/
+    ├── TEMPLATE_README.md
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    example
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/keboolaApi/client.py
+================================================
+import json
+import logging
+
+import requests
+
+
+class KeboolaClientException(Exception):
+    pass
+
+
+class KeboolaClient:
+    def __init__(self, token, url):
+        self.token = token
+        self.url = f'{url}/v2/storage'
+        self.headers = {
+            'X-StorageApi-Token': self.token,
+            'Content-Type': 'application/json'
+        }
+
+    @staticmethod
+    def _handle_http_error(response):
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            response_error = json.loads(e.response.text)
+            raise KeboolaClientException(
+                f"{response_error.get('error')}. Exception code {response_error.get('code')}") from e
+
+    def get_trigger(self, flow_ids):
+        # return all triggers that are in the flow_ids list
+        return [trigger for trigger in self.get_triggers() if trigger.get('configurationId') in flow_ids]
+
+    def get_triggers(self):
+        url = f'{self.url}/triggers'
+        response = requests.get(url=url, headers=self.headers)
+
+        self._handle_http_error(response)
+        return response.json()
+
+    def get_component_configuration_detail(self, component_id, configuration_id):
+        url = f'{self.url}/components/{component_id}/configs/{configuration_id}'
+        response = requests.get(url=url, headers=self.headers)
+
+        self._handle_http_error(response)
+        return response.json()
+
+    def get_table_detail(self, table_id):
+        url = f'{self.url}/tables/{table_id}'
+        response = requests.get(url=url, headers=self.headers)
+
+        self._handle_http_error(response)
+        return response.json()
+
+    def remove_trigger(self, trigger_id):
+        url = f'{self.url}/triggers/{trigger_id}'
+        response = requests.delete(url=url, headers=self.headers)
+
+        self._handle_http_error(response)
+        logging.info(f"Trigger id:{trigger_id} deleted!")
+        return response.text
+
+    def create_trigger(self, trigger):
+        url = f'{self.url}/triggers'
+        response = requests.post(url=url, headers=self.headers, json=trigger)
+
+        self._handle_http_error(response)
+        logging.info(f"Trigger id:{response.json().get('id')} created!")
+        return response.json()
+
+
+================================================
+File: /src/component.py
+================================================
+"""
+Template Component main class.
+
+"""
+import csv
+import logging
+from typing import List, Dict
+
+from keboola.component.base import ComponentBase, sync_action
+from keboola.component.exceptions import UserException
+from keboola.component.sync_actions import SelectElement, ValidationResult
+
+import keboolaApi.client as client
+
+# configuration variables
+KEY_OUTPUT_LIST_FLOWS = 'output_list_flows'
+KEY_FLOW_TRIGGER_IDS = 'flow_trigger_ids'
+
+
+class Component(ComponentBase):
+    """
+        Extends base class for general Python components. Initializes the CommonInterface
+        and performs configuration validation.
+
+        For easier debugging the data folder is picked up by default from `../data` path,
+        relative to working directory.
+
+        If `debug` parameter is present in the `config.json`, the default logger is set to verbose DEBUG mode.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.client = None
+
+    def run(self):
+        """
+        Main execution code
+        """
+        self._init_configuration()
+        params = self.configuration.parameters
+
+        # reset triggers
+        if params.get(KEY_FLOW_TRIGGER_IDS) or len(params.get(KEY_FLOW_TRIGGER_IDS)) > 0:
+            triggers = self._list_triggers(params.get(KEY_FLOW_TRIGGER_IDS))
+            for trigger in triggers:
+                # Remove triggers
+                if trigger:
+                    logging.info(
+                        f"Reset trigger id:{trigger.get('id')} "
+                        f"for flow name:{trigger.get('configuration_detail').get('name')}")
+                    new_trigger_conf = self._prep_new_trigger_configuration(trigger)
+                    self.client.create_trigger(new_trigger_conf)
+                    self.client.remove_trigger(trigger.get('id'))
+
+        # List triggers to output
+        if params.get(KEY_OUTPUT_LIST_FLOWS):
+            # List triggers
+            triggers = self._list_triggers()
+            if triggers:
+                columns = ['flow_configuration_id',
+                           'trigger_last_run',
+                           'flow_configuration_name',
+                           'selected_table_id',
+                           'selected_table_is_expected',
+                           'selected_table_last_import_date']
+
+                # Create output table (Tabledefinition - just metadata)
+                out_table = self.create_out_table_definition('flows_with_trigger.csv',
+                                                             primary_key=['flow_configuration_id', 'selected_table_id'])
+                logging.info(out_table.full_path)
+
+                # Create output table (Tabledefinition - just metadata)
+                with open(out_table.full_path, mode='wt', encoding='utf-8', newline='') as out_file:
+                    # write result with column added
+                    writer = csv.DictWriter(out_file, fieldnames=columns, dialect='kbc')
+                    writer.writeheader()
+
+                    for trigger in triggers:
+                        for table in trigger.get('tables'):
+                            writer.writerow({'flow_configuration_id': trigger.get('configuration_detail').get('id'),
+                                             'trigger_last_run': trigger.get('lastRun'),
+                                             'flow_configuration_name': trigger.get('configuration_detail').get('name'),
+                                             'selected_table_id': table.get('tableId'),
+                                             'selected_table_is_expected': table.get('table_detail').get('is_expected',
+                                                                                                         None),
+                                             'selected_table_last_import_date': table.get('table_detail').get(
+                                                 'lastImportDate',
+                                                 None)})
+
+                # Save table manifest (output.csv.manifest) from the tabledefinition
+                self.write_manifest(out_table)
+
+    def _check_environments_variables(self):
+        """
+        Check the presence of required environment variables and log an error if any are missing.
+        """
+        if not self.environment_variables.token:
+            logging.error("Environment variable self.environment_variables.token not found!")
+
+        if not self.environment_variables.url:
+            logging.error("Environment variable url not found!")
+
+    def _init_configuration(self):
+        self._check_environments_variables()
+        # Access parameters in data/config.json
+        self.client = client.KeboolaClient(self.environment_variables.token, self.environment_variables.url)
+
+    def _list_triggers(self, flow_ids=None):
+        """
+        Get list of triggers from the client
+        """
+        if flow_ids:
+            triggers: List[Dict] = self.client.get_trigger(flow_ids)
+        else:
+            triggers = self.client.get_triggers()
+
+        for trigger in triggers:
+            # Add configuration details to the trigger
+            try:
+                configuration_detail = self.client.get_component_configuration_detail(trigger.get('component'),
+                                                                                      trigger.get('configurationId'))
+                trigger['configuration_detail'] = configuration_detail
+            except client.KeboolaClientException as e:
+                logging.debug(
+                    f"Error while get_configuration_detail "
+                    f"for {trigger.get('component')}:{trigger.get('configurationId')} "
+                    f"for trigger {trigger.get('id')}: {e}")
+
+            # Add table details to the trigger
+            for table in trigger.get('tables'):
+                table_detail = self.client.get_table_detail(table.get('tableId'))
+                if table_detail:
+                    table_detail['is_expected'] = self._is_expected(trigger.get('lastRun'),
+                                                                    table_detail.get('lastImportDate'))
+                    table['table_detail'] = table_detail
+                # add some flag if some tables are missing
+                else:
+                    trigger['some_tables_missing'] = True
+        return [trigger for trigger in triggers if trigger.get('configuration_detail', None)]
+
+    @sync_action('list_flows')
+    def list_flows(self):
+        """
+        List all flows and formate it to a list of SelectElement
+        """
+        self._init_configuration()
+        return [SelectElement(label=trigger.get('configuration_detail').get('name'),
+                              value=trigger.get('configuration_detail').get('id')) for trigger in self._list_triggers()]
+
+    @sync_action('flow_detail')
+    def flow_detail(self):
+        """
+        List all flows and format it to a Markdown table
+        """
+        self._init_configuration()
+        params = self.configuration.parameters
+        # Get detail of triggers
+        if params.get(KEY_FLOW_TRIGGER_IDS):
+            # Initialize the Markdown table
+            markdown_table = "| Flow | Trigger Last Run | Selected Tables | Last Import | Is expected |\n"
+            markdown_table += "|------|------------------|-----------------|-------------|-------------|\n"
+            # Fill in the table rows
+            markdown_table += ''.join(
+                f"| **{trigger['configuration_detail']['name']}** "
+                f"| {trigger['lastRun']} "
+                f"| **{table['table_detail']['id']}** "
+                f"| {table['table_detail']['lastImportDate']}) "
+                f"| {table['table_detail']['is_expected']} |\n"
+                for trigger in self._list_triggers(params.get(KEY_FLOW_TRIGGER_IDS))
+                for table in trigger.get('tables')
+            )
+
+            # Return the Markdown table
+            return ValidationResult(message=markdown_table)
+
+    @staticmethod
+    def _prep_new_trigger_configuration(trigger):
+        new_trigger_conf = {
+            'runWithTokenId': trigger.get('runWithTokenId'),
+            'component': trigger.get('component'),
+            'configurationId': trigger.get('configurationId'),
+            'coolDownPeriodMinutes': trigger.get('coolDownPeriodMinutes'),
+            'tableIds': [tbl.get('tableId') for tbl in trigger.get('tables')]
+        }
+        return new_trigger_conf
+
+    @staticmethod
+    def _is_expected(last_run, last_import):
+        if last_run >= last_import:
+            return True
+        else:
+            return False
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        # this triggers the run method by default and is controlled by the configuration.action parameter
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/logger
+================================================
+gelf
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+app-flow-trigger-tracker long description
+
+================================================
+File: /component_config/licenseUrl.md
+================================================
+https://github.com/keboola/component-app-flow-trigger-tracker/blob/master/LICENSE.md
+
+================================================
+File: /component_config/sourceCodeUrl.md
+================================================
+https://github.com/keboola/component-app-flow-trigger-tracker
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+Configuration description.
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+kds-team.app-flow-trigger-tracker short description
+
+================================================
+File: /component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Application configuration",
+  "properties": {
+    "flow_trigger_ids": {
+      "propertyOrder": 1,
+      "title": "Flow triggers to reset",
+      "type": "array",
+      "description": "The ID of the trigger you wish to reset.",
+      "enum": [],
+      "items": {
+        "enum": [],
+        "type": "string"
+      },
+      "format": "select",
+      "options": {
+        "async": {
+          "cache": true,
+          "label": "Re-load flows with trigger",
+          "action": "list_flows",
+          "autoload": []
+        }
+      },
+      "uniqueItems": true
+    },
+    "validation_button": {
+        "type": "button",
+        "format": "sync-action",
+        "propertyOrder": 10,
+        "options": {
+          "async": {
+            "label": "Check flow triggers statuses",
+            "action": "flow_detail",
+            "autoload": [
+              "parameters.flow_trigger_ids"
+            ]
+          }
+        }
+      }
+  }
+}
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/documentationUrl.md
+================================================
+https://github.com/keboola/component-app-flow-trigger-tracker/blob/master/README.md
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/developer_portal/update_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+
+# Check if the APP_NAME environment variable is set
+if [ -z "$KBC_DEVELOPERPORTAL_APP" ]; then
+    echo "Error: KBC_DEVELOPERPORTAL_APP environment variable is not set."
+    exit 1
+fi
+
+if [ -z "$IS_DEPLOY_READY" ]; then
+    echo ":Error IS_DEPLOY_READY environment variable is not set."
+    exit 1
+fi
+
+
+# Pull the latest version of the developer portal CLI Docker image
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+# Function to update a property for the given app ID
+update_property() {
+    local app_id="$1"
+    local prop_name="$2"
+    local file_path="$3"
+
+    if [ ! -f "$file_path" ]; then
+        echo "File '$file_path' not found. Skipping update for property '$prop_name' of application '$app_id'."
+        return
+    fi
+
+    # shellcheck disable=SC2155
+    local value=$(<"$file_path")
+
+    echo "Updating $prop_name for $app_id"
+    echo "$value"
+
+    if [ -n "$value" ]; then
+        docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property "$KBC_DEVELOPERPORTAL_VENDOR" "$app_id" "$prop_name" --value="$value"
+        echo "Property $prop_name updated successfully for $app_id"
+    else
+        echo "$prop_name is empty for $app_id!"
+        exit 1
+    fi
+}
+
+app_id="$KBC_DEVELOPERPORTAL_APP"
+is_deploy_ready="$IS_DEPLOY_READY"
+
+if [[ $is_deploy_ready == 'true' ]]; then
+    update_property "$app_id" "isDeployReady" "component_config/isDeployReady.md"
+    update_property "$app_id" "longDescription" "component_config/component_long_description.md"
+    update_property "$app_id" "configurationSchema" "component_config/configSchema.json"
+    update_property "$app_id" "configurationRowSchema" "component_config/configRowSchema.json"
+    update_property "$app_id" "configurationDescription" "component_config/configuration_description.md"
+    update_property "$app_id" "shortDescription" "component_config/component_short_description.md"
+    update_property "$app_id" "logger" "component_config/logger"
+    update_property "$app_id" "loggerConfiguration" "component_config/loggerConfiguration.json"
+    update_property "$app_id" "licenseUrl" "component_config/licenseUrl.md"
+    update_property "$app_id" "documentationUrl" "component_config/documentationUrl.md"
+    update_property "$app_id" "sourceCodeUrl" "component_config/sourceCodeUrl.md"
+    update_property "$app_id" "uiOptions" "component_config/uiOptions.md"
+fi
+
+# Update the actions.md file
+source "$(dirname "$0")/fn_actions_md_update.sh" "$is_deploy_ready"
+# update_property actions
+update_property "$app_id" "actions" "component_config/actions.md"
+
+
+
+
+
+
+
+================================================
+File: /scripts/developer_portal/fn_actions_md_update.sh
+================================================
+#!/bin/bash
+
+# Set the path to the Python script file
+PYTHON_FILE="src/component.py"
+# Set the path to the Markdown file containing actions
+MD_FILE="component_config/actions.md"
+# Flag for adding missing actions to the file
+ADD_MISSING=false
+
+# Check if the flag for adding missing actions was provided
+if [ "$1" == "true" ]; then
+    ADD_MISSING=true
+fi
+
+# Check if the Markdown file exists, if not, exit without creating it
+if [ ! -f "$MD_FILE" ] && [ "$ADD_MISSING" != true ]; then
+    exit 0
+fi
+
+# Function to check if an element exists in an array
+array_contains() {
+    local array="$1[@]"
+    local seeking=$2
+    local in=1
+    for element in "${!array}"; do
+        if [[ $element == "$seeking" ]]; then
+            in=0
+            break
+        fi
+    done
+    return $in
+}
+
+# Get all occurrences of lines containing @sync_action('XXX') from the .py file
+SYNC_ACTIONS=$(grep -o "@sync_action('[^']*')" "$PYTHON_FILE" | sed "s/@sync_action('\([^']*\)')/\1/" | sort | uniq)
+
+# Read the content of the actions.md file into a variable and extract the list of actions
+MD_CONTENT=$(grep -o '\[.*\]' "$MD_FILE" | tr -d '[]"')
+
+# Convert the MD_CONTENT to a proper array
+IFS=',' read -r -a EXISTING_ACTIONS <<< "$MD_CONTENT"
+
+# If MD_CONTENT is empty, initialize EXISTING_ACTIONS array as empty
+if [ -z "$MD_CONTENT" ]; then
+    EXISTING_ACTIONS=()
+fi
+
+# Iterate over each occurrence of @sync_action('XXX')
+for sync_action in $SYNC_ACTIONS; do
+    found=false
+    # Iterate over each action in the actions.md file
+    for md_action in "${EXISTING_ACTIONS[@]}"; do
+        # Check if the occurrence is found in the actions.md file
+        if [ "$sync_action" == "$md_action" ]; then
+            found=true
+            break
+        fi
+    done
+    # If the action is not found
+    if [ "$found" == false ]; then
+        echo "Warning: Action '$sync_action' not found in $MD_FILE"
+        # If the flag for adding missing actions is set
+        if [ "$ADD_MISSING" == true ]; then
+            echo "Adding missing action '$sync_action' to $MD_FILE"
+            # Add the missing action to the file
+            EXISTING_ACTIONS+=("$sync_action")
+        fi
+    fi
+done
+
+# If no sync actions were found and the flag for adding missing actions is not set, exit without updating the file
+if [ ${#EXISTING_ACTIONS[@]} -eq 0 ] && [ "$ADD_MISSING" == false ]; then
+    exit 0
+fi
+
+# Convert the array to JSON format
+JSON_ACTIONS=$(printf '"%s",' "${EXISTING_ACTIONS[@]}")
+JSON_ACTIONS="[${JSON_ACTIONS%,}]"
+
+# Update the content of the actions.md file
+echo "$JSON_ACTIONS" > "$MD_FILE"
+
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.component==1.4.3
+keboola.utils
+keboola.http-client
+mock~=5.1.0
+freezegun~=1.4.0
+
+requests
+
+================================================
+File: /.github/workflows/push.yml
+================================================
+name: Keboola Component Deployment Pipeline
+on: [ push ]
+concurrency: ci-${{ github.ref }} # to avoid tag collisions in the ECR
+env:
+  DOCKERHUB_USER: "keboolabot"
+  KBC_DEVELOPERPORTAL_APP: "kds-team.app-flow-trigger-tracker"
+  KBC_DEVELOPERPORTAL_VENDOR: "kds-team"
+  KBC_DEVELOPERPORTAL_USERNAME: "kds-team+github"
+
+  # to be set in repository secrets:
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }} # required for pushing to ECR
+  # KBC_STORAGE_TOKEN: ${{ secrets.KBC_STORAGE_TOKEN }} # required for running KBC tests (optional)
+  # KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+
+  # Test KBC project: https://connection.keboola.com/admin/projects/5415
+  KBC_TEST_PROJECT_CONFIGS: "" # space separated list of config ids (optional)
+
+jobs:
+  push_event_info:
+    runs-on: ubuntu-latest
+    outputs:
+      app_image_tag: ${{ steps.tag.outputs.app_image_tag }}
+      is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
+      is_default_branch: ${{ steps.default_branch.outputs.is_default_branch }}
+      is_deploy_ready: ${{ steps.deploy_ready.outputs.is_deploy_ready }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Fetch all branches from remote repository
+        run: git fetch --prune --unshallow --tags -f
+
+      - name: Get current branch name
+        id: current_branch
+        run: |
+          if [[ ${{ github.ref }} != "refs/tags/"* ]]; then
+            branch_name=${{ github.ref_name }}
+            echo "branch_name=$branch_name" | tee -a $GITHUB_OUTPUT
+          else
+            raw=$(git branch -r --contains ${{ github.ref }})
+            branch="$(echo ${raw//origin\//} | tr -d '\n')"
+            echo "branch_name=$branch" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Is current branch the default branch
+        id: default_branch
+        run: |
+          echo "default_branch='${{ github.event.repository.default_branch }}'"
+          if [ "${{ github.event.repository.default_branch }}" = "${{ steps.current_branch.outputs.branch_name }}" ]; then
+             echo "is_default_branch=true" | tee -a $GITHUB_OUTPUT
+          else
+             echo "is_default_branch=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Set image tag
+        id: tag
+        run: |
+          TAG=${{ github.ref_name }}
+          IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
+          echo "is_semantic_tag=$IS_SEMANTIC_TAG" | tee -a $GITHUB_OUTPUT
+          echo "app_image_tag=$TAG" | tee -a $GITHUB_OUTPUT
+
+      - name: It is ready to deploy
+        id: deploy_ready
+        run: |
+          if [[ "${{ steps.default_branch.outputs.is_default_branch }}" == "true" \
+            && "${{ github.ref }}" == refs/tags/* \
+            && "${{ steps.tag.outputs.is_semantic_tag }}" == "true" ]]; then
+              echo "is_deploy_ready=true" | tee -a $GITHUB_OUTPUT
+          else
+              echo "is_deploy_ready=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+  build:
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Docker login
+        if: env.DOCKERHUB_TOKEN
+        run: docker login --username "${{ env.DOCKERHUB_USER }}" --password "${{ env.DOCKERHUB_TOKEN }}"
+
+      - name: Build image
+        run: docker build -t "${{ env.KBC_DEVELOPERPORTAL_APP }}" .
+
+      - name: Push image to ECR
+        uses: keboola/action-push-to-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          # TODO determine the latest tag?
+          push_latest: ${{ needs.push_event_info.is_semantic_tag }}
+          source_image: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+
+  tests:
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - build
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Pull image from ECR
+        uses: keboola/action-pull-from-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          target_image: ${{ env.KBC_DEVELOPERPORTAL_APP}}
+          tag_as_latest: true
+
+      - name: Run tests
+        run: |
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }} flake8 . --config=flake8.cfg
+          echo "Running unit-tests..."
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }} python -m unittest discover
+
+  tests-kbc:
+    env:
+      KBC_TEST_PROJECT_CONFIGS: ${{ vars.KBC_TEST_PROJECT_CONFIGS }}
+      KBC_STORAGE_TOKEN: ${{ secrets.KBC_STORAGE_TOKEN }}
+    needs:
+      - push_event_info
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run KBC test jobs
+        if: ${{ env.KBC_TEST_PROJECT_CONFIGS != '' }} && ${{ env.KBC_STORAGE_TOKEN != '' }}
+        uses: keboola/action-run-configs-parallel@master
+        with:
+          token: ${{ secrets.KBC_STORAGE_TOKEN }}
+          componentId: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          configs: ${{ env.KBC_TEST_PROJECT_CONFIGS }}
+
+  deploy:
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - tests
+      - tests-kbc
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set tag in the Developer Portal
+        uses: keboola/action-set-tag-developer-portal@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+
+  update_developer_portal_properties:
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+      IS_DEPLOY_READY: ${{ needs.push_event_info.outputs.is_deploy_ready }}
+    needs:
+      - push_event_info
+      - build
+      - tests
+      - tests-kbc
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Update developer portal properties
+        run: |
+          chmod +x scripts/developer_portal/*.sh
+          scripts/developer_portal/update_properties.sh
+
+
+================================================
+File: /TEMPLATE_README.md
+================================================
+# KBC Component Python template
+
+Python template for KBC Component creation. Defines the default structure and all Bitbucket pipeline CI scripts for automatic deployment.
+
+Use as a starting point when creating a new component.
+
+Example uses [keboola.component](https://pypi.org/project/keboola.component) library providing useful methods for KBC related tasks 
+and boilerplate methods often needed by components, for more details see [documentation](https://github.com/keboola/python-component/blob/main/README.md)
+
+*NOTE: Previously the template was based on top of the deprecated [keboola-python-util-lib library](https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/src/master/)*
+
+**Table of contents:**  
+  
+[TOC]
+
+# Recommended component architecture
+It is recommended to use the [keboola.component library](https://pypi.org/project/keboola.component), 
+for each component. Major advantage is that it reduces the boilerplate code replication, the developer can focus on core component logic 
+and not on boilerplate tasks. If anything is missing in the library, please fork and create a pull request with additional changes, 
+so we can all benefit from it
+
+**Base components on [CommonInterface](https://htmlpreview.github.io/?https://raw.githubusercontent.com/keboola/python-component/main/docs/api-html/component/interface.html#keboola.component.interface.CommonInterface)**
+
+- No need to write configuration processing and validation code each time
+- No need to setup logging environment manually
+- No need to write code to store manifests, write statefile, retrieve dates based on relative period, and many more.
+- The main focus can be the core component logic, which increases the code readability for new comers.
+
+**Base Client on [HtttpClient](https://pypi.org/project/keboola.http-client/)**
+
+- No need to write HTTP request handling over and over again
+- Covers basic authentication, retry strategy, headers, default parameters
+
+
+## Architecture using the template
+
+![picture](docs/imgs/architecture.png)
+
+## Example component
+This template contains functional example of an [hello-world component](https://bitbucket.org/kds_consulting_team/kbc-python-template/src/master/src/component.py), 
+it can be run with [sample configuration](https://bitbucket.org/kds_consulting_team/kbc-python-template/src/master/data/) and it produces valid results. 
+It is advisable to use this structure as a base for new components. Especially the `component.py` module, which should only 
+contain the base logic necessary for communication with KBC interface, processing parameters, collecting results
+ and calling targeted API service methods. 
+
+
+# Creating a new component
+Clone this repository into new folder and remove git history
+```bash
+git clone https://bitbucket.org/kds_consulting_team/kbc-python-template.git my-new-component
+cd my-new-component
+rm -rf .git
+git init
+git remote add origin PATH_TO_YOUR_BB_REPO
+git add .
+git commit -m 'initial'
+git push -u origin master
+```
+
+**Method #2:**
+
+Copy the contents of the template folder into your clone empty repository
+
+```bash
+git clone PATH_TO_YOUR_BB_REPO my-new-component
+# now copy the contents of the template into the my-new-component dir
+cd my-new-component
+git add .
+git commit -m 'initial'
+git push -u origin master
+```
+
+# Setting up the CI
+ - Bitbucket: Enable [pipelines](https://confluence.atlassian.com/bitbucket/get-started-with-bitbucket-pipelines-792298921.html) in the repository.
+    - For Github: Check that the [workflows are enabled](https://docs.github.com/en/actions/managing-workflow-runs/disabling-and-enabling-a-workflow).
+    The actions are present in `.github/workflows/` folder. 
+ - Set `KBC_DEVELOPERPORTAL_APP` env variable (dev portal app id)
+ 
+ In case it is not set on the account level, set also other required dev portal env variables:
+ 
+ - `KBC_DEVELOPERPORTAL_PASSWORD` - service account password
+ - `KBC_DEVELOPERPORTAL_USERNAME` - service account username
+ - `KBC_DEVELOPERPORTAL_VENDOR` - dev portal vendor
+ - `KBC_STORAGE_TOKEN` - (optional) in case you wish to run KBC automated tests
+  
+ 
+ ![picture](docs/imgs/ci_variable.png)
+ 
+The script execution is defined in three stages:
+
+## Default stage
+This script is executed on push to any branch except the master branch. It executes basic build and code quality steps. Following steps are performed:
+Build docker image
+Execute flake8 lint tests
+Execute python unittest
+(Optional) Push image with tag :test into the AWS repository for manual testing in KBC
+If any of the above steps results in non 0 status, the build will fail. It is impossible to merge branches that fail to build into the master branch.
+
+## Master stage
+This script is executed on any push or change in the master branch. It performs every step as the default stage. Additionally, 
+the `./scripts/update_dev_portal_properties.sh` script is executed. 
+This script propagates all changes in the Component configuration files (component_config folder) to the Developer portal.
+Currently these Dev Portal configuration parameters are supported:
+
+ - `configSchema.json`
+ - `configRowSchema.json`
+ - `component_short_description.md`
+ - `component_long_description.md`    
+
+The choice to include this script directly in the master branch was made to simplify ad-hoc changes of the component configuration parameters. For instance if you wish to slightly modify the configuration schema without affecting the code itself, it is possible to simply push the changes directly into the master and these will be automatically propagated to the production without rebuilding the image itself. Solely Developer Portal configuration metadata is deployed at this stage.
+
+## Tagged commit stage
+Whenever a tagged commit is added, or tag created this script gets executed. This is a deployment phase, so a successful build results in new code being deployed in KBC production.
+At this stage all steps present in the default and master stage are executed. Additionally, 
+`deploy.sh` script that pushes the newly built image / tag into the ECR repository and KBC production is executed.
+The deploy script is executed only after all tests and proper build steps passed. 
+Moreover, the `deploy.sh` script will be executed **only in the master branch**. In other words if you create a tagged commit in another branch, the pipeline gets triggered but deployment script will fail, because it is not triggered within a master branch. This is to prevent accidental deployment from a feature branch.
+
+ 
+# GELF logging
+
+The template automatically chooses between STDOUT and GELF logger based on the Developer Portal configuration.
+
+To fully leverage the benefits such as outputting the `Stack Trace` into the log event detail (available by clicking on the log event) 
+log exceptions using `logger.exception(ex)`.
+
+**TIP:** When the logger verbosity is set to `verbose` you may leverage `extra` fields to log the detailed message in the detail of the log event by adding extra fields to you messages:
+
+```python
+logging.error(f'{error}. See log detail for full query. ',
+                         extra={"failed_query": json.dumps(query)})
+```
+
+Recommended [GELF logger setup](https://developers.keboola.com/extend/common-interface/logging/#setting-up) (Developer Portal) to allow debug mode logging:
+
+```json
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+``` 
+ 
+# Development
+ 
+This example contains runnable container with simple unittest. For local testing it is useful to include `data` folder in the root
+and use docker-compose commands to run the container or execute tests. 
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path:
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone https://bitbucket.org:kds_consulting_team/kbc-python-template.git my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+## Testing
+
+The preset pipeline scripts contain sections allowing pushing testing image into the ECR repository and automatic 
+testing in a dedicated project. These sections are by default commented out. 
+
+**Running KBC tests on deploy step, before deployment**
+
+Uncomment following section in the deployment step in `bitbucket-pipelines.yml` file:
+
+```yaml
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+```
+
+Make sure that you have `KBC_STORAGE_TOKEN` env. variable set, containing appropriate storage token with access 
+to your KBC project. Also make sure to create a functional testing configuration and replace the `BASE_KBC_CONFIG` placeholder with its id.
+
+**Pushing testing image for manual KBC tests**
+
+In some cases you may wish to execute a testing version of your component manually prior to publishing. For instance to test various
+configurations on it. For that it may be convenient to push the `test` image on every push either to master, or any branch.
+
+To achieve that simply uncomment appropriate sections in `bitbucket-pipelines.yml` file, either in master branch step or in `default` step.
+
+```yaml
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+```
+ 
+ Once the build is finished, you may run such configuration in any KBC project as many times as you want by using [run-job](https://kebooladocker.docs.apiary.io/#reference/run/create-a-job-with-image/run-job) API call, using the `test` image tag.
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.11-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+app-flow-trigger-tracker
+=============
+
+Description
+
+This component is used to reset the flow triggers in the Keboola platform.
+Also can it used to get the flow triggers for a specific flow and their information about statuses.
+
+Functionality notes
+===================
+Reset flow triggers = drop & create.
+
+Configuration
+=============
+
+flow_trigger_ids
+-------
+List of flow configuration Ids to reset.
+
+output_list_flows
+-------
+Hiden parameter for listing all flows in the project and write it to the output.
+
+Output
+======
+
+flows_with_trigger
+
+Development
+-----------
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to
+your custom path in the `docker-compose.yml` file:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clone this repository, init the workspace and run the component with following
+command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+git clone https://github.com/keboola/component-app-flow-trigger-tracker app-flow-trigger-tracker
+cd app-flow-trigger-tracker
+docker-compose build
+docker-compose run --rm dev
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run the test suite and lint check using this command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose run --rm test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Integration
+===========
+
+For information about deployment and integration with KBC, please refer to the
+[deployment section of developers
+documentation](https://developers.keboola.com/extend/component/deployment/)
+
+

@@ -37,6 +37,11 @@
 - Repository: https://github.com/keboola/ex-email-attachments
 - Description: Keboola Email attachments extractor
 
+### component-generator
+- [Documentation](github/component-generator/llm.txt)
+- Repository: https://github.com/keboola/component-generator
+- Description: Tool for creating Keboola Connection components
+
 ### ex-docs-tutorial
 - [Documentation](github/ex-docs-tutorial/llm.txt)
 - Repository: https://github.com/keboola/ex-docs-tutorial
@@ -55,6 +60,11 @@
 ### wr-storage
 - [Documentation](github/wr-storage/llm.txt)
 - Repository: https://github.com/keboola/wr-storage
+- Description: None
+
+### component-bitbucket-pipelines-test
+- [Documentation](github/component-bitbucket-pipelines-test/llm.txt)
+- Repository: https://github.com/keboola/component-bitbucket-pipelines-test
 - Description: None
 
 ### ex-storage
@@ -132,6 +142,11 @@
 - Repository: https://github.com/keboola/ex-azure-storage-table
 - Description: Azure Table storage / Azure Cosmos DB Table API extractor.
 
+### component-bulk-modify
+- [Documentation](github/component-bulk-modify/llm.txt)
+- Repository: https://github.com/keboola/component-bulk-modify
+- Description: None
+
 ### ex-google-ads
 - [Documentation](github/ex-google-ads/llm.txt)
 - Repository: https://github.com/keboola/ex-google-ads
@@ -150,6 +165,66 @@
 ### ex-facebook
 - [Documentation](github/ex-facebook/llm.txt)
 - Repository: https://github.com/keboola/ex-facebook
+- Description: None
+
+### component-app-flow-trigger-tracker
+- [Documentation](github/component-app-flow-trigger-tracker/llm.txt)
+- Repository: https://github.com/keboola/component-app-flow-trigger-tracker
+- Description: None
+
+### component-heureka
+- [Documentation](github/component-heureka/llm.txt)
+- Repository: https://github.com/keboola/component-heureka
+- Description: None
+
+### component-toast
+- [Documentation](github/component-toast/llm.txt)
+- Repository: https://github.com/keboola/component-toast
+- Description: None
+
+### component-portable
+- [Documentation](github/component-portable/llm.txt)
+- Repository: https://github.com/keboola/component-portable
+- Description: None
+
+### component-quickbooks-online
+- [Documentation](github/component-quickbooks-online/llm.txt)
+- Repository: https://github.com/keboola/component-quickbooks-online
+- Description: None
+
+### component-bigquery-byodb-view-writer
+- [Documentation](github/component-bigquery-byodb-view-writer/llm.txt)
+- Repository: https://github.com/keboola/component-bigquery-byodb-view-writer
+- Description: None
+
+### component-zendesk
+- [Documentation](github/component-zendesk/llm.txt)
+- Repository: https://github.com/keboola/component-zendesk
+- Description: None
+
+### component-lever
+- [Documentation](github/component-lever/llm.txt)
+- Repository: https://github.com/keboola/component-lever
+- Description: Lever API connectors in Python
+
+### component-cnb-exchange-rates
+- [Documentation](github/component-cnb-exchange-rates/llm.txt)
+- Repository: https://github.com/keboola/component-cnb-exchange-rates
+- Description: None
+
+### component-kafka
+- [Documentation](github/component-kafka/llm.txt)
+- Repository: https://github.com/keboola/component-kafka
+- Description: None
+
+### component-franconnect
+- [Documentation](github/component-franconnect/llm.txt)
+- Repository: https://github.com/keboola/component-franconnect
+- Description: None
+
+### component-adform
+- [Documentation](github/component-adform/llm.txt)
+- Repository: https://github.com/keboola/component-adform
 - Description: None
 
 ## Bitbucket Repositories
