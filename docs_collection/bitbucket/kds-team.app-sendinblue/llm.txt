@@ -1,0 +1,1171 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-sendinblue/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── lib/
+    │   │   ├── component.py
+    │   │   ├── client.py
+    │   │   └── result.py
+    │   └── main.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   └── tables/
+    │       │       ├── test.csv
+    │       │       └── test.csv.manifest
+    │       └── out/
+    │           └── tables/
+    │               ├── messages.csv.manifest
+    │               ├── errors.csv
+    │               ├── errors.csv.manifest
+    │               └── messages.csv
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.2.2**
+Added full documentation to the component.
+
+**0.2.1**
+Fixed error with no to object being outputted in messages table
+
+**0.2.0**
+Added recipient object, bcc and cc and params
+
+================================================
+File: /src/lib/component.py
+================================================
+import csv
+import json
+import logging
+import sys
+from lib.client import sendInBlueClient
+from lib.result import resultWriter
+from kbc.env_handler import KBCEnvHandler
+
+
+API_KEY = '#apiKey'
+
+MANDATORY_PARAMS = [API_KEY]
+REQUIRED_COLUMNS = ['emailObject', 'templateId']
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self):
+
+        KBCEnvHandler.__init__(self, MANDATORY_PARAMS)
+        self.validate_config(MANDATORY_PARAMS)
+
+        self.paramApiKey = self.cfg_params[API_KEY]
+        self.varInputTables = self.configuration.get_input_tables()
+        self._checkInputTables()
+
+        self.client = sendInBlueClient(apiKey=self.paramApiKey)
+        self.writer = resultWriter(self.data_path)
+
+    def _checkInputTables(self):
+
+        if len(self.varInputTables) == 0:
+
+            logging.error("No input table provided.")
+            sys.exit(1)
+
+        for _table in self.varInputTables:
+
+            _tablePath = _table['full_path']
+            _manPath = _tablePath + '.manifest'
+
+            with open(_manPath) as _manFile:
+
+                _manifest = json.load(_manFile)
+
+            _columnDiff = set(REQUIRED_COLUMNS) - set(_manifest['columns'])
+
+            if len(_columnDiff) != 0:
+
+                logging.error("Missing columns %s in table %s. Please check the input mapping." %
+                              (list(_columnDiff), _table['source']))
+                sys.exit(1)
+
+    def _check_json(self, dictToCheck, dictType):
+        # type = ['to', 'bcc', 'params']
+
+        if dictToCheck is None and dictType in ('cc', 'bcc', 'params'):
+
+            return True
+
+        try:
+
+            dictJS = json.loads(dictToCheck)
+
+            if dictType in ('to', 'cc', 'bcc') and isinstance(dictJS, list):
+
+                return True
+
+            elif dictType in ('to', 'cc', 'bcc') and not isinstance(dictJS, list):
+
+                return False
+
+            elif dictType == 'params' and isinstance(dictJS, dict):
+
+                return True
+
+            elif dictType == 'params' and not isinstance(dictJS, dict):
+
+                return False
+
+            else:
+
+                logging.error("Unhandled dictType.")
+                sys.exit(2)
+
+        except ValueError:
+
+            return False
+
+    def run(self):
+
+        for table in self.varInputTables:
+
+            with open(table['full_path'], 'r') as _inFile:
+
+                _rdr = csv.DictReader(_inFile)
+
+                for row in _rdr:
+
+                    toObject = row['emailObject']
+                    templateId = row['templateId']
+                    paramsObject = row.get('params')
+                    ccObject = row.get('ccObject')
+                    bccObject = row.get('bccObject')
+
+                    if templateId not in self.client.varTemplates:
+
+                        logging.warn("Unknown template %s. Skipping row!" % templateId)
+
+                        _errDict = {
+                                    'error': 'templateError',
+                                    'errorMessage': "Template does not exist.",
+                                    'additionalInfo': templateId,
+                                    'emailObject': toObject
+                                    }
+
+                        self.writer.writerErrors.writerow(_errDict)
+                        continue
+
+                    if paramsObject == '' or paramsObject == '{}':
+                        paramsObject = None
+
+                    if ccObject == '' or ccObject == '{}':
+                        ccObject = None
+
+                    if bccObject == '' or bccObject == '{}':
+                        bccObject = None
+
+                    toObjectCheck = self._check_json(toObject, 'to')
+                    paramsObjectCheck = self._check_json(paramsObject, 'params')
+                    ccObjectCheck = self._check_json(ccObject, 'cc')
+                    bccObjectCheck = self._check_json(bccObject, 'bcc')
+
+                    if not all([toObjectCheck, paramsObjectCheck, ccObjectCheck, bccObjectCheck]):
+
+                        logging.warn("Invalid object detected.")
+
+                        _errDict = {
+                                    'error': 'JSONError',
+                                    'errorMessage': "Invalid input format for one of " +
+                                                    "emailObject, paramObject, ccObject, bccObject.",
+                                    'additionalInfo': [toObjectCheck, paramsObjectCheck, ccObjectCheck, bccObjectCheck],
+                                    'emailObject': toObject
+                                    }
+
+                        self.writer.writerErrors.writerow(_errDict)
+
+                        continue
+
+                    logging.info(f"Sending email to {toObject}")
+
+                    _sc, _msg = self.client.sendTransactionalEmail(
+                        toObject=toObject, templateId=templateId, params=paramsObject,
+                        cc=ccObject, bcc=bccObject)
+
+                    if _sc == 201:
+
+                        _msgDict = {
+                            'messageId': _msg,
+                            'emailObject': json.dumps(toObject)
+                        }
+
+                        self.writer.writerMessages.writerow(_msgDict)
+
+                    else:
+
+                        _errDict = {
+                            'error': 'sendError',
+                            'errorMessage': _sc,
+                            'additionalInfo': _msg,
+                            'emailObject': json.dumps(toObject)
+                        }
+
+                        self.writer.writerErrors.writerow(_errDict)
+
+
+================================================
+File: /src/lib/client.py
+================================================
+import logging
+import json
+import os
+import sys
+from kbc.client_base import HttpClientBase
+
+BASE_URL = 'https://api.sendinblue.com/v3/smtp'
+
+
+class sendInBlueClient(HttpClientBase):
+
+    def __init__(self, apiKey):
+
+        self.paramApiKey = apiKey
+
+        _def_headers = {"Accept": "application/json",
+                        "api-key": apiKey}
+
+        HttpClientBase.__init__(self, base_url=BASE_URL, max_retries=10,
+                                default_http_header=_def_headers, status_forcelist=(500, 502, 503, 524, 520),
+                                backoff_factor=0.3)
+
+        self._getTemplates()
+
+    def _getTemplates(self):
+
+        _url = os.path.join(self.base_url, 'templates')
+        _is_complete = False
+        limit = 50
+        offset = 0
+        all_templates = []
+
+        while _is_complete is False:
+
+            _params = {
+                'limit': limit,
+                'offset': offset
+            }
+
+            _rsp = self.get_raw(_url, params=_params)
+            _template_sc = _rsp.status_code
+
+            try:
+                _template_js = _rsp.json()
+
+            except ValueError:
+                _template_js = {'templates': []}
+
+            if _template_sc == 401:
+                logging.error("API request received %s: %s. Process exiting!" % (_template_sc, _template_js['message']))
+                logging.error("Please check the credentials.")
+
+                sys.exit(1)
+
+            elif _template_sc == 200:
+
+                all_templates += [str(t['id']) for t in _template_js['templates']]
+
+                if limit > len(_template_js['templates']):
+                    _is_complete = True
+                else:
+                    offset += limit
+
+            else:
+                logging.error(f"Unhandled exception. Received: {_template_sc} - {_template_js}.")
+                sys.exit(1)
+
+        self.varTemplates = all_templates
+
+        logging.debug("Template ids downloaded:")
+        logging.debug(self.varTemplates)
+
+    def sendTransactionalEmail(self, toObject, templateId, params=None, cc=None, bcc=None):
+
+        _url = os.path.join(self.base_url, 'email')
+        _body = {
+            'to': json.loads(toObject),
+            'templateId': int(templateId)
+        }
+
+        if params is not None:
+            _body['params'] = json.loads(params)
+
+        if cc is not None:
+            _body['cc'] = json.loads(cc)
+
+        if bcc is not None:
+            _body['bcc'] = json.loads(bcc)
+
+        _header = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+
+        logging.debug(_body)
+
+        _rsp = self.post_raw(_url, data=json.dumps(_body), headers=_header)
+        _mail_sc = _rsp.status_code
+
+        try:
+            _mail_js = _rsp.json()
+
+        except ValueError:
+            _mail_js = {}
+
+        if _mail_sc == 201:
+
+            return _mail_sc, _mail_js['messageId']
+
+        else:
+
+            logging.warning("Received status code %s: %s." % (_mail_sc, _mail_js))
+
+            if _mail_sc == 400:
+
+                return _mail_js, _mail_js['message']
+
+            else:
+
+                logging.error("Unhandled exception. Exiting!")
+                try:
+                    logging.error("Received %s - %s." % (_mail_sc, _mail_js['message']))
+                except KeyError:
+                    logging.error(f"Could not parse error message : {_mail_js}")
+                sys.exit(2)
+
+
+================================================
+File: /src/lib/result.py
+================================================
+import csv
+import json
+import os
+from kbc.result import KBCResult, KBCTableDef
+
+FIELDS_MESSAGES = ['messageId', 'emailObject']
+PK_MESSAGES = ['messageId']
+
+FIELDS_ERRORS = ['error', 'errorMessage', 'additionalInfo', 'emailObject']
+PK_ERRORS = []
+
+
+class resultWriter:
+
+    def __init__(self, dataPath):
+
+        self.paramDataPath = dataPath
+        self.run()
+
+    def createTableDefinition(self, tableName, tableColumns, tablePK):
+
+        _fileName = tableName + '.csv'
+        _fullPath = os.path.join(self.paramDataPath, 'out', 'tables', _fileName)
+
+        _tableDef = KBCTableDef(
+            name=tableName, columns=tableColumns, pk=tablePK)
+        _resultDef = KBCResult(file_name=_fileName,
+                               full_path=_fullPath, table_def=_tableDef)
+
+        return _resultDef
+
+    @staticmethod
+    def createWriter(tableDefinition):
+
+        _writer = csv.DictWriter(open(tableDefinition.full_path, 'w'),
+                                 fieldnames=tableDefinition.table_def.columns,
+                                 restval='', extrasaction='ignore',
+                                 quotechar='"', quoting=csv.QUOTE_ALL)
+
+        _writer.writeheader()
+
+        return _writer
+
+    @staticmethod
+    def createManifest(destination, pk=[], incremental=False):
+
+        _manifest = {'primary_key': pk, 'incremental': incremental}
+
+        with open(destination, 'w') as _manFile:
+
+            json.dump(_manifest, _manFile)
+
+    def run(self):
+
+        _msgTableDef = self.createTableDefinition(
+            'messages', FIELDS_MESSAGES, PK_MESSAGES)
+        self.writerMessages = self.createWriter(_msgTableDef)
+        self.createManifest(destination=_msgTableDef.full_path + '.manifest',
+                            pk=_msgTableDef.table_def.pk,
+                            incremental=True)
+
+        _errTableDef = self.createTableDefinition(
+            'errors', FIELDS_ERRORS, PK_ERRORS)
+        self.writerErrors = self.createWriter(_errTableDef)
+        self.createManifest(destination=_errTableDef.full_path + '.manifest',
+                            pk=_errTableDef.table_def.pk)
+
+
+================================================
+File: /src/main.py
+================================================
+import logging
+import os
+import logging_gelf.handlers
+import logging_gelf.formatters
+from lib.component import Component
+
+# Environment setup
+# sys.tracebacklimit = 0 - removed due to random application errors occurring with no traceback
+
+# Logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)-8s : [line:%(lineno)3s] %(message)s',
+    datefmt="%Y-%m-%d %H:%M:%S")
+
+if 'KBC_LOGGER_ADDR' in os.environ and 'KBC_LOGGER_PORT' in os.environ:
+
+    logger = logging.getLogger()
+    logging_gelf_handler = logging_gelf.handlers.GELFTCPSocketHandler(
+        host=os.getenv('KBC_LOGGER_ADDR'), port=int(os.getenv('KBC_LOGGER_PORT')))
+    logging_gelf_handler.setFormatter(
+        logging_gelf.formatters.GELFFormatter(null_character=True))
+    logger.addHandler(logging_gelf_handler)
+
+    # remove default logging to stdout
+    logger.removeHandler(logger.handlers[0])
+
+APP_VERSION = '0.2.5'
+
+if __name__ == '__main__':
+
+    logging.info("Running component version %s..." % APP_VERSION)
+    c = Component()
+    c.run()
+
+    logging.info("Sending process finished!")
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# Sendinblue
+
+Sendinblue is a SaaS solution for relationship marketing. The service allows you to define & send campaigns or send transactional templates.
+
+## Overview
+
+The component supports sending transactional emails from predefined templates to a list of email addresses. It's also possible to define template parameters to customize templates for recipients.
+
+In order to be able to send transactional emails, the following is required:
+- a Sendinblue account,
+- activated transactional email service,
+- defined email templates.
+
+The component uses [send a transaction email](https://developers.sendinblue.com/reference#sendtransacemail) endpoint. For correct specification of all objects, follow the documentation.
+
+## Configuration
+
+The sample of the configuration, including input and output tables, can be found in [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.app-sendinblue/src/master/component_config/sample-config/). In general, an API token and at least one input table is needed to successfully run the component.
+
+### API Key (`#apiKey`)
+
+The API key for the Sendinblue service needs to be obtained from Sendinblue account settings. More information can be found in [the article](https://help.sendinblue.com/hc/en-us/articles/209467485-What-s-an-API-key-and-how-can-I-get-mine-).
+
+
+### Input table
+
+Multiple input tables can be specified on input. The input table must have 2 mandatory columns, otherwise the execution will fail. The list of allowed columns is following:
+
+- `emailObject` - an array of objects of recipients,
+- `templateId` - an id of a template, which will be sent to the recipient,
+- `params` - an object of parameters to be appended to the template,
+- `ccObject` - an array of objects of recipients to be included in copy,
+- `bccObject` - an array of objects of recipients to be included in blind copy.
+
+All of the columns are described in more detailed below.
+
+#### Columns `emailObject`, `ccObject`, `bccObject`
+
+An `emailObject` is a mandatory column, while both `ccObject` and `bccObject` are optional columns and may be left blank or not included at all. All three objects share the same configuration.
+
+All recipients included within a single array will be included in a single email. Each object within the array must consists of mandatory field `email` and optional field `name`. If the mandatory field `email` is missing, the error from Sendinblue API is returned and recorded in the `errors` table. A sample of such object, might look like this:
+
+```
+[
+    {
+        "email": "john@doe.com"
+    },
+    {
+        "email": "testy@mctestface.com",
+        "name": "Testy McTestFace"
+    }
+]
+```
+
+which would result in the email being sent to two recipients, whereas the below specification would send email to a single recipient:
+
+```
+[
+    {
+        "email": "john@doe.com"
+    }
+]
+```
+
+#### Column `templateId`
+
+An identification number of the template, which will be sent to specified recipients. If template is not found or active, the error is recorded in `errors` table. The column is mandatory.
+
+#### Column `params`
+
+An optional column to personalize each template. For correct specification of parameters in the template, [follow the official parameters guide](https://help.sendinblue.com/hc/en-us/articles/360000946299-Create-customize-transactional-email-templates). An example of `params` object:
+
+```
+{
+    "product": "protein",
+    "value": "20.00"
+}
+```
+
+### Output table
+
+As an output, 2 tables are returned:
+
+- `messages` - contains information about message ID and recipients, loaded incrementally,
+- `errors` - contains information about errors.
+
+## Development
+
+For development purposes use:
+```
+docker-compose build dev
+docker-compose run --rm dev
+```
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+### API Key (`#apiKey`)
+
+The API key for the Sendinblue service needs to be obtained from Sendinblue account settings. More information can be found in [the article](https://help.sendinblue.com/hc/en-us/articles/209467485-What-s-an-API-key-and-how-can-I-get-mine-).
+
+
+### Input table
+
+Multiple input tables can be specified on input. The input table must have 2 mandatory columns, otherwise the execution will fail. The list of allowed columns is following:
+
+- `emailObject` - an array of objects of recipients,
+- `templateId` - an id of a template, which will be sent to the recipient,
+- `params` - an object of parameters to be appended to the template,
+- `ccObject` - an array of objects of recipients to be included in copy,
+- `bccObject` - an array of objects of recipients to be included in blind copy.
+
+All of the columns are described in more detailed below.
+
+#### Columns `emailObject`, `ccObject`, `bccObject`
+
+An `emailObject` is a mandatory column, while both `ccObject` and `bccObject` are optional columns and may be left blank or not included at all. All three objects share the same configuration.
+
+All recipients included within a single array will be included in a single email. Each object within the array must consists of mandatory field `email` and optional field `name`. If the mandatory field `email` is missing, the error from Sendinblue API is returned and recorded in the `errors` table. A sample of such object, might look like this:
+
+```
+[
+    {
+        "email": "john@doe.com"
+    },
+    {
+        "email": "testy@mctestface.com",
+        "name": "Testy McTestFace"
+    }
+]
+```
+
+which would result in the email being sent to two recipients, whereas the below specification would send email to a single recipient:
+
+```
+[
+    {
+        "email": "john@doe.com"
+    }
+]
+```
+
+#### Column `templateId`
+
+An identification number of the template, which will be sent to specified recipients. If template is not found or active, the error is recorded in `errors` table. The column is mandatory.
+
+#### Column `params`
+
+An optional column to personalize each template. For correct specification of parameters in the template, [follow the official parameters guide](https://help.sendinblue.com/hc/en-us/articles/360000946299-Create-customize-transactional-email-templates). An example of `params` object:
+
+```
+{
+    "product": "protein",
+    "value": "20.00"
+}
+```
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Sendinblue offers SaaS services for transactional emails and relationship marketing.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Parameters",
+  "required": [
+    "#apiKey"
+  ],
+  "properties": {
+    "#apiKey": {
+      "type": "string",
+      "title": "API Key",
+      "format": "password",
+      "minLength": 1,
+      "description": "API key to Sendinblue service.</br>Follow the <a href='https://help.sendinblue.com/hc/en-us/articles/209467485-What-s-an-API-key-and-how-can-I-get-mine-'>article</a> to obtain one.",
+      "propertyOrder": 100
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#apiKey": "API-KEY"
+  },
+  "image_parameters": {},
+  "authorization": {}
+}
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"emailObject","templateId","params","ccObject","bccObject"
+"[{""email"":""john@doe.com"",""name"":""John Doe""}]","856","{""EVENT"":""BOUGHT""}","[{""email"":""JOHN.DOE@email.com"",""name"":""JD""}]","[{""email"":""Jenny.Doe@email.com""}]"
+"invalidObject@email.com","dasds","{}","",""
+"[{""email"":""john@doe.com"",""name"":""John Doe""}]","dasdgsad","{""EVENT"":""BOUGHT""}","[{""email"":""JOHN.DOE@email.com"",""name"":""JD""}]","[{""email"":""Jenny.Doe@email.com""}]"
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "emailObject",
+        "templateId",
+        "params",
+        "ccObject",
+        "bccObject"
+    ],
+    "metadata": [],
+    "column_metadata": {}
+}
+
+================================================
+File: /component_config/sample-config/out/tables/messages.csv.manifest
+================================================
+{"primary_key": ["messageId"], "incremental": true}
+
+================================================
+File: /component_config/sample-config/out/tables/errors.csv
+================================================
+"error","errorMessage","additionalInfo","emailObject"
+"JSONError","Invalid input format for one of emailObject, paramObject, ccObject, bccObject.","[False, True, True, True]","invalidObject@emaik.com"
+"templateError","Template does not exist.","dasdgsad","[{""email"":""john@doe.com"",""name"":""John Doe""}]"
+
+
+================================================
+File: /component_config/sample-config/out/tables/errors.csv.manifest
+================================================
+{"primary_key": [], "incremental": false}
+
+================================================
+File: /component_config/sample-config/out/tables/messages.csv
+================================================
+"messageId","emailObject"
+"<201908191032.63550413258@smtp-relay.mailin.fr>",""
+
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run.sh
+================================================
+#!/bin/sh
+set -e
+
+TABLES_PATH=$KBC_DATADIR/out/tables
+FILES_PATH=$KBC_DATADIR/out/files
+
+if [ "$(ls -A $TABLES_PATH)" ]; then
+    TABLES_PATH=$TABLES_PATH/*
+     rm -r $TABLES_PATH
+fi
+
+if [ "$(ls -A $FILES_PATH)" ]; then
+    FILES_PATH=$FILES_PATH/*
+     rm -r $FILES_PATH
+fi
+
+python /code/src/main.py
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.4.zip#egg=kbc
+logging_gelf==0.0.18
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.7.2-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python3", "-u", "/code/src/main.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Sendinblue
+
+Sendinblue is a SaaS solution for relationship marketing. The service allows you to define & send campaigns or send transactional templates.
+
+## Overview
+
+The component supports sending transactional emails from predefined templates to a list of email addresses. It's also possible to define template parameters to customize templates for recipients.
+
+In order to be able to send transactional emails, the following is required:
+- a Sendinblue account,
+- activated transactional email service,
+- defined email templates.
+
+The component uses [send a transaction email](https://developers.sendinblue.com/reference#sendtransacemail) endpoint. For correct specification of all objects, follow the documentation.
+
+## Configuration
+
+The sample of the configuration, including input and output tables, can be found in [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.app-sendinblue/src/master/component_config/sample-config/). In general, an API token and at least one input table is needed to successfully run the component.
+
+### API Key (`#apiKey`)
+
+The API key for the Sendinblue service needs to be obtained from Sendinblue account settings. More information can be found in [the article](https://help.sendinblue.com/hc/en-us/articles/209467485-What-s-an-API-key-and-how-can-I-get-mine-).
+
+
+### Input table
+
+Multiple input tables can be specified on input. The input table must have 2 mandatory columns, otherwise the execution will fail. The list of allowed columns is following:
+
+- `emailObject` - an array of objects of recipients,
+- `templateId` - an id of a template, which will be sent to the recipient,
+- `params` - an object of parameters to be appended to the template,
+- `ccObject` - an array of objects of recipients to be included in copy,
+- `bccObject` - an array of objects of recipients to be included in blind copy.
+
+All of the columns are described in more detailed below.
+
+#### Columns `emailObject`, `ccObject`, `bccObject`
+
+An `emailObject` is a mandatory column, while both `ccObject` and `bccObject` are optional columns and may be left blank or not included at all. All three objects share the same configuration.
+
+All recipients included within a single array will be included in a single email. Each object within the array must consists of mandatory field `email` and optional field `name`. If the mandatory field `email` is missing, the error from Sendinblue API is returned and recorded in the `errors` table. A sample of such object, might look like this:
+
+```
+[
+    {
+        "email": "john@doe.com"
+    },
+    {
+        "email": "testy@mctestface.com",
+        "name": "Testy McTestFace"
+    }
+]
+```
+
+which would result in the email being sent to two recipients, whereas the below specification would send email to a single recipient:
+
+```
+[
+    {
+        "email": "john@doe.com"
+    }
+]
+```
+
+#### Column `templateId`
+
+An identification number of the template, which will be sent to specified recipients. If template is not found or active, the error is recorded in `errors` table. The column is mandatory.
+
+#### Column `params`
+
+An optional column to personalize each template. For correct specification of parameters in the template, [follow the official parameters guide](https://help.sendinblue.com/hc/en-us/articles/360000946299-Create-customize-transactional-email-templates). An example of `params` object:
+
+```
+{
+    "product": "protein",
+    "value": "20.00"
+}
+```
+
+### Output table
+
+As an output, 2 tables are returned:
+
+- `messages` - contains information about message ID and recipients, loaded incrementally,
+- `errors` - contains information about errors.
+
+## Development
+
+For development purposes use:
+```
+docker-compose build dev
+docker-compose run --rm dev
+```
+

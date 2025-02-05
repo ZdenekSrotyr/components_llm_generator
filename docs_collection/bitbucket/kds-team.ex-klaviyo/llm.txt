@@ -1,0 +1,1974 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-klaviyo/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   ├── __pycache__/
+    │   └── klaviyo.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   ├── configSchema_old.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.1**
+
+- fix requirements
+- add src folder to path for tests
+
+**0.1.0**
+
+- src folder structure
+- remove dependency on handler lib - import the code directly to enable modifications until its released
+
+**0.0.2**
+
+- add dependency to base lib
+- basic tests
+
+**0.0.1**
+
+- add utils scripts
+- move kbc tests directly to pipelines file
+- use uptodate base docker image
+- add changelog
+
+
+================================================
+File: /src/component.py
+================================================
+'''
+Template Component main class.
+
+'''
+
+import csv
+import datetime  # noqa
+import datetime  # noqa
+import json
+import logging
+import os  # noqa
+import re
+import sys
+import time
+
+import backoff
+import pandas as pd
+import requests  # noqa
+from kbc.env_handler import KBCEnvHandler
+from kbc.result import KBCTableDef  # noqa
+from kbc.result import ResultWriter  # noqa
+
+from requests.exceptions import RequestException
+
+from klaviyo import Klaviyo
+
+# configuration variables
+KEY_DEBUG = 'debug'
+KEY_API_TOKEN = '#api_token'
+KEY_ENDPOINT = 'endpoints'
+KEY_METRIC_TIMELINE_START_DATE = 'metric_timeline_start_date'
+KEY_SEGMENTS = 'segments'
+
+MANDATORY_PARS = [
+    KEY_API_TOKEN,
+    KEY_ENDPOINT,
+    KEY_METRIC_TIMELINE_START_DATE,
+    KEY_SEGMENTS
+]
+MANDATORY_IMAGE_PARS = []
+
+# Default Table Output Destination
+DEFAULT_TABLE_SOURCE = "/data/in/tables/"
+DEFAULT_TABLE_DESTINATION = "/data/out/tables/"
+DEFAULT_FILE_DESTINATION = "/data/out/files/"
+DEFAULT_FILE_SOURCE = "/data/in/files/"
+
+BASE_URL = 'https://a.klaviyo.com/api/'
+REQUEST_MAP = {
+    'campaigns': {
+        'endpoint': 'v1/campaigns',
+        'mapping': 'campaigns',
+        'primary_key': 'id',
+        'dataField': 'data'
+    },
+    'campaign_recipients': {
+        'endpoint': 'v1/campaign/{child_id}/recipients',
+        'required': 'campaigns',
+        'mapping': 'recipients',
+        'primary_key': 'id',
+        'dataField': 'data'
+    },
+    'lists': {
+        'endpoint': 'v2/lists',
+        'mapping': 'lists',
+        'primary_key': 'list_id',
+        'dataField': '.'
+    },
+    'group_members': {
+        'endpoint': 'v2/group/{child_id}/members/all',
+        'required': 'lists',
+        'mapping': 'group_members',
+        'primary_key': 'id',
+        'dataField': 'records',
+        'pagination': 'marker'
+    },
+    'email_templates': {
+        'endpoint': 'v1/email-templates',
+        'mapping': 'email_templates',
+        'primary_key': 'id',
+        'dataField': 'data'
+    },
+    'metrics': {
+        'endpoint': 'v1/metrics',
+        'mapping': 'metrics',
+        'dataField': 'data',
+        'primary_key': 'id'
+    },
+    'metric_timeline': {
+        'endpoint': 'v1/metrics/timeline?count=200',
+        'mapping': 'metrics',
+        'dataField': 'data',
+        'primary_key': 'id'
+    },
+    "person_details_v2": {
+        'endpoint': 'v1/person/{child_id}',
+        'required': 'group_members',
+        'mappping': 'person_details',
+        'primary_key': 'id',
+        'dataField': '.'
+    }
+}
+
+ROOT_ENDPOINTS = {
+    'campaigns': [],
+    'lists': [],
+    'email_templates': [],
+    'group_members': [],
+    'metrics': [],
+    'metric_timeline': [],
+    'person_details_v2': []
+}
+
+REQUESTED_ENDPOINTS = []
+REQUEST_ORDER = [
+    'campaigns',
+    'campaign_recipients',
+    'lists',
+    'group_members',
+    'email_templates',
+    'metrics',
+    'metric_timeline',
+    'person_details_v2'
+]
+
+MISSING_HEADERS = []
+
+APP_VERSION = '0.0.5'
+
+now = int(datetime.datetime.now().timestamp())
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, debug=False):
+        KBCEnvHandler.__init__(self, MANDATORY_PARS)
+        logging.info('Running version %s', APP_VERSION)
+        logging.info('Loading configuration...')
+
+        # Disabling list of libraries you want to output in the logger
+        disable_libraries = []
+        for library in disable_libraries:
+            logging.getLogger(library).disabled = True
+
+        # override debug from config
+        if self.cfg_params.get(KEY_DEBUG):
+            debug = True
+
+        log_level = logging.DEBUG if debug else logging.INFO
+        # setup GELF if available
+        if os.getenv('KBC_LOGGER_ADDR', None):
+            self.set_gelf_logger(log_level)
+        else:
+            self.set_default_logger(log_level)
+
+        try:
+            self.validate_config()
+            self.validate_image_parameters(MANDATORY_IMAGE_PARS)
+        except ValueError as e:
+            logging.error(e)
+            exit(1)
+
+    def run(self):
+        '''
+        Main execution code
+        '''
+
+        params = self.cfg_params  # noqa
+
+        # Validating if the configuration is entered properly
+        self.validate_user_input(params)
+
+        # User parameters
+        self.api_token = params.get(KEY_API_TOKEN)
+        endpoints = params.get(KEY_ENDPOINT)
+        metric_timeline_start_date = params.get(KEY_METRIC_TIMELINE_START_DATE)
+        self.segments = params.get(KEY_SEGMENTS)
+
+        # Setting up metric timeline start date
+        if metric_timeline_start_date != '':
+            self.metric_timeline_timestamp = int(time.mktime(
+                time.strptime(metric_timeline_start_date, "%Y-%m-%d")))
+        else:
+            today = datetime.date.today()
+            yesterday = today - datetime.timedelta(days=1)
+            self.metric_timeline_timestamp = int(time.mktime(
+                time.strptime(yesterday.strftime("%Y-%m-%d"), "%Y-%m-%d")))
+
+        # Handling state file
+        if not self.get_state_file():
+            self.state = {}
+        else:
+            self.state = self.get_state_file()
+
+        logging.info(f'Current State: {self.state}')
+
+        for r in REQUEST_ORDER:
+            if endpoints[r]:
+                self.fetch(r)
+
+        self.write_state_file(self.state)
+
+        logging.info("Extraction finished")
+
+    def validate_user_input(self, params):
+        '''
+        Validating user inputs
+        '''
+
+        # 1 - empty configuration
+        if not params:
+            logging.error('Your configuration is missing.')
+            sys.exit(1)
+
+        # 2 - Validating if endpoints are selected
+        endpoint_count = 0
+        for endpoint in params['endpoints']:
+            if params['endpoints'][endpoint]:
+                endpoint_count += 1
+        if endpoint_count == 0:
+            logging.error('Please select at least one endpoint.')
+            sys.exit(1)
+
+        # 3 - Validating segment inputs if person-details_v2
+        if params['endpoints']['person_details_v2']:
+            if params['segments']['all_customer'] == '':
+                logging.error(
+                    'Endpoint [Person Details by Segment] requires segment ID. Segment ID is missing.')
+                sys.exit(1)
+
+        # 4 - Check credentials
+        if params['#api_token'] == '':
+            logging.error('Your API token is missing.')
+            sys.exit(1)
+
+        # 5 - Deprecating [Person Details]
+        if params['endpoints']['person_details']:
+            params['endpoints']['person_details'] = False
+
+    def fetch(self, endpoint):
+        logging.info(f'Requesting [{endpoint}]')
+
+        request_properties = REQUEST_MAP[endpoint]
+
+        if endpoint == 'person_details_v2':
+            # validate if we had all the person_ids
+            segment_id = ''
+            person_ids = []
+
+            # Fetching person_details_v2 headers from state if exist
+            person_headers = self.state['person_details_v2'] if 'person_details_v2' in self.state else [
+            ]
+
+            # if 'person_details_v2' not in self.state or len(self.state['person_details_v2']) == 0:
+            segment_id = self.segments['all_customer']
+
+            logging.info(f'Fetching Segment [{segment_id}]')
+
+            # Klaviyo SDK
+            klaviyo_sdk = Klaviyo(self.api_token)
+
+            # Fetching all person_ids
+            all_profiles = klaviyo_sdk.get_profile_ids(segment_id)
+            if all_profiles:
+                person_ids = person_ids + all_profiles
+            logging.info(f'Total person_ids: [{len(person_ids)}]')
+
+            # Fetching all person_details
+            itr_n = 1000
+            lower_limit = 0  # noqa
+            upper_limit = itr_n if itr_n < len(person_ids) else len(person_ids)  # noqa
+            person_details_limit = len(person_ids)  # noqa
+
+            # LOAD WITH PAGINATION
+            while lower_limit <= person_details_limit:
+                person_ids_array = person_ids[lower_limit:upper_limit]
+
+                data_in, person_headers, new_person_headers = klaviyo_sdk.get_profiles_parallel(
+                    person_ids_array, person_headers)
+
+                if new_person_headers:
+                    self.append_new_columns_to_table(
+                        table_name=endpoint, all_output_columns=person_headers, new_output_columns=new_person_headers)
+
+                # Outputting paginated data into output file
+                self._output(df_json=data_in, filename=endpoint,
+                             output_columns=person_headers)
+
+                lower_limit += itr_n
+                upper_limit += itr_n
+                upper_limit = len(person_ids) if upper_limit > len(
+                    person_ids) else upper_limit
+                logging.info(f'Fetched [{upper_limit}] person_ids')
+
+            logging.info(f'Total fetched Person IDs: {person_details_limit}')
+
+            # Saving headers into state
+            self.state['person_details_v2'] = person_headers
+
+        elif 'required' in request_properties:
+            # Fetch required endpoint if not requested yet
+            if request_properties['required'] not in REQUESTED_ENDPOINTS:
+                self.fetch(request_properties['required'])
+
+            for itr in ROOT_ENDPOINTS[request_properties['required']]:
+
+                endpoint_url = request_properties['endpoint'].replace(
+                    '{child_id}', itr)
+
+                pagination_loop = True
+                pagination_param = {}
+                group_members_itr = 0
+
+                # Continuing pagination method for person_details
+                if endpoint == 'person_details':
+                    # Configure state file
+                    if 'person_details' not in self.state:
+                        self.state['person_details'] = []
+
+                    # Check if we fetch the person yet
+                    # and itr in self.state['person_details']:
+                    if itr in ROOT_ENDPOINTS[endpoint]:
+                        continue
+
+                # Continuing pagiantion method for group_members
+                if endpoint == 'group_members':
+                    # state property for group_members
+                    if 'group_members' not in self.state:
+                        self.state['group_members'] = {}
+
+                    # if group_members exists in state, but is empty, keboola saves an empty object as [] instead of {}
+                    if not self.state["group_members"]:
+                        self.state['group_members'] = {}
+
+                    if itr in self.state['group_members']:
+                        if self.state['group_members'][itr]:
+                            pagination_param['marker'] = self.state['group_members'][itr]
+
+                while pagination_loop:
+
+                    data_in = self.get_request(
+                        endpoint=endpoint_url, params=pagination_param).json()
+
+                    # Hanlding paignation loop if pagiantion param found
+                    if 'marker' in data_in:
+                        pagination_param['marker'] = data_in['marker']
+                    elif 'next_offset' in data_in:
+                        pagination_param['offset'] = data_in['next_offset']
+                    else:
+                        pagination_loop = False
+
+                    # Fetching the datafield
+                    if request_properties['dataField'] == '.':
+                        data_in = data_in
+                    else:
+                        data_in = data_in[request_properties['dataField']]
+
+                    # making sure we are not double fetching the same person
+                    if endpoint == 'person_details':
+                        ROOT_ENDPOINTS[endpoint].append(data_in['id'])
+
+                    # formatting
+                    data_in = [data_in] if isinstance(data_in, dict) else data_in
+                    data_out = []
+
+                    if endpoint in ['campaign_recipients', 'group_members']:
+                        for row in data_in:
+                            tmp = {}
+                            for item in row:
+                                tmp[item] = row[item]
+                            parent_key = '{}_id'.format(
+                                request_properties['required'][:-1])
+                            tmp[parent_key] = itr
+                            data_out.append(tmp)
+                            if endpoint == 'group_members':
+                                ROOT_ENDPOINTS['group_members'].append(
+                                    tmp['id'])
+
+                    elif endpoint in ['person_details']:
+                        logging.error(
+                            'Endpoint [Person Details] is not longer supported. Please use [Person Details V2]')
+                        sys.exit(1)
+
+                    else:
+                        data_out = data_in
+
+                    # API sometimes send phonenumber in response, sometimes not, we have to have add it in cases that
+                    # it is not occuring as it breaks the output table when it is not present.
+                    if endpoint == 'group_members':
+                        for i, datum in enumerate(data_out):
+                            if "phone_number" not in datum:
+                                data_out[i]["phone_number"] = ""
+
+                    self._output(df_json=data_out, filename=endpoint)
+
+                    # Pagination limit for group_members
+                    group_members_itr += 1
+                    # if len(ROOT_ENDPOINTS['group_members']) >= request_limit:
+                    if group_members_itr == 5 and endpoint == 'group_members':
+                        if 'marker' in pagination_param and pagination_loop:
+                            self.state['group_members'][itr] = pagination_param['marker']
+                        else:
+                            self.state['group_members'][itr] = ''
+                        break
+
+        else:
+            endpoint_url = request_properties['endpoint']
+
+            pagination_loop = True
+            pagination_param = {}
+            page = 0
+
+            # Pagination limit for metric timeline
+            metric_timeline_itr = 0
+            metric_timeline_limit = 100_000
+
+            while pagination_loop:
+
+                # Handling state
+                # Check if metric_timeline has state
+                if endpoint == 'metric_timeline':
+                    if 'metric_timeline' in self.state:
+                        pagination_param['since'] = self.state['metric_timeline']
+                        pagination_param['sort'] = 'asc'
+                    else:
+                        pagination_param['since'] = self.metric_timeline_timestamp
+                        pagination_param['sort'] = 'asc'
+                    logging.info(
+                        f'Pagination [since] parameters: [{pagination_param["since"]}]')
+
+                data_in = self.get_request(
+                    endpoint=endpoint_url, params=pagination_param).json()
+
+                # Pagination
+                if 'total' in data_in:
+                    if data_in['end'] + 1 < data_in['total']:
+                        page += 1
+                        pagination_param['page'] = page
+                    else:
+                        pagination_loop = False
+
+                elif 'next' in data_in and endpoint == 'metric_timeline':
+                    # The end of pagination
+                    if pagination_param['since'] == data_in['next'] or data_in['next'] is None:
+                        pagination_loop = False
+
+                    pagination_param['since'] = data_in['next']
+                    metric_timeline_itr += 1
+
+                    # Pagination Limit
+                    if metric_timeline_itr == metric_timeline_limit:
+                        logging.warning("The component has reached iteration limit of 100k for "
+                                        "the metric_timeline endpoint.")
+                        pagination_loop = False
+
+                else:
+                    pagination_loop = False
+
+                # Data Output
+                data_out = data_in if request_properties[
+                                          'dataField'] == '.' else data_in[request_properties['dataField']]
+
+                if not data_out:
+                    logging.warning(f"No data found for endpoint : {endpoint}")
+                data_out = [data_out] if isinstance(data_out, dict) else data_out
+
+                for row in data_out:
+                    ROOT_ENDPOINTS[endpoint].append(
+                        row[request_properties['primary_key']])
+
+                self._output(df_json=data_out, filename=endpoint)
+
+                # Output pagination parameters
+                tmp_json = data_in
+                if 'data' in tmp_json:
+                    del tmp_json['data']
+                logging.info('Pagination Parameters: [{}]'.format(tmp_json))
+
+                # Output State for metric_event
+                if endpoint == 'metric_timeline' and 'next' in data_in:
+                    if data_in['next'] is not None:
+                        self.state[endpoint] = data_in['next']
+
+        REQUESTED_ENDPOINTS.append(endpoint)
+
+    @backoff.on_exception(backoff.expo, (ConnectionResetError, RequestException), max_tries=5)
+    def get_request(self, endpoint, params=None, retry=0):
+        if params is None:
+            params = {}
+        request_url = BASE_URL + endpoint
+        params['api_key'] = self.api_token
+
+        r = requests.get(url=request_url, params=params)
+        if r.status_code not in [200, 201]:
+            logging.error(f'Request issue: {r.text}')
+            if r.status_code == 429 and retry < 10:
+                logging.info(f'Retrying {retry}...')
+                time.sleep(15)
+                r = self.get_request(
+                    endpoint=endpoint, params=params, retry=retry + 1)
+            else:
+                logging.error(r.json()['message'])
+                sys.exit(1)
+
+        return r
+
+    def _output(self, df_json, filename, output_columns=None):
+        if df_json:
+            new_output_columns = self._convert_headers(
+                output_columns) if output_columns is not None else output_columns
+
+            # Output headers
+            output_filename = f'{self.tables_out_path}/{filename}.csv'
+            data_output = pd.DataFrame(df_json, dtype=str)
+
+            # order columns because api shuffes order of attributes in responses
+            data_output.sort_index(axis=1, inplace=True)
+
+            # move id column at the beginning if exists in the df
+            if 'id' in data_output.columns:
+                id_column = data_output.pop('id')
+                data_output.insert(0, 'id', id_column)
+
+            if not os.path.isfile(output_filename):
+                with open(output_filename, 'a') as b:
+                    if output_columns is not None:
+                        data_output.to_csv(
+                            b, header=new_output_columns, index=False, columns=output_columns)
+                    else:
+                        data_output.to_csv(
+                            b, index=False, columns=output_columns)
+                b.close()
+            else:
+                with open(output_filename, 'a') as b:
+                    data_output.to_csv(
+                        b, index=False, header=False, columns=output_columns)
+                b.close()
+
+            self._create_manifest(filename)
+
+    def _create_manifest(self, filename):
+        # logging.info(f'Creating [{filename}] manifest')
+        manifest = {
+            'incremental': True
+        }
+
+        output_filename = f'{self.tables_out_path}/{filename}.csv.manifest'
+        if filename in ['campaigns', 'person_details', 'metric_timeline', 'metrics', 'person_details_v2']:
+            manifest['primary_key'] = ['id']
+        elif filename in ['lists']:
+            manifest['primary_key'] = ['list_id']
+        elif filename in ['group_members']:
+            manifest['primary_key'] = ['list_id', 'id']
+        elif filename in ['campaign_recipients']:
+            manifest['primary_key'] = ['campaign_id', 'customer_id']
+
+        with open(output_filename, 'w') as file_out:
+            json.dump(manifest, file_out)
+
+    def _convert_headers(self, columns):
+        '''
+        Convert all column names to Keboola standard column name parser
+        '''
+
+        # Renaming the columns up to Keboola standards to prevent
+        # any duplicate columns
+        new_columns = []
+        for col in columns:
+            tmp_col = re.sub(r'[^0-9a-zA-Z]+', '_', col)
+            tmp_col = tmp_col[:-1] if tmp_col[-1] == '_' else tmp_col
+            tmp_col = tmp_col[1:] if tmp_col[0] == '_' else tmp_col
+
+            itr = 0  # increase as same column name is found
+            col_after = tmp_col
+
+            # Rule: maximizing the number of characters allowed in a column
+            if len(col_after) > 64:
+                col_after = col_after[:63]
+
+            while col_after in new_columns:
+                if len(col_after) >= 63:
+                    col_after = f'{tmp_col[:61]}_{itr}'
+                    # col_after = f'{col_after[:61]}_{itr}'
+                else:
+                    col_after = f'{tmp_col}_{itr}'
+                itr += 1
+
+            '''# Rule: maximizing the number of characters allowed in a column
+            if len(col_after) > 64:
+                col_after = col_after[:64]'''
+
+            new_columns.append(col_after)
+
+        return new_columns
+
+    def append_new_columns_to_table(self, table_name, all_output_columns, new_output_columns):
+        # Creating TMP file
+        output_filename = f'{self.tables_out_path}/{table_name}.csv'
+
+        all_output_columns_converted = self._convert_headers(
+            all_output_columns)
+        new_output_columns_converted = self._convert_headers(
+            new_output_columns)
+
+        # Ensure the file exist
+        if os.path.isfile(output_filename):
+            tmp_filename = f'{self.tables_out_path}/TEMP_{table_name}.csv'
+            os.system(f'mv {output_filename} {tmp_filename}')
+
+            with open(tmp_filename, 'r') as r_csvfile:
+                with open(output_filename, 'w') as w_csvfile:
+                    dict_reader = csv.DictReader(r_csvfile, delimiter=',')
+                    # add new column with existing
+                    fieldnames = all_output_columns_converted
+                    writer_csv = csv.DictWriter(
+                        w_csvfile, fieldnames, delimiter=',')
+                    writer_csv.writeheader()
+
+                    for row in dict_reader:
+                        for col in new_output_columns_converted:
+                            row[col] = ''
+                        writer_csv.writerow(row)
+
+            r_csvfile.close()
+            w_csvfile.close()
+
+            # Removing TMP file
+            os.system(f'rm {tmp_filename}')
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        debug = sys.argv[1]
+    else:
+        debug = True
+    comp = Component(debug)
+    comp.run()
+
+
+================================================
+File: /src/klaviyo.py
+================================================
+import time
+import multiprocessing
+import requests
+import logging
+import sys  # NOQA
+
+
+class Klaviyo:
+
+    def __init__(self, private_key):
+
+        self.private_key = private_key
+
+    def get_profile_ids(self, segment_id):
+        '''
+        get list of ids from a given list/segment
+        '''
+
+        marker = None
+
+        ids = []
+        members_url = f'https://a.klaviyo.com/api/v2/group/{segment_id}/members/all?api_key={self.private_key}'
+
+        while True:
+
+            if not marker:
+
+                members_call = members_url
+
+            else:
+
+                members_call = f'{members_url}&marker={marker}'
+
+            response = requests.get(members_call)
+
+            if response.status_code == 200:
+
+                members_content = response.json()
+
+                ids.extend([record['id']
+                            for record in members_content['records']])
+
+                if 'marker' in members_content:
+
+                    marker = members_content['marker']
+
+                else:
+
+                    break
+
+            elif response.status_code == 429:
+
+                sleep = eval(response.json()['detail'].split()[-2])
+
+                logging.warning(
+                    f'rate limit exceeded, # seconds to sleep: {sleep}')
+                time.sleep(sleep)
+
+            else:
+
+                logging.error('ERROR 404')
+                return None
+
+            logging.info('IDs SAVED: [{}]'.format(len(ids)))
+
+        logging.info('IDs SAVED: [{}]'.format(len(ids)))
+        return ids
+
+    def get_profile(self, profile_id):
+        '''
+        extract profile data of a given ID; if no such id, returns None
+        '''
+
+        while True:
+
+            # logging.debug(f'Fetching Profile [{profile_id}]')
+            profile_call = f'https://a.klaviyo.com/api/v1/person/{profile_id}?api_key={self.private_key}'
+
+            response = requests.get(profile_call)
+
+            if response.status_code == 429:
+
+                sleep = eval(response.json()['detail'].split()[-2])
+
+                logging.warning(
+                    f'rate limit exceeded, # seconds to sleep: {sleep}')
+                time.sleep(sleep)
+
+            else:
+
+                if response.status_code == 200:
+
+                    profile = response.json()
+                    tmp = {}
+
+                    for header in profile:
+                        output_header = header.replace('$', 'k_')
+                        tmp[output_header] = profile.get(header)
+
+                    return tmp
+
+                else:
+
+                    if response.status_code == 404:
+
+                        logging.error('ERROR: 404')
+
+                    else:
+
+                        logging.error(
+                            f'UNKNOWN RESPONSE: {response.status_code}')
+
+                    return None
+
+    def get_profiles_parallel(self, profile_ids, profile_headers):
+        '''
+        given a list of profile IDs, return a list of profiles, using parallel API calls
+        '''
+
+        cores = multiprocessing.cpu_count()
+        # logging.info(f'MultiProcessing cores: {cores}')
+
+        pool = multiprocessing.Pool(processes=cores)
+
+        result = pool.map(self.get_profile, profile_ids)
+        pool.close()
+        pool.join()
+
+        # out = [profile for profile in result if profile]
+
+        out = []
+        new_profile_headers = []
+
+        for profile in result:
+            if profile:
+                out.append(profile)
+                current_profile_headers = list(profile)
+                new_columns = list(
+                    set(current_profile_headers)-set(profile_headers))
+
+                for col in new_columns:
+                    if col not in new_profile_headers:
+
+                        new_profile_headers.append(col)
+                        profile_headers.append(col)
+
+        return out, profile_headers, new_profile_headers
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+Fetching customer profiles, lists, campaigns and metrics from the [Klaviyo email marketing platform](https://www.klaviyo.com/?utm_source=google&utm_campaign=Branded-Klaviyo-Search&utm_term=klaviyo&utm_medium=paid&match=e&gclid=CjwKCAiA-f78BRBbEiwATKRRBA6z61AGOOHNWVxlT1MQsxdYa28smyXg03o7QSWQ-KUqohg_8Y8--BoCg_EQAvD_BwE)
+
+## Klaviyo API Documentation
+[Klaviyo API](https://www.klaviyo.com/docs)
+
+## Configuration
+Due to the nature of the API limit, it is recommended to have **Metrics Timeline** and **Person Details by Segment**. Gapping these two endpoints to different extraction period can prevent the component bouncing on the API limit.
+
+
+## Parameters
+
+1. API Token
+    - Your Klaviyo Account API Token
+    - To Fetch your API Token:
+      1. Log into your Klaviyo platform
+      2. Your profile name (top right)
+      3. Account
+      4. Settings
+      5. API Keys
+      6. Create API Key (if required)
+
+2. Endpoints
+    1. [Campaigns](https://www.klaviyo.com/docs/api/campaigns#campaigns)
+        - Summary information for all campaigns you've created that includes the name, ID, list, subject, from email address, from name, status, and date created
+    2. [Campaign Recipients](https://www.klaviyo.com/docs/api/campaigns#campaign-recipients)
+        - Summary information about email recipients for the campaign specified that includes each recipients email, customer ID, and status
+        - Since this endpoint requires the result from **Campaigns**, the component will automatically download content from **Campaigns** even if **Campaigns** is not selected
+    3. [Lists](https://www.klaviyo.com/docs/api/v2/lists)
+        - Get a listing of all of the lists in an account
+    4. [Group Members](https://www.klaviyo.com/docs/api/v2/lists#get-members-all)
+        - Get all of the emials, phone numbers for profiles from lists available
+        - Since this endpoint requires the result from **Lists**, the component will automatically download content from **Lists** even if **Lists** is not selected
+    5. [Email Templates](https://www.klaviyo.com/docs/api/email-templates#email-templates)
+        - Returns a list of all the email templates you've created
+    6. [Metrics](https://www.klaviyo.com/docs/api/metrics#metrics)
+        - Returns a list of all the metrics
+    7. [Metrics Timeline](https://www.klaviyo.com/docs/api/metrics#metric-timeline)
+        - Returns a batched timeline of all events in your Klaviyo account
+        - The component will store the latest metric event offset and it will be used for the next run.
+        - The component has been restricted to fetch 10,000 metric timeline records due to timeout limits. If your account contains more Metrics Events, please run this endpoint more frequently.
+    8. [Person Details by Segment](https://www.klaviyo.com/docs/api/v2/lists#get-members)
+        - Fetching all the data attributes for a person from the input segment
+        - If you want to fetch all person profiles, please refer to `How-to` in **Segments** below
+
+3. Metric Timeline Start Date
+    - Required when **Metrics Timeline** is selected
+    - This will inform the component on when the component will start fetching the metric timeline. An updated metric event offset will be stored in the state of the configuration for next job run.
+
+4. Segments
+    - Required when **Person Details by Segment** is selected
+    - The segment which the component will be used to fetch the list of person details
+    - According to Klaivyo, you can create the segment below to fetch all person profiles:
+        - Segment definitions:
+            - Condition: `Properties about someone`
+            - Dimension: `Email`
+            - Dimension Value: `is set` OR `is not set`
+        - Please refer to this [screenshot](https://bitbucket.org/kds_consulting_team/kds-team.ex-klaviyo/src/master/docs/ALL_CUSTOMER_SEGMENT.png) if you are unsure
+          
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+## Parameters
+
+1. API Token
+    - Your Klaviyo Account API Token
+    - To Fetch your API Token:
+      1. Log into your Klaviyo platform
+      2. Your profile name (top right)
+      3. Account
+      4. Settings
+      5. API Keys
+      6. Create API Key (if required)
+
+2. Endpoints
+    1. [Campaigns](https://www.klaviyo.com/docs/api/campaigns#campaigns)
+        - Summary information for all campaigns you've created that includes the name, ID, list, subject, from email address, from name, status, and date created
+    2. [Campaign Recipients](https://www.klaviyo.com/docs/api/campaigns#campaign-recipients)
+        - Summary information about email recipients for the campaign specified that includes each recipients email, customer ID, and status
+        - Since this endpoint requires the result from **Campaigns**, the component will automatically download content from **Campaigns** even if **Campaigns** is not selected
+    3. [Lists](https://www.klaviyo.com/docs/api/v2/lists)
+        - Get a listing of all of the lists in an account
+    4. [Group Members](https://www.klaviyo.com/docs/api/v2/lists#get-members-all)
+        - Get all of the emials, phone numbers for profiles from lists available
+        - Since this endpoint requires the result from **Lists**, the component will automatically download content from **Lists** even if **Lists** is not selected
+    5. [Email Templates](https://www.klaviyo.com/docs/api/email-templates#email-templates)
+        - Returns a list of all the email templates you've created
+    6. [Metrics](https://www.klaviyo.com/docs/api/metrics#metrics)
+        - Returns a list of all the metrics
+    7. [Metrics Timeline](https://www.klaviyo.com/docs/api/metrics#metric-timeline)
+        - Returns a batched timeline of all events in your Klaviyo account
+        - The component will store the latest metric event offset and it will be used for the next run.
+        - The component has been restricted to fetch 10,000 metric timeline records due to timeout limits. If your account contains more Metrics Events, please run this endpoint more frequently.
+    8. [Person Details by Segment](https://www.klaviyo.com/docs/api/v2/lists#get-members)
+        - Fetching all the data attributes for a person from the input segment
+        - If you want to fetch all person profiles, please refer to `How-to` in **Segments** below
+
+3. Metric Timeline Start Date
+    - Required when **Metrics Timeline** is selected
+    - This will inform the component on when the component will start fetching the metric timeline. An updated metric event offset will be stored in the state of the configuration for next job run.
+
+4. Segments
+    - Required when **Person Details by Segment** is selected
+    - The segment which the component will be used to fetch the list of person details
+    - According to Klaivyo, you can create the segment below to fetch all person profiles:
+        - Segment definitions:
+            - Condition: `Properties about someone`
+            - Dimension: `Email`
+            - Dimension Value: `is set` OR `is not set`
+        - Please refer to this [screenshot](https://bitbucket.org/kds_consulting_team/kds-team.ex-klaviyo/src/master/docs/ALL_CUSTOMER_SEGMENT.png) if you are unsure
+          
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Fetching customer related resources from Klaviyo
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+    "type": "object",
+    "title": "extractor configuration",
+    "required": [
+        "#api_token",
+        "endpoints",
+        "metric_timeline_start_date",
+        "segments"
+    ],
+    "properties": {
+        "#api_token": {
+            "type": "string",
+            "title": "API token",
+            "format": "password",
+            "propertyOrder": 100
+        },
+        "endpoints": {
+            "type": "object",
+            "required": [
+                "campaigns",
+                "campaign_recipients",
+                "lists",
+                "group_members",
+                "email_templates",
+                "metrics",
+                "metric_timeline",
+                "person_details_v2"
+            ],
+            "title": "Endpoints",
+            "propertyOrder": 200,
+            "properties": {
+                "campaigns": {
+                    "type": "boolean",
+                    "title": "Campaigns",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 200
+                },
+                "campaign_recipients": {
+                    "type": "boolean",
+                    "title": "Campaign Recipients",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 250
+                },
+                "lists": {
+                    "type": "boolean",
+                    "title": "Lists",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 300
+                },
+                "group_members": {
+                    "type": "boolean",
+                    "title": "Group Members",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 400
+                },
+                "person_details": {
+                    "type": "boolean",
+                    "title": "Person Details",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 500
+                },
+                "email_templates": {
+                    "type": "boolean",
+                    "title": "Email Templates",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 600
+                },
+                "metrics": {
+                    "type": "boolean",
+                    "title": "Metrics",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 700
+                },
+                "metric_timeline": {
+                    "type": "boolean",
+                    "title": "Metrics Timeline",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 800
+                },
+                "person_details_v2": {
+                    "type": "boolean",
+                    "title": "Person Details by Segment",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 900
+                }
+            }
+        },
+        "metric_timeline_start_date": {
+            "type": "string",
+            "title": "Metric Timeline Start Date",
+            "propertyOrder": 300,
+            "format": "date",
+            "default": "2020-01-01",
+            "description": "Requried when [Metric Timeline] is selected."
+        },
+        "segments": {
+            "type": "object",
+            "title": "Segments",
+            "format": "table",
+            "propertyOrder": 350,
+            "description": "Required when [Person Details by Segment] is selected.",
+            "required": [
+                "all_customer"
+            ],
+            "properties": {
+                "all_customer": {
+                    "type": "string",
+                    "title": "All Customer Segment ID",
+                    "propertyOrder": 100
+                }
+            }
+        }
+    }
+}
+
+================================================
+File: /component_config/configSchema_old.json
+================================================
+{
+    "type": "object",
+    "title": "extractor configuration",
+    "required": [
+        "#api_token",
+        "endpoints",
+        "metric_timeline_start_date",
+        "segments",
+        "clear_state"
+    ],
+    "properties": {
+        "#api_token": {
+            "type": "string",
+            "title": "API token",
+            "format": "password",
+            "propertyOrder": 100
+        },
+        "endpoints": {
+            "type": "object",
+            "required": [
+                "campaigns",
+                "campaign_recipients",
+                "lists",
+                "group_members",
+                "email_templates",
+                "metrics",
+                "metric_timeline",
+                "person_details_v2"
+            ],
+            "title": "Endpoints",
+            "propertyOrder": 200,
+            "properties": {
+                "campaigns": {
+                    "type": "boolean",
+                    "title": "Campaigns",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 200
+                },
+                "campaign_recipients": {
+                    "type": "boolean",
+                    "title": "Campaign Recipients",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 250
+                },
+                "lists": {
+                    "type": "boolean",
+                    "title": "Lists",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 300
+                },
+                "group_members": {
+                    "type": "boolean",
+                    "title": "Group Members",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 400
+                },
+                "email_templates": {
+                    "type": "boolean",
+                    "title": "Email Templates",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 600
+                },
+                "metrics": {
+                    "type": "boolean",
+                    "title": "Metrics",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 700
+                },
+                "metric_timeline": {
+                    "type": "boolean",
+                    "title": "Metrics Timeline",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 800
+                },
+                "person_details_v2": {
+                    "type": "boolean",
+                    "title": "Person Details by Segment",
+                    "format": "checkbox",
+                    "default": false,
+                    "propertyOrder": 900
+                }
+            }
+        },
+        "metric_timeline_start_date": {
+            "type": "string",
+            "propertyOrder": 300,
+            "format": "date",
+            "default": "2020-01-01",
+            "description": "Requried when [Metric Timeline] is selected."
+        },
+        "segments": {
+            "type": "object",
+            "title": "Segments",
+            "format": "table",
+            "propertyOrder": 350,
+            "description": "Required when [Person Details by Segment] is selected.",
+            "required": [
+                "all_customer",
+                "new_customer"
+            ],
+            "properties": {
+                "all_customer": {
+                    "type": "string",
+                    "title": "All Customer Segment ID",
+                    "propertyOrder": 100
+                },
+                "new_customer": {
+                    "type": "string",
+                    "title": "New Customer Segment ID",
+                    "propertyOrder": 200
+                }
+            }
+        },
+        "clear_state": {
+            "type": "boolean",
+            "default": false,
+            "propertyOrder": 400,
+            "description": "Clearning the state stored in the component configuration."
+        }
+    }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.10.zip#egg=kbc
+logging_gelf==0.0.18
+mock
+freezegun
+pandas
+backoff
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.2-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install --upgrade pip
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+Copyright (c) 2018 Keboola DS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Klaviyo Extractor
+
+Fetching customer profiles, lists, campaigns and metrics from the [Klaviyo email marketing platform](https://www.klaviyo.com/?utm_source=google&utm_campaign=Branded-Klaviyo-Search&utm_term=klaviyo&utm_medium=paid&match=e&gclid=CjwKCAiA-f78BRBbEiwATKRRBA6z61AGOOHNWVxlT1MQsxdYa28smyXg03o7QSWQ-KUqohg_8Y8--BoCg_EQAvD_BwE)
+
+## Klaviyo API Documentation
+[Klaviyo API](https://www.klaviyo.com/docs)
+
+## Configuration
+Due to the nature of the API limit, it is recommended to have **Metrics Timeline** and **Person Details by Segment**. Gapping these two endpoints to different extraction period can prevent the component bouncing on the API limit.
+
+
+## Parameters
+
+1. API Token
+    - Your Klaviyo Account API Token
+    - To Fetch your API Token:
+      1. Log into your Klaviyo platform
+      2. Your profile name (top right)
+      3. Account
+      4. Settings
+      5. API Keys
+      6. Create API Key (if required)
+
+2. Endpoints
+    1. [Campaigns](https://www.klaviyo.com/docs/api/campaigns#campaigns)
+        - Summary information for all campaigns you've created that includes the name, ID, list, subject, from email address, from name, status, and date created
+    2. [Campaign Recipients](https://www.klaviyo.com/docs/api/campaigns#campaign-recipients)
+        - Summary information about email recipients for the campaign specified that includes each recipients email, customer ID, and status
+        - Since this endpoint requires the result from **Campaigns**, the component will automatically download content from **Campaigns** even if **Campaigns** is not selected
+    3. [Lists](https://www.klaviyo.com/docs/api/v2/lists)
+        - Get a listing of all of the lists in an account
+    4. [Group Members](https://www.klaviyo.com/docs/api/v2/lists#get-members-all)
+        - Get all of the emials, phone numbers for profiles from lists available
+        - Since this endpoint requires the result from **Lists**, the component will automatically download content from **Lists** even if **Lists** is not selected
+    5. [Email Templates](https://www.klaviyo.com/docs/api/email-templates#email-templates)
+        - Returns a list of all the email templates you've created
+    6. [Metrics](https://www.klaviyo.com/docs/api/metrics#metrics)
+        - Returns a list of all the metrics
+    7. [Metrics Timeline](https://www.klaviyo.com/docs/api/metrics#metric-timeline)
+        - Returns a batched timeline of all events in your Klaviyo account
+        - The component will store the latest metric event offset and it will be used for the next run.
+        - The component has been restricted to fetch 100,000 metric timeline records due to timeout limits. If your account contains more Metrics Events, please run this endpoint more frequently.
+    8. [Person Details by Segment](https://www.klaviyo.com/docs/api/v2/lists#get-members)
+        - Fetching all the data attributes for a person from the input segment
+        - If you want to fetch all person profiles, please refer to `How-to` in **Segments** below
+
+3. Metric Timeline Start Date
+    - Required when **Metrics Timeline** is selected
+    - This will inform the component on when the component will start fetching the metric timeline. An updated metric event offset will be stored in the state of the configuration for next job run.
+
+4. Segments
+    - Required when **Person Details by Segment** is selected
+    - The segment which the component will be used to fetch the list of person details
+    - According to Klaivyo, you can create the segment below to fetch all person profiles:
+        - Segment definitions:
+            - Condition: `Properties about someone`
+            - Dimension: `Email`
+            - Dimension Value: `is set` OR `is not set`
+        - Please refer to this [screenshot](https://bitbucket.org/kds_consulting_team/kds-team.ex-klaviyo/src/master/docs/ALL_CUSTOMER_SEGMENT.png) if you are unsure
+          
+

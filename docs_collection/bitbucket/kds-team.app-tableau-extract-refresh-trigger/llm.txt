@@ -1,0 +1,1839 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-tableau-extract-refresh-trigger/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   └── tableau_custom/
+    │       ├── endpoints/
+    │       │   ├── tasks_endpoint.py
+    │       │   └── __init__.py
+    │       ├── __init__.py
+    │       └── custom_daos.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       └── in/
+    │           └── state.json
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.1**
+
+- fix requirements
+- add src folder to path for tests
+
+**0.1.0**
+
+- src folder structure
+- remove dependency on handler lib - import the code directly to enable modifications until its released
+
+**0.0.2**
+
+- add dependency to base lib
+- basic tests
+
+**0.0.1**
+
+- add utils scripts
+- move kbc tests directly to pipelines file
+- use uptodate base docker image
+- add changelog
+
+
+================================================
+File: /src/component.py
+================================================
+'''
+Template Component main class.
+
+'''
+import logging
+import os
+import sys
+import time
+
+import tableauserverclient as tsc
+import xmltodict
+from kbc.env_handler import KBCEnvHandler
+
+# configuration variables
+from tableau_custom.endpoints.tasks_endpoint import TaskCustom
+
+# global constants
+
+KEY_TAG = 'tag'
+KEY_NAME = 'name'
+KEY_LUID = 'luid'
+KEY_API_PASS = '#password'
+KEY_USER_NAME = 'user'
+KEY_ENDPOINT = 'endpoint'
+KEY_POLL_MODE = 'poll_mode'
+KEY_DS_NAME = 'name'
+KEY_DS_TYPE = 'type'
+KEY_DATASOURCES = 'datasources'
+KEY_WORKBOOKS = 'workbooks'
+KEY_SITE_ID = 'site_id'
+KEY_CONTINUE_ON_ERROR = 'continue_on_error'
+
+KEY_AUTH_TYPE = 'authentication_type'
+MANDATORY_PARS = [KEY_API_PASS, KEY_USER_NAME, KEY_DATASOURCES, KEY_ENDPOINT]
+
+APP_VERSION = '0.0.1'
+
+logger = logging.getLogger('tableau.endpoint.tasks')
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, debug=False):
+        KBCEnvHandler.__init__(self, MANDATORY_PARS, )
+        # override debug from config
+        if self.cfg_params.get('debug'):
+            debug = True
+
+        log_level = logging.DEBUG if debug else logging.INFO
+        # setup GELF if available
+        if os.getenv('KBC_LOGGER_ADDR', None):
+            self.set_gelf_logger(log_level)
+        else:
+            self.set_default_logger(log_level)
+        logging.info('Running version %s', APP_VERSION)
+        logging.info('Loading configuration...')
+
+        if not debug:
+            # suppress info logging on the Tableau endpoints
+            logging.getLogger('tableau.endpoint.jobs').setLevel(logging.ERROR)
+            logging.getLogger('tableau.endpoint.datasources').setLevel(logging.ERROR)
+
+        try:
+            self.validate_config()
+        except ValueError as e:
+            logging.exception(e)
+            exit(1)
+
+        site_id = self.cfg_params.get(KEY_SITE_ID) or ''
+        # intialize instance parameteres
+
+        if self.cfg_params.get(KEY_AUTH_TYPE, 'user/password') == 'user/password':
+            self.auth = tsc.TableauAuth(self.cfg_params[KEY_USER_NAME], self.cfg_params[KEY_API_PASS],
+                                        site_id=site_id)
+        elif self.cfg_params.get(KEY_AUTH_TYPE) == "Personal Access Token":
+            self.auth = tsc.PersonalAccessTokenAuth(token_name=self.cfg_params['token_name'],
+                                                    personal_access_token=self.cfg_params['#token_secret'],
+                                                    site_id=site_id)
+        api_version = self.cfg_params.get('api_version', 'use_server_version')
+        if api_version == 'use_server_version':
+            user_server_version = True
+        else:
+            user_server_version = False
+        logging.debug(f"use server:{user_server_version}, api: {api_version}")
+        self.server = tsc.Server(self.cfg_params[KEY_ENDPOINT], use_server_version=user_server_version)
+
+        if not user_server_version:
+            self.server.version = api_version
+        self.server_info = self.server.server_info.get()
+        logging.info(F"Using API version: {self.server.version}")
+
+    def run(self):
+        '''
+        Main execution code
+        '''
+        params = self.cfg_params  # noqa
+        continue_on_error = params.get(KEY_CONTINUE_ON_ERROR, False)
+
+        with self.server.auth.sign_in(self.auth):
+            executed_jobs = dict()
+
+            data_sources = params[KEY_DATASOURCES]
+            if data_sources:
+                # tasks
+                # filter only datasource refresh tasks
+                logging.info('Validating extract names...')
+
+                all_ds, validation_errors = self._get_all_ds_by_filter("datasources", data_sources)
+                logging.debug(F'Recognized datasets: {all_ds}')
+
+                if validation_errors:
+                    for err in validation_errors:
+                        logging.exception(err)
+                    exit(1)
+                ds_to_refresh = self.validate_dataset_names(all_ds, data_sources)
+
+                tasks = self.get_all_datasource_refresh_tasks()
+                # get all datasources for tasks
+                logging.info('Retrieving extract tasks and validating extract types...')
+                ds_tasks = self.get_all_ds_for_tasks(tasks, all_ds)
+                logging.debug(F"Found datasource tasks: {ds_tasks}")
+                self.validate_dataset_types(ds_tasks, ds_to_refresh)
+
+                for ds in data_sources:
+                    task = ds_tasks[ds[KEY_DS_NAME]][ds[KEY_DS_TYPE].lower()]
+                    logging.info(F'Triggering extract for: "{ds[KEY_DS_NAME]}" with LUID: "{task.target.id}""')
+                    try:
+                        job_id = self._run_task(task)
+                        executed_jobs[ds[KEY_DS_NAME]] = job_id
+                    except Exception as ex:
+                        if continue_on_error:
+                            logging.warning(F'Failed to trigger extract for dataset: {ds[KEY_DS_NAME]}. {ex}')
+                        else:
+                            raise ex
+
+            workbooks = params.get(KEY_WORKBOOKS, False)
+            if workbooks:
+                all_wb, validation_errors = self._get_all_ds_by_filter("workbooks", workbooks)
+                for wb in all_wb:
+                    logging.info(F'Triggering extract for: "{wb.name}" with LUID: "{wb.id}""')
+                    try:
+                        job = self.server.workbooks.refresh(wb)
+                        executed_jobs[wb.name] = job.id
+                    except Exception as ex:
+                        if continue_on_error:
+                            logging.warning(F'Failed to trigger extract for workbook: {wb.name}. {ex}')
+                        else:
+                            raise ex
+
+            # poll job statuses
+            if params.get(KEY_POLL_MODE):
+                logging.info('Polling extract refresh statuses.')
+                self._wait_for_finish(executed_jobs)
+
+        logging.info('Trigger finished successfully!')
+
+    def _run_task(self, task):
+        response = self.server.tasks.run(task)
+        root = xmltodict.parse(response)
+
+        job_id = root['tsResponse']['job']['@id']
+        return job_id
+
+    def get_all_datasource_refresh_tasks(self):
+        # filter only datasource refresh tasks
+        tasks = list(tsc.Pager(TaskCustom(self.server)))
+        logging.debug(F'Found tasks: {tasks}')
+        return [task for task in tasks if task.target is not None and task.target.type == 'datasource']
+
+    def validate_dataset_names(self, all_ds, datasources):
+        conf_ds_names = dict()
+        for ds in datasources:
+            conf_ds_names[ds['name']] = ds['type']
+        ds_names = [ds.name for ds in all_ds]
+        inv_names = [nm for nm in conf_ds_names if nm not in ds_names]
+        if inv_names:
+            raise ValueError(F'Some datasets do not exist! {inv_names}')
+        return conf_ds_names
+
+    def get_all_ds_for_tasks(self, tasks, all_ds):
+        ds_tasks = dict()
+        ds_ids = dict()
+        for ds in all_ds:
+            ds_ids[ds.id] = ds.name
+
+        for t in tasks:
+            if t.target.id not in ds_ids:
+                continue
+
+            ds = self.server.datasources.get_by_id(t.target.id)
+            # normalize increment task
+            ds_tasks[ds.name] = ds_tasks.get(ds.name, dict())
+            ds_tasks[ds.name][t.task_type.lower()] = t
+
+        return ds_tasks
+
+    def validate_dataset_types(self, ds_tasks, param):
+
+        inv_ds = [{ds: param[ds]} for ds in param if not ds_tasks.get(ds, {}).get(param[ds].lower())]
+
+        if inv_ds:
+            raise ValueError(F'Some datasets do not have the required refresh type task: {inv_ds}. '
+                             F'Please create the extract refresh of that type first.')
+
+    def _wait_for_finish(self, executed_jobs):
+        remaining_jobs = executed_jobs.copy()
+        failed_jobs = dict()
+        while remaining_jobs:
+            for ds_name in executed_jobs:
+                job = self.server.jobs.get_by_id(executed_jobs[ds_name])
+                if int(job.finish_code) >= 0:
+                    remaining_jobs.pop(ds_name, {})
+
+                    if int(job.finish_code) > 0:  # job failed
+                        failed_jobs[ds_name] = job
+            time.sleep(60)   # preventing too many requests error
+
+        if failed_jobs:
+            raise RuntimeError(F'Some jobs did not finish properly: {failed_jobs}')
+
+    def _get_all_ds_by_filter(self, kind, data_sources):
+        all_ds = list()
+        validation_errors = list()
+        for ds_filter in data_sources:
+            # if luid specified get the source
+            if ds_filter.get(KEY_LUID):
+                res = getattr(self.server, kind).get_by_id(ds_filter[KEY_LUID])
+                ds = [res] if res else []
+
+            else:
+                ds = self._get_all_datasources_by_filter(kind, ds_filter[KEY_NAME], ds_filter.get(KEY_TAG))
+            all_ds.extend(ds)
+            err = self._validate_ds_result(ds_filter, ds)
+            if err:
+                validation_errors.append(err)
+
+        return all_ds, validation_errors
+
+    def _str_ds(self, ds_arr):
+        str = '['
+        for ds in ds_arr:
+            str += F'(Name: {ds.name}, Project:{ds.project_name}, LUID: {ds.id}, tags: {ds.tags}), '
+        str += ']'
+        return str
+
+    def _validate_ds_result(self, filter, ds):
+        ds_error = None
+        if not ds and not filter.get(KEY_LUID):
+            ds_error = F'There is no result for combination of name & tag {filter}'
+        if not ds and filter.get(KEY_LUID):
+            ds_error = F'There is no result for specified LUID, the datasource does not exist {filter[KEY_LUID]}'
+
+        # this happens when luid is set and name is not matching the dataset
+        if len(ds) == 1 and filter[KEY_NAME] != ds[0].name:
+            ds_error = F"The dataset name retrieved by the specified LUID: '{ds[0].name}' " \
+                       F"does not match the '{filter[KEY_NAME]}' specified in corresponding filter: {filter}"
+
+        if len(ds) > 1:
+            ds_error = F"There is more results for given filter: {filter}, " \
+                       F"set more specific tag or use LUID. The results are: {self._str_ds(ds)}"
+        return ds_error
+
+    def _get_all_datasources_by_filter(self, kind, name, tag):
+        req_option = tsc.RequestOptions()
+        req_option.filter.add(tsc.Filter(tsc.RequestOptions.Field.Name,
+                                         tsc.RequestOptions.Operator.Equals,
+
+                                         name))
+        if tag:
+            req_option.filter.add(tsc.Filter(tsc.RequestOptions.Field.Tags,
+                                             tsc.RequestOptions.Operator.Equals,
+                                             tag))
+
+        datasource_items = list(tsc.Pager(getattr(self.server, kind), req_option))
+        return datasource_items
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        debug = sys.argv[1]
+    else:
+        debug = False
+    try:
+        comp = Component(debug)
+        comp.run()
+    except Exception as e:
+        logging.exception(e)
+        exit(1)
+
+
+================================================
+File: /src/tableau_custom/endpoints/tasks_endpoint.py
+================================================
+from pip._internal.utils import logging
+from tableauserverclient import MissingRequiredFieldError
+from tableauserverclient.server import RequestFactory
+from tableauserverclient.server.endpoint import Tasks
+from tableauserverclient.server.endpoint.endpoint import api
+from tableauserverclient.models import PaginationItem
+
+from tableau_custom.custom_daos import TaskItem
+
+logger = logging.getLogger('tableau.endpoint.tasks')
+
+
+class TaskCustom(Tasks):
+
+    @property
+    def baseurl(self):
+        return "{0}/sites/{1}/tasks".format(self.parent_srv.baseurl,
+                                            self.parent_srv.site_id)
+
+    def __normalize_task_type(self, task_type):
+        """
+            The word for extract refresh used in API URL is "extractRefreshes".
+            It is different than the tag "extractRefresh" used in the request body.
+        """
+        if task_type == TaskItem.Type.ExtractRefresh:
+            return '{}es'.format(task_type)
+        else:
+            return task_type
+
+    @api(version='2.6')
+    def get(self, req_options=None, task_type=TaskItem.Type.ExtractRefresh):
+        if task_type == TaskItem.Type.DataAcceleration:
+            self.parent_srv.assert_at_least_version("3.8")
+
+        logger.info('Querying all {} tasks for the site'.format(task_type))
+
+        url = "{0}/{1}".format(self.baseurl, self.__normalize_task_type(task_type))
+        server_response = self.get_request(url, req_options)
+
+        pagination_item = PaginationItem.from_response(server_response.content,
+                                                       self.parent_srv.namespace)
+        all_tasks = TaskItem.from_response(server_response.content,
+                                           self.parent_srv.namespace,
+                                           task_type)
+        return all_tasks, pagination_item
+
+    @api(version='2.6')
+    def get_by_id(self, task_id):
+        if not task_id:
+            error = "No Task ID provided"
+            raise ValueError(error)
+        logger.info("Querying a single task by id ({})".format(task_id))
+        url = "{}/{}/{}".format(self.baseurl,
+                                self.__normalize_task_type(TaskItem.Type.ExtractRefresh), task_id)
+        server_response = self.get_request(url)
+        return TaskItem.from_response(server_response.content, self.parent_srv.namespace)[0]
+
+    @api(version='2.6')
+    def run(self, task_item):
+        if not task_item.id:
+            error = "User item missing ID."
+            raise MissingRequiredFieldError(error)
+
+        url = "{0}/{1}/{2}/runNow".format(self.baseurl,
+                                          self.__normalize_task_type(TaskItem.Type.ExtractRefresh), task_item.id)
+        run_req = RequestFactory.Task.run_req(task_item)
+        server_response = self.post_request(url, run_req)
+        return server_response.content
+
+    # Delete 1 task by id
+    @api(version="3.6")
+    def delete(self, task_id, task_type=TaskItem.Type.ExtractRefresh):
+        if task_type == TaskItem.Type.DataAcceleration:
+            self.parent_srv.assert_at_least_version("3.8")
+
+        if not task_id:
+            error = "No Task ID provided"
+            raise ValueError(error)
+        url = "{0}/{1}/{2}".format(self.baseurl,
+                                   self.__normalize_task_type(task_type), task_id)
+        self.delete_request(url)
+        logger.info('Deleted single task (ID: {0})'.format(task_id))
+
+
+================================================
+File: /src/tableau_custom/custom_daos.py
+================================================
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+from tableauserverclient import Target
+from tableauserverclient.datetime_helpers import parse_datetime
+from tableauserverclient.models.property_decorators import property_is_enum, property_is_valid_time, \
+    property_not_nullable
+
+
+class IntervalItem(object):
+    class Frequency:
+        Hourly = "Hourly"
+        Daily = "Daily"
+        Weekly = "Weekly"
+        Monthly = "Monthly"
+
+    class Occurrence:
+        Minutes = "minutes"
+        Hours = "hours"
+        WeekDay = "weekDay"
+        MonthDay = "monthDay"
+
+    class Day:
+        Sunday = "Sunday"
+        Monday = "Monday"
+        Tuesday = "Tuesday"
+        Wednesday = "Wednesday"
+        Thursday = "Thursday"
+        Friday = "Friday"
+        Saturday = "Saturday"
+        LastDay = "LastDay"
+
+
+class HourlyInterval(object):
+    def __init__(self, start_time, end_time, interval_value):
+
+        self.start_time = start_time
+        self.end_time = end_time
+        self.interval = interval_value
+
+    @property
+    def _frequency(self):
+        return IntervalItem.Frequency.Hourly
+
+    @property
+    def start_time(self):
+        return self._start_time
+
+    @start_time.setter
+    @property_is_valid_time
+    @property_not_nullable
+    def start_time(self, value):
+        self._start_time = value
+
+    @property
+    def end_time(self):
+        return self._end_time
+
+    @end_time.setter
+    @property_is_valid_time
+    @property_not_nullable
+    def end_time(self, value):
+        self._end_time = value
+
+    @property
+    def interval(self):
+        return self._interval
+
+    @interval.setter
+    def interval(self, interval):
+        VALID_INTERVALS = {.25, .5, 1, 2, 4, 6, 8, 12}
+        if float(interval) not in VALID_INTERVALS:
+            error = "Invalid interval {} not in {}".format(interval, str(VALID_INTERVALS))
+            raise ValueError(error)
+
+        self._interval = interval
+
+    def _interval_type_pairs(self):
+
+        # We use fractional hours for the two minute-based intervals.
+        # Need to convert to minutes from hours here
+        if self.interval in {.25, .5}:
+            calculated_interval = int(self.interval * 60)
+            interval_type = IntervalItem.Occurrence.Minutes
+        else:
+            calculated_interval = self.interval
+            interval_type = IntervalItem.Occurrence.Hours
+
+        return [(interval_type, str(calculated_interval))]
+
+
+class DailyInterval(object):
+    def __init__(self, start_time):
+        self.start_time = start_time
+
+    @property
+    def _frequency(self):
+        return IntervalItem.Frequency.Daily
+
+    @property
+    def start_time(self):
+        return self._start_time
+
+    @start_time.setter
+    @property_is_valid_time
+    @property_not_nullable
+    def start_time(self, value):
+        self._start_time = value
+
+
+class WeeklyInterval(object):
+    def __init__(self, start_time, *interval_values):
+        self.start_time = start_time
+        self.interval = interval_values
+
+    @property
+    def _frequency(self):
+        return IntervalItem.Frequency.Weekly
+
+    @property
+    def start_time(self):
+        return self._start_time
+
+    @start_time.setter
+    @property_is_valid_time
+    @property_not_nullable
+    def start_time(self, value):
+        self._start_time = value
+
+    @property
+    def interval(self):
+        return self._interval
+
+    @interval.setter
+    def interval(self, interval_values):
+        if not all(hasattr(IntervalItem.Day, day) for day in interval_values):
+            raise ValueError("Invalid week day defined " + str(interval_values))
+
+        self._interval = interval_values
+
+    def _interval_type_pairs(self):
+        return [(IntervalItem.Occurrence.WeekDay, day) for day in self.interval]
+
+
+class MonthlyInterval(object):
+    def __init__(self, start_time, interval_value):
+        self.start_time = start_time
+        self.interval = str(interval_value)
+
+    @property
+    def _frequency(self):
+        return IntervalItem.Frequency.Monthly
+
+    @property
+    def start_time(self):
+        return self._start_time
+
+    @start_time.setter
+    @property_is_valid_time
+    @property_not_nullable
+    def start_time(self, value):
+        self._start_time = value
+
+    @property
+    def interval(self):
+        return self._interval
+
+    @interval.setter
+    def interval(self, interval_value):
+        error = "Invalid interval value for a monthly frequency: {}.".format(interval_value)
+
+        # This is weird because the value could be a str or an int
+        # The only valid str is 'LastDay' so we check that first. If that's not it
+        # try to convert it to an int, if that fails because it's an incorrect string
+        # like 'badstring' we catch and re-raise. Otherwise we convert to int and check
+        # that it's in range 1-31
+
+        # changed in 3.20
+        # changed in 3.21 https://help.tableau.com/current/api/rest_api/en-us/REST/rest_api_ref.htm#create_cloud_extract_refresh_task # noqa
+        if interval_value not in ["LastDay", "Last", "First", "Second", "Third", "Fourth", "Fifth"]:
+            try:
+                if not (1 <= int(interval_value) <= 31):
+                    raise ValueError(error)
+            except ValueError:
+                if interval_value not in ["LastDay", "Last", "First", "Second", "Third", "Fourth", "Fifth"]:
+                    raise ValueError(error)
+
+        self._interval = str(interval_value)
+
+    def _interval_type_pairs(self):
+        return [(IntervalItem.Occurrence.MonthDay, self.interval)]
+
+
+class ScheduleItem(object):
+    class Type:
+        Extract = "Extract"
+        Flow = "Flow"
+        Subscription = "Subscription"
+        DataAcceleration = "DataAcceleration"
+
+    class ExecutionOrder:
+        Parallel = "Parallel"
+        Serial = "Serial"
+
+    class State:
+        Active = "Active"
+        Suspended = "Suspended"
+
+    def __init__(self, name, priority, schedule_type, execution_order, interval_item):
+        self._created_at = None
+        self._end_schedule_at = None
+        self._id = None
+        self._next_run_at = None
+        self._state = None
+        self._updated_at = None
+        self.interval_item = interval_item
+        self.execution_order = execution_order
+        self.name = name
+        self.priority = priority
+        self.schedule_type = schedule_type
+
+    def __repr__(self):
+        return "<Schedule#{_id} \"{_name}\" {interval_item}>".format(**self.__dict__)
+
+    @property
+    def created_at(self):
+        return self._created_at
+
+    @property
+    def end_schedule_at(self):
+        return self._end_schedule_at
+
+    @property
+    def execution_order(self):
+        return self._execution_order
+
+    @execution_order.setter
+    @property_is_enum(ExecutionOrder)
+    def execution_order(self, value):
+        self._execution_order = value
+
+    @property
+    def id(self):
+        return self._id
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        self._name = value
+
+    @property
+    def next_run_at(self):
+        return self._next_run_at
+
+    @property
+    def priority(self):
+        return self._priority
+
+    @priority.setter
+    def priority(self, value):
+        self._priority = value
+
+    @property
+    def schedule_type(self):
+        return self._schedule_type
+
+    @schedule_type.setter
+    def schedule_type(self, value):
+        self._schedule_type = value
+
+    @property
+    def state(self):
+        return self._state
+
+    @state.setter
+    @property_is_enum(State)
+    def state(self, value):
+        self._state = value
+
+    @property
+    def updated_at(self):
+        return self._updated_at
+
+    @property
+    def warnings(self):
+        return self._warnings
+
+    def _parse_common_tags(self, schedule_xml, ns):
+        if not isinstance(schedule_xml, ET.Element):
+            schedule_xml = ET.fromstring(schedule_xml).find('.//t:schedule', namespaces=ns)
+        if schedule_xml is not None:
+            (_, name, _, _, updated_at, _, next_run_at, end_schedule_at, execution_order,
+             priority, interval_item) = self._parse_element(schedule_xml, ns)
+
+            self._set_values(id_=None,
+                             name=name,
+                             state=None,
+                             created_at=None,
+                             updated_at=updated_at,
+                             schedule_type=None,
+                             next_run_at=next_run_at,
+                             end_schedule_at=end_schedule_at,
+                             execution_order=execution_order,
+                             priority=priority,
+                             interval_item=interval_item)
+
+        return self
+
+    def _set_values(self, id_, name, state, created_at, updated_at, schedule_type,
+                    next_run_at, end_schedule_at, execution_order, priority, interval_item, warnings=None):
+        if id_ is not None:
+            self._id = id_
+        if name:
+            self._name = name
+        if state:
+            self._state = state
+        if created_at:
+            self._created_at = created_at
+        if updated_at:
+            self._updated_at = updated_at
+        if schedule_type:
+            self._schedule_type = schedule_type
+        if next_run_at:
+            self._next_run_at = next_run_at
+        if end_schedule_at:
+            self._end_schedule_at = end_schedule_at
+        if execution_order:
+            self._execution_order = execution_order
+        if priority:
+            self._priority = priority
+        if interval_item:
+            self._interval_item = interval_item
+        if warnings:
+            self._warnings = warnings
+
+    @classmethod
+    def from_response(cls, resp, ns):
+        parsed_response = ET.fromstring(resp)
+        return cls.from_element(parsed_response, ns)
+
+    @classmethod
+    def from_element(cls, parsed_response, ns):
+        warnings = cls._read_warnings(parsed_response, ns)
+
+        all_schedule_items = []
+        all_schedule_xml = parsed_response.findall('.//t:schedule', namespaces=ns)
+        for schedule_xml in all_schedule_xml:
+            (id_, name, state, created_at, updated_at, schedule_type, next_run_at,
+             end_schedule_at, execution_order, priority, interval_item) = cls._parse_element(schedule_xml, ns)
+
+            schedule_item = cls(name, priority, schedule_type, execution_order, interval_item)
+
+            schedule_item._set_values(id_=id_,
+                                      name=None,
+                                      state=state,
+                                      created_at=created_at,
+                                      updated_at=updated_at,
+                                      schedule_type=None,
+                                      next_run_at=next_run_at,
+                                      end_schedule_at=end_schedule_at,
+                                      execution_order=None,
+                                      priority=None,
+                                      interval_item=None,
+                                      warnings=warnings)
+
+            all_schedule_items.append(schedule_item)
+        return all_schedule_items
+
+    @staticmethod
+    def _parse_interval_item(parsed_response, frequency, ns):
+        start_time = parsed_response.get("start", None)
+        start_time = datetime.strptime(start_time, "%H:%M:%S").time()
+        end_time = parsed_response.get("end", None)
+        if end_time is not None:
+            end_time = datetime.strptime(end_time, "%H:%M:%S").time()
+        interval_elems = parsed_response.findall(".//t:intervals/t:interval", namespaces=ns)
+        interval = []
+        for interval_elem in interval_elems:
+            interval.extend(interval_elem.attrib.items())
+
+        if frequency == IntervalItem.Frequency.Daily:
+            return DailyInterval(start_time)
+
+        if frequency == IntervalItem.Frequency.Hourly:
+            interval_occurrence, interval_value = interval.pop(0)
+
+            # We use fractional hours for the two minute-based intervals.
+            # Need to convert to hours from minutes here
+            if interval_occurrence == IntervalItem.Occurrence.Minutes:
+                interval_value = float(interval_value) / 60
+
+            return HourlyInterval(start_time, end_time, interval_value)
+
+        if frequency == IntervalItem.Frequency.Weekly:
+            interval_values = [i[1] for i in interval]
+            return WeeklyInterval(start_time, *interval_values)
+
+        if frequency == IntervalItem.Frequency.Monthly:
+            interval_occurrence, interval_value = interval.pop()
+            return MonthlyInterval(start_time, interval_value)
+
+    @staticmethod
+    def _parse_element(schedule_xml, ns):
+        id = schedule_xml.get('id', None)
+        name = schedule_xml.get('name', None)
+        state = schedule_xml.get('state', None)
+        created_at = parse_datetime(schedule_xml.get('createdAt', None))
+        updated_at = parse_datetime(schedule_xml.get('updatedAt', None))
+        schedule_type = schedule_xml.get('type', None)
+        frequency = schedule_xml.get('frequency', None)
+        next_run_at = parse_datetime(schedule_xml.get('nextRunAt', None))
+        end_schedule_at = parse_datetime(schedule_xml.get('endScheduleAt', None))
+        execution_order = schedule_xml.get('executionOrder', None)
+
+        priority = schedule_xml.get('priority', None)
+        if priority:
+            priority = int(priority)
+
+        interval_item = None
+        frequency_detail_elem = schedule_xml.find('.//t:frequencyDetails', namespaces=ns)
+        if frequency_detail_elem is not None:
+            interval_item = ScheduleItem._parse_interval_item(frequency_detail_elem, frequency, ns)
+
+        return id, name, state, created_at, updated_at, schedule_type, \
+               next_run_at, end_schedule_at, execution_order, priority, interval_item  # noqa
+
+    @staticmethod
+    def parse_add_to_schedule_response(response, ns):
+        parsed_response = ET.fromstring(response.content)
+        warnings = ScheduleItem._read_warnings(parsed_response, ns)
+        all_task_xml = parsed_response.findall('.//t:task', namespaces=ns)
+
+        error = "Status {}: {}".format(response.status_code, response.reason) \
+            if response.status_code < 200 or response.status_code >= 300 else None
+        task_created = len(all_task_xml) > 0
+        return error, warnings, task_created
+
+    @staticmethod
+    def _read_warnings(parsed_response, ns):
+        all_warning_xml = parsed_response.findall('.//t:warning', namespaces=ns)
+        warnings = list() if len(all_warning_xml) > 0 else None
+        for warning_xml in all_warning_xml:
+            warnings.append(warning_xml.get('message', None))
+        return warnings
+
+
+class TaskItem(object):
+    class Type:
+        ExtractRefresh = "extractRefresh"
+        DataAcceleration = "dataAcceleration"
+
+    def __init__(self, id_, task_type, priority, consecutive_failed_count=0, schedule_id=None,
+                 schedule_item=None, last_run_at=None, target=None):
+        self.id = id_
+        self.task_type = task_type
+        self.priority = priority
+        self.consecutive_failed_count = consecutive_failed_count
+        self.schedule_id = schedule_id
+        self.schedule_item = schedule_item
+        self.last_run_at = last_run_at
+        self.target = target
+
+    def __repr__(self):
+        return "<Task#{id} {task_type} pri({priority}) failed({consecutive_failed_count}) schedule_id({" \
+               "schedule_id}) target({target})>".format(**self.__dict__)
+
+    @classmethod
+    def from_response(cls, xml, ns, task_type=Type.ExtractRefresh):
+        parsed_response = ET.fromstring(xml)
+        all_tasks_xml = parsed_response.findall(
+            './/t:task/t:{}'.format(task_type), namespaces=ns)
+
+        all_tasks = (TaskItem._parse_element(x, ns) for x in all_tasks_xml)
+
+        return list(all_tasks)
+
+    @classmethod
+    def _parse_element(cls, element, ns):
+        schedule_item = None
+        target = None
+        last_run_at = None
+        workbook_element = element.find('.//t:workbook', namespaces=ns)
+        datasource_element = element.find('.//t:datasource', namespaces=ns)
+        last_run_at_element = element.find('.//t:lastRunAt', namespaces=ns)
+
+        schedule_item_list = ScheduleItem.from_element(element, ns)
+        if len(schedule_item_list) >= 1:
+            schedule_item = schedule_item_list[0]
+
+        # according to the Tableau Server REST API documentation,
+        # there should be only one of workbook or datasource
+        if workbook_element is not None:
+            workbook_id = workbook_element.get('id', None)
+            target = Target(workbook_id, "workbook")
+        if datasource_element is not None:
+            datasource_id = datasource_element.get('id', None)
+            target = Target(datasource_id, "datasource")
+        if last_run_at_element is not None:
+            last_run_at = parse_datetime(last_run_at_element.text)
+
+        task_type = element.get('type', None)
+        priority = int(element.get('priority', -1))
+        consecutive_failed_count = int(element.get('consecutiveFailedCount', 0))
+        id_ = element.get('id', None)
+        return cls(id_, task_type, priority, consecutive_failed_count, schedule_item.id,
+                   schedule_item, last_run_at, target)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+            - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:$TEST_TAG
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+Allows triggering Tableau extract refresh tasks based on type (`Incremental`, `Full`). Supports `poll mode` to control whether to wait on the result or just trigger and pass.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+Create a [PAT token](https://help.tableau.com/current/pro/desktop/en-us/useracct.htm#create-and-revoke-personal-access-tokens) to authenticate. 
+
+Specify datasource with extract tasks to be refreshed.
+
+**NOTE**: Only extract with tasks/schedules defined will be refreshed.
+Any datasources without extract refresh defined won't be available for the trigger.
+
+### LUID setup
+
+The LUIDs are Tableau server internal unique identificators of datasource objects. It is recommended to use the LUID in 
+combination with datasource name to ensure there is no ambiguity in the setup, because in theory, it is possible 
+for multiple datasources to have same name and/or tags.
+
+If you don't know the LUID you may use unique combination of the `name` and `tag` parameters first to identify the datasource. Once you run the configuration 
+for the first time, the appropriate `LUID` will be displayed for each specified data source in the **job log**. 
+Look for message like `INFO - Triggering extract for: "TABLEAU_TRIGGER_TEST" with LUID: "067098d0-d160-4117-977c-b18f1051aec7""` 
+in the job log and use the displayed `LUID` to update the configuration after first run.
+
+Additional documentation [available here.](https://bitbucket.org/kds_consulting_team/kds-team.app-tableau-extract-refresh-trigger/src/master/README.md)
+
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Trigger Tableu extract refresh directly from Keboola Connection.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Configuration",
+  "required": [
+    "endpoint",
+    "datasources",
+    "poll_mode",
+    "site_id",
+    "authentication_type"
+  ],
+  "properties": {
+    "authentication_type": {
+      "type": "string",
+      "title": "Authentication Type",
+      "enum": [
+        "Personal Access Token"
+      ],
+      "readOnly": true,
+      "default": "Personal Access Token",
+      "propertyOrder": 10
+    },
+    "token_name": {
+      "type": "string",
+      "title": "PAT Token Name",
+      "description": "To create the token see the <a href=\"https://help.tableau.com/current/server/en-us/security_personal_access_tokens.htm#create-tokens\">documentation</a>",
+      "propertyOrder": 100,
+      "options": {
+        "dependencies": {
+          "authentication_type": [
+            "Personal Access Token"
+          ]
+        }
+      }
+    },
+    "#token_secret": {
+      "type": "string",
+      "title": "PAT Token Secret",
+      "description": "To create the token see the <a href=\"https://help.tableau.com/current/server/en-us/security_personal_access_tokens.htm#create-tokens\">documentation</a>",
+      "format": "password",
+      "propertyOrder": 200,
+      "options": {
+        "dependencies": {
+          "authentication_type": [
+            "Personal Access Token"
+          ]
+        }
+      }
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Tableau server API endpoint URL",
+      "description": "Just the domain part from the URL, e.g. https://dub01.online.tableau.com",
+      "propertyOrder": 250
+    },
+    "site_id": {
+      "type": "string",
+      "title": "Tableau Site ID. Use with online version",
+      "description": "The Site ID can be found in the URL: https://dub01.online.tableau.com/#/site/SITE_ID/home",
+      "propertyOrder": 255
+    },
+    "poll_mode": {
+      "type": "number",
+      "title": "Poll mode",
+      "description": "If set to `Yes` the trigger will wait for all triggered jobs to finish, otherwise it will trigger all the jobs and finish successfully right after.",
+      "propertyOrder": 455,
+      "enum": [
+        0,
+        1
+      ],
+      "default": 0,
+      "options": {
+        "enum_titles": [
+          "No",
+          "Yes"
+        ]
+      }
+    },
+    "continue_on_error": {
+      "type": "boolean",
+      "title": "Continue on error",
+      "description": "If set to true, the component will continue with refresh of other data sources or workbooks even if the current one fails.",
+      "propertyOrder": 465,
+      "enum": [
+        false,
+        true
+      ],
+      "default": false
+    },
+    "datasources": {
+      "type": "array",
+      "title": "Tableau datasources",
+      "description": "List of published datasources with extracts to trigger. Note that there must be appropriate tasks/schedules set for all these sources otherwise the execution will fail",
+      "items": {
+        "format": "grid",
+        "type": "object",
+        "title": "Extract",
+        "required": [
+          "name",
+          "tag",
+          "luid",
+          "type"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Data source name.",
+            "description": "<b>Required</b> Data source name as found in Tableau.",
+            "propertyOrder": 1000
+          },
+          "tag": {
+            "type": "string",
+            "title": "Data source tag.",
+            "description": "Optional data source tag as found in Tableau.",
+            "propertyOrder": 2000
+          },
+          "luid": {
+            "type": "string",
+            "title": "Tableu server unique LUID of the datasource (as represented via API)",
+            "description": "Optional unique datasource identifier i.e. xx12-3324-1323, available via API. This ensures unique identification of the datasource. If specified, the 'tag' parameter is ignored. Fill this in after the first execution. The LUID will be printed in the component job log.",
+            "propertyOrder": 3000
+          },
+          "type": {
+            "enum": [
+              "RefreshExtractTask",
+              "IncrementExtractTask"
+            ],
+            "options": {
+              "enum_titles": [
+                "Full",
+                "Incremental"
+              ]
+            },
+            "type": "string",
+            "title": "Refresh type",
+            "description": "Extract refresh type",
+            "default": "Full",
+            "propertyOrder": 4000
+          }
+        }
+      }
+    },
+    "workbooks": {
+      "type": "array",
+      "title": "Tableau workbooks",
+      "description": "List of workbooks which embedded datasources will be refreshed.",
+      "items": {
+        "format": "grid",
+        "type": "object",
+        "title": "Workbook",
+        "required": [
+          "name",
+          "tag",
+          "luid"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Workbook name.",
+            "description": "<b>Required</b> Workbook name as found in Tableau.",
+            "propertyOrder": 1000
+          },
+          "tag": {
+            "type": "string",
+            "title": "Workbook tag.",
+            "description": "Optional workbook tag as found in Tableau.",
+            "propertyOrder": 2000
+          },
+          "luid": {
+            "type": "string",
+            "title": "Tableu server unique LUID of the workbook (as represented via API)",
+            "description": "Optional unique datasource identifier i.e. xx12-3324-1323, available via API. This ensures unique identification of the workbook. If specified, the 'tag' parameter is ignored. Fill this in after the first execution. The LUID will be printed in the component job log.",
+            "propertyOrder": 3000
+          }
+        }
+      }
+    }
+
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#password": "password",
+    "user": "username",
+    "endpoint": "https://dev-tableau.example.com",
+    "datasources": [
+      {
+        "name": "MY_EXTRACT",
+        "tag": "some_optional_tag",
+        "luid": "LUID (if specified other params are ignored)",
+        "type": " RefreshExtractTask OR IncrementExtractTask"
+      }
+    ],
+    "poll_mode": 1,
+    "debug": false
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+#set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.5.zip#egg=kbc
+mock
+freezegun
+tableauserverclient==0.32
+xmltodict
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.12-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+# Set the PYTHONWARNINGS environment variable
+ENV PYTHONWARNINGS "ignore::UserWarning:_distutils_hack"
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Tableau extract trigger app
+
+Component allowing to trigger Tableau extract refresh tasks directly from KBC.
+
+**Table of contents:**  
+  
+[TOC]
+
+# Configuration
+
+## Tableau credentials
+
+- **Token Name** - [REQ] Tableau user's PAT name. Note that the user must be owner of the dataset or Site admin.
+- **Token Secret** - [REQ] Tableau user's PAT Secret
+- **Endpoint** - [REQ] Tableu server API endpoint. Just the domain from the URL, e.g. `https://dub01.online.tableau.com`
+- **Site ID** - [REQ] Tableu Site ID. Optional - for Tableau online. You can find the ID in the URL. 
+E.g. **`SITE_ID`** in `https://dub01.online.tableau.com/#/site/SITE_ID/home`
+
+### PAT
+
+Since 02/2022 the PATs are required as a method of authentication. Follow [this guide](https://help.tableau.com/current/pro/desktop/en-us/useracct.htm#create-and-revoke-personal-access-tokens) to set it up 
+
+
+## Poll mode
+
+Specify whether the app should wait for all triggered tasks to finish. If set to `Yes` the trigger will wait for all triggered jobs to finish, 
+otherwise it will trigger all the jobs and finish successfully right after.
+
+## Tableau datasource specification
+
+The trigger application is executing tasks / schedules that are defined on data sources. Specify a list of data sources 
+with extracts to trigger in this section. 
+
+**IMPORTANT NOTE** 
+
+- there must be appropriate tasks/schedules set for all these sources otherwise the execution will fail.
+- The datasource in Tableau Online must be published.
+
+Each data source is uniquely defined by the `LUID`, which is only available via API and there's no way to retrieve it 
+via the UI. For this reason the data source may be identified by several identifiers.
+
+**Steps to set up the data source:**
+
+1. Define data source name and optionally a tag.
+2. Define the refresh task type. If not present create it first in the extract definition in Tableau.
+3. After first run, look for the LUID outputted in the job log.
+4. Set up LUID parameter to fix the unique identification of the data source.
+
+### Data source name
+
+Name of the datasource with extract refresh tasks to trigger as displayed in the UI (see image below). 
+**NOTE** This may not be unique. If there's more sources with the same name found the trigger will fail and list of the available,
+sources and its' eventual tags will be displayed in the job log. In such case you will need to add a tag to disambiguate.  
+
+### Data source Tag 
+
+Optional parameter defining a data source tag as found in Tableau. Use this to disambiguate the data source if there's 
+more data sources with a same name.
+
+### Tableu server unique LUID
+
+Optional unique datasource identifier i.e. xx12-3324-1323,
+available via API. This ensures unique identification of the datasource. If specified, the `tag` parameter is ignored.
+
+#### LUID setup
+
+If you don't know the LUID you may use unique combination of the `name` and `tag` parameters to identify the datasource. Once you run the configuration 
+for the first time, the appropriate `LUID` will be displayed for each specified data source in the **job log**. Use it to update the `LUID` after first run 
+to ensure unique match, since there may be more datasources with the same name and tag potentially in the future but LUID is unique at all times.
+
+
+### Refresh type
+ 
+Refresh type of the task that is specified for the data source. If the specified type of the refresh task is not defined, 
+the job will fail.
+
+## Tableau workbook specification
+
+To refresh an embedded data source in a workbook.
+
+**Steps to set up the data source:**
+
+1. Define workbook name and optionally a tag.
+2. After first run, look for the LUID outputted in the job log.
+3. Set up LUID parameter to fix the unique identification of the workbook.
+
+### Workbook name
+
+Name of the workbook as displayed in the UI. 
+**NOTE** This may not be unique. If there's more workbooks with the same name found the trigger will fail and list of the available,
+sources and its' eventual tags will be displayed in the job log. In such case you will need to add a tag to disambiguate.  
+
+### Workbook Tag 
+
+Optional parameter defining a data source tag as found in Tableau. Use this to disambiguate the data source if there's 
+more data sources with a same name.
+
+### Tableu server unique LUID
+
+Optional unique datasource identifier i.e. xx12-3324-1323,
+available via API. This ensures unique identification of the workbook. If specified, the `tag` parameter is ignored.
+
+
+
+![Tableau extract](docs/imgs/extract.png)
+
+**IMPORTANT NOTE:** Each datasource must have the required extract refresh set up, e.g. Full refresh, otherwise it won't be recognized and the trigger will fail. If more tasks of a same type are present, only one of them will be triggered.
+
+## Development
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path in the docker-compose file:
+
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+### Example JSON configuration
+
+```json
+{
+  "parameters": {
+    "#password": "XXXXX",
+    "user": "example@keboola.com",
+    "site_id": "testsite",
+    "endpoint":"https://dub01.online.tableau.com/",
+    "datasources": [
+      {"name":"FullTestExtract", "type": "RefreshExtractTask", "luid": "ecf7d5e0-c493-4e03-8d55-106f9f46af3b"},
+      {"name":"IncrementalTestExtract", "type": "IncrementExtractTask", "luid": "ecf7d5e0-a345-4e03-8d55-106f9f46af1g"}
+    ],
+    "poll_mode": 1,
+    "debug": false
+  },
+  "image_parameters": {}
+}
+```
+
+**NOTE**: For generation of the config.json using a friendly GUI form use [this link](https://json-editor.github.io/json-editor/?data=N4Ig9gDgLglmB2BnEAuUMDGCA2MBGqIAZglAIYDuApomALZUCsIANOHgFZUZQD62ZAJ5gArlELwwAJzplsrEIgwALKrNSgogiFUJhO3cW1hRsulCADCCIjADmIqWVgIFUqgEcRMdwBNUANogIohUUgoAxBBkiIgU0v5sVPC+EGAw8EYgvs4xolIYNApp2Ni8dGC+umyIMFBUvDD+ALpsEFKQYbBFaMGh4b1aOoSIUFIZdgomZoQAKmR4ZmQiAAQhYSvwZAzFHTpSWgDyUlUDAIwADBcAvmxRMXEJGiBD5opjE1N1Mxbzi1TLNb9FbRWLxE4KEgyZyEUGPCFtPZdQTHU6oABMV1uIGSqXSmWerxGH3gk2M3zefyWq36ADcNgBBAAKAEkVri0hkoCsAKoAJQAMgoqkpxtA4PBCAApELcqCqFa+ehkDIgsgHFZEDp0Fbyqi8wUsdkAOjsxpWyigUAgiBQAHo7b4RHgLmdjTgMlRjeR/stjVg6LtOgcUScwhjGDcanUGk1Cdo3qNxqSvqZKQtqSsAMoxlYsgAi5p5oRWFDqyhWHvg+vpUlqrjYIowYpckt+Cpz9Tz+ZWGDI8BWeH1JBEKRWqr1BoFKAtVpt9sdztd7vguGr3ozAJE/vodoidtq9TtWZZswAorwC3blPRqiB2sGjmGBujGIxsSUyhUqvHhhZ4CIdBDuE5JpoQTJgKUKzfneTYthKhAskQKyhHKYArAABgAmjQGG6gqHx2HYGxllBFAqtyUIrHI2C6uMRFhFQvgrBw+iILq6G2PAMCIMoRpgHqUhliWdSljAUGEcRUjURJCqsXg7H9sxXE8RWiAiBghSxEQIilIIKz0Za1FEPUUjGkG+xPmiKAACxvkkAGBigAQXCwZytNkVBEMs2DiCgrngOKCDIL0ySAbw0w9EEAByYAKDhyDNNc2I5OQtCOFpv5vOqTiCKmPwgFSW6Krk6UFEUjY0M2MBBW2IACjx3JgMhqV5BlNBifK7IAB5jGQPDsVA6GSWE5qxV28rOPhjHQbKg76mQEAPu0MDOPqaUANaIAeKhMbpHWoZq0gybReolmVWmVoJwnrQqVDddwYgSmJUHeeJCgxnQIWgFCsh+SAdjjIkLwJnoBg8Plbxnr1TgQ2w7heD4TGBCAWw7MYZBkiA2DeMDRIectXQwD0oBo+YmigxYSafKBBX5rkKH5IUmzbF6wpVfBrgWAAPHgAB8fKeN4fjc3a/MrPT5CM+1LMMNR7EjmOqpFX6FnIqi4YoJcWIY5MgyU+8yZY5FhCS2Q0vlbqmPmZVoo1a2hCHLVcglVLF3rZj8tHaOzHK5uquIo+obWZiOvY7jWXEkbkNzJuNJhLWazcV4+oCjyBaVshk6te7KwABQxAZVDtDQyT1MxtKrSszIsgAlOzdu1Y7zu0aOMAp67bWW00ZcwLYGwwMaXorN13VnOiAC0ADMU/ojZE9nLPU9GmQtIqgI/wrJX5s1+aszKDx7JII4HVtx3PeZH3mDOM9zXTZ37vmkhKE6BgV9MUak4AOTkHYX9qk4BgplxzsXsJIPw5oABi4lToH1AQOMgJkNiTlsHWbk91Hqtj3gqNOGdSK0SHCCZM5dxwDknAGNI1ZMgsX0CsbAYAzRqxDBrAYU8rhRhBn+UAYUnJBEFlqGgyhoZ9R4PMRAG0FAsngM2NQZdhGwygGIiRHlICtm+jiRyEUKQhSCJA3S8g2BSJkQwTIcgQBJWMAbamKZaZvH4e4XiupQa22qk3Cw8j+rcncAIxxRJKreV0v9PRpQmFWU1jZdhyUonYl4mACgvAwgdDrIQLkYRPEIWMKoHYFg8BgAEkmRaNkQDJSAA)
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone repo_path my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+

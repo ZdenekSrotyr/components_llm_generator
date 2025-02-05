@@ -1,0 +1,1290 @@
+Directory structure:
+└── kds_consulting_team-kds-team.wr-microsoft-dynamics/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   ├── dynamics/
+    │   │   ├── client.py
+    │   │   └── result.py
+    │   └── configuration.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   └── tables/
+    │       │       ├── contacts.csv
+    │       │       └── leads.csv
+    │       └── out/
+    │           └── tables/
+    │               ├── results.csv.manifest
+    │               └── results.csv
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── images/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.1**
+Fixed public links in documentation.
+MINOR: Tweaks to configuration schema to open links in new tab.
+
+**0.1.0**
+Documentation added.
+Tweaked configuration schema.
+Added sample configuration with examples.
+FIX: Fixed error message when no ID was provided on delete operation.
+FIX: Fixed default value for `continue_on_error` parameter, defaults to `true`.
+
+**0.0.1**
+Working version of the extractor which allows to query any entity supported by Microsoft Dynamics 365's Web API.
+Automatic parsing and querying of the entities.
+
+================================================
+File: /src/component.py
+================================================
+import csv
+import logging
+import json
+import os
+from keboola.component.base import ComponentBase
+from keboola.component.exceptions import UserException
+from configuration import Configuration
+from dynamics.client import DynamicsClient
+from dynamics.result import DynamicsResultsWriter
+
+APP_VERSION = '0.1.3'
+
+SUPPORTED_OPERATIONS = ['delete', 'create_and_update', 'upsert']
+MANDATORYFIELDS_UPSERT = ['id', 'data']
+MANDATORYFIELDS_DELETE = ['id']
+
+
+class Component(ComponentBase):
+
+    def __init__(self):
+
+        super().__init__()
+        self.cfg: Configuration
+        self._client: DynamicsClient = None
+        self.in_tables = self.get_input_tables_definitions()
+        self.writer = DynamicsResultsWriter(self.tables_out_path)
+
+    def run(self):
+
+        self._init_configuration()
+        self.check_input_tables()
+
+        self.init_client()
+        self._client.get_entity_metadata()
+
+        self.check_input_endpoints()
+
+        self.check_input_attributes()
+
+        for table in self.in_tables:
+
+            endpoint = table.name.replace('.csv', '')
+
+            logging.info(f"Writing data to {endpoint}.")
+            error_counter = 0
+
+            with open(table.full_path) as inTable:
+
+                table_reader = csv.DictReader(inTable)
+
+                for row in table_reader:
+
+                    record_id = row['id'].strip()
+                    record_data = None
+
+                    if record_id == '' and self.cfg.operation != 'create_and_update':
+                        if self.cfg.continue_on_error is False:
+                            raise UserException("For upsert and delete operations, all records must have valid IDs "
+                                                "provided.")
+
+                        self.writer.writerow({
+                            **row,
+                            **{
+                                'operation_status': "MISSING_ID_ERROR",
+                                'operation_response': "For upsert and delete operations, an ID must to be provided" +
+                                                      " for all records."
+                            }
+                        }, endpoint, self.cfg.operation)
+                        error_counter += 1
+                        continue
+
+                    if self.cfg.operation == 'create_and_update':
+                        if record_id == '':
+                            record_operation = 'create'
+                        else:
+                            record_operation = 'update'
+
+                    else:
+                        record_operation = self.cfg.operation
+
+                    if record_operation != 'delete':
+                        record_data = self.parse_json_from_string(row['data'])
+
+                        if record_data is None:
+                            if self.cfg.continue_on_error is False:
+                                raise UserException(''.join([f"Invalid data provided. {row['data']} is not a valid",
+                                                             " JSON or Python Dictionary representation."]))
+
+                            else:
+                                self.writer.writerow({**row, **{
+                                    'operation_status': "DATA_ERROR",
+                                    'operation_message': "Data provided is not a valid JSON or Python Dict object."
+                                }}, endpoint, record_operation)
+
+                                error_counter += 1
+                                continue
+
+                    req_record = self.make_request(record_operation, endpoint, record_id, record_data)
+
+                    success, request_id, request_status_dict = self.parse_response(record_operation, req_record)
+
+                    if success is False and self.cfg.continue_on_error is False:
+                        raise UserException(f"There was an error during {record_operation} operation"
+                                            f"on {endpoint} endpoint. Received: {request_status_dict}.")
+
+                    else:
+                        error_counter += int(not success)
+                        self.writer.writerow({**row, **request_status_dict}, endpoint, record_operation, request_id)
+
+            if error_counter != 0:
+                logging.warning(''.join([f"There were {error_counter} errors during {self.cfg.operation} operation on",
+                                         f" {endpoint} endpoint."]))
+
+    def _init_configuration(self) -> None:
+        try:
+            self.validate_configuration_parameters(Configuration.get_dataclass_required_parameters())
+        except UserException as e:
+            raise UserException(f"{e} The configuration is invalid. Please check that you added a configuration row.")
+        self.cfg: Configuration = Configuration.fromDict(parameters=self.configuration.parameters)
+
+    def init_client(self):
+        organization_url = self.configuration.parameters.get('organization_url')
+        if not organization_url:
+            raise UserException('You must fill in the Organization URL')
+
+        credentials = self.configuration.oauth_credentials
+
+        if not credentials:
+            raise UserException("The configuration is not authorized. Please authorize it first.")
+
+        refresh_token = credentials.data['refresh_token']
+
+        self._client = DynamicsClient(credentials.appKey, credentials.appSecret, organization_url,
+                                      refresh_token, self.cfg.api_version)
+
+    def check_input_tables(self):
+
+        if len(self.in_tables) == 0:
+            raise UserException("No input tables specified. At least one input table is required.")
+
+        if self.cfg.operation == 'delete':
+            _mandFields = MANDATORYFIELDS_DELETE
+
+        else:
+            _mandFields = MANDATORYFIELDS_UPSERT
+
+        mand_fields_set = set(_mandFields)
+        tables_with_missing_fields = []
+
+        for table in self.in_tables:
+            with open(table.full_path) as in_table:
+
+                _rdr = csv.DictReader(in_table)
+                _table_cols = set(_rdr.fieldnames if _rdr.fieldnames is not None else [])
+                col_diff = list(mand_fields_set - _table_cols)
+
+                if len(col_diff) != 0:
+                    tables_with_missing_fields += [table.name]
+
+        if len(tables_with_missing_fields) != 0:
+            raise UserException(f"Mandatory fields {mand_fields_set} missing in tables {tables_with_missing_fields}.")
+
+    def check_input_endpoints(self):
+
+        unsupported_endpoints = []
+
+        for table in self.in_tables:
+            endpoint = table.name.replace('.csv', '').lower()
+            if endpoint not in list(self._client.supported_endpoints.keys()):
+                unsupported_endpoints += [endpoint]
+
+        if len(unsupported_endpoints) > 0:
+            url_endpoints = os.path.join(self.cfg.organization_url,
+                                         f'api/data/{self.cfg.api_version}/EntityDefinitions?%24select=EntitySetName')
+            raise UserException(' '.join(["Some endpoints are not available in the Dynamics CRM API instance.",
+                                          f"Unsupported endpoints: {unsupported_endpoints}. For the list of available",
+                                          f"endpoints, please visit: {url_endpoints},",
+                                          "or refer to your Dynamics CRM settings."]))
+
+    def check_input_attributes(self):
+
+        for table in self.in_tables:
+            table_name = table.name.replace('.csv', '').lower()
+            endpoint = self._client.supported_endpoints[table_name]
+            supported_attributes = self._client.get_endpoint_attributes(endpoint)
+
+            logging.info(f"Supported attributes for {endpoint}: {supported_attributes}")
+
+            with open(table.full_path) as inTable:
+                table_reader = csv.DictReader(inTable)
+                row_counter = 0
+                for row in table_reader:
+                    row_counter += 1
+                    record_id = row['id'].strip()
+
+                    if record_id == '' and self.cfg.operation != 'create_and_update':
+                        raise UserException(f"In {table.name} on the line {row_counter} is missing ID."
+                                            " For upsert and delete operations, all records must have valid IDs")
+
+                    if self.cfg.operation == 'create_and_update':
+                        if record_id == '':
+                            record_operation = 'create'
+                        else:
+                            record_operation = 'update'
+
+                    else:
+                        record_operation = self.cfg.operation
+
+                    if record_operation != 'delete':
+                        record_data = self.parse_json_from_string(row['data'])
+                        record_keys = [key.replace("@odata.bind", "") for key in record_data.keys()]
+                        missing = [item for item in record_keys if item not in supported_attributes]
+
+                        if missing:
+                            raise UserException(f"In {table.name} on the line {row_counter} are"
+                                                f" unsupported attributes: {missing}")
+
+        logging.info("All attributes in input tables are supported.")
+
+    @staticmethod
+    def get_request_id(request):
+
+        _reqid = request.headers.get('req_id')
+        if _reqid is not None:
+            _reqid = _reqid.split(',')[0].strip()
+
+        return _reqid
+
+    @staticmethod
+    def parse_json_from_string(object_string):
+
+        try:
+            return json.loads(object_string)
+
+        except ValueError:
+            pass
+
+        try:
+            return eval(object_string)
+
+        except SyntaxError:
+            pass
+
+        return None
+
+    def make_request(self, operation, endpoint, record_id, record_data):
+
+        if operation == 'delete':
+            return self._client.delete_record(endpoint, record_id)
+
+        elif operation == 'upsert':
+            return self._client.upsert_record(endpoint, record_id, record_data)
+
+        elif operation == 'update':
+            return self._client.update_record(endpoint, record_id, record_data)
+
+        elif operation == 'create':
+            return self._client.create_record(endpoint, record_data)
+
+    def parse_response(self, operation, request_object):
+
+        status_code = request_object.status_code
+        id_req = self.get_request_id(request_object)
+
+        if status_code == 204:
+            response = ''
+            if operation == 'create':
+                response = request_object.headers['OData-EntityId']
+
+            return (True, id_req, {
+                'operation_status': f"REQUEST_OK - {status_code}",
+                'operation_response': response
+            })
+
+        elif status_code == 404:
+            response = request_object.json()['error']['message']
+
+            return (False, id_req, {
+                'operation_status': f"REQUEST_ERROR - {status_code}",
+                'operation_response': response
+            })
+
+        elif status_code == 401:
+            return (False, id_req, {
+                'operation_status': f"REQUEST_ERROR - {status_code}",
+                'operation_response': request_object.reason
+            })
+
+        elif status_code == 400:
+            response = request_object.json()['error']['message'].split('\r\n')[0]
+            response = ' '.join(["Attribute you're trying to update most likely does not exist.",
+                                 "Please, check all attributes are published in CRM.",
+                                 f"\nReceived: {response}"])
+
+            return (False, id_req, {
+                'operation_status': f"REQUEST_ERROR - {status_code}",
+                'operation_response': response
+            })
+
+        else:
+            return (False, id_req, {
+                'operation_status': f"UNKNOWN_ERROR - {status_code}",
+                'operation_response': request_object.json()
+            })
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        # this triggers the run method by default and is controlled by the configuration.action parameter
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(1)
+
+
+================================================
+File: /src/dynamics/client.py
+================================================
+import logging
+import os
+
+import requests
+from keboola.component import UserException
+from keboola.http_client import HttpClient
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+class DynamicsClient(HttpClient):
+    MSFT_LOGIN_URL = 'https://login.microsoftonline.com/common/oauth2/token'
+    MAX_RETRIES = 7
+    PAGE_SIZE = 2000
+
+    def __init__(self, client_id, client_secret, resource_url, refresh_token, api_version,
+                 max_page_size: int = PAGE_SIZE):
+
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.resource_url = os.path.join(resource_url, '')
+        self._refresh_token = refresh_token
+        self._max_page_size = max_page_size
+        self.supported_endpoints = []
+        _accessToken = self.refresh_token()
+        super().__init__(base_url=os.path.join(resource_url, 'api/data/', api_version),
+                         max_retries=self.MAX_RETRIES, auth_header={
+            'Authorization': f'Bearer {_accessToken}'
+        })
+
+    def refresh_token(self):
+
+        headers_refresh = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json'
+        }
+
+        body_refresh = {
+            'client_id': self.client_id,
+            'grant_type': 'refresh_token',
+            'client_secret': self.client_secret,
+            'resource': self.resource_url,
+            'refresh_token': self._refresh_token
+        }
+
+        resp = requests.post(self.MSFT_LOGIN_URL, headers=headers_refresh, data=body_refresh)
+        code, response_json = resp.status_code, resp.json()
+
+        if code == 200:
+            logging.debug("Access token refreshed successfully.")
+            return response_json['access_token']
+
+        else:
+            raise UserException(f"Could not refresh access token. Received {code} - {response_json}.")
+
+    def __response_hook(self, res, *args, **kwargs):
+
+        if res.status_code == 401:
+            token = self._refresh_token()
+            self.update_auth_header({"Authorization": f'Bearer {token}'})
+
+            res.request.headers['Authorization'] = f'Bearer {token}'
+            s = requests.Session()
+            return self.requests_retry_session(session=s).send(res.request)
+
+    def requests_retry_session(self, session=None):
+
+        session = session or requests.Session()
+        retry = Retry(
+            total=self.max_retries,
+            read=self.max_retries,
+            connect=self.max_retries,
+            backoff_factor=self.backoff_factor,
+            status_forcelist=self.status_forcelist,
+            allowed_methods=('GET', 'POST', 'PATCH', 'UPDATE', 'DELETE')
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        # append response hook
+        session.hooks['response'].append(self.__response_hook)
+        return session
+
+    def get_entity_metadata(self) -> None:
+
+        url = os.path.join(self.base_url, 'EntityDefinitions')
+
+        params_meta = {
+            '$select': 'EntitySetName,LogicalName'
+        }
+
+        response = self.get_raw(url, is_absolute_path=True, params=params_meta)
+        try:
+            response.raise_for_status()
+            json_data = response.json()
+            self.supported_endpoints = {entity['EntitySetName'].lower(): entity['LogicalName'].lower()
+                                        for entity in json_data['value'] if entity['EntitySetName'] is not None}
+
+        except requests.HTTPError as e:
+            raise e
+
+    def get_endpoint_attributes(self, entity_name: str) -> list:
+
+        url = os.path.join(self.base_url, f'EntityDefinitions(LogicalName=\'{entity_name}\')/Attributes')
+
+        response = self.get_raw(url, is_absolute_path=True)
+
+        try:
+            response.raise_for_status()
+            json_data = response.json()
+
+            attributes = [attr.get('LogicalName') for attr in json_data.get('value')
+                          if attr.get('IsValidForCreate') or attr.get('IsValidForUpdate')]
+
+            return attributes
+
+        except requests.HTTPError as e:
+            raise e
+
+    def create_record(self, endpoint, data):
+        url_create = os.path.join(self.base_url, endpoint)
+        data_create = data
+        return self.post_raw(endpoint_path=url_create, json=data_create)
+
+    def update_record(self, endpoint, record_id, data):
+        url_update = os.path.join(self.base_url, f'{endpoint}({record_id})')
+        headers_update = {
+            'If-Match': '*'
+        }
+        data_update = data
+        return self.patch_raw(endpoint_path=url_update, json=data_update, headers=headers_update, is_absolute_path=True)
+
+    def upsert_record(self, endpoint, record_id, data):
+        url_update = os.path.join(self.base_url, f'{endpoint}({record_id})')
+        data_update = data
+        return self.patch_raw(endpoint_path=url_update, json=data_update)
+
+    def delete_record(self, endpoint, record_id):
+        url_delete = os.path.join(self.base_url, f'{endpoint}({record_id})')
+        return self.delete_raw(url_delete)
+
+
+================================================
+File: /src/dynamics/result.py
+================================================
+import csv
+import hashlib
+import json
+import os
+import time
+
+FIELDS_RESULTS = ['request_id', 'timestamp', 'endpoint', 'operation',
+                  'id', 'data', 'operation_status', 'operation_response']
+PK_RESULTS = ['request_id']
+
+
+class DynamicsResultsWriter:
+
+    def __init__(self, data_out_path):
+
+        self.parDataOutPath = data_out_path
+        self.parTablePath = os.path.join(self.parDataOutPath, 'results.csv')
+
+        self._create_manifest()
+        self._create_writer()
+
+    def _create_manifest(self):
+
+        _template = {
+            'incremental': True,
+            'primary_key': PK_RESULTS,
+            'columns': FIELDS_RESULTS
+        }
+
+        with open(self.parTablePath + '.manifest', 'w') as manFile:
+            json.dump(_template, manFile)
+
+    def _create_writer(self):
+
+        self.writer = csv.DictWriter(open(self.parTablePath, 'w'), fieldnames=FIELDS_RESULTS, restval='',
+                                     extrasaction='ignore', quotechar='\"', quoting=csv.QUOTE_ALL)
+
+    def writerow(self, row_dict, endpoint, operation, request_id=None):
+
+        write_time = str(int(time.time() * 1000))
+
+        if request_id is None:
+            encode_string = '|'.join([write_time, endpoint, operation, str(row_dict)])
+            request_id = hashlib.md5(encode_string.encode()).hexdigest()
+
+        write_dict = {
+            **row_dict,
+            **{
+                'request_id': request_id,
+                'endpoint': endpoint,
+                'operation': operation,
+                'timestamp': write_time
+            }
+        }
+
+        self.writer.writerow(write_dict)
+
+
+================================================
+File: /src/configuration.py
+================================================
+import dataclasses
+from dataclasses import dataclass
+from typing import List
+from enum import Enum
+
+import dataconf
+
+
+class ConfigurationBase:
+
+    @staticmethod
+    def fromDict(parameters: dict):
+        return dataconf.dict(parameters, Configuration, ignore_unexpected=True)
+        pass
+
+    @staticmethod
+    def _convert_private_value_inv(value: str):
+        if value and value.startswith('pswd_'):
+            return value.replace('pswd_', '#', 1)
+        else:
+            return value
+
+    @classmethod
+    def get_dataclass_required_parameters(cls) -> List[str]:
+        """
+        Return list of required parameters based on the dataclass definition (no default value)
+        Returns: List[str]
+
+        """
+        return [cls._convert_private_value_inv(f.name) for f in dataclasses.fields(cls)
+                if f.default == dataclasses.MISSING
+                and f.default_factory == dataclasses.MISSING]
+
+
+class Operation(str, Enum):
+    delete = "delete"
+    create_and_update = "create_and_update"
+    upsert = "upsert"
+
+
+@dataclass
+class Configuration(ConfigurationBase):
+    api_version: str
+    organization_url: str
+    operation: Operation
+    continue_on_error: bool = True
+    debug: bool = False
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - echo 'Pushing test image to repo. [tag=test]'
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# Microsoft Dynamics 365 Writer
+
+Microsoft Dynamics 365 is a product line of customer relationship management by Microsoft. The Microsoft Dynamics 365 writer for Keboola allows users to write data to their Dynamics instance with data directly from Keboola. The writer supports writing data to any available entity in Dynamics 365 instance, including custom entities.
+
+The writer utilizes WebAPI Graph API and supports all versions of the API. For more information about the WebAPI, please read [the API reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/about).
+
+## Useful links
+
+- [Create an entity record](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/create-entity-web-api)
+- [Update or delete an entity record](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/update-delete-entities-using-web-api)
+- [Create relationships between entities using `@odata.bind`](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/associate-disassociate-entities-using-web-api#associate-entities-on-update-using-single-valued-navigation-property)
+- [Lookup vs. Navigation properties](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/web-api-types-operations#lookup-properties)
+- [WebAPI reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/about)
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+### Input tables
+
+For each run, at least one input table needs to be specified. The name of the input table names marks the endpoint, to which the data will be loaded. For example, data from table `contacts.csv` will be written to endpoint `contacts`, data from `leads.csv` will be written to endpoint `leads`, etc. 
+
+#### Valid entities (endpoints)
+
+If one of the tables defines an entity (endpoint), which is not part of the target Dynamics CRM instance, an error will be raised before writing begins.
+
+For a list of default Microsoft defined entities, please visit [Web API EntityType Reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/entitytypes). This list, however, does not include custom created entities and fields. For a complete list of entities, visit `[ORGANIZATION_URL]/api/data/[API_VERSION]/EntityDefinitions?%24select=EntitySetName`, where `ORGANIZATION_URL` is a unique URL of the Dynamics CRM instance for your organization, and `API_VERSION` is the API version specification, you'd like to use; e.g. `https://keboola.crm.dynamics.com/api/data/v9.1/EntityDefinitions?%24select=EntitySetName`. 
+*Note: If the above request returns page error (i.e. HTTP ERROR 401), you need to be logged in first to access the resouce.*
+
+#### Mandatory columns
+
+Each operation requires a set of columns to be included with each table.
+
+##### Delete operation
+
+For `delete` operation, which deletes records from target entities, only column `id` is required, which contains unique identificators of records to be deleted. IDs of particular records can be found in the URL of said record in the UI version of Microsoft Dynamics 365 or using the accompanying extractor component for Dynamics 365.
+
+![record_id](https://bitbucket.org/kds_consulting_team/kds-team.wr-microsoft-dynamics/raw/master/docs/images/record_id.png)
+
+##### Upsert operation
+
+For operation `upsert`, columns `id` and `data` are required. `id`, as is the case in previous case, must contain unique identifier of records to be upserted. The field cannot be left empty, i.e. every row must have a valid ID, which will be accepted by the WebAPI. This way, the upsert operation allows users to specify their own ID for each record (more on that in *Parameters* section).
+
+In `data` column, a valid JSON or Python Dictionary representation must be provided, which will be forwarded to the API.
+
+##### Create and update operation
+
+All tables for this operation must have the same fields as in `upsert` operation with one exception, the `id` can be left blank. All blank IDs will be automatically created by the API and automatically assigned an ID. **This operation is recommended to be used over upsert.**
+
+### Parameters
+
+#### Organization URL (`organization_url`)
+
+The URL of Dynamics 365 instance, where all API calls will be made. The URL can be discovered using [Global Discovery Service](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/discover-url-organization-web-api) or from the URL of web instance:
+
+![organization_url](https://bitbucket.org/kds_consulting_team/kds-team.wr-microsoft-dynamics/raw/master/docs/images/organization_url.png)
+
+#### API Version (`api_version`)
+
+The API version of WebAPI which will be used to query the data. For a list of available APIs, please visit [API reference](https://docs.microsoft.com/en-us/dynamics365/customerengagement/on-premises/developer/webapi/web-api-versions).
+
+#### Operation (`operation`)
+
+The operation, which should be performed on the data in the CRM. Available options are:
+
+- **delete**
+    - configuration name: `delete`
+    - description: The operation deletes all records from the target CRM instance, which match the IDs provided. The operation cannot be reversed and deletes the records forever.
+- **create and update**
+    - configuration name: `create_and_update`
+    - description: The operation updates records, which have an ID specified in the input table and creates those, where ID is left blank. This operation is **preferred over upserting the data**, since IDs creation and all necessary relationships are handled automatically via the API.
+- **upsert**
+    - configuration name: `upsert`
+    - description: All of the data is upserted into the API, i.e. all existing records are updated and non-existent records are created. For each non-existent record, an ID **must** be provided, which matches the ID format used by CRM instance. Non-comfortable IDs will be rejected by the API.
+
+#### Continue on Error (`continue_on_error`)
+
+A boolean flag, which marks, whether the writer should continue, when an exception, either from the API or configuration table, is encountered. An exception can be any 4xx response from the API, i.e. error when creating/updating/deleting a record, or an invalid JSON, missing ID, etc.
+
+If set to `true`, writer continues executing until all rows from input tables are processed. After the component is finished, **an output table** with all operations is created, where success or failure of each operation is recorded. If set to `false`, the application raises an exception immediately after encountering any error.
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Microsoft Dynamics is a line of enterprise resource planning and customer relationship management software applications.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Parameters",
+  "required": [
+    "organization_url",
+    "api_version",
+    "operation",
+    "continue_on_error"
+  ],
+  "properties": {
+    "organization_url": {
+      "type": "string",
+      "title": "Organization URL",
+      "description": "URL to the CRM system located in the Dynamics 365 cloud. Usually in format <a href='https://<organization>.crm.dynamics.com' target='_blank'>https://&ltorganization&gt.crm.dynamics.com</a>.",
+      "propertyOrder": 100,
+      "minLength": 20
+    },
+    "api_version": {
+      "type": "string",
+      "title": "API Version",
+      "propertyOrder": 200,
+      "description": "The API version, which will be used to query the data. For a list of available versions, please, refer to <a href='https://docs.microsoft.com/en-us/dynamics365/customerengagement/on-premises/developer/webapi/web-api-versions' target='_blank'>Microsoft's Web API documentation</a>.",
+      "minLength": 4,
+      "default": "v9.2"
+    },
+    "operation": {
+      "type": "string",
+      "title": "Operation",
+      "propertyOrder": 300,
+      "description": "The API operation to be performed with the data. Check the documentation for more information.",
+      "enum": [
+        "delete",
+        "create_and_update",
+        "upsert"
+      ],
+      "default": "create_and_update",
+      "options": {
+        "enum_titles": [
+          "delete",
+          "create and update",
+          "upsert"
+        ]
+      }
+    },
+    "continue_on_error": {
+      "type": "boolean",
+      "title": "Continue on Error",
+      "propertyOrder": 400,
+      "description": "Marks, if the writer should continue writing data, if an error with any record occured.",
+      "default": true
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "organization_url": "https://keboolads.crm4.dynamics.com/",
+    "api_version": "v9.1",
+    "operation": "create_and_update",
+    "continue_on_error": true
+  },
+  "image_parameters": {},
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2020-01-01 00:13:30",
+        "#data": "{ \"token_type\": \"Bearer\", \"scope\": \"user_impersonation\", \"expires_in\": \"3599\", \"ext_expires_in\": \"3599\", \"expires_on\": \"1579274445\", \"not_before\": \"1579270545\", \"resource\": \"https://keboolads.crm4.dynamics.com/\", \"access_token\": \"<ACCESS_TOKEN>\", \"refresh_token\": \"<REFRESH_TOKEN>\" }",
+        "oauthVersion": "2.0",
+        "appKey": "<CLIENT_ID>",
+        "#appSecret": "<CLIENT_SECRET>"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/tables/contacts.csv
+================================================
+"id","data"
+"7372a805-953f-ea11-a812-000d3a45b0c4","{""lastname"":""McTestFace"", ""emailaddress1"":""testy.mctestface@gmail.com""}"
+"","{'fullname': 'John Rich'}"
+
+================================================
+File: /component_config/sample-config/in/tables/leads.csv
+================================================
+"id","data"
+"b74d460e-953f-ea11-a812-000d3a45b0c4","{'lastname': 'Keboola'}"
+
+================================================
+File: /component_config/sample-config/out/tables/results.csv.manifest
+================================================
+{"incremental": true, "primary_key": ["request_id"], "columns": ["request_id", "timestamp", "endpoint", "operation", "id", "data", "operation_status", "operation_response"]}
+
+================================================
+File: /component_config/sample-config/out/tables/results.csv
+================================================
+"a34da304-a14a-45a7-8785-2eb8118ed822","1579975712198","contacts","delete","7372a805-953f-ea11-a812-000d3a45b0c4","","REQUEST_ERROR - 404","Contact With Id = 7372a805-953f-ea11-a812-000d3a45b0c4 Does Not Exist"
+"34f1e5c1-a2c4-4ef4-85de-ec381135db38","1579975712436","contacts","delete","8372a805-953f-ea11-a812-000d3a45b0c4","","REQUEST_ERROR - 404","Contact With Id = 8372a805-953f-ea11-a812-000d3a45b0c4 Does Not Exist"
+"2ac5553f-77ff-48a2-b75c-d736f86cb547","1579975712675","leads","delete","a74d460e-953f-ea11-a812-000d3a45b0c4","","REQUEST_ERROR - 404","Lead With Id = a74d460e-953f-ea11-a812-000d3a45b0c4 Does Not Exist"
+"ca35c927-9ff1-4ced-b878-234dee5bc983","1579975712902","leads","delete","b74d460e-953f-ea11-a812-000d3a45b0c4","","REQUEST_OK - 204",""
+
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.utils==1.1.0
+keboola.component==1.4.3
+keboola.http-client
+requests==2.31.0
+dataconf~=2.3.0
+urllib3==2.2.0
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.6-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install --upgrade pip
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Microsoft Dynamics 365 Writer
+
+## Introduction
+
+Microsoft Dynamics 365 is a product line of customer relationship management by Microsoft. The Microsoft Dynamics 365 writer for Keboola allows users to write data to their Dynamics instance with data directly from Keboola. The writer supports writing data to any available entity in Dynamics 365 instance, including custom entities.
+
+The writer utilizes WebAPI Graph API and supports all versions of the API. For more information about the WebAPI, please read [the API reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/about).
+
+## Configuration
+
+A sample configuration of the writer can be found in [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.wr-microsoft-dynamics/src/master/component_config/sample-config/). 
+
+### Authorization
+
+The component needs to be authorized by a user with access to Dynamics 365. The writer then performs all of the operations on behalf of the user, i.e. all of the operations have user's unique identification linked to the operation.
+
+For local run of the writer, please refer to [correct configuration file specification](https://developers.keboola.com/extend/common-interface/oauth/#authorize).
+
+### Input tables
+
+For each run, at least one input table needs to be specified. The name of the input table names marks the endpoint, to which the data will be loaded. For example, data from table `contacts.csv` will be written to endpoint `contacts`, data from `leads.csv` will be written to endpoint `leads`, etc. 
+
+#### Valid entities (endpoints)
+
+If one of the tables defines an entity (endpoint), which is not part of the target Dynamics CRM instance, an error will be raised before writing begins.
+
+For a list of default Microsoft defined entities, please visit [Web API EntityType Reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/entitytypes). This list, however, does not include custom created entities and fields. For a complete list of entities, visit `[ORGANIZATION_URL]/api/data/[API_VERSION]/EntityDefinitions?%24select=EntitySetName`, where `ORGANIZATION_URL` is a unique URL of the Dynamics CRM instance for your organization, and `API_VERSION` is the API version specification, you'd like to use; e.g. `https://keboola.crm.dynamics.com/api/data/v9.1/EntityDefinitions?%24select=EntitySetName`. 
+*Note: If the above request returns page error (i.e. HTTP ERROR 401), you need to be logged in first to access the resouce.*
+
+#### Mandatory columns
+
+Each operation requires a set of columns to be included with each table.
+
+##### Delete operation
+
+For `delete` operation, which deletes records from target entities, only column `id` is required, which contains unique identificators of records to be deleted. IDs of particular records can be found in the URL of said record in the UI version of Microsoft Dynamics 365 or using the accompanying extractor component for Dynamics 365.
+
+![record_id](docs/images/record_id.png)
+
+##### Upsert operation
+
+For operation `upsert`, columns `id` and `data` are required. `id`, as is the case in previous case, must contain unique identifier of records to be upserted. The field cannot be left empty, i.e. every row must have a valid ID, which will be accepted by the WebAPI. This way, the upsert operation allows users to specify their own ID for each record (more on that in *Parameters* section).
+
+In `data` column, a valid JSON or Python Dictionary representation must be provided, which will be forwarded to the API.
+
+##### Create and update operation
+
+All tables for this operation must have the same fields as in `upsert` operation with one exception, the `id` can be left blank. All blank IDs will be automatically created by the API and automatically assigned an ID. **This operation is recommended to be used over upsert.**
+
+### Parameters
+
+#### Organization URL (`organization_url`)
+
+The URL of Dynamics 365 instance, where all API calls will be made. The URL can be discovered using [Global Discovery Service](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/discover-url-organization-web-api) or from the URL of web instance:
+
+![organization_url](docs/images/organization_url.png)
+
+#### API Version (`api_version`)
+
+The API version of WebAPI which will be used to query the data. For a list of available APIs, please visit [API reference](https://docs.microsoft.com/en-us/dynamics365/customerengagement/on-premises/developer/webapi/web-api-versions).
+
+#### Operation (`operation`)
+
+The operation, which should be performed on the data in the CRM. Available options are:
+
+- **delete**
+    - configuration name: `delete`
+    - description: The operation deletes all records from the target CRM instance, which match the IDs provided. The operation cannot be reversed and deletes the records forever.
+- **create and update**
+    - configuration name: `create_and_update`
+    - description: The operation updates records, which have an ID specified in the input table and creates those, where ID is left blank. This operation is **preferred over upserting the data**, since IDs creation and all necessary relationships are handled automatically via the API.
+- **upsert**
+    - configuration name: `upsert`
+    - description: All of the data is upserted into the API, i.e. all existing records are updated and non-existent records are created. For each non-existent record, an ID **must** be provided, which matches the ID format used by CRM instance. Non-comfortable IDs will be rejected by the API.
+
+#### Continue on Error (`continue_on_error`)
+
+A boolean flag, which marks, whether the writer should continue, when an exception, either from the API or configuration table, is encountered. An exception can be any 4xx response from the API, i.e. error when creating/updating/deleting a record, or an invalid JSON, missing ID, etc.
+
+If set to `true`, writer continues executing until all rows from input tables are processed. After the component is finished, **an output table** with all operations is created, where success or failure of each operation is recorded. If set to `false`, the application raises an exception immediately after encountering any error.
+
+## Output table
+
+If `continue_on_error` is set to `true`, at the end of a run, the application outputs a table with results - an audit log per se. The table is loaded incrementally into storage.
+
+Columns in the output table are following:
+
+- **`request_id`**
+    - **description:** A primary key of the table. Each request to the API, both successful and unsuccessful, returns a unique request identificator, which can be used for audit purposes. The id of each request is recorded in the column. If an application 'fails' before making a request to the API (e.g. invalid JSON), the request ID is generated by the component.
+- **`timestamp`**
+    - **description:** A UNIX timestamp of each event recorded in the table. All times are in UTC and recorded in miliseconds.
+- **`endpoint`**
+    - **description:** An endpoint to which a request was made. Inherited from input tables name.
+- **`operation`**
+    - **description:** An operation, which was performed with the record.
+    - **possible values:**
+        - `delete` - a deletion of a record was performed,
+        - `upsert` - a record was upserted,
+        - `create` - a record was created,
+        - `update` - a record was updated.
+- **`id`**
+    - **description:** An ID of a record, taken from input table.
+- **`data`**
+    - **description:** Data which was appended to the request, taken from input table.
+- **`operation_status`**
+    - **description:** A status of the operation. All operations include a status message and a status code, which was returned from the API if a request was made. All successful requests contain `OK` keyword, while all failed operations contain `ERROR` keyword.
+    - **possible values:** `REQUEST_OK`, `REQUEST_ERROR`, `UNKNOWN_ERROR`, `MISSING_ID_ERROR`, `DATA_ERROR`
+- **`operation_response`**
+    - **description:** A message for each operation performed. In case of failed operation, contains message about why the operation failed. In case of successful operation, its left mostly blank, except for successful `create` operation, in which case a URL to newly created entity will be included.
+
+
+## Useful links
+
+- [Create an entity record](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/create-entity-web-api)
+- [Update or delete an entity record](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/update-delete-entities-using-web-api)
+- [Create relationships between entities using `@odata.bind`](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/associate-disassociate-entities-using-web-api#associate-entities-on-update-using-single-valued-navigation-property)
+- [Lookup vs. Navigation properties](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/web-api-types-operations#lookup-properties)
+- [WebAPI reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/about)
+
+## Local development
+
+For local development, use following commands to build and run an image:
+
+```
+docker-compose build dev
+docker-compose run --rm dev
+```
+

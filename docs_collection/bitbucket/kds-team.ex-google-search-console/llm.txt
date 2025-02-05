@@ -1,0 +1,1765 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-google-search-console/
+    ├── .travis.yml
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   └── google_search_console/
+    │       ├── exception.py
+    │       ├── __init__.py
+    │       └── client.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── logger
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── loggerConfiguration.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /.travis.yml
+================================================
+sudo: false
+
+services:
+  - docker
+
+jobs:
+  include:
+    - stage: tests
+      script:
+        - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+        - docker run $APP_IMAGE python -m unittest discover
+      # push test image to ECR - uncomment for testing before deployment
+      #  - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+      #  - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+      #  - docker tag $APP_IMAGE:latest $REPOSITORY:test
+      #  - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+      #  - docker push $REPOSITORY:test
+      #  - docker pull quay.io/keboola/syrup-cli:latest
+    - stage: deploy_dev_portal
+      if: branch = master
+      script: "./scripts/update_dev_portal_properties.sh"
+
+before_script:
+  - export APP_IMAGE=keboola-component
+  - docker -v
+  - docker build -t $APP_IMAGE .
+  - chmod +x ./scripts/update_dev_portal_properties.sh
+  - chmod +x ./deploy.sh
+
+after_success:
+  - docker images
+
+deploy:
+  provider: script
+  skip_cleanup: true
+  script: ./deploy.sh
+  on:
+    tags: true
+    branch: master
+
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    example
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.1**
+
+- fix requirements
+- add src folder to path for tests
+
+**0.1.0**
+
+- src folder structure
+- remove dependency on handler lib - import the code directly to enable modifications until its released
+
+**0.0.2**
+
+- add dependency to base lib
+- basic tests
+
+**0.0.1**
+
+- add utils scripts
+- move kbc tests directly to pipelines file
+- use uptodate base docker image
+- add changelog
+
+
+================================================
+File: /src/component.py
+================================================
+import logging
+import dateparser
+import warnings
+import csv
+from datetime import date
+from os import path, mkdir, listdir, rmdir
+from datetime import timedelta
+from typing import List
+from keboola.component.base import ComponentBase, UserException
+from google_search_console import GoogleSearchConsoleClient, ClientError, ClientAuthError
+from keboola.component.dao import OauthCredentials
+from typing import Dict, Tuple, Generator
+from googleapiclient.errors import HttpError
+import json
+
+
+KEY_DOMAIN = 'domain'
+KEY_OUT_TABLE_NAME = "out_table_name"
+KEY_ENDPOINT = "endpoint"
+KEY_SEARCH_ANALYTICS_DIMENSIONS = "search_analytics_dimensions"
+KEY_DATE_FROM = "date_from"
+KEY_DATE_TO = "date_to"
+KEY_DATE_RANGE = "date_range"
+KEY_SEARCH_TYPE = "search_type"
+KEY_CLIENT_ID = "appKey"
+KEY_CLIENT_SECRET = "appSecret"
+KEY_REFRESH_TOKEN = "refresh_token"
+KEY_FILTER_GROUPS = "filter_groups"
+KEY_AUTH_DATA = "data"
+KEY_LOADING_OPTIONS = "loading_options"
+KEY_LOADING_OPTIONS_INCREMENTAL = "incremental"
+KEY_SERVICE_ACCOUNT = "#service_account_info"
+KEY_INCLUDE_FRESH = "include_fresh"
+
+SITEMAPS_HEADERS = ["path", "lastSubmitted", "isPending", "isSitemapsIndex", "type", "lastDownloaded", "warnings",
+                    "errors"]
+
+SEARCH_TYPES = ["news", "video", "image", "web", "discover", "googleNews"]
+
+REQUIRED_PARAMETERS = [KEY_DOMAIN, KEY_OUT_TABLE_NAME, KEY_ENDPOINT]
+REQUIRED_IMAGE_PARS = []
+
+# Ignore dateparser warnings regarding pytz
+warnings.filterwarnings(
+    "ignore",
+    message="The localize method is no longer necessary, as this time zone supports the fold attribute",
+)
+
+
+class Component(ComponentBase):
+    def __init__(self) -> None:
+        super().__init__(required_parameters=REQUIRED_PARAMETERS,
+                         required_image_parameters=REQUIRED_IMAGE_PARS)
+        params = self.configuration.parameters
+        self.out_table_name = params.get(KEY_OUT_TABLE_NAME)
+        self.validate_table_name(self.out_table_name)
+        self.out_table_name = "".join([self.out_table_name, ".csv"])
+        self.endpoint = params.get(KEY_ENDPOINT)
+        self.domain = params.get(KEY_DOMAIN)
+        self.filter_groups = params.get(KEY_FILTER_GROUPS, [[]])
+
+        self.service_account_info = params.get(KEY_SERVICE_ACCOUNT, None)
+
+    def run(self) -> None:
+        client_id_credentials = self.configuration.oauth_credentials
+
+        if self.service_account_info:
+            gsc_client = self.get_gsc_client(service_account_info=self.service_account_info)
+        else:
+            gsc_client = self.get_gsc_client(client_id_credentials=client_id_credentials)
+
+        logging.getLogger("googleapiclient.http").disabled = True
+
+        if self.endpoint == "Search analytics":
+            self.fetch_and_write_search_analytics_data(gsc_client)
+
+        elif self.endpoint == "Sitemaps":
+            sitemap_data = self.get_sitemaps_data(gsc_client)
+            self.write_results(sitemap_data)
+
+        else:
+            raise ValueError("Endpoint selected does not exist")
+
+    def fetch_and_write_search_analytics_data(self, gsc_client: GoogleSearchConsoleClient) -> None:
+        params = self.configuration.parameters
+        search_analytics_dimensions = self.parse_list_from_string(params.get(KEY_SEARCH_ANALYTICS_DIMENSIONS, ""))
+        incremental = params.get(KEY_LOADING_OPTIONS, {}).get(KEY_LOADING_OPTIONS_INCREMENTAL, 0)
+        date_downloaded = date.today()
+        table = self.create_out_table_definition(self.out_table_name,
+                                                 primary_key=search_analytics_dimensions,
+                                                 incremental=incremental,
+                                                 is_sliced=True)
+        self.create_sliced_directory(table.full_path)
+        fieldnames = []
+        try:
+            for i, search_data_slice in enumerate(self.get_search_analytics_data(gsc_client)):
+                parsed_slice = self.parse_search_analytics_data(search_data_slice, search_analytics_dimensions)
+                slice_path = path.join(table.full_path, str(i))
+                fieldnames = list(parsed_slice[0].keys())
+                fieldnames.append("date_downloaded")
+                fieldnames.append("domain")
+                self.write_results_to_out_table(slice_path, fieldnames, parsed_slice, date_downloaded)
+            table.columns = fieldnames
+            if len(listdir(table.full_path)) != 0:
+                self.write_tabledef_manifest(table)
+            else:
+                logging.warning("No Data Found")
+                rmdir(table.full_path)
+        except (ClientError, HttpError, ClientAuthError) as cl_error:
+            raise UserException(cl_error) from cl_error
+
+    @staticmethod
+    def create_sliced_directory(table_path: str) -> None:
+        logging.info("Creating sliced file")
+        if not path.isdir(table_path):
+            mkdir(table_path)
+
+    @staticmethod
+    def get_gsc_client(client_id_credentials: OauthCredentials = None, service_account_info: str = "")\
+            -> GoogleSearchConsoleClient:
+        if service_account_info:
+            try:
+                service_account_dict = json.loads(service_account_info)
+            except json.decoder.JSONDecodeError:
+                raise UserException("Cannot parse service account json.")
+
+            try:
+                return GoogleSearchConsoleClient.from_service_account(service_account_dict)
+            except ClientError as client_error:
+                raise UserException(client_error) from client_error
+        elif client_id_credentials:
+            client_id = client_id_credentials[KEY_CLIENT_ID]
+            client_secret = client_id_credentials[KEY_CLIENT_SECRET]
+            refresh_token = client_id_credentials[KEY_AUTH_DATA][KEY_REFRESH_TOKEN]
+
+            try:
+                return GoogleSearchConsoleClient.from_auth_code(client_id, client_secret, refresh_token)
+            except ClientError as client_error:
+                raise UserException(client_error) from client_error
+        else:
+            raise UserException(
+                "Component is not authorized, please authorize the app in the authorization configuration ")
+
+    def write_results(self, data: List[Dict]) -> None:
+        fieldnames = list(data[0].keys())
+        fieldnames.append("date_downloaded")
+        fieldnames.append("domain")
+        date_downloaded = date.today()
+        out_table = self.create_out_table_definition(name=self.out_table_name,
+                                                     columns=fieldnames)
+        self.write_results_to_out_table(out_table.full_path, fieldnames, data, date_downloaded)
+        self.write_tabledef_manifest(out_table)
+
+    def write_results_to_out_table(self, file_path: str, fieldnames: List[str], data: List[Dict],
+                                   date_downloaded: date) -> None:
+        with open(file_path, mode='wt', encoding='utf-8', newline='') as out_file:
+            writer = csv.DictWriter(out_file, fieldnames)
+            for result in data:
+                result["date_downloaded"] = date_downloaded
+                result["domain"] = self.domain
+                writer.writerow(result)
+
+    def get_search_analytics_data(self, gsc_client: GoogleSearchConsoleClient) -> Generator:
+        params = self.configuration.parameters
+        search_analytics_dimensions = self.parse_list_from_string(params.get(KEY_SEARCH_ANALYTICS_DIMENSIONS, ""))
+        search_type = params.get(KEY_SEARCH_TYPE)
+        if search_type and search_type not in SEARCH_TYPES:
+            raise UserException(f"Type must be one of the following {SEARCH_TYPES}, you entered '{search_type}'.")
+        if not search_analytics_dimensions:
+            raise UserException("Missing Search Analytics dimensions, please fill them in")
+
+        date_from, date_to = self.get_date_range(params.get(KEY_DATE_FROM),
+                                                 params.get(KEY_DATE_TO),
+                                                 params.get(KEY_DATE_RANGE))
+
+        logging.info(
+            f"Fetching data for search analytics for {search_analytics_dimensions} dimensions for domain {self.domain},"
+            f"for dates from {date_from} to {date_to}")
+
+        logging.info(f"Filters set as {self.filter_groups}")
+
+        if not self.filter_groups:
+            return self._get_search_analytics_data(gsc_client, date_from, date_to, search_analytics_dimensions,
+                                                   search_type)
+
+        for filter_group in self.filter_groups:
+            return self._get_search_analytics_data(gsc_client, date_from, date_to, search_analytics_dimensions,
+                                                   search_type, filter_group=filter_group)
+
+    def _get_search_analytics_data(self, gsc_client: GoogleSearchConsoleClient, date_from: date, date_to: date,
+                                   search_analytics_dimensions: List[str], search_type: str,
+                                   filter_group=None) -> Generator:
+        include_fresh = self.configuration.parameters.get(KEY_INCLUDE_FRESH, False)
+        if filter_group is None:
+            filter_group = []
+        try:
+            paged_data = gsc_client.get_search_analytics_data(date_from, date_to, self.domain,
+                                                              search_analytics_dimensions, search_type,
+                                                              filter_group, include_fresh)
+            return paged_data
+        except ClientError as client_error:
+            raise UserException(client_error.args[0].error_details[0]["message"]) from client_error
+
+    @staticmethod
+    def filter_duplicates_from_data(data: List[Dict]) -> List[Dict]:
+        seen = set()
+        new_data = []
+        for datum in data:
+            t = tuple(sorted(datum.items()))
+            if t not in seen:
+                seen.add(t)
+                new_data.append(datum)
+        return new_data
+
+    @staticmethod
+    def parse_list_from_string(string_list: str) -> List[str]:
+        if "," in string_list:
+            return [word.strip() for word in string_list.split(",") if len(word) > 1]
+        else:
+            return [string_list]
+
+    def parse_search_analytics_data(self, data: List[Dict], dimensions: List[str]) -> List[Dict]:
+        parsed_data = []
+        for row in data:
+            parsed_data.append(self._parse_search_analytics_row(row, dimensions))
+        return parsed_data
+
+    @staticmethod
+    def _parse_search_analytics_row(row: Dict, dimensions: List[str]) -> Dict:
+        parsed_row = {}
+        for i, dimension in enumerate(dimensions):
+            parsed_row[dimension] = row["keys"][i]
+        data_headers = list(row.keys())
+        data_headers.remove("keys")
+        for key in data_headers:
+            parsed_row[key] = row[key]
+        return parsed_row
+
+    def get_sitemaps_data(self, gsc_client: GoogleSearchConsoleClient) -> List[Dict]:
+        logging.info("Fetching sitemaps data")
+        data = self._get_sitemaps_data(gsc_client)
+        logging.info("Parsing results")
+        data = self.parse_sitemaps_data(data)
+        return data
+
+    def _get_sitemaps_data(self, gsc_client: GoogleSearchConsoleClient) -> List[Dict]:
+        try:
+            return gsc_client.get_sitemaps_data(self.domain)
+        except ClientError as client_error:
+            raise UserException(client_error.args[0].error_details[0]["message"]) from client_error
+        except ClientAuthError as client_auth_error:
+            raise UserException(client_auth_error)
+
+    def parse_sitemaps_data(self, data: List[Dict]) -> List[Dict]:
+        parsed_data = []
+        for row in data:
+            parsed_data.extend(self.parse_sitemaps_row(row))
+        return parsed_data
+
+    def parse_sitemaps_row(self, row: Dict) -> List[Dict]:
+        if "contents" in row:
+            return self._parse_sitemap_content_row(row)
+        else:
+            return self._parse_sitemap_error_row(row)
+
+    @staticmethod
+    def _parse_sitemap_content_row(row: Dict) -> List[Dict]:
+        content_rows = []
+        for content in row["contents"]:
+            parsed_row = {}
+            for sitemap_header in SITEMAPS_HEADERS:
+                parsed_row[sitemap_header] = row.get(sitemap_header)
+            parsed_row["content_type"] = content["type"]
+            parsed_row["submitted"] = content["submitted"]
+            parsed_row["indexed"] = content["indexed"]
+            content_rows.append(parsed_row)
+        return content_rows
+
+    @staticmethod
+    def _parse_sitemap_error_row(row: Dict) -> List[Dict]:
+        error_rows = []
+        parsed_row = {}
+        for sitemap_header in SITEMAPS_HEADERS:
+            parsed_row[sitemap_header] = row.get(sitemap_header)
+        parsed_row["content_type"] = ""
+        parsed_row["submitted"] = ""
+        parsed_row["indexed"] = ""
+        error_rows.append(parsed_row)
+        return error_rows
+
+    def get_date_range(self, date_from: str, date_to: str, date_range: str) -> Tuple[date, date]:
+        if date_range == "Last week (sun-sat)":
+            start_date, end_date = self.get_last_week_dates()
+        elif date_range == "Last month":
+            start_date, end_date = self.get_last_month_dates()
+        elif date_range == "Custom":
+            try:
+                start_date = dateparser.parse(date_from).date()
+                end_date = dateparser.parse(date_to).date()
+            except AttributeError:
+                raise UserException("Date input is invalid, please recheck the documentation on valid inputs")
+        else:
+            raise UserException(f"Date range type : {date_range} is invalid")
+        return start_date, end_date
+
+    @staticmethod
+    def get_last_week_dates() -> Tuple[date, date]:
+        today = date.today()
+        offset = (today.weekday() - 5) % 7
+        last_week_saturday = today - timedelta(days=offset)
+        last_week_sunday = last_week_saturday - timedelta(days=6)
+        return last_week_sunday, last_week_saturday
+
+    @staticmethod
+    def get_last_month_dates() -> Tuple[date, date]:
+        last_day_of_prev_month = date.today().replace(day=1) - timedelta(days=1)
+        start_day_of_prev_month = date.today().replace(day=1) - timedelta(days=last_day_of_prev_month.day)
+        return start_day_of_prev_month, last_day_of_prev_month
+
+    @staticmethod
+    def validate_table_name(table_name: str) -> None:
+        if not table_name.replace("_", "").isalnum():
+            raise UserException(
+                "Output Table name is not valid, make sure it only contains alphanumeric characters and underscores")
+
+
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        comp.run()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /src/google_search_console/exception.py
+================================================
+class RetryableException(Exception):
+    pass
+
+
+class ClientAuthError(Exception):
+    pass
+
+
+class ClientError(Exception):
+    pass
+
+
+================================================
+File: /src/google_search_console/__init__.py
+================================================
+from .client import GoogleSearchConsoleClient, ClientError, ClientAuthError  # noqa
+
+
+================================================
+File: /src/google_search_console/client.py
+================================================
+import logging
+
+from google.oauth2.credentials import Credentials
+from google.oauth2.service_account import Credentials as ServiceAccountCredentials
+from retry import retry
+from google.auth.transport import requests
+from googleapiclient.errors import HttpError
+from googleapiclient import discovery
+from google.auth.exceptions import RefreshError
+from .exception import ClientError, RetryableException, ClientAuthError
+from typing import Dict, List, Generator
+from datetime import date
+import socket
+
+API_ROW_LIMIT = 25000
+RETRYABLE_ERROR_CODES = ["concurrentLimitExceeded", "dailyLimitExceeded", "dailyLimitExceededUnreg", "limitExceeded",
+                         "quotaExceeded", "rateLimitExceeded", "rateLimitExceededUnreg", "userRateLimitExceeded",
+                         "userRateLimitExceededUnreg", "variableTermExpiredDailyExceeded", "variableTermLimitExceeded",
+                         "dailyLimitExceeded402", "quotaExceeded402", "servingLimitExceeded"]
+
+
+class GoogleSearchConsoleClient:
+    def __init__(self, credentials: Credentials, **kwargs) -> None:
+        self.service = discovery.build('searchconsole', 'v1', credentials=credentials, cache_discovery=False)
+
+    @classmethod
+    def from_auth_code(cls, client_id, client_secret, refresh_token, token_uri="https://oauth2.googleapis.com/token"):
+        credentials = Credentials(None, client_id=client_id,
+                                  client_secret=client_secret,
+                                  refresh_token=refresh_token,
+                                  token_uri=token_uri)
+        request = requests.Request()
+        try:
+            credentials.refresh(request)
+        except RefreshError:
+            raise ClientError("Invalid credentials, please re-authenticate the application")
+
+        return cls(credentials)
+
+    @classmethod
+    def from_service_account(cls, service_account_info):
+        credentials = ServiceAccountCredentials.from_service_account_info(service_account_info)
+        credentials = credentials.with_scopes(['https://www.googleapis.com/auth/webmasters.readonly'])
+
+        return cls(credentials)
+
+    def get_verified_sites(self):
+        site_list = self.service.sites().list().execute()
+
+        verified_sites_urls = [s['siteUrl'] for s in site_list['siteEntry']
+                               if s['permissionLevel'] != 'siteUnverifiedUser'
+                               and s['siteUrl'][:4] == 'http']
+        return verified_sites_urls
+
+    def get_search_analytics_data(self, start_date: date, end_date: date, url: str, dimensions: List[str],
+                                  search_type: str = None, filter_groups: List[Dict] = None,
+                                  include_fresh: bool = False) -> Generator:
+        request: Dict = {
+            'startDate': str(start_date),
+            'endDate': str(end_date),
+            'dimensions': dimensions,
+            "dimensionFilterGroups": [],
+        }
+        if include_fresh:
+            request["dataState"] = "all"
+
+        if search_type:
+            request["type"] = search_type
+        for filters in filter_groups:
+            request["dimensionFilterGroups"].append({"groupType": "and", "filters": filters})
+        return self.get_result_pages(request, url)
+
+    def get_result_pages(self, request: Dict, url: str) -> Generator:
+        row_limit = API_ROW_LIMIT
+        start_row = 0
+        last_page = False
+        while not last_page:
+            request["rowLimit"] = row_limit
+            request["startRow"] = start_row
+            response = self.execute_search_analytics_request(self.service, url, request)
+            if "rows" in response:
+                data = response["rows"]
+                yield data
+                if len(data) != row_limit:
+                    last_page = True
+                start_row = start_row + row_limit
+            else:
+                last_page = True
+
+    def execute_search_analytics_request(self, service, property_uri: str, request: Dict) -> Dict:
+        try:
+            search_analytics_data = self._execute_search_analytics_request(service, property_uri, request)
+            if not search_analytics_data:
+                search_analytics_data = self._execute_search_analytics_request(service,
+                                                                               "".join(["sc-domain:", property_uri]),
+                                                                               request)
+            if not search_analytics_data:
+                search_analytics_data = self._execute_search_analytics_request(service,
+                                                                               "".join(["https://www.", property_uri]),
+                                                                               request)
+            if not search_analytics_data:
+                search_analytics_data = self._execute_search_analytics_request(service,
+                                                                               "".join(["http://www.", property_uri]),
+                                                                               request)
+            if not search_analytics_data:
+                search_analytics_data = self._execute_search_analytics_request(service,
+                                                                               "".join(["https://", property_uri]),
+                                                                               request)
+            if not search_analytics_data:
+                search_analytics_data = self._execute_search_analytics_request(service,
+                                                                               "".join(["http://", property_uri]),
+                                                                               request)
+            if not search_analytics_data:
+                raise ClientAuthError("Found no search analytics data. Make sure you have sufficient rights and the "
+                                      "url is valid.")
+            return search_analytics_data
+        except socket.timeout:
+            raise ClientError("Connection timed out, please try a smaller query")
+
+    @retry(RetryableException, tries=3, delay=60, jitter=600)
+    def _execute_search_analytics_request(self, service, property_uri: str, request: Dict) -> Dict:
+        try:
+            return service.searchanalytics().query(siteUrl=property_uri, body=request).execute()
+        except HttpError as http_error:
+            logging.error(f"Encountered error when querying search analytics: {http_error}")
+            if http_error.status_code == 403:
+                pass
+            else:
+                self._process_exception(http_error)
+
+    def get_sitemaps_data(self, url: str) -> List[Dict]:
+        sitemaps = self._get_sitemaps_data(url)
+        if not sitemaps:
+            sitemaps = self._get_sitemaps_data("".join(["sc-domain:", url]))
+        if not sitemaps:
+            sitemaps = self._get_sitemaps_data("".join(["https://www.", url]))
+        if not sitemaps:
+            sitemaps = self._get_sitemaps_data("".join(["http://www.", url]))
+        if not sitemaps:
+            sitemaps = self._get_sitemaps_data("".join(["https://", url]))
+        if not sitemaps:
+            sitemaps = self._get_sitemaps_data("".join(["http://", url]))
+        if not sitemaps:
+            raise ClientAuthError(f"{url} is not a valid Search Console site URL. Check the error log and make sure "
+                                  f"you have sufficient rights and if the url is valid.")
+        return sitemaps
+
+    @retry(RetryableException, tries=3, delay=60, jitter=600)
+    def _get_sitemaps_data(self, url: str) -> List[Dict]:
+        try:
+            sitemaps = self.service.sitemaps().list(siteUrl=url).execute()["sitemap"]
+            return sitemaps
+        except HttpError as http_error:
+            if http_error.status_code == 403:
+                pass
+            else:
+                self._process_exception(http_error)
+        except KeyError:
+            raise ClientError(f"Could not fetch sitemaps from the API, the returned data did not contain the sitemaps. "
+                              f"Data returned :({self.service.sitemaps().list(siteUrl=url).execute()}) ")
+
+    @staticmethod
+    def _process_exception(http_error):
+        try:
+            logging.error(http_error.error_details)
+            if http_error.error_details[0]["reason"] in RETRYABLE_ERROR_CODES:
+                raise RetryableException(http_error.error_details[0]["reason"]) from http_error
+            else:
+                if http_error.reason == 'Request contains an invalid argument.':
+                    raise ClientError("Request contains an invalid argument. Make sure all your dimensions and "
+                                      "filters are valid along with your search Type filter.")
+                raise ClientError(http_error)
+        except TypeError:
+            raise ClientError(http_error)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/logger
+================================================
+gelf
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+This component allows you to extract statistics and site data of domains that are linked to your Google account.
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Google Search Console is a web service by Google which allows webmasters to check indexing status and optimize visibility of their websites. 
+
+================================================
+File: /component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{}
+
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{
+  "title": "Row Configuration",
+  "type": "object",
+  "required": [
+    "domain",
+    "endpoint",
+    "out_table_name"
+  ],
+  "properties": {
+    "domain": {
+      "title": "Domain",
+      "type": "string",
+      "description": "Domain name you wish to extract data from eg. keboola.com",
+      "propertyOrder": 1
+    },
+    "endpoint": {
+      "title": "Endpoint",
+      "type": "string",
+      "enum": [
+        "Search analytics",
+        "Sitemaps"
+      ],
+      "default": "Search analytics",
+      "propertyOrder": 2
+    },
+    "search_analytics_dimensions": {
+      "title": "Dimensions",
+      "type": "string",
+      "options": {
+        "dependencies": {
+          "endpoint": "Search analytics"
+        }
+      },
+      "description": "Comma separated list of search analytics dimensions eg. page, query, date",
+      "propertyOrder": 3
+    },
+    "search_type": {
+      "title": "Type",
+      "type": "string",
+      "options": {
+        "dependencies": {
+          "endpoint": "Search analytics"
+        }
+      },
+      "description": " Filter results to the following types: news, video, image, web, discover, or googleNews",
+      "propertyOrder": 4
+    },
+    "date_range": {
+      "title": "Date range type",
+      "type": "string",
+      "enum": [
+        "Last week (sun-sat)",
+        "Last month",
+        "Custom"
+      ],
+      "options": {
+        "dependencies": {
+          "endpoint": "Search analytics"
+        }
+      },
+      "propertyOrder": 5
+    },
+    "date_from": {
+      "title": "Date from",
+      "type": "string",
+      "options": {
+        "dependencies": {
+          "date_range": "Custom",
+          "endpoint": "Search analytics"
+        }
+      },
+      "description": "Date in YYYY-MM-DD format or dateparser string i.e. 5 days ago, 1 month ago, yesterday, etc.",
+      "propertyOrder": 6
+    },
+    "date_to": {
+      "title": "Date to",
+      "type": "string",
+      "options": {
+        "dependencies": {
+          "date_range": "Custom",
+          "endpoint": "Search analytics"
+        }
+      },
+      "description": "Date in YYYY-MM-DD format or dateparser string i.e. 5 days ago, 1 month ago, yesterday, etc.",
+      "propertyOrder": 7
+    },
+    "include_fresh": {
+      "title": "Include fresh data",
+      "type": "boolean",
+      "default": false,
+      "format": "checkbox",
+      "options": {
+        "dependencies": {
+          "endpoint": "Search analytics"
+        }
+      },
+      "description": "Include also fresh data, which can change later. <a href=\"https://developers.google.com/search/blog/2019/09/search-performance-fresh-data\">Find more about fresh data in Search Console</a> ",
+      "propertyOrder": 8
+    },
+    "out_table_name": {
+      "title": "Output name",
+      "type": "string",
+      "description": "Name of output table in Keboola storage",
+      "propertyOrder": 9
+    },
+    "filter_groups": {
+      "type": "array",
+      "options": {
+        "dependencies": {
+          "endpoint": "Search analytics"
+        }
+      },
+      "format": "table",
+      "title": "Filter Groups",
+      "propertyOrder": 10,
+      "items": {
+        "type": "array",
+        "title": "Filter Group",
+        "format": "table",
+        "propertyOrder": 11,
+        "items": {
+          "type": "object",
+          "title": "Filter",
+          "properties": {
+            "dimension": {
+              "title": "Dimension",
+              "type": "string",
+              "propertyOrder": 15
+            },
+            "operator": {
+              "type": "string",
+              "title": "Operator",
+              "enum": [
+                "contains",
+                "equals",
+                "notContains",
+                "notEquals"
+              ],
+              "propertyOrder": 20,
+              "default": "equals"
+            },
+            "expression": {
+              "type": "string",
+              "title": "Expression",
+              "propertyOrder": 30
+            }
+          }
+        }
+      }
+    },
+    "loading_options": {
+      "type": "object",
+      "title": "Loading Options",
+      "propertyOrder": 100,
+      "required": [
+        "incremental"
+      ],
+      "options": {
+        "dependencies": {
+          "endpoint": "Search analytics"
+        }
+      },
+      "properties": {
+        "incremental": {
+          "type": "integer",
+          "enum": [
+            0,
+            1
+          ],
+          "options": {
+            "enum_titles": [
+              "Full Load",
+              "Incremental Update"
+            ]
+          },
+          "default": 0,
+          "title": "Load type",
+          "description": "If set to Incremental update, the result tables will be updated based on primary key and new records will be fetched. Full load overwrites the destination table each time.",
+          "propertyOrder": 200
+        }
+      }
+    },
+    "use_service_account": {
+      "title": "Use Service Account",
+      "type": "boolean",
+      "format": "checkbox",
+      "default": false,
+      "description": "Enables the use of service account."
+    },
+    "#service_account_info": {
+      "title": "Service Account Info",
+      "type": "string",
+      "format": "textarea",
+      "description": "To use your service account, copy and paste the entire JSON code into the text area. Not sure how to create a service account? Check out the <a href='https://developers.google.com/identity/protocols/oauth2/service-account#creatinganaccount'>Google Identity Documentation</a> for step-by-step instructions.",
+            "options": {
+        "dependencies": {
+          "use_service_account": true
+        }
+      }
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+fi
+
+echo "Updating logger settings"
+
+value=`cat component_config/logger`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} logger --value="$value"
+else
+    echo "logger type is empty!"
+fi
+
+echo "Updating logger configuration"
+value=`cat component_config/loggerConfiguration.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} loggerConfiguration --value="$value"
+else
+    echo "loggerConfiguration is empty!"
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+mock~=4.0.3
+freezegun~=1.1.0
+dateparser==1.1.8
+retry~=0.9.2
+google-api-python-client==2.107.0
+keboola.component==1.1.0
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.6-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Google Search Console Extractor
+This component allows you to extract statistics and site data of domains that are linked to your Google account.
+
+**Table of contents:**  
+  
+[TOC]
+
+## Configuration
+
+### Authorization
+
+- **Oauth 2.0** Authorization is done via instant authorization, link Google account.
+
+- For **Service account** type authorization, you will have to create a service account in [Service Account Page](https://console.cloud.google.com/projectselector2/iam-admin/serviceaccounts?supportedpurview=project) and assign proper access rights in [Google Search Console](https://search.google.com/u/1/search-console/users).
+You will also have to enable Google Search Console API in your [Google Cloud Console](https://console.cloud.google.com/apis/dashboard).
+
+### Row configuration
+
+ - Domain (domain) - [REQ] Domain name you wish to extract data from eg. keboola.com - if the domain has data across all URL variations, under the Domain it needs to be as sc-domain:domainname.com
+ - Endpoint (endpoint) - [REQ] Search analytics or Sitemaps
+ - Dimensions (search_analytics_dimensions) - [REQ For Search Analytics] List of search analytics dimensions eg. page, query, date
+ - Type (search_type) - [OPT] filter the results for the following types : news, video, image, web, discover, or googleNews
+ - Date range type (date_range) - [REQ For Search Analytics] Type of date range
+    - Last week (sun-sat) used for WEEK dimension
+    - Last month (from first day of the previous month to last day of the previous month)
+    - Custom - must then specify date from and to (3 days ago to 1 day ago) (1 march 2021 to 23 march 2021)
+ - Date from (date_from) - [REQ For Search Analytics] Start date of the report eg. 3 days ago
+ - Date to (date_to) - [REQ For Search Analytics] End date of the report eg. 1 day ago
+ - Output name (out_table_name) - [REQ] Name of output table in Keboola storage
+ - Filters (filters) - [OPT] - list of filter groups:
+      - Filters in a single filter group are grouped by "and", therefore if 2 filters are in a filter group, they must both be satisfied to return data
+      - Filters in separate filter groups work with "or", therefore at least 1 of the filters must be satisfied to return data
+   
+
+
+### Sample configuration parameters
+
+```json
+{
+  "parameters": {
+    "date_to": "3 days ago",
+    "date_from": "5 days ago",
+    "date_range": "Custom",
+    "endpoint": "Search analytics",
+    "search_analytics_dimensions": "page, query, date",
+    "domain": "domain.cz",
+    "out_table_name": "search_analytics",
+    "filter_groups": [
+      [
+        {
+          "dimension": "query",
+          "operator": "contains",
+          "expression": "x"
+        }
+      ],
+      [
+        {
+          "dimension": "query",
+          "operator": "contains",
+          "expression": "y"
+        }
+      ]
+    ]
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"TOKENHERE\"}",
+        "oauthVersion": "2.0",
+        "appKey": "APIKEY.apps.googleusercontent.com",
+        "#appSecret": "SECRET"
+      }
+    }
+  }
+}
+```
+
+Development
+-----------
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to
+your custom path in the docker-compose file:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clone this repository, init the workspace and run the component with following
+command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+git clone repo_path my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run the test suite and lint check using this command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose run --rm test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Integration
+===========
+
+For information about deployment and integration with KBC, please refer to the
+[deployment section of developers
+documentation](https://developers.keboola.com/extend/component/deployment/)
+

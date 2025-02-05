@@ -1,0 +1,1403 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-mailgun-deprecated/
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   ├── kbc/
+    │   │   ├── client_base.py
+    │   │   ├── __init__.py
+    │   │   └── env_handler.py
+    │   ├── .DS_Store
+    │   └── mailgun/
+    │       ├── mailgun.py
+    │       ├── delivery_check.py
+    │       └── __init__.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── deployment/
+    │   ├── flake8.cfg
+    │   └── deploy.sh
+    ├── component_config/
+    │   ├── configuration_description.md
+    │   ├── stack_parameters.json
+    │   └── configSchema.json
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    ├── util-scripts/
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   └── build_n_run.ps1
+    └── README.md
+
+================================================
+File: /change_log.md
+================================================
+**0.6.4**
+ECR build and uplink.
+
+**0.6.3**
+Changed type of error, that is raised when a parameter is missing. Prompts user to enter the missing parameter.
+
+**0.6.1**
+Logs are incrementally loaded to storage.
+
+**0.6.0**
+Changed the way of scheduled delivery, for more precise results. The scheduled delivery time should now be inputted in format `YYYY-MM-DD HH:MM:SS ±ZZZZ`.
+
+**0.5.4**
+Fixed bug, that caused application crash, when fetching logs for mailing list of length 0.
+
+**0.5.3**
+Updated README
+Added LICENSE
+
+**0.5.2**
+Added GELF logging
+
+**0.5.1**
+Fixed unittests
+
+**0.5.0**
+Added logs fetcher which will, by default, save logs to *out.c-mailgun.logs*
+
+================================================
+File: /src/component.py
+================================================
+import sys
+import os
+import logging
+import codecs
+import json
+import pandas as pd
+import requests
+import time
+import logging_gelf.handlers
+import logging_gelf.formatters
+from keboola import docker
+from mailgun.mailgun import send_complex_message
+from mailgun.delivery_check import delivery_time_check
+
+
+# Environment setup
+abspath = os.path.abspath(__file__)
+script_path = os.path.dirname(abspath)
+os.chdir(script_path)
+sys.tracebacklimit = 3
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)-8s : [line:%(lineno)3s] %(message)s',
+    datefmt="%Y-%m-%d %H:%M:%S")
+
+logger = logging.getLogger()
+logging_gelf_handler = logging_gelf.handlers.GELFTCPSocketHandler(
+    host=os.getenv('KBC_LOGGER_ADDR'),
+    port=int(os.getenv('KBC_LOGGER_PORT'))
+    )
+logging_gelf_handler.setFormatter(logging_gelf.formatters.GELFFormatter(null_character=True))
+logger.addHandler(logging_gelf_handler)
+
+# removes the initial stdout logging
+logger.removeHandler(logger.handlers[0])
+
+
+# Access the supplied rules
+try:
+    cfg = docker.Config('/data/')
+    params = cfg.get_parameters()
+    user = params['user']
+    password = params['#password']
+    from_name = params['from_name']
+    domain = params['domain']
+except KeyError as e:
+    logging.error("Parameter %s is missing. Please, provide the parameter and try again." % e)
+    sys.exit(1)
+
+logging.info("Successfully fetched all parameters.")
+
+# Tables congig
+cfg = docker.Config('/data/')
+in_tables = cfg.get_input_tables()
+out_tables = cfg.get_expected_output_tables()
+# logging.info("IN tables mapped: "+str(in_tables))
+# logging.info("OUT tables mapped: "+str(out_tables))
+
+# Files config
+in_files = cfg.get_input_files()
+logging.info("IN files mapped: "+str(in_files))
+DEFAULT_FILE_INPUT = '/data/in/files/'
+
+# Won't accept more than 1 input table with specified columns
+if len(in_tables) > 1:
+    logging.error("Please use only one table as input table.")
+    sys.exit(1)
+elif len(in_tables) == 0:
+    logging.error("No input table was specified. Please select a table.")
+    sys.exit(1)
+else:
+    pass
+
+logging.warning("This component is deprecated. Please use mailgun v2.")
+
+
+def attachment_check(attachment_string, silent=False):
+    """
+    Function to check attachments
+    """
+    if len(attachment_string) == 0:
+        if silent:
+            pass
+        else:
+            return None
+
+    attachments = [att.strip() for att in attachment_string.split(',')]
+
+    for att in attachments:
+        if att == '':
+            attachments.remove(att)
+        elif att not in os.listdir(DEFAULT_FILE_INPUT) and att != '':
+            msg1 = "File %s is not in the directory." % att
+            msg2 = "List of available files is: %s" % os.listdir(
+                DEFAULT_FILE_INPUT)
+            logging.error(" ".join([msg1, msg2]))
+            sys.exit(1)
+
+    if silent:
+        pass
+    else:
+        return attachments
+
+
+def html_check(file):
+    """
+    Dummy function that checks, whether html file is in dir.
+    """
+
+    if file not in os.listdir(DEFAULT_FILE_INPUT):
+        msg1 = "File %s is not in the directory." % file
+        msg2 = "List of available files is: %s" % os.listdir(
+            DEFAULT_FILE_INPUT)
+        logging.error(" ".join([msg1, msg2]))
+        sys.exit(1)
+    else:
+        try:
+            codecs.open('/data/in/files/' + file, 'r').read()
+            logging.info("File %s read successfully" % file)
+        except FileNotFoundError as e:
+            logging.error("Could not read file %s. %s" % (file, str(e)))
+            sys.exit(2)
+
+
+def log_fetcher(msg_id, user, password, domain):
+    """
+    Function, to check logs for provided message ids.
+    Input is always a list of ids.
+    """
+
+    logs = pd.DataFrame({
+        'msg_id': [],
+        'event_id': [],
+        'recipient': [],
+        'event': [],
+        'json': []
+    })
+
+    for id in msg_id:
+        response = requests.get(
+            'https://api.mailgun.net/v3/%s/events' % domain,
+            auth=(user, password),
+            params={"message-id": str(id)})
+        response_json = response.json()['items']
+
+        for event_json in response_json:
+            event_id = event_json['id']
+            recipient = event_json['recipient']
+            event = event_json['event']
+            logs = logs.append(pd.DataFrame({
+                    'msg_id': [id],
+                    'event_id': [event_id],
+                    'recipient': [recipient],
+                    'event': [event],
+                    'json': [json.dumps(event_json)]
+                }), ignore_index=True)
+
+    logs.to_csv('/data/out/tables/logs.csv', index=False)
+
+
+def main():
+    # Making sure all columns are included
+    mailing_list = pd.read_csv(in_tables[0]['full_path'], dtype=str).fillna("")
+    col_spec = set(["email", "name", "html_file",
+                    "subject", "attachments", "delivery"])
+    col_boolean = len(col_spec.difference(set(list(mailing_list)))) != 0
+
+    if col_boolean:
+        msg1 = "Input table does not contain all the necessary columns."
+        msg2 = "Missing columns are: %s." % str(
+            col_spec.difference(set(list(mailing_list))))
+        msg3 = "Please see documentation for more information."
+        logging.error(" ".join([msg1, msg2, msg3]))
+        sys.exit(1)
+
+    # Mailgun variables
+    from_id = from_name + ' <postmaster@%s>' % domain
+    domain_url = 'https://api.mailgun.net/v3/%s/messages' % domain
+
+    # ANTI-SPAM
+    # if any of the attachments or html bodies is not present
+    # an error will be thrown. This is done before any email
+    # is sent, so that if somebody tries to run the application
+    # again, the person in mailing list won't be spammed.
+    for _, row in mailing_list.iterrows():
+        html = row['html_file']
+        att = row['attachments'].strip()
+        logging.info("Checking html file %s." % html)
+        html_check(html)
+        if att != '':
+            logging.info("Checking attachments %s." % att)
+            attachment_check(att)
+            logging.info("Attachments checked.")
+
+    for index, row in mailing_list.iterrows():
+        # Recipient variables
+        to_id = '%(name)s <%(email)s>' % row
+        html_path = DEFAULT_FILE_INPUT + row['html_file']
+        html_body = codecs.open(html_path, 'r').read() % (row)
+        delivery = delivery_time_check(row['delivery'])
+        attachments = attachment_check(row['attachments'])
+
+        logging.debug("Sending message to %(email)s." % row)
+
+        # Sending a message
+        msg = send_complex_message(to_id,
+                                   from_id,
+                                   row['subject'],
+                                   html_body,
+                                   domain_url,
+                                   user,
+                                   password,
+                                   delivery,
+                                   attachments)
+
+        if msg.status_code == 200:
+            logging.info(
+                "An email to %(email)s was sent or scheduled successfully." % row)
+
+            mailing_list.loc[index, 'msg_id'] = msg.json(
+            )['id'].replace('<', '').replace('>', '')
+        elif msg.status_code == 401:
+            msg1 = "Logging in to Mailgun failed."
+            msg2 = "Attempt failed with %s %s" % (msg.status_code, msg.reason)
+            logging.error(" ".join([msg1, msg2]))
+            sys.exit(1)
+        else:
+            msg1 = "Could not send a message. Process exited"
+            msg2 = "with %s %s" % (msg.status_code, msg.reason)
+            logging.error(" ".join([msg1, msg2]))
+            sys.exit(2)
+
+    if mailing_list.shape[0] == 0:
+        logging.info("No messages have been sent. No logs for new messages could be fetched.")
+        sys.exit(0)
+    else:
+        time.sleep(10)
+        log_fetcher(mailing_list.msg_id, user, password, domain)
+        cfg.write_table_manifest(file_name='/data/out/tables/logs.csv',
+                                 destination='out.c-mailgun.logs',
+                                 primary_key=['msg_id', 'event_id'],
+                                 incremental=True)
+
+
+if __name__ == '__main__':
+    main()
+    logging.info("Logs can be found in out.c-mailgun.logs")
+    logging.info("Script finished.")
+
+
+================================================
+File: /src/kbc/client_base.py
+================================================
+'''
+Created on 5. 10. 2018
+
+@author: esner
+'''
+import requests
+import logging
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+
+
+class HttpClientBase:
+    """
+    Base class for implementing a single endpoint related to a single entities
+
+    Attributes:
+        base_url (str): The base URL for this endpoint.
+    """
+
+    def __init__(self, base_url, max_retries=10, backoff_factor=0.3,
+                 status_forcelist=(500, 502, 504), default_http_header=[], auth=None, default_params=None):
+        """
+        Create an endpoint.
+
+        Args
+            root_url (str): Root url of API.
+
+        """
+        if not base_url:
+            raise ValueError("Base URL is required.")
+        self.base_url = base_url
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        self.status_forcelist = status_forcelist
+        self._auth = auth
+        self._auth_header = default_http_header
+        self._default_params = default_params
+
+    def requests_retry_session(self, session=None):
+        session = session or requests.Session()
+        retry = Retry(
+            total=self.max_retries,
+            read=self.max_retries,
+            connect=self.max_retries,
+            backoff_factor=self.backoff_factor,
+            status_forcelist=self.status_forcelist,
+            method_whitelist=('GET', 'POST', 'PATCH', 'UPDATE')
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        return session
+
+    def _get_raw(self, url, params=None, **kwargs):
+        """
+        Construct a requests GET call with args and kwargs and process the
+        results.
+
+
+        Args:
+            url (str): requested url
+            params (dict): additional url params to be passed to the underlying
+                requests.get
+            **kwargs: Key word arguments to pass to the get requests.get
+
+        Returns:
+            r (requests.Response): object
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        s.auth = self._auth
+
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        s.headers.update(headers)
+        # set default params
+        if self._default_params:
+            params = self._default_params.update(params)
+
+        r = self.requests_retry_session(session=s).request('GET', url=url, params=params, auth=self._auth, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            # Handle different error codes
+            raise Exception('Request failed with code: {}, message: {}'.format(r.status_code, r.text))
+        else:
+            return r
+
+    def get(self, url, params=None, **kwargs):
+        r = self._get_raw(url, params, **kwargs)
+        return r.json()
+
+    def _post_raw(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+            **kwargs: Key word arguments to pass to the post request.
+
+        Returns:
+            body:
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        s.headers.update(headers)
+        s.auth = self._auth
+
+        params = kwargs.pop('params')
+        # set default params
+        if self._default_params:
+            kwargs.update({'params': self._default_params.update(params)})
+
+        r = self.requests_retry_session(session=s).request('POST', *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            logging.warning(e, exc_info=True)
+            # Handle different error codes
+            raise
+        else:
+            return r
+
+    def post(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+            **kwargs: Key word arguments to pass to the post request.
+
+        Returns:
+            body: json reposonse
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+
+        params = kwargs.pop('params', {})
+        # set default params
+        if self._default_params:
+            kwargs.update({'params': self._default_params.update(params)})
+        r = self.requests_retry_session(session=s).request('POST', headers=headers, *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            logging.warning(e, exc_info=True)
+            # Handle different error codes
+            raise
+        else:
+            return r.json()
+
+    def _patch(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+            **kwargs: Key word arguments to pass to the post request.
+
+        Returns:
+            body: Response body parsed from json.
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        r = requests.patch(headers=headers, *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            logging.warning(e, exc_info=True)
+            # Handle different error codes
+            raise
+        else:
+            return r
+
+
+================================================
+File: /src/kbc/env_handler.py
+================================================
+# ==============================================================================
+# KBC Env handler
+# ==============================================================================
+
+
+# ============================ Import libraries ==========================
+import logging
+import json
+import os
+import csv
+import pytz
+import math
+import sys
+from collections import Counter
+from keboola import docker
+import datetime
+from dateutil.relativedelta import relativedelta
+from _datetime import timedelta
+
+DEFAULT_DEL = ','
+DEFAULT_ENCLOSURE = '"'
+
+
+class KBCEnvHandler:
+    def __init__(self, mandatory_params, data_path=None):
+        # fetch data folder from ENV by default
+        if not data_path:
+            data_path = os.environ.get('KBC_DATADIR')
+
+        self.kbc_config_id = os.environ.get('KBC_CONFIGID')
+
+        self.data_path = data_path
+        self.configuration = docker.Config(data_path)
+        self.cfg_params = self.configuration.get_parameters()
+        self.tables_out_path = os.path.join(data_path, 'out', 'tables')
+        self.tables_in_path = os.path.join(data_path, 'in', 'tables')
+
+        self._mandatory_params = mandatory_params
+
+# ==============================================================================
+
+    def validateConfig(self):
+        '''
+        Validates config based on provided mandatory params.
+        Parameters can be grouped as arrays [Par1,Par2] => at least one of the pars has to be present
+        [par1,[par2,par3]] => either par1 OR both par2 and par3 needs to be present
+        '''
+        parameters = self.cfg_params
+        missing_fields = []
+        for field in self._mandatory_params:
+            if isinstance(field, list):
+                missing_fields.extend(self._validate_par_group(field))
+            elif not parameters.get(field):
+                missing_fields.append(field)
+
+        if missing_fields:
+            raise ValueError(
+                'Missing mandatory configuration fields: [{}] '.format(', '.join(missing_fields)))
+
+    def _validate_par_group(self, par_group):
+        missing_fields = []
+        is_present = False
+        for par in par_group:
+            if isinstance(par, list):
+                missing_subset = self._get_par_missing_fields(par)
+                missing_fields.extend(missing_subset)
+                if not missing_subset:
+                    is_present = True
+
+            elif self.cfg_params.get(par):
+                is_present = True
+            else:
+                missing_fields.append(par)
+        if not is_present:
+            return missing_fields
+        else:
+            return []
+
+    def _get_par_missing_fields(self, mand_params):
+        parameters = self.cfg_params
+        missing_fields = []
+        for field in mand_params:
+            if not parameters.get(field):
+                missing_fields.append(field)
+        return missing_fields
+
+    def get_input_table_by_name(self, table_name):
+        tables = self.configuration.get_input_tables()
+        table = [t for t in tables if t.get('destination') == table_name]
+        if not table:
+            raise ValueError(
+                'Specified input mapping [{}] does not exist'.format(table_name))
+        return table[0]
+
+
+# ================================= Logging ==============================
+
+    def set_default_logger(self, log_level='INFO'):  # noqa: E301
+
+        hdl = logging.StreamHandler(sys.stdout)
+        logging.basicConfig(
+            level=log_level,
+            format='%(levelname)s - %(message)s',
+            handlers=[hdl])
+
+        logger = logging.getLogger()
+        return logger
+
+    def get_state_file(self):
+        logging.getLogger().info('Loading state file..')
+        state_file_path = os.path.join(self.data_path, 'in', 'state.json')
+        if not os.path.isfile(state_file_path):
+            logging.getLogger().info('State file not found. First run?')
+            return
+        try:
+            with open(state_file_path, 'r') \
+                    as state_file:
+                return json.load(state_file)
+        except (OSError, IOError):
+            raise ValueError(
+                "State file state.json unable to read "
+            )
+
+    def write_state_file(self, state_dict):
+        if not isinstance(state_dict, dict):
+            raise TypeError('Dictionary expected as a state file datatype!')
+
+        with open(os.path.join(self.configuration.data_dir, 'out', 'state.json'), 'w+') as state_file:
+            json.dump(state_dict, state_file)
+
+    def create_sliced_tables(self, folder_name, pkey=None, incremental=False,
+                             src_delimiter=DEFAULT_DEL, src_enclosure=DEFAULT_ENCLOSURE, dest_bucket=None):
+        """
+        Creates prepares sliced tables from all files in DATA_PATH/out/tables/{folder_name} - i.e. removes all headers
+        and creates single manifest file based on provided parameters.
+
+        folder_name -- folder name in DATA_PATH directory that contains files for slices,
+        the same name will be used as table name
+
+        src_enclosure -- enclosure of the source file ["]
+        src_delimiter -- delimiter of the source file [,]
+        dest_bucket -- name of the destination bucket (optional)
+
+
+        """
+        log = logging
+        log.info('Creating sliced tables for [{}]..'.format(folder_name))
+
+        folder_path = os.path.join(self.tables_out_path, folder_name)
+
+        if not os.path.isdir(folder_path):
+            raise ValueError("Specified folder ({}) does not exist in the data folder ({})".format(
+                folder_name, self.data_path))
+
+        # get files
+        files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if os.path.isfile(
+            os.path.join(folder_path, f))]
+
+        header = self.get_and_remove_headers_in_all(
+            files, src_delimiter, src_enclosure)
+        if dest_bucket:
+            destination = dest_bucket + '.' + folder_name
+        else:
+            destination = folder_name
+
+        log.info('Creating manifest file..')
+        self.configuration.write_table_manifest(
+            file_name=folder_path, destination=destination, primary_key=pkey, incremental=incremental, columns=header)
+
+    def get_and_remove_headers_in_all(self, files, delimiter, enclosure):
+        """
+        Removes header from all specified files and return it as a list of strings
+
+        Throws error if there is some file with different header.
+
+        """
+        first_run = True
+        for file in files:
+            curr_header = self._get_and_remove_headers(
+                file, delimiter, enclosure)
+            if first_run:
+                header = curr_header
+                first_file = file
+                first_run = False
+            # check whether header matches
+            if Counter(header) != Counter(curr_header):
+                raise Exception('Header in file {}:[{}] is different than header in file {}:[{}]'.format(
+                    first_file, header, file, curr_header))
+        return header
+
+    def _get_and_remove_headers(self, file, delimiter, enclosure):
+        """
+        Removes header from specified file and return it as a list of strings.
+        Creates new updated file 'upd_'+origFileName and deletes the original
+        """
+        head, tail = os.path.split(file)
+        with open(file, "r") as input_file:
+            with open(os.path.join(head, 'upd_' + tail), 'w+', newline='') as updated:
+                reader = csv.DictReader(
+                    input_file, delimiter=delimiter, quotechar=enclosure)
+                header = reader.fieldnames
+                writer = csv.DictWriter(
+                    updated, fieldnames=header, delimiter=DEFAULT_DEL, quotechar=DEFAULT_ENCLOSURE)
+                for row in reader:
+                    # write row
+                    writer.writerow(row)
+        os.remove(file)
+        return header
+
+    def process_results(self, res_files, def_bucket_name, output_bucket):
+        for res in res_files:
+            dest_bucket = def_bucket_name + str(self.kbc_config_id)
+            if output_bucket:
+                suffix = '-' + output_bucket
+            else:
+                suffix = ''
+
+            # build manifest
+            self.configuration.write_table_manifest(
+                file_name=res['full_path'],
+                destination=dest_bucket + suffix + '.' + res['name'],
+                primary_key=res['pkey'],
+                incremental=True)
+
+    def process_results_sliced(self, res_files):
+        res_sliced_folders = {}
+        for file in res_files:
+            res_sliced_folders.update({file['name']: file['pkey']})
+
+        for folder in res_sliced_folders:
+            self.create_sliced_tables(folder, res_sliced_folders[folder], True)
+
+# ==============================================================================
+# == UTIL functions
+
+    def get_past_date(self, str_days_ago, to_date=None, tz=pytz.utc):
+        '''
+        Returns date in specified timezone relative to today.
+
+        e.g.
+        '5 hours ago',
+        'yesterday',
+        '3 days ago',
+        '4 months ago',
+        '2 years ago',
+        'today'
+        '''
+        if to_date:
+            TODAY = to_date
+        else:
+            TODAY = datetime.datetime.now(tz)
+        splitted = str_days_ago.split()
+        if len(splitted) == 1 and splitted[0].lower() == 'today':
+            return TODAY
+        elif len(splitted) == 1 and splitted[0].lower() == 'yesterday':
+            date = TODAY - relativedelta(days=1)
+            return date
+        elif splitted[1].lower() in ['hour', 'hours', 'hr', 'hrs', 'h']:
+            date = datetime.datetime.now() - \
+                relativedelta(hours=int(splitted[0]))
+            return date.date()
+        elif splitted[1].lower() in ['day', 'days', 'd']:
+            date = TODAY - relativedelta(days=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['wk', 'wks', 'week', 'weeks', 'w']:
+            date = TODAY - relativedelta(weeks=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['mon', 'mons', 'month', 'months', 'm']:
+            date = TODAY - relativedelta(months=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['yrs', 'yr', 'years', 'year', 'y']:
+            date = TODAY - relativedelta(years=int(splitted[0]))
+            return date
+        else:
+            raise ValueError('Invalid relative period!')
+
+    def split_dates_to_chunks(self, start_date, end_date, intv, strformat="%m%d%Y"):
+        '''
+        Splits dates in given period into chunks of specified max size.
+
+        Params:
+        start_date -- start_period [datetime]
+        end_date -- end_period [datetime]
+        intv -- max chunk size
+        strformat -- dateformat of result periods
+
+        Usage example:
+        list(split_dates_to_chunks("2018-01-01", "2018-01-04", 2, "%Y-%m-%d"))
+
+            returns [{start_date: "2018-01-01", "end_date":"2018-01-02"}
+                     {start_date: "2018-01-02", "end_date":"2018-01-04"}]
+        '''
+        return list(self._split_dates_to_chunks_gen(start_date, end_date, intv, strformat))
+
+    def _split_dates_to_chunks_gen(self, start_date, end_date, intv, strformat="%m%d%Y"):
+        '''
+        Splits dates in given period into chunks of specified max size.
+
+        Params:
+        start_date -- start_period [datetime]
+        end_date -- end_period [datetime]
+        intv -- max chunk size
+        strformat -- dateformat of result periods
+
+        Usage example:
+        list(split_dates_to_chunks("2018-01-01", "2018-01-04", 2, "%Y-%m-%d"))
+
+            returns [{start_date: "2018-01-01", "end_date":"2018-01-02"}
+                     {start_date: "2018-01-02", "end_date":"2018-01-04"}]
+        '''
+
+        nr_days = (end_date - start_date).days
+
+        if nr_days <= intv:
+            yield {'start_date': start_date.strftime(strformat),
+                   'end_date': end_date.strftime(strformat)}
+        elif intv == 0:
+            diff = timedelta(days=1)
+            for i in range(nr_days):
+                yield {'start_date': (start_date + diff * i).strftime(strformat),
+                       'end_date': (start_date + diff * i).strftime(strformat)}
+        else:
+            nr_parts = math.ceil(nr_days / intv)
+            diff = (end_date - start_date) / nr_parts
+            for i in range(nr_parts):
+                yield {'start_date': (start_date + diff * i).strftime(strformat),
+                       'end_date': (start_date + diff * (i + 1)).strftime(strformat)}
+
+
+================================================
+File: /src/mailgun/mailgun.py
+================================================
+import os
+import requests
+
+
+def send_complex_message(to_id,
+                         from_id,
+                         subject,
+                         html_body,
+                         live_url,
+                         username,
+                         password,
+                         delivery_date="Mon, 01 Jan 2018 09:00:00 -0000",
+                         attachments=None):
+    '''
+    to, from_id, subject, and html_body should be self explanatory.
+    attachments is a list of file paths, like this:
+
+    ['/tmp/tmp5paoks/image001.png','/tmp/tmp5paoks/test.txt']
+    '''
+
+    if delivery_date:
+        data = {"from": from_id,
+                "to": [to_id, ""],
+                "subject": subject,
+                "html": html_body,
+                "o:deliverytime": delivery_date}
+    else:
+        data = {"from": from_id,
+                "to": [to_id, ""],
+                "subject": subject,
+                "html": html_body}
+
+    files = None
+    if attachments:
+        files = {}
+        count = 0
+        for attachment in attachments:
+            path = '/data/in/files/' + attachment
+            with open(path, 'rb') as f:
+                files['attachment[' +
+                      str(count)+']'] = (os.path.basename(path), f.read())
+            count = count + 1
+
+    return requests.post(live_url,
+                         auth=(username, password),
+                         files=files,
+                         data=data)
+
+
+================================================
+File: /src/mailgun/delivery_check.py
+================================================
+import datetime
+import re
+import logging
+
+
+def delivery_time_check(delivery_time):
+    """
+    Dummy function that checks, whether delivery time was correctly inputted.
+    """
+    pattern = r'((20)[0-9]{2})-([0][1-9]|[1][0-2])-([0][1-9]|[1-2][0-9]|[3][0-1])' + \
+        r'\s{1}([0|1][0-9]|[2][0-3]):[0-5][0-9]:[0-5][0-9]\s{1}(\+|-)([0|1][0-9]{3})'
+
+    if re.fullmatch(pattern, str(delivery_time)):
+        scheduled_delivery = datetime.datetime.strptime(delivery_time,
+                                                        '%Y-%m-%d %H:%M:%S %z')\
+            .strftime('%a, %d %b %Y %H:%M:%S %z')
+        logging.info("Delivery scheduled for %s." % scheduled_delivery)
+    elif delivery_time == '':
+        scheduled_delivery = None
+        logging.info(
+            "Delivery time was not inputted. Message will be delivered ASAP.")
+    else:
+        scheduled_delivery = None
+        msg1 = "Delivery time was inputted wrong. %s is unsupported." % delivery_time
+        msg2 = "Message will be delivered straightaway."
+        logging.warn(" ".join([msg1, msg2]))
+
+    return scheduled_delivery
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/deployment/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+
+  tags:
+    '*':
+      - step:
+          script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/deployment/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover          
+          - echo "Preparing KBC test image"
+          - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+          # push test image to ECR - uncomment when initialised
+          # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          # - docker push $REPOSITORY:test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP 476186605 test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+          - ./deployment/deploy.sh
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /deployment/flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deployment/deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+### Inputs
+Mailgun component takes the following parameters and table as inputs.
+
+* **Username** - Mailgun username. If API key is used, fill in `api`. 
+* **Token** - Password or API key for Mailgun.
+* **Domain** - Domain, from which the mail should be sent. See [How to send mail](https://documentation.mailgun.com/en/latest/quickstart-sending.html#how-to-start-sending-email).
+* **From** - Specifiec in whose name should the mail be sent.
+* **Input Table** with records of emails. Each row will be sent as separate email, to separate address, name, body, etc. specified in the input table. Table **must include** following columns:
+    * `email` - Email address to which an email will be sent.
+    * `name` - Name of the person. Will be used in creating an email handle. Can be left blank.
+    * `html_file` - Name of the file in KBC storage to be used as html body, in format `KBCID_filename.ext`, where `KBCID` is ID of the file in KBC storage, `filename.ext` is the name and extension of given file.
+    * `subject` - Subject of an email.
+    * `attachments` - String separated names of files in KBC storage to be attached to the email. Error is raised, if files are not inputted correctly or are not in the folder. Attachments must be in format `KBCID_filename.ext`, where `KBCID` is ID of the file in KBC storage, `filename.ext` is the name and extension of given file.
+    * `delivery` - Scheduled delivery time in format `YYYY-MM-DD HH:MM:SS ±ZZZZ` (e.g. `2019-02-28 16:00:00 +0000` or `2018-03-17 09:00:00 -0900`). If inputted correctly, an email will be delivered at this time. Otherwise, an email will be delivered straightaway.
+    * `**kwargs` - Other columns. Each of these columns can be used to fill in the html body using standard Python string handlers. For example, if the html body has `Weather is %(weather)s, %(name)s.` in it, the handles `%(weather)s` and `%(name)s` will be replaced by their respective values in column `weather` and `name` from the input table, thus producing (e.g.) `Weather is nice, John.`
+
+
+### Output
+A table with logs, saved to `out.c-mailgun.logs`.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+	"type": "object",
+	"title": "Parameters",
+	"required": [
+	  "user",
+	  "#password",
+	  "domain",
+	  "from_name"
+	],
+	"properties": {
+	  "user": {
+		"type": "string",
+		"title": "Username",
+		"default": "api",
+		"minLength": 1,
+		"description": "Username for Mailgun. If API token is used, insert api.",
+		"propertyOrder": 1
+	  },
+	  "domain": {
+		"type": "string",
+		"title": "Domain",
+		"default": "",
+		"description": "Domain used in Mailgun, e.g. 'company.com'.",
+		"propertyOrder": 3
+	  },
+	  "#password": {
+		"type": "string",
+		"title": "Token",
+		"format": "password",
+		"default": "",
+		"description": "Token or password for Mailgun API.",
+		"propertyOrder": 2
+	  },
+	  "from_name": {
+		"type": "string",
+		"title": "From",
+		"default": "",
+		"description": "Who should be named as a sender, e.g. John Doe.",
+		"propertyOrder": 4
+	  }
+	}
+  }
+
+================================================
+File: /requirements.txt
+================================================
+logging_gelf
+
+
+================================================
+File: /Dockerfile
+================================================
+FROM quay.io/keboola/docker-custom-python:latest
+
+COPY . /code/
+COPY /data/ /data/
+RUN pip install flake8
+
+RUN pip install --ignore-installed -r /code/requirements.txt
+
+WORKDIR /code/
+
+CMD ["python3", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+Copyright (c) 2018 Keboola DS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+
+================================================
+File: /util-scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /util-scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /util-scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -t $COMP_TAG ../
+
+echo Running component...
+$DATA_PATH = Read-Host -Prompt 'Input data folder path:'
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /README.md
+================================================
+## Mailgun
+
+Mailgun component is able to send an email via Mailgun API. 
+Basic requirements are:
+  * Mailgun account
+  * registered domain (if emails are to be sent outside of sandbox accepted; see Mailgun help)
+
+This component takes as input a table of email addresses and names, to which an email is sent. In the table, other attributes can be added, which can then be used to fill in the html body (e.g. date of birth, etc.).
+**The input table needs to contain following columns: email, name, html_file, subject, attachments, delivery.**
+
+### Inputs
+Mailgun component takes the following parameters and table as inputs.
+
+* **Username** - Mailgun username. If API key is used, fill in `api`. 
+* **Token** - Password or API key for Mailgun.
+* **Domain** - Domain, from which the mail should be sent. See [How to send mail](https://documentation.mailgun.com/en/latest/quickstart-sending.html#how-to-start-sending-email).
+* **From** - Specifiec in whose name should the mail be sent.
+* **Input Table** with records of emails. Each row will be sent as separate email, to separate address, name, body, etc. specified in the input table. Table **must include** following columns:
+    * `email` - Email address to which an email will be sent.
+    * `name` - Name of the person. Will be used in creating an email handle. Can be left blank.
+    * `html_file` - Name of the file in KBC storage to be used as html body, in format `KBCID_filename.ext`, where `KBCID` is ID of the file in KBC storage, `filename.ext` is the name and extension of given file.
+    * `subject` - Subject of an email.
+    * `attachments` - String separated names of files in KBC storage to be attached to the email. Error is raised, if files are not inputted correctly or are not in the folder. Attachments must be in format `KBCID_filename.ext`, where `KBCID` is ID of the file in KBC storage, `filename.ext` is the name and extension of given file.
+    * `delivery` - Scheduled delivery time in format `YYYY-MM-DD HH:MM:SS ±ZZZZ` (e.g. `2019-02-28 16:00:00 +0000` or `2018-03-17 09:00:00 -0900`). If inputted correctly, an email will be delivered at this time. Otherwise, an email will be delivered straightaway.
+    * `**kwargs` - Other columns. Each of these columns can be used to fill in the html body using standard Python string handlers. For example, if the html body has `Weather is %(weather)s, %(name)s.` in it, the handles `%(weather)s` and `%(name)s` will be replaced by their respective values in column `weather` and `name` from the input table, thus producing (e.g.) `Weather is nice, John. See more information in example below.`
+
+### Example
+
+As an example, the following input table is created, serving as a mailing list.
+
+|email|name|html_file|subject|attachments|delivery|weather|degrees_celsius|amount_spent|prize|percentage_votes|
+|---|---|---|---|---|---|---|---|---|---|---|---|
+|john@doe.com|John Doe|example_1.html|Weather for London||2019-01-04 09:00:00 +0000|sunny|24||||
+|johnny.bravo@besthair.com|Johnny Bravo|example_1.html|Weather for Seattle||2019-02-28 10:00:00 +0900|rainy|9||||
+|testy@mctestface.com|Testy McTestface|example_2.html|Today's spending|12345678_attachment.pdf||||$2500|||
+|albert.einstein@emc2.edu|Albert Einstein|example_3.html|You won it!||||||Scientist of the Century|94.2|
+
+In the table, there are 4 unique recipients. To 2 of them, the same email is sent with weather information, to another one a spending report is sent along
+and to the last one a letter of congratulations is sent. Three different email bodies are sent, their specification and outcome is below.
+
+#### Recipients 1 & 2 - scheduled delivery of an email
+
+Both emails are scheduled for delivery in two different time-zones.
+
+##### example_1.html
+
+```
+<!DOCTYPE html>
+<html>
+<body>
+<p>Hello %(name)s,</p>
+<p>The weather will be %(weather)s, the temperature will reach %(degrees_celsius)s&#8451.</p>
+
+</body>
+</html>
+```
+
+This specification will result in two emails being sent:
+
+##### Email 1
+```
+  From: From Name <postmaster@domain.com>
+  To: John Doe <john@doe.com>
+  Subject: Weather for London
+  Delivered: 2019-01-04 09:00:02 +0000
+  
+  Body:
+  
+  Hello John Doe,
+  The weather will be sunny, the temperature will reach 24°C.
+```
+
+##### Email 2
+```
+  From: From Name <postmaster@domain.com>
+  To: Johnny Bravo <johnny.bravo@besthair.com>
+  Subject: Weather for Seattle
+  Delivered: 2019-02-28 10:00:03 +0900
+  
+  Body:
+  
+  Hello Johnny Bravo,
+  The weather will be rainy, the temperature will reach 9°C.
+```
+
+#### Recipient 3 - sending an attachment
+
+The email to the recipient will include attachment, with a bank statement from his account. Since no delivery time is specified, the email
+will be sent straight-away.
+
+##### example_2.html
+
+```
+<!DOCTYPE html>
+<html>
+<body>
+<p>Hello %(name)s,</p>
+<p>You've spent $%(amount_spent)s today, so far. Attached is a bank statement.</p>
+
+</body>
+</html>
+```
+
+##### Email 3
+
+```
+  From: From Name <postmaster@domain.com>
+  To: Testy McTestface <testy@mctestface.com>
+  Subject: Today's spending
+  
+  Body:
+  Hello Testy McTestface,
+  You've spend $2500 today, so far. Attached is a bank statement.
+  
+  Attachments:
+  12345678_attachment.pdf
+```
+
+Note that the number before the attachment is a KBC storage ID, which can be found in files section in storage area.
+
+
+#### Recipient 4 - usage of percentage in an email
+
+If, in any case, a percentage sign is needed in the body of an email, in raw .html file, it needs to be doubled, i.e. `%%` instead of `%`. 
+This is due to the fact, that Python treats single `%` as a string handler and will try to input a value as a replacement. 
+
+##### Bad .html
+
+Input:
+```
+<p>The share is 75%.</p>
+```
+Output: 
+ValueError
+
+##### Good .html
+
+Input:
+```
+<p>The share is 75%%.</p>
+```
+Output:
+The share is 75%.
+
+
+##### example_3.html
+
+```
+<!DOCTYPE html>
+<html>
+<body>
+<h1>CONGRATULATIONS!</h1>
+<p>You won %(prize)s award, with %(percentage_votes)s%% share of votes.</p>
+
+</body>
+</html>
+```
+
+##### Email 4
+
+```
+  From: From Name <postmaster@domain.com>
+  To: Albert Einstein <albert.einstein@emc2.edu>
+  Subject: You won it!
+  
+  Body:
+  CONGRATULATIONS!
+  You won Scientist of the Century award, with 94.2% share of votes.
+```
+
+### Output
+A table with logs, saved to `out.c-mailgun.logs`.
+

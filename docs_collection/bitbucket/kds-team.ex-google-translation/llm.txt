@@ -1,0 +1,1223 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-google-translation/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   └── client/
+    │       ├── __init__.py
+    │       └── client.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── logger
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── loggerConfiguration.json
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   └── tables/
+    │       │       ├── test.csv
+    │       │       └── test.csv.manifest
+    │       └── out/
+    │           └── tables/
+    │               ├── translated-text.csv
+    │               └── translated-text.csv.manifest
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command: 
+      - /bin/sh
+      - /code/scripts/run.sh
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.3.5**
+Added sample table examples.
+Changed component descriptions.
+
+**0.3.4**
+Corrected logging level. Changed support from multiple tables to only a single table. Multiple tables support might be re-added in the future.
+
+**0.3.3**
+Language sanitization added. Previously, when language wasn't specified in lowercase, it'd not be properly identified.
+
+**0.3.2**
+Changed post_raw method from `requests.post` to `HttpClientBase.post_raw`
+
+**0.3.1**
+Added fix for empty input mapping. When the input is not specified, an error will be raised.
+
+**0.3.0**
+Changed the component source code to use the newest KBCEnvHandler library. Added retry for failed requests and exponential backoff for requests over the limit.
+
+================================================
+File: /src/component.py
+================================================
+import csv
+import logging
+from typing import Dict
+
+from keboola.component.base import ComponentBase
+from keboola.component.dao import TableDefinition
+from keboola.component.exceptions import UserException
+
+from client import GoogleTranslateClient, GoogleTranslateClientException
+
+API_KEY = '#API_key'
+TARGET_LANGUAGE_KEY = 'target_language'
+
+MANDATORY_PARS = [API_KEY, TARGET_LANGUAGE_KEY]
+OUTPUT_FIELDS = ['id', 'translatedText', 'detectedSourceLanguage']
+DEFAULT_OUTPUT_PK = ['id', 'translatedText', 'detectedSourceLanguage']
+DEFAULT_OUTPUT_TABLE_NAME = "translated-text.csv"
+
+FAILED_OUTPUT_FIELDS = ['id', 'failed_text', "reason"]
+FAILED_OUTPUT_PK = ['id']
+
+
+class Component(ComponentBase):
+
+    def __init__(self):
+        super().__init__()
+        self.client = None
+
+    def run(self):
+        self.validate_configuration_parameters(MANDATORY_PARS)
+        self.validate_input_table()
+        self._init_client()
+
+        input_table = self.get_input_table()
+        self._create_result_table()
+
+        logging.info("Starting translation...")
+
+        self.translate_file(input_table)
+
+        logging.info("Translation finished")
+
+        self.close_result()
+
+    def _init_client(self) -> None:
+        params = self.configuration.parameters
+        try:
+            self.client = GoogleTranslateClient(params.get(API_KEY), params.get(TARGET_LANGUAGE_KEY))
+        except GoogleTranslateClientException as google_exc:
+            raise UserException(google_exc) from google_exc
+
+    def translate_file(self, input_table: TableDefinition) -> None:
+        _requestCounter = 0
+        with open(input_table.full_path) as _input:
+            reader = csv.DictReader(_input)
+            for row in reader:
+                _requestCounter += 1
+                if _requestCounter % 500 == 0:
+                    logging.info(f"Made {_requestCounter} requests to Google Translate API.")
+                self.translate_row(row)
+
+    def translate_row(self, row: Dict) -> None:
+        row_id = row['id']
+        to_translate = row['text']
+        source_language = row.get('source')
+        if source_language is not None:
+            source_language = source_language.lower()
+        try:
+            _rsp_js = self.client.translate_text(text=to_translate, source_language=source_language)
+            parsed_response = self.parse_translate_response(_rsp_js, source_language, row_id)
+            self.writer.writerow(parsed_response)
+        except GoogleTranslateClientException as google_exc:
+            logging.warning(f"Could not translate text for id {row_id}. \n{google_exc}")
+            self.fail_writer.writerow({'id': row_id, 'failed_text': to_translate, "reason": google_exc})
+
+    @staticmethod
+    def parse_translate_response(_rsp_js: Dict, source_language: str, row_id: str) -> Dict:
+        _translatedText = _rsp_js['translatedText']
+        _detectedSourceLanguage = _rsp_js.get('detectedSourceLanguage')
+        if _detectedSourceLanguage is None:
+            _detectedSourceLanguage = source_language
+        return {'id': row_id, 'translatedText': _translatedText, 'detectedSourceLanguage': _detectedSourceLanguage}
+
+    def _create_result_table(self) -> None:
+        params = self.configuration.parameters
+        if 'destination' in params:
+            destination = params['destination']
+            incremental = (True if destination.get('load_type') == 'incremental_load' else False)
+            self.table_definition = self.create_out_table_definition(name=destination.get('output_table_name'),
+                                                                     incremental=incremental,
+                                                                     columns=OUTPUT_FIELDS,
+                                                                     primary_key=destination.get('primary_keys'))
+        else:
+            # backward compatibility for older configurations
+            self.table_definition = self.create_out_table_definition(DEFAULT_OUTPUT_TABLE_NAME,
+                                                                     columns=OUTPUT_FIELDS,
+                                                                     primary_key=DEFAULT_OUTPUT_PK)
+
+        self.out_file = open(self.table_definition.full_path, 'w')
+        self.writer = csv.DictWriter(self.out_file, fieldnames=OUTPUT_FIELDS,
+                                     restval='', extrasaction='ignore',
+                                     quotechar='"', quoting=csv.QUOTE_ALL)
+
+        self.failed_table_definition = self.create_out_table_definition("failed_translations.csv",
+                                                                        columns=FAILED_OUTPUT_FIELDS,
+                                                                        primary_key=FAILED_OUTPUT_PK)
+
+        self.failed_out_file = open(self.failed_table_definition.full_path, 'w')
+        self.fail_writer = csv.DictWriter(self.failed_out_file, fieldnames=FAILED_OUTPUT_FIELDS,
+                                          restval='', extrasaction='ignore',
+                                          quotechar='"', quoting=csv.QUOTE_ALL)
+
+    def close_result(self) -> None:
+        self.out_file.close()
+        self.write_manifest(self.table_definition)
+
+        self.failed_out_file.close()
+        self.write_manifest(self.failed_table_definition)
+
+    def validate_input_table(self) -> None:
+        input_tables = self.get_input_tables_definitions()
+
+        if len(input_tables) == 0:
+            raise UserException(
+                "No input table was provided. Please provide an input table, with mandatory columns \"id\"," +
+                " \"text\" and optional column \"source\". See documentation for more information.")
+
+        input_table = input_tables[0]
+
+        if 'id' not in input_table.columns or 'text' not in input_table.columns:
+            raise UserException(
+                f"Missing required column \"id\" or \"text\" in table {input_table.name}. "
+                f"Please, make sure all of the required columns are inputted.")
+
+    def get_input_table(self) -> TableDefinition:
+        return self.get_input_tables_definitions()[0]
+
+
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /src/client/__init__.py
+================================================
+from .client import (GoogleTranslateClient,  # noqa
+                     GoogleTranslateClientException)
+
+
+================================================
+File: /src/client/client.py
+================================================
+import json
+import logging
+from json import JSONDecodeError
+from typing import Dict
+
+import requests
+from keboola.http_client import HttpClient
+from requests.exceptions import HTTPError
+
+BASE_URL = 'https://translation.googleapis.com/language/translate/v2'
+
+ENDPOINT_LANGUAGES = "languages"
+
+
+class GoogleTranslateClientException(Exception):
+    pass
+
+
+class GoogleTranslateClient(HttpClient):
+
+    def __init__(self, token: str, target_language: str):
+        parameters = {'key': token, 'target': target_language, 'format': 'text'}
+        self.token = token
+        self.target_language = target_language
+
+        super().__init__(base_url=BASE_URL,
+                         default_params=parameters,
+                         status_forcelist=(403, 500, 502),
+                         max_retries=10,
+                         backoff_factor=0.3)
+
+        self._test_connection()
+        self._init_supported_languages()
+
+    def _test_connection(self) -> None:
+        try:
+            self.get(endpoint_path=ENDPOINT_LANGUAGES, params={'key': self.token})
+        except HTTPError as http_error:
+            raise GoogleTranslateClientException("API token verification failed. "
+                                                 "Make sure your API token is valid.") from http_error
+        logging.info("API token verified. Login successful.")
+
+    def _init_supported_languages(self) -> None:
+        try:
+            _rsp = self.get(endpoint_path=ENDPOINT_LANGUAGES, params={'key': self.token})
+        except HTTPError as http_error:
+            raise GoogleTranslateClientException(http_error) from http_error
+
+        self.supported_languages = [x['language'].lower() for x in _rsp['data']['languages']]
+
+        logging.debug("Supported languages are:")
+        logging.debug(self.supported_languages)
+
+    def translate_text(self, text: str, source_language: str = '') -> Dict:
+
+        if source_language != '' and source_language not in self.supported_languages:
+            source_language = ''
+        elif source_language == self.target_language:
+            source_language = ''
+
+        params = {'q': text, 'source': source_language}
+
+        logging.debug("Request parameters:")
+        logging.debug(params)
+
+        raw_result = self._translate_text(params)
+        translation_data = self.process_result(raw_result)
+        return translation_data
+
+    def _translate_text(self, params: Dict) -> requests.Response:
+        try:
+            return self.post_raw(data=params)
+        except requests.exceptions.RetryError as e:
+            raise GoogleTranslateClientException(
+                f"There were some issues with translating the text. Retry 10x failed. Reason: {e}. "
+                f"Possible issue might be related to daily limits reached. "
+                f"Try raising daily limit value in Google Cloud Console settings.") from e
+
+    def process_result(self, raw_result: requests.Response) -> Dict:
+        if raw_result.ok is True:
+            return raw_result.json()['data']['translations'][0]
+        else:
+            error_message = self.process_error_message(raw_result.text)
+            raise GoogleTranslateClientException(f"Failed to translate text : {error_message}")
+
+    @staticmethod
+    def process_error_message(error: str) -> str:
+        try:
+            error_data = json.loads(error)
+            return error_data.get("error").get("message")
+        except (JSONDecodeError, KeyError):
+            return error
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /component_config/logger
+================================================
+gelf
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# Google Translate
+
+## Overview
+
+The application for Google Translate allows to translate text into a desired language using Google Translate API. The Cloud Translation is a paid service serviced by Google and is subject to [Google Cloud's Terms & Condition](https://cloud.google.com/terms/). For pricing information, please visit the [support pages](https://cloud.google.com/translate/pricing).
+
+## Requirements
+
+The component requires valid Google Cloud API token with translation allowed. The API token is subject to [limits](https://cloud.google.com/translate/quotas) thus you will need to set up the translation limits according to your needs. The component uses exponential backoff to overcome Google's 100 second limit in case it is reached. In case the daily limit is reached, the component will fail.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+A sample configuration can be found in [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.ex-google-translation/src/master/component_config/sample-config/) including table inputs and outputs. Output table is loaded incrementally with `id` column used as a primary key.
+
+### Input table
+
+Each of the table must contain 2 required columns and may contain 1 optional column to make the translation more precise. The list of columns is:
+
+- `id` - (required) the column is used as primary key in the output,
+- `text` - (required) text to be translated,
+- `source` - (optional) an [ISO-639-1 language identifier](https://cloud.google.com/translate/docs/languages) of the source language of the text. If the column is left out or left blank, the Translate API will automatically detect the source language.
+
+Any additional columns will be ignored by the component. The input table therefore might take a form like the one below.
+
+| id 	| text                                     	| source 	| randomColumn 	    |
+|----	|------------------------------------------	|--------	|--------------	    |
+| 1 	| Tôi lái xe máy của tôi khi tôi ngã xuống 	|        	| foo          	    |
+| 2  	| Je n'ai pas fait mon devoir              	| fr     	| bar          	    |
+| 3  	| Hello, it's very nice to meet you.       	| en     	| foobar       	    |
+
+### API Token (`#API_key`)
+
+The API token can be obtained in the credentials section of the [Google Cloud Console](https://console.cloud.google.com/apis/credentials). The API token must have translation allowed, otherwise the component will fail.
+
+### Target language (`target_language`)
+
+An [ISO-639-1 language identifier](https://cloud.google.com/translate/docs/languages) of the language to which all text will be translated.
+
+## Output
+
+The output of the component is a table with translated rows. The table is loaded incrementally with column `id` used as a primary key and with following column specification:
+
+- `id` - identificator of text request. Relates to input table and is used as PK,
+- `translatedText` - a translation of the text in the target language,
+- `detectedSourceLanguage` - if `source` is not specified, the column contains information on detected language in the text. Otherwise it is equal to `source`.
+
+The output table will therefore take the following form:
+
+| id 	| translatedText                        	| detectedSourceLanguage 	|
+|----	|---------------------------------------	|------------------------	|
+| 1  	| I drove my motorbike when I fell down 	| vi                     	|
+| 2  	| I did not do my homework              	| fr                     	|
+| 3  	| Hello, it's very nice to meet you.    	| en                     	|
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Google Translate allows to translate text into any supported language.
+
+================================================
+File: /component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+    "type": "object",
+    "title": "Configuration",
+    "required": [
+        "#API_key",
+        "target_language"
+    ],
+    "properties": {
+        "#API_key": {
+            "propertyOrder": 100,
+            "type": "string",
+            "title": "Google API Key",
+            "format": "password",
+            "minLength": 4,
+            "description": "For API key, please visit <a href='https://console.cloud.google.com/apis/credentials'>Google Cloud Console</a><ol><li>Create a new API key by clicking: Create credentials -> API Keys</li><li>Use your existing API key and add Translation API to API restrictions</li></ol><br>Please refer to GCP <a href='https://cloud.google.com/translate/pricing'>pricing guide</a> for detailed information about the costs of API requests."
+        },
+        "target_language": {
+            "propertyOrder": 200,
+            "enum": [
+                "af",
+                "sq",
+                "am",
+                "ar",
+                "hy",
+                "az",
+                "eu",
+                "be",
+                "bn",
+                "bs",
+                "bg",
+                "ca",
+                "ceb",
+                "ny",
+                "zh",
+                "zh-TW",
+                "co",
+                "hr",
+                "cs",
+                "da",
+                "nl",
+                "en",
+                "eo",
+                "et",
+                "tl",
+                "fi",
+                "fr",
+                "fy",
+                "gl",
+                "ka",
+                "de",
+                "el",
+                "gu",
+                "ht",
+                "ha",
+                "haw",
+                "iw",
+                "hi",
+                "hmn",
+                "hu",
+                "is",
+                "ig",
+                "id",
+                "ga",
+                "it",
+                "ja",
+                "jw",
+                "kn",
+                "kk",
+                "km",
+                "ko",
+                "ku",
+                "ky",
+                "lo",
+                "la",
+                "lv",
+                "lt",
+                "lb",
+                "mk",
+                "mg",
+                "ms",
+                "ml",
+                "mt",
+                "mi",
+                "mr",
+                "mn",
+                "my",
+                "ne",
+                "no",
+                "ps",
+                "fa",
+                "pl",
+                "pt",
+                "pa",
+                "ro",
+                "ru",
+                "sm",
+                "gd",
+                "sr",
+                "st",
+                "sn",
+                "sd",
+                "si",
+                "sk",
+                "sl",
+                "so",
+                "es",
+                "su",
+                "sw",
+                "sv",
+                "tg",
+                "ta",
+                "te",
+                "th",
+                "tr",
+                "uk",
+                "ur",
+                "uz",
+                "vi",
+                "cy",
+                "xh",
+                "yi",
+                "yo",
+                "zu"
+            ],
+            "options": {
+                "enum_titles": [
+                    "Afrikaans",
+                    "Albanian",
+                    "Amharic",
+                    "Arabic",
+                    "Armenian",
+                    "Azerbaijani",
+                    "Basque",
+                    "Belarusian",
+                    "Bengali",
+                    "Bosnian",
+                    "Bulgarian",
+                    "Catalan",
+                    "Cebuano",
+                    "Chichewa",
+                    "Chinese (Simplified)",
+                    "Chinese (Traditional)",
+                    "Corsican",
+                    "Croatian",
+                    "Czech",
+                    "Danish",
+                    "Dutch",
+                    "English",
+                    "Esperanto",
+                    "Estonian",
+                    "Filipino",
+                    "Finnish",
+                    "French",
+                    "Frisian",
+                    "Galician",
+                    "Georgian",
+                    "German",
+                    "Greek",
+                    "Gujarati",
+                    "Haitian Creole",
+                    "Hausa",
+                    "Hawaiian",
+                    "Hebrew",
+                    "Hindi",
+                    "Hmong",
+                    "Hungarian",
+                    "Icelandic",
+                    "Igbo",
+                    "Indonesian",
+                    "Irish",
+                    "Italian",
+                    "Japanese",
+                    "Javanese",
+                    "Kannada",
+                    "Kazakh",
+                    "Khmer",
+                    "Korean",
+                    "Kurdish (Kurmanji)",
+                    "Kyrgyz",
+                    "Lao",
+                    "Latin",
+                    "Latvian",
+                    "Lithuanian",
+                    "Luxembourgish",
+                    "Macedonian",
+                    "Malagasy",
+                    "Malay",
+                    "Malayalam",
+                    "Maltese",
+                    "Maori",
+                    "Marathi",
+                    "Mongolian",
+                    "Myanmar (Burmese)",
+                    "Nepali",
+                    "Norwegian",
+                    "Pashto",
+                    "Persian",
+                    "Polish",
+                    "Portuguese",
+                    "Punjabi",
+                    "Romanian",
+                    "Russian",
+                    "Samoan",
+                    "Scots Gaelic",
+                    "Serbian",
+                    "Sesotho",
+                    "Shona",
+                    "Sindhi",
+                    "Sinhala",
+                    "Slovak",
+                    "Slovenian",
+                    "Somali",
+                    "Spanish",
+                    "Sundanese",
+                    "Swahili",
+                    "Swedish",
+                    "Tajik",
+                    "Tamil",
+                    "Telugu",
+                    "Thai",
+                    "Turkish",
+                    "Ukrainian",
+                    "Urdu",
+                    "Uzbek",
+                    "Vietnamese",
+                    "Welsh",
+                    "Xhosa",
+                    "Yiddish",
+                    "Yoruba",
+                    "Zulu"
+                ]
+            },
+            "type": "string",
+            "title": "Target Language",
+            "default": "en",
+            "description": "Choose the target language to which the text will be translated. <br/> The list of supported languages is available on <a href='https://cloud.google.com/translate/docs/languages'>Google support pages</a>."
+        },
+        "destination": {
+            "title": "Destination",
+            "type": "object",
+            "propertyOrder": 400,
+            "required": [
+                "output_table_name",
+                "load_type"
+            ],
+            "properties": {
+                "output_table_name": {
+                    "type": "string",
+                    "title": "Storage Table Name",
+                    "description": "Name of the table stored in Storage.",
+                    "default": "translated-text.csv",
+                    "propertyOrder": 10
+                },
+                "load_type": {
+                    "type": "string",
+                    "enum": [
+                        "full_load",
+                        "incremental_load"
+                    ],
+                    "options": {
+                        "enum_titles": [
+                            "Full Load",
+                            "Incremental Load"
+                        ]
+                    },
+                    "default": "full_load",
+                    "format": "checkbox",
+                    "title": "Load Type",
+                    "description": "If Full load is used, the destination table will be overwritten every run. If incremental load is used, data will be upserted into the destination table. Tables with a primary key will have rows updated, tables without a primary key will have rows appended.",
+                    "propertyOrder": 20
+                },
+                "primary_keys": {
+                    "type": "array",
+                    "format": "select",
+                    "title": "Primary Keys",
+                    "default": [
+                        "id",
+                        "translatedText",
+                        "detectedSourceLanguage"
+                    ],
+                    "description": "List of primary keys. If a primary key is set, updates can be done on the table by selecting incremental loads. The primary key can consist of multiple columns. The primary key of an existing table cannot be changed.",
+                    "propertyOrder": 30,
+                    "items": {
+                        "enum": [
+                        "id",
+                        "translatedText",
+                        "detectedSourceLanguage"
+                    ],
+                        "type": "string"
+                    },
+                    "uniqueItems": true,
+                    "minItems": 1
+                }
+            }
+        }
+    }
+}
+
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "#API_key": "XXXXXXXXXXXXXX",
+    "target_language": "en"
+  },
+  "image_parameters": {},
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv"
+        }
+      ]
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"source","text","id"
+"EN","Hello, it's very nice to meet you.","12345"
+"FR","Je n'ai pas fait mon devoir","000000"
+"","Tôi lái xe máy của tôi khi tôi ngã xuống","999999"
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 3,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": ["id", "text", "source"],
+    "metadata": [],
+    "column_metadata": {}
+}
+
+================================================
+File: /component_config/sample-config/out/tables/translated-text.csv
+================================================
+"id","translatedText","detectedSourceLanguage"
+"12345","Hello, it's very nice to meet you.","en"
+"000000","I did not do my homework","fr"
+"999999","I drove my motorbike when I fell down","vi"
+
+
+================================================
+File: /component_config/sample-config/out/tables/translated-text.csv.manifest
+================================================
+{"primary_key": ["id"], "incremental": true}
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+fi
+
+echo "Updating logger settings"
+
+value=`cat component_config/logger`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} logger --value="$value"
+else
+    echo "logger type is empty!"
+fi
+
+echo "Updating logger configuration"
+value=`cat component_config/loggerConfiguration.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} loggerConfiguration --value="$value"
+else
+    echo "loggerConfiguration is empty!"
+fi
+
+================================================
+File: /scripts/run.sh
+================================================
+#!/bin/sh
+set -e
+
+python /code/src/main.py
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.utils==1.1.0
+keboola.component==1.4.3
+keboola.csvwriter==1.0.1
+keboola.http-client==1.0.0
+requests==2.31.0
+
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.6-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY /component_config /code/component_config/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Google Translate
+
+## Overview
+
+The application for Google Translate allows to translate text into a desired language using Google Translate API. The Cloud Translation is a paid service serviced by Google and is subject to [Google Cloud's Terms & Condition](https://cloud.google.com/terms/). For pricing information, please visit the [support pages](https://cloud.google.com/translate/pricing).
+
+## Requirements
+
+The component requires valid Google Cloud API token with translation allowed. The API token is subject to [limits](https://cloud.google.com/translate/quotas) thus you will need to set up the translation limits according to your needs. The component uses exponential backoff to overcome Google's 100 second limit in case it is reached. In case the daily limit is reached, the component will fail.
+
+## Input & Output
+
+A sample configuration can be found in [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.ex-google-translation/src/master/component_config/sample-config/) including table inputs and outputs. Output table is loaded incrementally with `id` column used as a primary key.
+
+### Input table
+
+Each of the table must contain 2 required columns and may contain 1 optional column to make the translation more precise. The list of columns is:
+
+- `id` - (required) the column is used as primary key in the output,
+- `text` - (required) text to be translated,
+- `source` - (optional) an [ISO-639-1 language identifier](https://cloud.google.com/translate/docs/languages) of the source language of the text. If the column is left out or left blank, the Translate API will automatically detect the source language.
+
+Any additional columns will be ignored by the component. The input table therefore might take a form like the one below.
+
+| id 	| text                                     	| source 	| randomColumn 	    |
+|----	|------------------------------------------	|--------	|--------------	    |
+| 1 	| Tôi lái xe máy của tôi khi tôi ngã xuống 	|        	| foo          	    |
+| 2  	| Je n'ai pas fait mon devoir              	| fr     	| bar          	    |
+| 3  	| Hello, it's very nice to meet you.       	| en     	| foobar       	    |
+
+### API Token (`#API_key`)
+
+The API token can be obtained in the credentials section of the [Google Cloud Console](https://console.cloud.google.com/apis/credentials). The API token must have translation allowed, otherwise the component will fail.
+
+### Target language (`target_language`)
+
+An [ISO-639-1 language identifier](https://cloud.google.com/translate/docs/languages) of the language to which all text will be translated.
+
+## Output
+
+The output of the component is a table with translated rows. The table can be loaded as full or incremental load type, also you can define the PK. [More information about storing tables is here](https://help.keboola.com/storage/tables/#incremental-loading).  
+
+The table contains the following columns:
+
+- `id` - identificator of text request. Relates to input table and is used as PK,
+- `translatedText` - a translation of the text in the target language,
+- `detectedSourceLanguage` - if `source` is not specified, the column contains information on detected language in the text. Otherwise it is equal to `source`.
+
+The output table will therefore take the following form:
+
+| id 	| translatedText                        	| detectedSourceLanguage 	|
+|----	|---------------------------------------	|------------------------	|
+| 1  	| I drove my motorbike when I fell down 	| vi                     	|
+| 2  	| I did not do my homework              	| fr                     	|
+| 3  	| Hello, it's very nice to meet you.    	| en                     	|
+
+## Development
+
+For development purposes, the container needs to be built and image ran. Use following commands:
+
+```
+docker-compose build dev
+docker-compose run --rm dev
+```
+
+or 
+
+```
+docker-compose up
+```
+

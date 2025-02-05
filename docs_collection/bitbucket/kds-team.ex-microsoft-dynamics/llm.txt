@@ -1,0 +1,1493 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-microsoft-dynamics/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── component.py
+    │   └── dynamics/
+    │       ├── client.py
+    │       └── result.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       └── out/
+    │           └── tables/
+    │               ├── contacts.csv
+    │               └── contacts.csv.manifest
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── images/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.0**
+FEAT: Added query support for new-line separated queries and ampersand-separated queries
+DOCS: Added documentation for the component including sample configuration.
+
+**0.0.1**
+
+Working version of the extractor which allows to query any entity supported by Microsoft Dynamics 365's Web API.
+Automatic parsing and querying of the entities.
+
+================================================
+File: /src/component.py
+================================================
+import logging
+import json
+import os
+import sys
+from keboola.component import UserException
+from keboola.component.base import ComponentBase, sync_action
+from keboola.component.sync_actions import SelectElement
+from dynamics.client import DynamicsClient
+from dynamics.result import DynamicsWriter
+
+APP_VERSION = '1.2.0'
+
+KEY_ORGANIZATIONURL = 'organization_url'
+KEY_ENDPOINT = 'endpoint'
+KEY_API_VERSION = 'api_version'
+KEY_INCREMENTAL = 'incremental'
+KEY_QUERY = 'query'
+KEY_DEBUG = 'debug'
+KEY_DOWNLOAD_FORMATTED_VALUES = "download_formatted_values"
+
+MANDATORY_PARAMS = [KEY_ORGANIZATIONURL, KEY_API_VERSION]
+
+AUTH_APPKEY = 'appKey'
+AUTH_APPSECRET = '#appSecret'
+AUTH_APPDATA = '#data'
+AUTH_APPDATA_REFRESHTOKEN = 'refresh_token'
+
+sys.tracebacklimit = 0
+
+
+class Component(ComponentBase):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.cfg_params = self.configuration.parameters
+
+        self._validate_config()
+
+        if self.cfg_params.get(KEY_DEBUG, False) is True:
+            logger = logging.getLogger()
+            logger.setLevel(level='DEBUG')
+
+            sys.tracebacklimit = 3
+
+        auth = self.get_authorization()
+        self.par_client_id = auth[AUTH_APPKEY]
+        self.par_client_secret = auth[AUTH_APPSECRET]
+
+        auth_data = json.loads(auth[AUTH_APPDATA])
+        self.parRefreshToken = auth_data[AUTH_APPDATA_REFRESHTOKEN]
+
+        self.par_endpoint = self.cfg_params.get(KEY_ENDPOINT, '').lower()
+        self.parTable = self.par_endpoint + '.csv'
+        self.parApiVersion = self.cfg_params[KEY_API_VERSION]
+        self.parResourceUrl = self.cfg_params[KEY_ORGANIZATIONURL]
+        self.parQuery = '&'.join([q for q in self.cfg_params.get(KEY_QUERY, '').split('\n') if q != ''])
+        self.parIncremental = bool(self.cfg_params.get(KEY_INCREMENTAL, True))
+        self.download_formatted_values = bool(self.cfg_params.get(KEY_DOWNLOAD_FORMATTED_VALUES, False))
+
+        self.client = DynamicsClient(self.par_client_id, self.par_client_secret,
+                                     self.parResourceUrl, self.parRefreshToken,
+                                     self.parApiVersion)
+
+    def get_authorization(self):
+
+        try:
+            return self.configuration.config_data["authorization"]["oauth_api"]["credentials"]
+        except KeyError:
+            raise UserException("Authorization is missing in configuration file.")
+
+    def _validate_config(self) -> None:
+        missing_parameters = [param for param in MANDATORY_PARAMS if param not in self.configuration.parameters]
+
+        if missing_parameters:
+            raise UserException(f"Missing required configuration parameters: {', '.join(missing_parameters)}")
+
+    def run(self):
+
+        logging.info("Running component version %s..." % APP_VERSION)
+
+        if self.par_endpoint not in self.client.var_api_objects:
+
+            raise UserException(' '.join([
+                f"Endpoint \"{self.par_endpoint}\" is not supported by your Dynamics instance.",
+                "Please, refer to documentation at",
+                "https://docs.microsoft.com/en-us/dynamics365/" +
+                "customer-engagement/web-api/entitytypes for",
+                "the list of default available resources; or visit",
+                f"{os.path.join(self.client.par_resource_url, 'EntityDefinitions')}",
+                "for a complete list of all objects supported by your Dynamics instance."]))
+
+        else:
+
+            logging.info(f"Downloading data for endpoint \"{self.par_endpoint}\".")
+
+            _has_more = True
+            _has_wrtr = False
+            _next_link = None
+            _req_count = 0
+            _pk = self.client.var_api_objects[self.par_endpoint]['PrimaryIdAttribute']
+
+            while _has_more is True:
+
+                _req_count += 1
+                _results, _next_link = self.client.download_data(self.par_endpoint,
+                                                                 query=self.parQuery,
+                                                                 next_link_url=_next_link,
+                                                                 download_formatted_values=self.download_formatted_values)  # noqa
+
+                if _has_wrtr is False:
+
+                    if len(_results) == 0:
+                        logging.info(f"No data returned for endpoint \"{self.par_endpoint}\".")
+                        _has_more = False
+                        sys.exit(0)
+
+                    else:
+                        self.writer = DynamicsWriter(self.tables_out_path, self.par_endpoint, _results,
+                                                     [_pk], self.parIncremental)
+
+                        _has_wrtr = True
+
+                self.writer.writerows(_results)
+                _has_more = True if _next_link else False
+
+                if _req_count % 20 == 0:
+                    logging.info(f"Made {_req_count} requests to the API so far.")
+
+        logging.info(f"Made {_req_count} requests to the API in total for endpoint \"{self.par_endpoint}\".")
+
+    @sync_action('list_endpoints')
+    def list_endpoints(self):
+
+        try:
+            self.client.get_entity_metadata()
+
+        except Exception as e:
+            raise UserException(f"Failed to list endpoints: {e}")
+
+        return [SelectElement(value=obj, label=obj) for obj in list(self.client.var_api_objects.keys())]
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        # this triggers the run method by default and is controlled by the configuration.action parameter
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(1)
+
+
+================================================
+File: /src/dynamics/client.py
+================================================
+import logging
+import os
+import requests
+from keboola.http_client import HttpClient
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from keboola.component import UserException
+
+
+class DynamicsClient(HttpClient):
+    MSFT_LOGIN_URL = 'https://login.microsoftonline.com/common/oauth2/token'
+    MAX_RETRIES = 7
+    PAGE_SIZE = 2000
+
+    def __init__(self, client_id, client_secret, resource_url, refresh_token, api_version):
+
+        self.par_client_id = client_id
+        self.par_client_secret = client_secret
+        self.par_resource_url = str(os.path.join(resource_url, 'api/data', api_version))
+        self.par_resource_url_base = os.path.join(resource_url, '')
+        self.par_refresh_token = refresh_token
+        self.par_api_version = api_version
+
+        super().__init__(base_url=self.par_resource_url, max_retries=self.MAX_RETRIES)
+        _accessToken = self.refresh_token()
+
+        _defHeader = {
+            'Authorization': f'Bearer {_accessToken}',
+            'Accept': 'application/json'
+        }
+
+        self._auth_header = _defHeader
+        self.get_entity_metadata()
+
+    def refresh_token(self):
+
+        self._auth_header = {}
+
+        headers_refresh = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json'
+        }
+
+        body_refresh = {
+            'client_id': self.par_client_id,
+            'grant_type': 'refresh_token',
+            'client_secret': self.par_client_secret,
+            'resource': self.par_resource_url_base,
+            'refresh_token': self.par_refresh_token
+        }
+
+        req_refresh = self.post_raw(endpoint_path=self.MSFT_LOGIN_URL, headers=headers_refresh, data=body_refresh)
+        sc_refresh, js_refresh = req_refresh.status_code, req_refresh.json()
+
+        if sc_refresh == 200:
+            logging.debug("Access token refreshed successfully.")
+            return js_refresh['access_token']
+
+        else:
+            raise UserException(f"Could not refresh access token. Received {sc_refresh} - {js_refresh}.")
+
+    def __response_hook(self, res, *args, **kwargs):
+
+        if res.status_code == 401:
+            token = self.refresh_token()
+            self._auth_header = {"Authorization": f'Bearer {token}',
+                                 "Accept": "application/json"}
+
+            res.request.headers['Authorization'] = f'Bearer {token}'
+            s = requests.Session()
+            return self.requests_retry_session(session=s).send(res.request)
+
+    def requests_retry_session(self, session=None):
+
+        session = session or requests.Session()
+        retry = Retry(
+            total=self.max_retries,
+            read=self.max_retries,
+            connect=self.max_retries,
+            backoff_factor=self.backoff_factor,
+            status_forcelist=self.status_forcelist,
+            method_whitelist=('GET', 'POST', 'PATCH', 'UPDATE', 'DELETE')
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        # append response hook
+        session.hooks['response'].append(self.__response_hook)
+        return session
+
+    def get_entity_metadata(self):
+
+        url_meta = os.path.join(self.base_url, 'EntityDefinitions')
+        params_meta = {
+            '$select': 'PrimaryIdAttribute,EntitySetName'
+        }
+
+        req_meta = self.get_raw(endpoint_path=url_meta, params=params_meta)
+        sc_meta, js_meta = req_meta.status_code, req_meta.json()
+
+        if sc_meta == 200:
+
+            logging.debug("Obtained logical definitions of entities.")
+            self.var_api_objects = {e['EntitySetName'].lower(): e for e in js_meta['value']
+                                    if e['EntitySetName'] is not None}
+
+        else:
+            raise UserException(f"Could not obtain entity metadata for resource. Received: {sc_meta} - {js_meta}.")
+
+    def download_data(self, endpoint, query=None, next_link_url=None, download_formatted_values=False):
+
+        prefer_value = f"odata.maxpagesize={self.PAGE_SIZE}"
+        if download_formatted_values:
+            prefer_value = f'{prefer_value}, odata.include-annotations="OData.Community.Display.V1.FormattedValue"'
+
+        headers_query = {
+            'Prefer': prefer_value
+        }
+
+        if next_link_url is not None and next_link_url != '':
+            url_query = next_link_url
+
+        else:
+            url_query = os.path.join(self.base_url, endpoint)
+
+            if query is not None and query != '':
+                url_query += '?' + query
+
+        req_query = self.get_raw(endpoint_path=url_query, headers=headers_query)
+        sc_query, js_query = req_query.status_code, req_query.json()
+
+        if sc_query == 200:
+
+            _results = js_query['value']
+            _nextLink = js_query.get('@odata.nextLink', None)
+
+            return _results, _nextLink
+
+        else:
+
+            _err_msg = js_query['error']['message']
+
+            if 'Could not find a property named' in _err_msg:
+                _add_msg = 'When querying foreign key fields, do not forget to ommit "fk" part of the field, e.g. ' + \
+                           '"fk_accountid" -> "_accountid". Please, refer to the documentation for more information.'
+
+            else:
+                _add_msg = ''
+
+            raise UserException(f"Could not query endpoint \"{endpoint}\"."
+                                f"Received: {sc_query} - {_err_msg} {_add_msg}")
+
+
+================================================
+File: /src/dynamics/result.py
+================================================
+import csv
+import json
+import os
+
+FORMATTED_VALUE_LABEL = "@OData.Community.Display.V1.FormattedValue"
+
+
+class DynamicsWriter:
+
+    def __init__(self, output_path, table_filename, writer_object, primary_keys=None, incremental=True):
+        if primary_keys is None:
+            primary_keys = []
+
+        self.par_output_path = output_path
+        self.par_table_name = f'{table_filename}.csv'
+        self.par_full_table_path = os.path.join(self.par_output_path, self.par_table_name)
+        self.par_incremental = incremental
+        self.par_object = writer_object
+        self.par_primary_keys = primary_keys
+        self.get_and_map_columns()
+        self.create_manifest()
+        self.create_writer()
+
+    def get_and_map_columns(self):
+
+        all_columns = []
+
+        for o in self.par_object:
+            all_columns += o.keys()
+
+        all_columns = list(set(all_columns))
+        map_columns = {}
+
+        for column in all_columns:
+            if column.startswith('_') is True:
+                map_columns[column] = self._get_valid_kbc_storage_name(column)
+            elif self._is_formatted_value_column(column):
+                map_columns[column] = self._get_shortened_formatted_value_column_name(column)
+            elif '@odata' in column:
+                continue
+            else:
+                map_columns[column] = column
+
+        self.var_map_columns = map_columns
+
+    def _get_valid_kbc_storage_name(self, column_name):
+        if not self._is_formatted_value_column(column_name):
+            return f'fk{column_name}'
+        column_cleaned = self._get_shortened_formatted_value_column_name(column_name)
+        return f"fk{column_cleaned}"
+
+    @staticmethod
+    def _is_formatted_value_column(column_name: str) -> bool:
+        if FORMATTED_VALUE_LABEL in column_name:
+            return True
+
+    @staticmethod
+    def _get_shortened_formatted_value_column_name(column_name: str) -> str:
+        name_with_removed_formatted_value = column_name.replace(FORMATTED_VALUE_LABEL, "")
+        return f"{name_with_removed_formatted_value}_formattedValue"
+
+    def create_writer(self):
+
+        self.writer = csv.DictWriter(open(self.par_full_table_path, 'w'),
+                                     fieldnames=list(self.var_map_columns.keys()),
+                                     restval='', extrasaction='ignore',
+                                     quotechar='"', quoting=csv.QUOTE_ALL)
+
+    def create_manifest(self):
+
+        template = {
+            'primary_key': self.par_primary_keys,
+            'incremental': self.par_incremental,
+            'columns': list(self.var_map_columns.values())
+        }
+
+        with open(self.par_full_table_path + '.manifest', 'w') as manFile:
+            json.dump(template, manFile)
+
+    def writerows(self, data_to_write):
+
+        self.writer.writerows(data_to_write)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - echo 'Pushing test image to repo. [tag=test]'
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# Microsoft Dynamics 365 Extractor
+
+Microsoft Dynamics 365 is a product line of customer relationship management by Microsoft. The Microsoft Dynamics 365 extractor for Keboola allows users to extract data from their Dynamics instance. The extractor supports downloading data from any available entity in Dynamics 365 instance, including custom entities.
+
+The extractor utilizes WebAPI Graph API and supports all versions of the API. For more information about the WebAPI, please read [the API reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/about).
+
+## Useful links
+
+- [WebAPI Reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/about)
+- [Query Data Using WebAPI](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/query-data-web-api)
+- [Use WebAPI functions](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/use-web-api-functions)
+- [WebAPI Query Function Reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/queryfunctions)
+- [LastXDays Function](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/lastxdays)
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+### Organization URL (`organization_url`)
+
+The URL of Dynamics 365 instance, where all API calls will be made. The URL can be discovered using [Global Discovery Service](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/discover-url-organization-web-api) or from the URL of web instance:
+
+![organization_url](https://bitbucket.org/kds_consulting_team/kds-team.ex-microsoft-dynamics/raw/master/docs/images/organization_url.png)
+
+
+### API Version (`api_version`)
+
+The API version of WebAPI which will be used to query the data. For a list of available APIs, please visit [API reference](https://docs.microsoft.com/en-us/dynamics365/customerengagement/on-premises/developer/webapi/web-api-versions).
+
+### Endpoint (`endpoint`)
+
+For a list of default Microsoft defined entities, please visit [Web API EntityType Reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/entitytypes). This list, however, does not include custom created entities and fields. For a complete list of entities, visit `[ORGANIZATION_URL]/api/data/[API_VERSION]/EntityDefinitions?%24select=EntitySetName`, where `ORGANIZATION_URL` is a unique URL of the Dynamics CRM instance for your organization, and `API_VERSION` is the API version specification, you'd like to use; e.g. `https://keboola.crm.dynamics.com/api/data/v9.1/EntityDefinitions?%24select=EntitySetName`.
+
+*Note: If the above request returns page error (i.e. HTTP ERROR 401), you need to be logged in first to access the resouce.*
+
+If application receives an endpoint (entity), which is not part of the CRM instance, the run will be terminated.
+
+### Query (`query`)
+
+A WebAPI query allows users to further specify results which should be retrieved from the Microsoft Dynamics 365 instance. A basic tutorial on how to query data can be found in the [WebAPI documentation](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/query-data-web-api). Individual pieces of the query need to be separated by a new line or by ampersand (&). Below are discussed some examples.
+
+For a complete list of query functions that can be used in the query, refer to [Query Function reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/queryfunctions). Please note, that all keywords must start with `$`.
+
+### Download Formatted Values (`download_formatted_values`)
+
+When you want to receive [formatted values](https://learn.microsoft.com/en-us/power-apps/developer/data-platform/webapi/query-data-web-api#include-formatted-values) 
+for properties with the results, set this value to true. The response will include the raw values with properties that match the following naming convention:
+<propertyname>_formattedValue.
+
+#### Selecting relevant columns
+
+Using keyword `$select`, it's possible to only specify columns which should be returned from the API. The list of columms should be comma-separated. If nothing is specified, all columns are returned.
+*Please note, that all **columns which start with `fk`** in the output table from the extractor, **do not contain the `fk` prefix** in the API. Thus, if you'd like to query a column starting with `fk`, **omit the prefix**; e.g. in the output table, a column named `fk_primarycontactid_value` would be queried using `$select=_primarycontactid_value`.*
+
+An example of `$select` query would be:
+```
+$select=firstname,lastname,emailaddress1,_accountid_value
+```
+
+#### Downloading a sample of the data
+
+Using keyword `$top`, you can limit the number of results returned by the API. This is especially useful, if you're unaware what attributes are returned by the API and want to avoid lengthy downloads of all records and all attributes. The `$top` keyword will only returned first X specified records.
+
+An example of `$top` query would be:
+
+```
+$top=5000
+```
+
+#### Filtering results
+
+Using keyword `$filter`, it's possible to only filter results, which satisy all conditions specified. WebAPI offers a wide range of functions, which allow to filter results to the utmost detail.
+
+**Time-based filtering**
+Each record in the Dynamics CRM contains two metadata columns `createdon` and `modifiedon`, which can be used query data with latest changes. Upon creation of each record, `createdon` and `modifiedon` share the same value; once a record is modified, `modifiedon` takes on a new value while `createdon` does not change. It is therefore recommended to query on field `modifiedon`, to capture all of the changes in records, including newly created records.
+
+An example of time-based filtering could be:
+
+```
+-- download data for past 30 days
+$filter=Microsoft.Dynamics.CRM.LastXDays(PropertyName='modifiedon',PropertyValue=30)
+
+-- download data with modified date greater than
+$filter=modifiedon gt 2020-01-01
+```
+
+**Attrribute-based filtering**
+Attribute-based filtering allows to filter data based on values of attributes of each records. 
+
+An example of attribute-based filtering could be:
+```
+-- download data which have 'test' in emailaddress1
+$filter=contains(emailaddress1,'test')
+
+-- download data which start with 'Name' in property firstname
+$filter=startswith(firstname,'Name')
+```
+
+#### Complete queries
+
+Complete queries need to be new-line separated or "&" separated. Examples of complete queries are below combining both `$select` and `$filter` are below:
+
+**Select and filter in last 7 days**
+
+```
+$select=leadid,firstname
+$filter=Microsoft.Dynamics.CRM.LastXDays(PropertyName='modifiedon',PropertyValue=7)
+```
+
+**Select and attribute and time-based chained filter**
+
+```
+$select=leadid,firstname
+$filter=Microsoft.Dynamics.CRM.LastXDays(PropertyName='modifiedon',PropertyValue=7) and contains(firstname, 'Name')
+```
+
+**Ampersand delimited query**
+
+```
+$filter=modifiedon gt 2019-01-01&select=emailaddress1
+```
+
+**Select and limit**
+
+```
+$select=contactid,fullname,emailaddress1,address1_city
+$top=500
+```
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Microsoft Dynamics is a line of enterprise resource planning and customer relationship management software applications.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "API Settings",
+  "required": [
+    "organization_url",
+    "api_version"
+  ],
+  "properties": {
+    "api_version": {
+      "type": "string",
+      "title": "API Version",
+      "minLength": 4,
+      "description": "The API version, which will be used to query the data. For a list of available versions, please, refer to <a href='https://docs.microsoft.com/en-us/dynamics365/customerengagement/on-premises/developer/webapi/web-api-versions' target='_blank'>Microsoft's Web API Versions</a> article, or <a href='https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/compose-http-requests-handle-errors#web-api-url-and-versions' target='_blank'>here</a> for the most recent version number.",
+      "propertyOrder": 200
+    },
+    "organization_url": {
+      "type": "string",
+      "title": "Organization URL",
+      "minLength": 20,
+      "description": "URL to the CRM system located in the Dynamics 365 cloud. Usually in format <a href='https://<organization>.crm.dynamics.com'>https://&ltorganization&gt.crm.dynamics.com</a>.",
+      "propertyOrder": 100
+    }
+  }
+}
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Parameters",
+  "required": [
+    "endpoint",
+    "advanced_mode",
+    "incremental"
+  ],
+  "properties": {
+    "endpoint": {
+      "type": "string",
+      "title": "Endpoint",
+      "description": "The entity, which will be queried against. For a list of available entities, please, refer to <a href='https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/entitytypes' target='_blank'>entity documentation</a>. For a list of custom entities, please refer to component documentation, or check the job log.",
+      "propertyOrder": 300,
+      "enum": [],
+      "format": "select",
+      "uniqueItems": true,
+      "options": {
+        "async": {
+          "label": "Re-load available endpoints",
+          "action": "list_endpoints"
+        }
+      }
+    },
+    "advanced_mode": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Use advanced mode - custom query",
+      "default": false,
+      "propertyOrder": 400
+    },
+    "query": {
+      "type": "string",
+      "title": "Query (advanced)",
+      "format": "textarea",
+      "options": {
+        "input_height": "100px",
+        "dependencies": {
+            "advanced_mode": true
+          }
+      },
+      "description": "A Microsoft Web API query, which will be sent along with the request. All pieces of query can be separated by new-line or \"&\".</br>Please, refer to <a href='https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/query-data-web-api'>this article</a> explaining how to use the querying language.",
+      "propertyOrder": 410
+    },
+    "download_formatted_values": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Download Formatted Values",
+      "description": "Select this option to receive formatted values for properties with the results",
+      "propertyOrder": 425
+    },
+    "incremental": {
+      "enum": [
+        1,
+        0
+      ],
+      "type": "number",
+      "title": "Load Type",
+      "default": 1,
+      "options": {
+        "enum_titles": [
+          "Incremental Load",
+          "Full Load"
+        ]
+      },
+      "description": "Incremental load will load the table with primary keys and upsert new data. Full load will overwrite existing table all of the time.",
+      "propertyOrder": 450
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "organization_url": "https://keboolads.crm4.dynamics.com/",
+    "api_version": "v9.1",
+    "endpoint": "contacts",
+    "query": "$select=contactid,fullname,lastname\n$filter=contains(name,'test')",
+    "incremental": true
+  },
+  "image_parameters": {},
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2020-01-01 00:13:30",
+        "#data": "{ \"token_type\": \"Bearer\", \"scope\": \"user_impersonation\", \"expires_in\": \"3599\", \"ext_expires_in\": \"3599\", \"expires_on\": \"1579274445\", \"not_before\": \"1579270545\", \"resource\": \"https://keboolads.crm4.dynamics.com/\", \"access_token\": \"<ACCESS_TOKEN>\", \"refresh_token\": \"<REFRESH_TOKEN>\" }",
+        "oauthVersion": "2.0",
+        "appKey": "<CLIENT_ID>",
+        "#appSecret": "<CLIENT_SECRET>"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/out/tables/contacts.csv
+================================================
+"Yvonne McKay (sample)","McKay (sample)","226aa527-793c-ea11-a813-000d3a45b3bb"
+"Susanna Stubberod (sample)","Stubberod (sample)","246aa527-793c-ea11-a813-000d3a45b3bb"
+"Nancy Anderson (sample)","Anderson (sample)","266aa527-793c-ea11-a813-000d3a45b3bb"
+"Maria Campbell (sample)","Campbell (sample)","286aa527-793c-ea11-a813-000d3a45b3bb"
+"Sidney Higa (sample)","Higa (sample)","2a6aa527-793c-ea11-a813-000d3a45b3bb"
+"Scott Konersmann (sample)","Konersmann (sample)","2c6aa527-793c-ea11-a813-000d3a45b3bb"
+"Robert Lyon (sample)","Lyon (sample)","2e6aa527-793c-ea11-a813-000d3a45b3bb"
+"Paul Cannon (sample)","Cannon (sample)","306aa527-793c-ea11-a813-000d3a45b3bb"
+"Rene Valdes (sample)","Valdes (sample)","326aa527-793c-ea11-a813-000d3a45b3bb"
+"Jim Glynn (sample)","Glynn (sample)","346aa527-793c-ea11-a813-000d3a45b3bb"
+"Patrick Sands (sample)","Sands (sample)","366aa527-793c-ea11-a813-000d3a45b3bb"
+"Susan Burk (sample)","Burk (sample)","386aa527-793c-ea11-a813-000d3a45b3bb"
+"Thomas Andersen (sample)","Andersen (sample)","3a6aa527-793c-ea11-a813-000d3a45b3bb"
+"Portal Customer","Customer","99db51a2-c34e-e111-bb8d-00155d03a715"
+"System Administrator","Administrator","7469fd95-c0bd-4236-90bf-1d1100291df5"
+"Vincent Lauriant","Lauriant","465b158c-541c-e511-80d3-3863bb347ba8"
+"Adrian Dumitrascu","Dumitrascu","49a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Cathan Cook","Cook","4ba0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Brian LaMee","LaMee","4da0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Walter Harp","Harp","4fa0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Cat Francis","Francis","51a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Forrest Chand","Chand","53a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Eva Corets","Corets","55a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Gabriele Cannata","Cannata","57a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"George Sullivan","Sullivan","59a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Tamer Salah","Salah","5ba0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Andrew Dixon","Dixon","5da0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Patrick Steiner","Steiner","5fa0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Susan Burk","Burk","61a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Alex Wu","Wu","63a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Yvonne McKay","McKay","65a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Darren Parker","Parker","69a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Allison Brown","Brown","6da0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Sean Chai","Chai","71a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Humberto Acevedo","Acevedo","73a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Luca Argentiero","Argentiero","b5a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"NeKeta Argrow","Argrow","b7a0e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Tomasz Bochenek","Bochenek","1fa1e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Nana Bule","Bule","55a1e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Greg Chapman","Chapman","9da1e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Can Comertoglu","Comertoglu","c9a1e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Robin Counts","Counts","d7a1e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Ofer Daliot","Daliot","eba1e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Cliff Didcock","Didcock","19a2e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Eva Elznicova","Elznicova","4fa2e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Daniel Escapa","Escapa","5da2e5b9-88df-e311-b8e5-6c3be5a8b200"
+"William Flash","Flash","75a2e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Viggo Forde","Forde","83a2e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Kari Furse","Furse","9ba2e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Chris Gallagher","Gallagher","a1a2e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Hugo Garcia","Garcia","a9a2e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Eric Gilmore","Gilmore","bfa2e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Jim Glynn","Glynn","c7a2e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Ryan Gregg","Gregg","e7a2e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Uzi Hefetz","Hefetz","35a3e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Roland Hofmann","Hofmann","61a3e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Viara Kalnakova","Kalnakova","a9a3e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Petr Karásek","Karásek","afa3e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Roxanne Kenison","Kenison","c7a3e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Oliver Kiel","Kiel","dba3e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Ivan Komashinsky","Komashinsky","09a4e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Jason Kozleski","Kozleski","19a4e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Benno Kurmann","Kurmann","39a4e5b9-88df-e311-b8e5-6c3be5a8b200"
+"George Li","Li","73a4e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Robert Lyon","Lyon","9fa4e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Tete Mensa-Annan","Mensa-Annan","ffa4e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Fabricio Noriega","Noriega","55a5e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Tom O'Neill","O'Neill","5fa5e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Wilson Pais","Pais","6fa5e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Ian Palangio","Palangio","71a5e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Rok Palčič","Palčič","73a5e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Flemming Pedersen","Pedersen","89a5e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Terrence Philip","Philip","9fa5e5b9-88df-e311-b8e5-6c3be5a8b200"
+"David Probst","Probst","c9a5e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Olivier Renaud","Renaud","f1a5e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Tihomir Sasic","Sasic","4ba6e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Naoki Sato","Sato","4fa6e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Isabelle Scemla","Scemla","55a6e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Gary Schare","Schare","5ba6e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Susanne Schustin","Schustin","67a6e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Alex Simmons","Simmons","8da6e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Hoe Yew Soon","Soon","b5a6e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Ryan Spanton","Spanton","b9a6e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Iben Thorell","Thorell","0fa7e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Bruno Torres","Torres","21a7e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Florian Voss","Voss","6fa7e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Thiti Wang-Aryattawanich","Wang-Aryattawanich","83a7e5b9-88df-e311-b8e5-6c3be5a8b200"
+"James Wittrell","Wittrell","afa7e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Robin Wood","Wood","b3a7e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Karin Zimprich","Zimprich","e3a7e5b9-88df-e311-b8e5-6c3be5a8b200"
+"Shaun Beasley","Beasley","9c7a70c3-4ec8-e411-80ee-c4346bac7be8"
+"Kim Abercrombie","Abercrombie","a230c305-4fc8-e411-80ee-c4346bac7be8"
+"Marco Tanara","Tanara","02fa7133-4fc8-e411-80ee-c4346bac7be8"
+"Bertie Hinton","Hinton","1a4f0c57-5666-e711-80f2-c4346bacfbbc"
+"Shelby Paul","Paul","bde6db77-5666-e711-80f2-c4346bacfbbc"
+"Isaac Lightner","Lightner","48b6c6a5-88d2-e411-80e9-c4346bad5694"
+"","","58dbd239-d12e-e711-8110-c4346bad9668"
+"Roland Roybal","Roybal","77a07064-1ae7-e611-80f4-e0071b661f01"
+"Romeo Gooding","Gooding","79a07064-1ae7-e611-80f4-e0071b661f01"
+"Hallie Jacobs","Jacobs","7ba07064-1ae7-e611-80f4-e0071b661f01"
+"Joni Hernandez","Hernandez","7da07064-1ae7-e611-80f4-e0071b661f01"
+"Tracie Blevins","Blevins","7fa07064-1ae7-e611-80f4-e0071b661f01"
+"Leland Fusco","Fusco","81a07064-1ae7-e611-80f4-e0071b661f01"
+"Hector Clausen","Clausen","83a07064-1ae7-e611-80f4-e0071b661f01"
+"Amos Conger","Conger","85a07064-1ae7-e611-80f4-e0071b661f01"
+"Eva Colon","Colon","87a07064-1ae7-e611-80f4-e0071b661f01"
+"Brandie Diaz","Diaz","8ba07064-1ae7-e611-80f4-e0071b661f01"
+"Consuelo Moses","Moses","8da07064-1ae7-e611-80f4-e0071b661f01"
+"Pearlie Blackburn","Blackburn","91a07064-1ae7-e611-80f4-e0071b661f01"
+"Sammy McCormick","McCormick","93a07064-1ae7-e611-80f4-e0071b661f01"
+"Ladonna Carlson","Carlson","95a07064-1ae7-e611-80f4-e0071b661f01"
+"Brain Rey","Rey","97a07064-1ae7-e611-80f4-e0071b661f01"
+"Karl McKee","McKee","99a07064-1ae7-e611-80f4-e0071b661f01"
+"Kendrick Carbajal","Carbajal","9ba07064-1ae7-e611-80f4-e0071b661f01"
+"Adrienne McMillan","McMillan","9da07064-1ae7-e611-80f4-e0071b661f01"
+"Pearl Chavez","Chavez","9fa07064-1ae7-e611-80f4-e0071b661f01"
+"Dudley Garay","Garay","a1a07064-1ae7-e611-80f4-e0071b661f01"
+"Sue Vance","Vance","a3a07064-1ae7-e611-80f4-e0071b661f01"
+"Trina Duncan","Duncan","a5a07064-1ae7-e611-80f4-e0071b661f01"
+"Calvin Conte","Conte","a7a07064-1ae7-e611-80f4-e0071b661f01"
+"Tommie Bowers","Bowers","a9a07064-1ae7-e611-80f4-e0071b661f01"
+"Bobbi Christian","Christian","aba07064-1ae7-e611-80f4-e0071b661f01"
+"Maynard Lafferty","Lafferty","afa07064-1ae7-e611-80f4-e0071b661f01"
+"Freida Farley","Farley","b1a07064-1ae7-e611-80f4-e0071b661f01"
+"Jodi Ferrell","Ferrell","b3a07064-1ae7-e611-80f4-e0071b661f01"
+"Ora Rodriguez","Rodriguez","b5a07064-1ae7-e611-80f4-e0071b661f01"
+"Alexis Fry","Fry","b7a07064-1ae7-e611-80f4-e0071b661f01"
+"Andrew Book","Book","b9a07064-1ae7-e611-80f4-e0071b661f01"
+"Darrell Bromley","Bromley","bba07064-1ae7-e611-80f4-e0071b661f01"
+"Mack Fannin","Fannin","bda07064-1ae7-e611-80f4-e0071b661f01"
+"Eloise Steele","Steele","bfa07064-1ae7-e611-80f4-e0071b661f01"
+"Terrie Patrick","Patrick","c1a07064-1ae7-e611-80f4-e0071b661f01"
+"Rudolph Schiller","Schiller","c3a07064-1ae7-e611-80f4-e0071b661f01"
+"Jayne Carr","Carr","c5a07064-1ae7-e611-80f4-e0071b661f01"
+"Catalina Weeks","Weeks","c7a07064-1ae7-e611-80f4-e0071b661f01"
+"Carol McLaughlin","McLaughlin","c9a07064-1ae7-e611-80f4-e0071b661f01"
+"Heriberto Nathan","Nathan","cba07064-1ae7-e611-80f4-e0071b661f01"
+"Everett Fielder","Fielder","cda07064-1ae7-e611-80f4-e0071b661f01"
+"Claudia Ballard","Ballard","cfa07064-1ae7-e611-80f4-e0071b661f01"
+"Margarita Russo","Russo","d1a07064-1ae7-e611-80f4-e0071b661f01"
+"Randy Thiel","Thiel","d3a07064-1ae7-e611-80f4-e0071b661f01"
+"Max McLean","McLean","d5a07064-1ae7-e611-80f4-e0071b661f01"
+"Clay Clemente","Clemente","d7a07064-1ae7-e611-80f4-e0071b661f01"
+"Bette Goodman","Goodman","d9a07064-1ae7-e611-80f4-e0071b661f01"
+"Trudy Dickson","Dickson","dba07064-1ae7-e611-80f4-e0071b661f01"
+"Amie Gonzales","Gonzales","dfa07064-1ae7-e611-80f4-e0071b661f01"
+"Nanette Cervantes","Cervantes","e5a07064-1ae7-e611-80f4-e0071b661f01"
+"Angelo Razo","Razo","eba07064-1ae7-e611-80f4-e0071b661f01"
+"Susanne Holcomb","Holcomb","eda07064-1ae7-e611-80f4-e0071b661f01"
+"Ty Tinker","Tinker","efa07064-1ae7-e611-80f4-e0071b661f01"
+"Gay Gilmore","Gilmore","f1a07064-1ae7-e611-80f4-e0071b661f01"
+"Jill David","David","f3a07064-1ae7-e611-80f4-e0071b661f01"
+"Summer Knight","Knight","f5a07064-1ae7-e611-80f4-e0071b661f01"
+"Kate Floyd","Floyd","f7a07064-1ae7-e611-80f4-e0071b661f01"
+"Reggie Amaral","Amaral","f9a07064-1ae7-e611-80f4-e0071b661f01"
+"Francine Duran","Duran","fba07064-1ae7-e611-80f4-e0071b661f01"
+"Leann Valencia","Valencia","fda07064-1ae7-e611-80f4-e0071b661f01"
+"Davis Flournoy","Flournoy","ffa07064-1ae7-e611-80f4-e0071b661f01"
+"Judy Simon","Simon","01a17064-1ae7-e611-80f4-e0071b661f01"
+"Frankie Mundy","Mundy","03a17064-1ae7-e611-80f4-e0071b661f01"
+"Janna Santana","Santana","05a17064-1ae7-e611-80f4-e0071b661f01"
+"Wayne Goolsby","Goolsby","07a17064-1ae7-e611-80f4-e0071b661f01"
+"Ashley Chinn","Chinn","09a17064-1ae7-e611-80f4-e0071b661f01"
+"Winifred Pollard","Pollard","0ba17064-1ae7-e611-80f4-e0071b661f01"
+"Kenya Briggs","Briggs","0da17064-1ae7-e611-80f4-e0071b661f01"
+"Tony Sellars","Sellars","0fa17064-1ae7-e611-80f4-e0071b661f01"
+"Greta Rodriquez","Rodriquez","11a17064-1ae7-e611-80f4-e0071b661f01"
+"Lucille Frazier","Frazier","13a17064-1ae7-e611-80f4-e0071b661f01"
+"Morgan Bird","Bird","15a17064-1ae7-e611-80f4-e0071b661f01"
+"Dawn Phelps","Phelps","17a17064-1ae7-e611-80f4-e0071b661f01"
+"Reba Potts","Potts","19a17064-1ae7-e611-80f4-e0071b661f01"
+"Hal Matheson","Matheson","1ba17064-1ae7-e611-80f4-e0071b661f01"
+"Marianne Watson","Watson","1da17064-1ae7-e611-80f4-e0071b661f01"
+"Katelyn Merritt","Merritt","1fa17064-1ae7-e611-80f4-e0071b661f01"
+"Bernadette Foley","Foley","21a17064-1ae7-e611-80f4-e0071b661f01"
+"Dianna Woodward","Woodward","23a17064-1ae7-e611-80f4-e0071b661f01"
+"Abraham McCormick","McCormick","25a17064-1ae7-e611-80f4-e0071b661f01"
+"Lizzie Foley","Foley","27a17064-1ae7-e611-80f4-e0071b661f01"
+"Cheri Castaneda","Castaneda","29a17064-1ae7-e611-80f4-e0071b661f01"
+"Allison Dickson","Dickson","2ba17064-1ae7-e611-80f4-e0071b661f01"
+"Florine Wilkerson","Wilkerson","2da17064-1ae7-e611-80f4-e0071b661f01"
+"Christal Robles","Robles","2fa17064-1ae7-e611-80f4-e0071b661f01"
+"Lula Walter","Walter","31a17064-1ae7-e611-80f4-e0071b661f01"
+"Rickie Seely","Seely","33a17064-1ae7-e611-80f4-e0071b661f01"
+"Clarence Desimone","Desimone","35a17064-1ae7-e611-80f4-e0071b661f01"
+"Christie Dawson","Dawson","37a17064-1ae7-e611-80f4-e0071b661f01"
+"Martina Welch","Welch","39a17064-1ae7-e611-80f4-e0071b661f01"
+"Tabatha Guy","Guy","3ba17064-1ae7-e611-80f4-e0071b661f01"
+"Jolene Keith","Keith","3da17064-1ae7-e611-80f4-e0071b661f01"
+"Faith Ratliff","Ratliff","3fa17064-1ae7-e611-80f4-e0071b661f01"
+"Jennifer Rivas","Rivas","41a17064-1ae7-e611-80f4-e0071b661f01"
+"Tamra Riggs","Riggs","43a17064-1ae7-e611-80f4-e0071b661f01"
+"Mike Fogarty","Fogarty","45a17064-1ae7-e611-80f4-e0071b661f01"
+"Reed Hermann","Hermann","47a17064-1ae7-e611-80f4-e0071b661f01"
+"Eva Dawson","Dawson","49a17064-1ae7-e611-80f4-e0071b661f01"
+"Pamela Golden","Golden","4ba17064-1ae7-e611-80f4-e0071b661f01"
+"Lawanda Massey","Massey","4da17064-1ae7-e611-80f4-e0071b661f01"
+"Orville Eagle","Eagle","4fa17064-1ae7-e611-80f4-e0071b661f01"
+"Laurie Norman","Norman","51a17064-1ae7-e611-80f4-e0071b661f01"
+"Gracie George","George","53a17064-1ae7-e611-80f4-e0071b661f01"
+"Faith Charles","Charles","55a17064-1ae7-e611-80f4-e0071b661f01"
+"Maryanne Wilcox","Wilcox","57a17064-1ae7-e611-80f4-e0071b661f01"
+"Madge Sutton","Sutton","59a17064-1ae7-e611-80f4-e0071b661f01"
+"Bob Kozak","Kozak","5ba17064-1ae7-e611-80f4-e0071b661f01"
+"Kellie Leblanc","Leblanc","5da17064-1ae7-e611-80f4-e0071b661f01"
+"Dick Cowley","Cowley","5fa17064-1ae7-e611-80f4-e0071b661f01"
+"Vicky Barker","Barker","61a17064-1ae7-e611-80f4-e0071b661f01"
+"Katheryn Dickson","Dickson","63a17064-1ae7-e611-80f4-e0071b661f01"
+"Jay Orth","Orth","65a17064-1ae7-e611-80f4-e0071b661f01"
+"June Low","Low","67a17064-1ae7-e611-80f4-e0071b661f01"
+"Reina Cabatana","Cabatana","69a17064-1ae7-e611-80f4-e0071b661f01"
+"Brady Hannon","Hannon","6ba17064-1ae7-e611-80f4-e0071b661f01"
+"Simon Raley","Raley","6da17064-1ae7-e611-80f4-e0071b661f01"
+"Wilson Chew","Chew","6fa17064-1ae7-e611-80f4-e0071b661f01"
+"Edgar Dominquez","Dominquez","71a17064-1ae7-e611-80f4-e0071b661f01"
+"Efrain Schreiner","Schreiner","73a17064-1ae7-e611-80f4-e0071b661f01"
+"Joseph Gonsalves","Gonsalves","75a17064-1ae7-e611-80f4-e0071b661f01"
+"Matthew Everson","Everson","77a17064-1ae7-e611-80f4-e0071b661f01"
+"Ricardo Seely","Seely","79a17064-1ae7-e611-80f4-e0071b661f01"
+"Norbert Sandberg","Sandberg","7ba17064-1ae7-e611-80f4-e0071b661f01"
+"Van Amundson","Amundson","7da17064-1ae7-e611-80f4-e0071b661f01"
+"Samuel McBride","McBride","7fa17064-1ae7-e611-80f4-e0071b661f01"
+"Victor Timm","Timm","81a17064-1ae7-e611-80f4-e0071b661f01"
+"Kris Nakamura","Nakamura","83a17064-1ae7-e611-80f4-e0071b661f01"
+"Ryan Brim","Brim","85a17064-1ae7-e611-80f4-e0071b661f01"
+"Luke Lundgren","Lundgren","87a17064-1ae7-e611-80f4-e0071b661f01"
+"Jorge Gault","Gault","89a17064-1ae7-e611-80f4-e0071b661f01"
+"Mallory Rosario","Rosario","1bb028ba-da09-e711-8107-e0071b6a1051"
+"Jennifer Wilkins","Wilkins","2d0f7e14-0c56-e711-8135-e0071b6a7021"
+
+
+================================================
+File: /component_config/sample-config/out/tables/contacts.csv.manifest
+================================================
+{"primary_key": ["contactid"], "incremental": true, "columns": ["fullname", "lastname", "contactid"]}
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.component==1.4.4
+keboola.http-client==1.0.0
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.5.0.zip#egg=kbc
+mock==5.1.0
+freezegun==1.4.0
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.12-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install --upgrade pip
+RUN pip install flake8
+RUN pip install -r /code/requirements.txt
+WORKDIR /code/
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Microsoft Dynamics 365 Extractor
+
+[TOC]
+
+## Introduction
+
+Microsoft Dynamics 365 is a product line of customer relationship management by Microsoft. The Microsoft Dynamics 365 extractor for Keboola allows users to extract data from their Dynamics instance. The extractor supports downloading data from any available entity in Dynamics 365 instance, including custom entities.
+
+The extractor utilizes WebAPI Graph API and supports all versions of the API. For more information about the WebAPI, please read [the API reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/about).
+
+
+## Developer Notes
+
+This component utilizes the Microsoft Dataverse Web API, which is for extending/ getting data in and out of
+Power Apps (which Microsoft Dynamics 365 is ). The documentation of the dataverse can be found [here](https://learn.microsoft.com/en-us/power-apps/developer/data-platform/webapi/overview).
+
+
+
+## Configuration
+
+A sample configuration of the writer can be found in [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.wr-microsoft-dynamics/src/master/component_config/sample-config/). 
+
+### Authorization
+
+The component needs to be authorized by a user with access to Dynamics 365. The writer then performs all of the operations on behalf of the user, i.e. all of the operations have user's unique identification linked to the operation.
+
+For local run of the writer, please refer to [correct configuration file specification](https://developers.keboola.com/extend/common-interface/oauth/#authorize).
+
+### Parameters
+
+#### Organization URL (`organization_url`)
+
+The URL of Dynamics 365 instance, where all API calls will be made. The URL can be discovered using [Global Discovery Service](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/discover-url-organization-web-api) or from the URL of web instance:
+
+![organization_url](docs/images/organization_url.png)
+
+
+#### API Version (`api_version`)
+
+The API version of WebAPI which will be used to query the data. For a list of available APIs, please visit [API reference](https://docs.microsoft.com/en-us/dynamics365/customerengagement/on-premises/developer/webapi/web-api-versions).
+
+#### Endpoint (`endpoint`)
+
+For a list of default Microsoft defined entities, please visit [Web API EntityType Reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/entitytypes). This list, however, does not include custom created entities and fields. For a complete list of entities, visit `[ORGANIZATION_URL]/api/data/[API_VERSION]/EntityDefinitions?%24select=EntitySetName`, where `ORGANIZATION_URL` is a unique URL of the Dynamics CRM instance for your organization, and `API_VERSION` is the API version specification, you'd like to use; e.g. `https://keboola.crm.dynamics.com/api/data/v9.1/EntityDefinitions?%24select=EntitySetName`. 
+*Note: If the above request returns page error (i.e. HTTP ERROR 401), you need to be logged in first to access the resouce.*
+
+If application receives an endpoint (entity), which is not part of the CRM instance, the run will be terminated.
+
+#### Download Formatted Values (`download_formatted_values`)
+
+When you want to receive [formatted values](https://learn.microsoft.com/en-us/power-apps/developer/data-platform/webapi/query-data-web-api#include-formatted-values) 
+for properties with the results, set this value to true. The response will include the raw values with properties that match the following naming convention:
+<propertyname>_formattedValue.
+
+#### Query (`query`)
+
+A WebAPI query allows users to further specify results which should be retrieved from the Microsoft Dynamics 365 instance. A basic tutorial on how to query data can be found in the [WebAPI documentation](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/query-data-web-api). Individual pieces of the query need to be separated by a new line or by ampersand (&). Below are discussed some examples.
+
+For a complete list of query functions that can be used in the query, refer to [Query Function reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/queryfunctions). Please note, that all keywords must start with `$`.
+
+##### Selecting relevant columns
+
+Using keyword `$select`, it's possible to only specify columns which should be returned from the API. The list of columms should be comma-separated. If nothing is specified, all columns are returned.
+*Please note, that all **columns which start with `fk`** in the output table from the extractor, **do not contain the `fk` prefix** in the API. Thus, if you'd like to query a column starting with `fk`, **omit the prefix**; e.g. in the output table, a column named `fk_primarycontactid_value` would be queried using `$select=_primarycontactid_value`.*
+
+An example of `$select` query would be:
+
+```
+$select=firstname,lastname,emailaddress1,_accountid_value
+```
+
+##### Downloading a sample of the data
+
+Using keyword `$top`, you can limit the number of results returned by the API. This is especially useful, if you're unaware what attributes are returned by the API and want to avoid lengthy downloads of all records and all attributes. The `$top` keyword will only returned first X specified records.
+
+An example of `$top` query would be:
+
+```
+$top=5000
+```
+
+##### Filtering results
+
+Using keyword `$filter`, it's possible to only filter results, which satisy all conditions specified. WebAPI offers a wide range of functions, which allow to filter results to the utmost detail.
+
+**Time-based filtering**
+
+Each record in the Dynamics CRM contains two metadata columns `createdon` and `modifiedon`, which can be used query data with latest changes. Upon creation of each record, `createdon` and `modifiedon` share the same value; once a record is modified, `modifiedon` takes on a new value while `createdon` does not change. It is therefore recommended to query on field `modifiedon`, to capture all of the changes in records, including newly created records.
+
+An example of time-based filtering could be:
+
+```
+-- download data for past 30 days
+$filter=Microsoft.Dynamics.CRM.LastXDays(PropertyName='modifiedon',PropertyValue=30)
+
+-- download data with modified date greater than
+$filter=modifiedon gt 2020-01-01
+```
+
+**Attrribute-based filtering**
+
+Attribute-based filtering allows to filter data based on values of attributes of each records. 
+
+An example of attribute-based filtering could be:
+```
+-- download data which have 'test' in emailaddress1
+$filter=contains(emailaddress1,'test')
+
+-- download data which start with 'Name' in property firstname
+$filter=startswith(firstname,'Name')
+```
+
+##### Complete queries
+
+Complete queries need to be new-line separated or "&" separated. Examples of complete queries are below combining both `$select` and `$filter` are below:
+
+**Select and filter in last 7 days**
+
+```
+$select=leadid,firstname
+$filter=Microsoft.Dynamics.CRM.LastXDays(PropertyName='modifiedon',PropertyValue=7)
+```
+
+**Select and attribute and time-based chained filter**
+
+```
+$select=leadid,firstname
+$filter=Microsoft.Dynamics.CRM.LastXDays(PropertyName='modifiedon',PropertyValue=7) and contains(firstname, 'Name')
+```
+
+**Ampersand delimited query**
+
+```
+$filter=modifiedon gt 2019-01-01&select=emailaddress1
+```
+
+**Select and limit**
+
+```
+$select=contactid,fullname,emailaddress1,address1_city
+$top=500
+```
+
+## Output
+
+Extractor outputs a table with desired results from an endpoint, with the same primary key that is present in the Dynamics CRM instance. The table is loaded incrementally.
+Please note, that metadata columns, which are returned from the API are omitted from the result and column, which start with `fk`, have this suffix artificially added due to compatibility with Keboola Storage.
+
+## Useful links
+
+- [WebAPI Reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/about)
+- [Query Data Using WebAPI](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/query-data-web-api)
+- [Use WebAPI functions](https://docs.microsoft.com/en-us/powerapps/developer/common-data-service/webapi/use-web-api-functions)
+- [WebAPI Query Function Reference](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/queryfunctions)
+- [LastXDays Function](https://docs.microsoft.com/en-us/dynamics365/customer-engagement/web-api/lastxdays)
+
+## Local development
+
+For local development, use following commands to build and run an image:
+
+```
+docker-compose build dev
+docker-compose run --rm dev
+```
+

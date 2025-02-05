@@ -1,0 +1,762 @@
+Directory structure:
+└── kds_consulting_team-kds-team.processor-compress/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   └── component.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   └── tables/
+    │       │       ├── test.csv
+    │       │       └── test.csv.manifest
+    │       └── out/
+    │           └── tables/
+    │               └── test.csv.gz
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.0.2**
+Removed verbose output for 7z and zip compressions
+
+**0.0.1**
+Working version of the processor.
+Added standard compression methods such as `gz`, `7z` and `zip`.
+
+================================================
+File: /src/component.py
+================================================
+import glob
+import logging
+import os
+import subprocess
+import sys
+
+import logging_gelf.formatters
+import logging_gelf.handlers
+from kbc.env_handler import KBCEnvHandler
+
+KEY_COMPRESSION = 'compression'
+FILE_PASSWORD = '#password'
+MANDATORY_PARAMS = []
+SUPPORTED_COMPRESSIONS = ['gz', 'zip', '7z']
+
+APP_VERSION = '0.0.2'
+sys.tracebacklimit = 0
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)-8s : [line:%(lineno)3s] %(message)s',
+    datefmt="%Y-%m-%d %H:%M:%S")
+
+if 'KBC_LOGGER_ADDR' in os.environ and 'KBC_LOGGER_PORT' in os.environ:
+    logger = logging.getLogger()
+    logging_gelf_handler = logging_gelf.handlers.GELFTCPSocketHandler(
+        host=os.getenv('KBC_LOGGER_ADDR'),
+        port=int(os.getenv('KBC_LOGGER_PORT'))
+    )
+    logging_gelf_handler.setFormatter(logging_gelf.formatters.GELFFormatter(null_character=True))
+    logger.addHandler(logging_gelf_handler)
+
+    # removes the initial stdout logging
+    logger.removeHandler(logger.handlers[0])
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self):
+
+        KBCEnvHandler.__init__(self, MANDATORY_PARAMS)
+
+        self.paramCompressionType = self.cfg_params.get(KEY_COMPRESSION, 'gz')
+        self.paramFilePassword = self.cfg_params.get(FILE_PASSWORD)
+        logging.debug("Using compression type %s." % self.paramCompressionType)
+
+        self._validateCompression()
+        self._validateEncryption()
+        self._getAllFiles()
+        self.run()
+
+    def _validateCompression(self):
+
+        if self.paramCompressionType == 'gzip':
+            self.paramCompressionType = 'gz'
+
+        if self.paramCompressionType not in SUPPORTED_COMPRESSIONS:
+            logging.error(
+                "Unsupported compression selected. Supported compression formats: %s." % SUPPORTED_COMPRESSIONS)
+            sys.exit(1)
+
+    def _validateEncryption(self):
+        if self.paramFilePassword is not None and self.paramCompressionType != '7z':
+            logging.error(
+                "You can encrypt only 7z archives. Please remove the password key from the config or change the "
+                "compression parameter to \"7z\".")
+            sys.exit(1)
+
+    def _getAllFiles(self):
+
+        filesFolder = os.path.join(self.data_path, 'in/files/', '*[!.manifest]')
+        tablesFolder = os.path.join(self.data_path, 'in/tables/', '*[!.manifest]')
+
+        filesList = glob.glob(filesFolder)
+        tablesList = glob.glob(tablesFolder)
+
+        self.varFiles = filesList + tablesList
+        logging.debug("All files:")
+        logging.debug(self.varFiles)
+
+    def _getDestinationFolder(self, pathToFile):
+
+        if '/in/tables/' in pathToFile:
+
+            return os.path.join(self.data_path, 'out/tables/')
+
+        elif '/in/files/' in pathToFile:
+
+            return os.path.join(self.data_path, 'out/files/')
+
+        else:
+
+            logging.error("Unknown path to file.")
+            sys.exit(2)
+
+    def compressGz(self):
+
+        for f in self.varFiles:
+
+            compressionCheck = subprocess.call(["gzip", f])
+
+            if compressionCheck != 0:
+                logging.error("Error when compressing file %s." % f)
+                sys.exit(1)
+
+            compressedName = f + '.gz'
+            destinationFolder = self._getDestinationFolder(f)
+
+            subprocess.call(["cp", compressedName, destinationFolder])
+
+    def compressZip(self):
+
+        for f in self.varFiles:
+
+            destinationFolder = self._getDestinationFolder(f)
+            fileName = f.split('/')[-1]
+
+            destinationFilename = os.path.join(destinationFolder, fileName + '.zip')
+
+            compressionCheck = subprocess.call(["zip", "-j", "-q", destinationFilename, f])
+
+            if compressionCheck != 0:
+                logging.error("Error when compressing file %s." % f)
+                sys.exit(1)
+
+    def compress7z(self):
+
+        for f in self.varFiles:
+
+            destinationFolder = self._getDestinationFolder(f)
+            fileName = f.split('/')[-1] + '.7z'
+
+            destinatonFilename = os.path.join(destinationFolder, fileName)
+
+            if self.paramFilePassword:
+                compressionCheck = subprocess.call(
+                    ["7z", "a", destinatonFilename, "-y", "-bsp0", "-bso0", f, f"-p{self.paramFilePassword}"])
+            else:
+                compressionCheck = subprocess.call(["7z", "a", destinatonFilename, "-y", "-bsp0", "-bso0", f])
+
+        if compressionCheck != 0:
+            logging.error("Error when compressing file %s." % f)
+            sys.exit(1)
+
+    def run(self):
+
+        if self.paramCompressionType == 'gz':
+
+            self.compressGz()
+
+        elif self.paramCompressionType == 'zip':
+
+            self.compressZip()
+
+        elif self.paramCompressionType == '7z':
+
+            self.compress7z()
+
+        else:
+
+            logging.error("Unknown compression type %s." % self.paramCompressionType)
+            sys.exit(1)
+
+
+if __name__ == '__main__':
+    Component()
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+#          - echo 'Pushing test image to repo. [tag=test]'
+#          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# Compress processor
+
+This processor allows to compress files with one of the formats `gz`, `7z` or `zip`. The processor uses bash libraries to compress these files.
+All of the files from `./in/files/` and `./in/tables/` folders are compressed, with exception of manifests. Compressed files are outputted to their respective `/out/` directory.
+
+## Usage
+
+Supports optional parameters:
+- `compression` - must be one of `gz`/`gzip`, `7z` or `zip`. Default value is `gz`.
+- `#password` - can be used only with `compression` = `7z`. Arbitrary string used for locking the file.
+
+### Sample configurations
+
+Default parameters:
+
+```
+{
+  "definition": {
+    "component": "kds-team.processor-compress"
+  }
+}
+```
+
+Choose compression type:
+
+```
+{
+  "definition": {
+    "component": "kds-team.processor-compress"
+  },
+  "parameters": {
+    "compression": "gzip"
+  }
+}
+```
+
+Encrypt files:
+```
+{
+  "definition": {
+    "component": "kds-team.processor-compress"
+  },
+  "parameters": {
+    "compression": "7z",
+    "#password": "BigBaldWolf"
+  }
+}
+```
+
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Compress file to specified format.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "compression": "gzip"
+  },
+  "image_parameters": {
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.4.zip#egg=kbc
+logging_gelf==0.0.18
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.7.2-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN apt-get install -y p7zip-full zip gzip
+
+RUN pip install flake8
+RUN pip install -r /code/requirements.txt
+WORKDIR /code/
+
+CMD ["python3", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# Compress processor
+
+This processor allows to compress files with one of the formats `gz`, `7z` or `zip`. The processor uses bash libraries to compress these files.
+All of the files from `./in/files/` and `./in/tables/` folders are compressed, with exception of manifests. Compressed files are outputted to their respective `/out/` directory.
+
+## Usage
+
+Supports optional parameters:
+- `compression` - must be one of `gz`/`gzip`, `7z` or `zip`. Default value is `gz`.
+- `#password` - can be used only with `compression` = `7z`. Arbitrary string used for locking the file.
+
+
+### Sample configurations
+
+Default parameters:
+
+```
+{
+  "definition": {
+    "component": "kds-team.processor-compress"
+  }
+}
+```
+
+Choose compression type:
+
+```
+{
+  "definition": {
+    "component": "kds-team.processor-compress"
+  },
+  "parameters": {
+    "compression": "7z"
+  }
+}
+```
+
+Encrypt files:
+
+```
+{
+  "definition": {
+    "component": "kds-team.processor-compress"
+  },
+  "parameters": {
+    "compression": "7z",
+    "#password": "BigBaldWolf"
+  }
+}
+```
+
+### Development
+
+For development, use:
+
+```
+docker-compose build dev
+docker-compose run --rm dev
+```
+

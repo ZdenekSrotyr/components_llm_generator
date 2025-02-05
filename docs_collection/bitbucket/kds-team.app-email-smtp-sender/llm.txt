@@ -1,0 +1,2639 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-email-smtp-sender/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── src/
+    │   ├── component.py
+    │   ├── configuration.py
+    │   ├── stack_overrides.py
+    │   └── client.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── logger
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── loggerConfiguration.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       └── in/
+    │           ├── tables/
+    │           │   ├── test.csv
+    │           │   └── test.csv.manifest
+    │           └── files/
+    │               ├── test_json.json
+    │               ├── template.txt
+    │               ├── template.html
+    │               ├── test_csv.csv
+    │               ├── test_xlsx.xlsx
+    │               ├── test_txt.txt
+    │               └── test_xls.xls
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── custom_stack_override.txt
+    ├── TEMPLATE_README.md
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    example
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: kds-team.app-email-smtp-sender
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: kds-team.app-email-smtp-sender
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/component.py
+================================================
+import csv
+import logging
+from typing import List, Tuple, Union, Dict, Set
+import re
+import time
+import json
+import os
+from io import StringIO
+from pathlib import Path
+
+from keboola.component.base import ComponentBase, sync_action
+from keboola.component.exceptions import UserException
+from keboola.component.sync_actions import ValidationResult, MessageType, SelectElement
+from keboola.component.dao import FileDefinition
+from kbcstorage.client import Client as StorageClient
+from kbcstorage.tables import Tables as StorageTables
+from jinja2 import Template
+
+from configuration import Configuration, ConnectionConfig, AdvancedEmailOptions
+from client import SMTPClient
+from stack_overrides import StackOverridesParameters
+
+KEY_ALLOWED_SENDER_EMAIL_ADDRESSES = 'allowed_sender_email_addresses'
+
+KEY_PLAINTEXT_TEMPLATE_COLUMN = 'plaintext_template_column'
+KEY_HTML_TEMPLATE_COLUMN = 'html_template_column'
+KEY_PLAINTEXT_TEMPLATE_FILENAME = 'plaintext_template_filename'
+KEY_HTML_TEMPLATE_FILENAME = 'html_template_filename'
+KEY_PLAINTEXT_TEMPLATE_DEFINITION = 'plaintext_template_definition'
+KEY_HTML_TEMPLATE_DEFINITION = 'html_template_definition'
+
+# STACK OVERRIDES
+KEY_ALLOWED_HOSTS = 'allowed_hosts'
+KEY_ADDRESS_WHITELIST = 'address_whitelist'
+KEY_DISABLE_ATTACHMENTS = 'disable_attachments'
+
+SLEEP_INTERVAL = 0.1
+
+RESULT_TABLE_COLUMNS = ('status', 'recipient_email_address', 'sender_email_address', 'subject',
+                        'plaintext_message_body', 'html_message_body', 'attachment_filenames', 'error_message')
+
+VALID_CONNECTION_CONFIG_MESSAGE = '✅ - Connection configuration is valid'
+VALID_SUBJECT_MESSAGE = '✅ - All subject placeholders are present in the input table'
+VALID_PLAINTEXT_TEMPLATE_MESSAGE = '✅ - All plaintext template placeholders are present in the input table'
+VALID_HTML_TEMPLATE_MESSAGE = '✅ - All HTML template placeholders are present in the input table'
+VALID_ATTACHMENTS_MESSAGE = '✅ - All attachments are present'
+
+general_error_row = {
+    'status': 'ERROR',
+    'recipient_email_address': '',
+    'sender_email_address': '',
+    'subject': '',
+    'plaintext_message_body': '',
+    'html_message_body': '',
+    'attachment_filenames': ''}
+
+
+class Component(ComponentBase):
+    """Component for sending emails"""
+
+    def __init__(self):
+        super().__init__()
+        self.cfg = Configuration
+        self._client: SMTPClient = None
+        self._results_writer = None
+        self.plaintext_template_path = None
+        self.html_template_path = None
+
+    def run(self):
+        self._init_configuration()
+        self.init_client()
+
+        if self.cfg.configuration_type == 'advanced':
+            validation_results = self.validate_config()
+            if validation_results.type == MessageType.DANGER:
+                raise UserException(validation_results.message)
+
+        in_tables = self.get_input_tables_definitions()
+        in_files_by_name = self.get_input_file_definitions_grouped_by_name()
+        email_data_table_name = self.cfg.advanced_options.email_data_table_name
+        email_data_table_path = self.load_email_data_table_path(in_tables, email_data_table_name)
+        self.plaintext_template_path, self.html_template_path = \
+            self._extract_template_files_full_paths(in_files_by_name)
+
+        try:
+            attachments_paths_by_filename = \
+                self.load_attachment_paths_by_filename(in_tables, email_data_table_name, in_files_by_name)
+        except Exception as e:
+            raise UserException(f"Error loading attachments: {str(e)}")
+
+        results_table = self.create_out_table_definition('results.csv', write_always=True)
+        with open(results_table.full_path, 'w', newline='') as output_file:
+            self._results_writer = csv.DictWriter(output_file, fieldnames=RESULT_TABLE_COLUMNS)
+            self._results_writer.writeheader()
+            self._results_writer.errors = False
+            self.send_emails(email_data_table_path=email_data_table_path,
+                             attachments_paths_by_filename=attachments_paths_by_filename)
+        self.write_manifest(results_table)
+
+        if self._results_writer.errors:
+            raise UserException("Some emails couldn't be sent - check results.csv for more details.")
+
+    def _init_configuration(self) -> None:
+        self.validate_configuration_parameters(Configuration.get_dataclass_required_parameters())
+        self.cfg: Configuration = Configuration.load_from_dict(self.configuration.parameters)
+
+    def _load_stack_overrides(self) -> StackOverridesParameters:
+        image_parameters = self.configuration.image_parameters or {}
+
+        allowed_hosts = image_parameters.get(KEY_ALLOWED_HOSTS, [])
+        allowed_sender_email_addresses = image_parameters.get(KEY_ALLOWED_SENDER_EMAIL_ADDRESSES, [])
+        address_whitelist = image_parameters.get(KEY_ADDRESS_WHITELIST, [])
+        disable_attachments = image_parameters.get(KEY_DISABLE_ATTACHMENTS, False)
+
+        return StackOverridesParameters(
+            allowed_hosts=allowed_hosts,
+            address_whitelist=address_whitelist,
+            disable_attachments=disable_attachments,
+            allowed_sender_email_addresses=allowed_sender_email_addresses
+        )
+
+    def init_client(self, connection_config: Union[ConnectionConfig, None] = None) -> None:
+        if connection_config is None:
+            connection_config = self.cfg.connection_config
+
+        proxy_server_config = connection_config.creds_config.proxy_server_config
+        oauth_config = connection_config.oauth_config
+        creds_config = connection_config.creds_config
+
+        overrides: StackOverridesParameters = self._load_stack_overrides()
+        self.validate_allowed_hosts(overrides, creds_config)
+        self.validate_allowed_sender_email_addresses(overrides, creds_config)
+
+        self._client = SMTPClient(
+            use_oauth=connection_config.use_oauth,
+            sender_email_address=creds_config.sender_email_address or oauth_config.sender_email_address,
+            password=creds_config.pswd_sender_password,
+            server_host=creds_config.server_host,
+            server_port=creds_config.server_port,
+            connection_protocol=creds_config.connection_protocol,
+            proxy_server_host=proxy_server_config.proxy_server_host,
+            proxy_server_port=proxy_server_config.proxy_server_port,
+            proxy_server_username=proxy_server_config.proxy_server_username,
+            proxy_server_password=proxy_server_config.pswd_proxy_server_password,
+            tenant_id=oauth_config.tenant_id,
+            client_id=oauth_config.client_id,
+            client_secret=oauth_config.pswd_client_secret,
+            address_whitelist=overrides.address_whitelist,
+            disable_attachments=overrides.disable_attachments,
+            without_login=creds_config.without_login
+        )
+
+        self._client.init_smtp_server()
+
+    @staticmethod
+    def validate_allowed_sender_email_addresses(overrides, creds_config):
+        if overrides.allowed_sender_email_addresses:
+            if not creds_config.sender_email_address:
+                raise UserException("Sender email address is not set in the configuration")
+            if creds_config.sender_email_address not in overrides.allowed_sender_email_addresses:
+                raise UserException(
+                    f"Sender email address {creds_config.sender_email_address} is not allowed for your stack")
+
+    @staticmethod
+    def validate_allowed_hosts(overrides: StackOverridesParameters, creds_config) -> None:
+        if overrides.allowed_hosts:
+            match = False
+            for item in overrides.allowed_hosts:
+                if item.get('host') == creds_config.server_host and item.get('port') == creds_config.server_port:
+                    match = True
+
+            if not match:
+                raise UserException(f"Host {creds_config.server_host}:{creds_config.server_port} is not allowed")
+
+    @staticmethod
+    def load_email_data_table_path(in_tables, email_data_table_name):
+        try:
+            table_path = next(in_table.full_path for in_table in in_tables
+                              if in_table.name == email_data_table_name)
+        except StopIteration:
+            table_path = None
+        return table_path
+
+    @staticmethod
+    def _load_attachment_tables(in_tables, table_to_exclude):
+        tables = {
+            in_table.name: in_table.full_path
+            for in_table in in_tables
+            if in_table.name != table_to_exclude}
+        return tables
+
+    def _load_attachment_files(self, in_files_by_name):
+        attachment_files = {}
+        for name, files in in_files_by_name.items():
+            file = files[0]
+            original_path = file.full_path
+            if original_path not in [self.plaintext_template_path, self.html_template_path]:
+                directory = os.path.split(original_path)[0]
+                new_path = os.path.join(directory, file.name)
+                Path.rename(original_path, new_path)
+                attachment_files[file.name] = new_path
+        return attachment_files
+
+    def load_attachment_paths_by_filename(self, in_tables, email_data_table_name, in_files_by_name):
+        if self.cfg.configuration_type == 'basic' and not self.cfg.basic_options.include_attachments:
+            return {}
+        table_attachments_paths_by_filename = self._load_attachment_tables(in_tables, email_data_table_name)
+        file_attachments_paths_by_filename = self._load_attachment_files(in_files_by_name)
+        return {**table_attachments_paths_by_filename, **file_attachments_paths_by_filename}
+
+    def send_emails(self, attachments_paths_by_filename: Dict[str, str],
+                    email_data_table_path: Union[str, None] = None) -> None:
+        continue_on_error = self.cfg.continue_on_error
+        dry_run = self.cfg.dry_run
+        use_advanced_options = self.cfg.configuration_type == 'advanced'
+        basic_options = self.cfg.basic_options
+        advanced_options = self.cfg.advanced_options
+        subject_config = advanced_options.subject_config
+        message_body_config = advanced_options.message_body_config
+        attachments_config = advanced_options.attachments_config
+        use_html_template = message_body_config.use_html_template
+        subject_column = None
+        plaintext_template_column = None
+        html_template_column = None
+        all_attachments = attachments_config.attachments_source == 'all_input_files'
+        attachments_column = attachments_config.attachments_column
+
+        if email_data_table_path:
+            in_table = open(email_data_table_path)
+            reader = csv.DictReader(in_table)
+            columns = set(reader.fieldnames)
+
+            if subject_config.subject_source == 'from_table':
+                subject_column = subject_config.subject_column
+            else:
+                subject_template_text = subject_config.subject_template_definition
+                self._validate_template_text(subject_template_text, columns)
+
+            if message_body_config.message_body_source == 'from_table':
+                plaintext_template_column = message_body_config.plaintext_template_column
+                if use_html_template:
+                    html_template_column = message_body_config.html_template_column
+            else:
+                plaintext_template_text = self._read_template_text()
+                self._validate_template_text(plaintext_template_text, columns)
+                if use_html_template:
+                    html_template_text = self._read_template_text(plaintext=False)
+                    self._validate_template_text(html_template_text, columns)
+        else:
+            try:
+                reader = iter(basic_options.recipient_email_addresses.split(','))
+            except AttributeError:
+                raise UserException("No input table found with specified name or no recipient email addresses provided")
+
+        for row in reader:
+            try:
+                recipient_email_address = row
+                if isinstance(reader, csv.DictReader):
+                    recipient_email_address = row[advanced_options.recipient_email_address_column]
+
+                if not use_advanced_options:
+                    rendered_subject = basic_options.subject
+                    rendered_plaintext_message = basic_options.message_body
+                    rendered_html_message = None
+                    custom_attachments_paths_by_filename = attachments_paths_by_filename
+                else:
+                    if subject_column is not None:
+                        subject_template_text = row[subject_column]
+                        self._validate_template_text(subject_template_text, columns)
+
+                    try:
+                        rendered_subject = Template(subject_template_text).render(row)
+                    except Exception:
+                        rendered_subject = subject_template_text
+
+                    if plaintext_template_column is not None:
+                        plaintext_template_text = row[plaintext_template_column]
+                        self._validate_template_text(plaintext_template_text, columns)
+
+                        if html_template_column is not None:
+                            html_template_text = row[html_template_column]
+                            self._validate_template_text(html_template_text, columns)
+
+                    rendered_plaintext_message = Template(plaintext_template_text).render(row)
+                    rendered_html_message = None
+                    if use_html_template:
+                        rendered_html_message = Template(html_template_text).render(row)
+
+                    custom_attachments_paths_by_filename = attachments_paths_by_filename
+                    if not self._client.disable_attachments:
+                        if not all_attachments:
+                            custom_attachments_paths_by_filename = {
+                                attachment_filename: attachments_paths_by_filename[attachment_filename]
+                                for attachment_filename in json.loads(row[attachments_column])
+                            }
+
+                email_ = self._client.build_email(
+                    recipient_email_address=recipient_email_address,
+                    subject=rendered_subject,
+                    attachments_paths_by_filename=custom_attachments_paths_by_filename,
+                    rendered_plaintext_message=rendered_plaintext_message,
+                    rendered_html_message=rendered_html_message)
+
+                status = 'OK'
+                error_message = ''
+                if not dry_run:
+
+                    try:
+                        logging.info(
+                            f"Sending email with subject: `{email_['Subject']}`"
+                            f" from `{email_['From']}` to `{email_['To']}`")
+
+                        if self._client.disable_attachments:
+                            attachment_paths = None
+                        else:
+                            attachment_paths = custom_attachments_paths_by_filename.values()
+
+                        self._client.send_email(email_, message_body=rendered_plaintext_message,
+                                                html_message_body=rendered_html_message,
+                                                attachments_paths=attachment_paths)
+
+                    except Exception as e:
+                        error_message = str(e)
+                        status = 'ERROR'
+                        self._results_writer.errors = True
+
+                rendered_html_message_writable = ''
+                if rendered_html_message:
+                    rendered_html_message_writable = rendered_html_message
+
+                attachments_to_log = json.dumps(list(custom_attachments_paths_by_filename)) \
+                    if custom_attachments_paths_by_filename else []
+
+                self._results_writer.writerow(dict(
+                    status=status,
+                    recipient_email_address=email_['To'],
+                    sender_email_address=email_['From'],
+                    subject=email_['Subject'],
+                    plaintext_message_body=rendered_plaintext_message,
+                    html_message_body=rendered_html_message_writable,
+                    attachment_filenames=attachments_to_log,
+                    error_message=error_message))
+                if error_message and not continue_on_error:
+                    break
+                time.sleep(SLEEP_INTERVAL)
+
+            except Exception as e:
+                self._results_writer.writerow({
+                    **general_error_row,
+                    'sender_email_address': self._client.sender_email_address,
+                    'recipient_email_address': recipient_email_address,
+                    'error_message': str(e)})
+                self._results_writer.errors = True
+                if not continue_on_error:
+                    break
+
+        try:
+            in_table.close()
+        except NameError:
+            pass
+
+    def _extract_template_files_full_paths(
+            self, in_files_by_name: Dict[str, List[FileDefinition]]) -> Tuple[Union[str, None], Union[str, None]]:
+        """Extracts full paths for template files if they are provided"""
+        msg_body_config = self.cfg.advanced_options.message_body_config
+        plaintext_template_path = None
+        html_template_path = None
+        if msg_body_config.message_body_source == 'from_template_file':
+            plaintext_template_filename = msg_body_config.plaintext_template_filename
+            plaintext_template_path = next(files[0].full_path for name, files in in_files_by_name.items()
+                                           if files[0].name.endswith(plaintext_template_filename))
+            if msg_body_config.use_html_template:
+                html_template_filename = msg_body_config.html_template_filename
+                html_template_path = next(files[0].full_path for name, files in in_files_by_name.items()
+                                          if files[0].name.endswith(html_template_filename))
+        return plaintext_template_path, html_template_path
+
+    @staticmethod
+    def _read_template_file(template_path: str) -> str:
+        with open(template_path) as file:
+            return file.read()
+
+    @staticmethod
+    def _parse_template_placeholders(template_text: str) -> Set[str]:
+        placeholders = re.findall(r'\{\{.*?\}\}', template_text)
+        placeholders = set([placeholder.strip('{}') for placeholder in placeholders])
+        return placeholders
+
+    def _validate_template_text(self, template_text: str, columns: set, continue_on_error: bool = False) -> None:
+        template_placeholders = self._parse_template_placeholders(template_text)
+        missing_columns = set(template_placeholders) - set(columns)
+        if missing_columns:
+            if not continue_on_error:
+                raise UserException("❌ - Missing columns: " + ', '.join(missing_columns))
+
+    def _get_attachments_filenames_from_table(self, in_table_path: str) -> Set[str]:
+        attachments_filenames = set()
+        try:
+            with open(in_table_path) as in_table:
+                reader = csv.DictReader(in_table)
+                attachments_column = self.cfg.advanced_options.attachments_config.attachments_column
+                for row in reader:
+                    for attachment_filename in json.loads(row[attachments_column]):
+                        attachments_filenames.add(attachment_filename)
+        except Exception as e:
+            raise UserException(f"Couldn't read attachments from table {in_table_path} "
+                                f"column {attachments_column}: {str(e)}")
+        return attachments_filenames
+
+    def _get_missing_columns_from_table(self, reader: csv.DictReader, column: str) -> Set[str]:
+        unique_placeholders = set()
+        for row in reader:
+            row_placeholders = self._parse_template_placeholders(template_text=row[column])
+            unique_placeholders = unique_placeholders.union(row_placeholders)
+        missing_columns = set(unique_placeholders) - set(reader.fieldnames)
+        return missing_columns
+
+    def _validate_templates_from_table(self, reader: csv.DictReader, plaintext: bool) -> ValidationResult:
+        message = VALID_PLAINTEXT_TEMPLATE_MESSAGE if plaintext else VALID_HTML_TEMPLATE_MESSAGE
+        key_template_column = KEY_PLAINTEXT_TEMPLATE_COLUMN if plaintext else KEY_HTML_TEMPLATE_COLUMN
+        message_type = MessageType.SUCCESS
+        template_column = self.cfg.advanced_options.message_body_config[key_template_column]
+        missing_columns = self._get_missing_columns_from_table(reader, template_column)
+        if missing_columns:
+            message = '❌ - Missing columns: ' + ', '.join(missing_columns)
+            message_type = MessageType.DANGER
+        return ValidationResult(message, message_type)
+
+    def _read_template_text(self, plaintext: bool = True) -> str:
+        """Reads in template either from file, or from config"""
+        message_body_config = self.cfg.advanced_options.message_body_config
+        message_body_source = message_body_config.message_body_source
+
+        if message_body_source == 'from_template_file':
+            key_template_filename = KEY_PLAINTEXT_TEMPLATE_FILENAME if plaintext else KEY_HTML_TEMPLATE_FILENAME
+            template_filename = message_body_config[key_template_filename]
+            files = self._list_files_in_sync_actions()
+            if not files:
+                raise UserException('No files found in the storage. Please use tags to select your files instead of '
+                                    'query.')
+            template_file_id = next(file['id'] for file in files if file['name'] == template_filename)
+            template_path = self._download_file_from_storage_api(template_file_id)
+            template_text = self._read_template_file(template_path)
+        elif message_body_source == 'from_template_definition':
+            key_template_text = KEY_PLAINTEXT_TEMPLATE_DEFINITION if plaintext else KEY_HTML_TEMPLATE_DEFINITION
+            template_text = message_body_config[key_template_text]
+        else:
+            raise UserException('Invalid message body source')
+        return template_text
+
+    def _init_storage_client(self) -> StorageClient:
+        storage_token = self.environment_variables.token
+        storage_client = StorageClient(self.environment_variables.url, storage_token)
+        return storage_client
+
+    def _return_table_path(self, table_name: str) -> str:
+        table_path = None
+        if self.configuration.action == 'run':
+            all_tables = self.get_input_tables_definitions()
+            for table in all_tables:
+                if table_name == table.name:
+                    table_path = table.full_path
+                    break
+
+        # download via storage api for sync actions
+        else:
+            table_path = self._download_table_from_storage_api(table_name)
+
+        return table_path
+
+    def _download_table_from_storage_api(self, table_name) -> str:
+        try:
+            storage_client = self._init_storage_client()
+            table_id = next(table.source for table in self.configuration.tables_input_mapping
+                            if table.destination == table_name)
+            table_path = storage_client.tables.export_to_file(table_id=table_id, path_name=self.files_in_path)
+        except Exception as e:
+            raise UserException(f"Failed to access table {table_name} in storage: {str(e)}")
+        return table_path
+
+    def _download_file_from_storage_api(self, file_id) -> str:
+        storage_client = self._init_storage_client()
+        file_path = storage_client.files.download(file_id=file_id, local_path=self.files_in_path)
+        return file_path
+
+    def _list_files_in_sync_actions(self) -> List[Dict]:
+        storage_client = self._init_storage_client()
+        all_input_files = []
+        try:
+            for file_input in self.configuration.config_data['storage']['input']['files']:
+                tags = [tag['name'] for tag in file_input['source']['tags']]
+                input_files = storage_client.files.list(tags=tags)
+                all_input_files.extend(input_files)
+            return all_input_files
+        except KeyError:
+            return []
+
+    def _validate_template(self, plaintext: bool = True) -> ValidationResult:
+        self._init_configuration()
+        valid_message = VALID_PLAINTEXT_TEMPLATE_MESSAGE if plaintext else VALID_HTML_TEMPLATE_MESSAGE
+        if self.cfg.advanced_options.message_body_config.message_body_source == 'from_table':
+            table_name = self.cfg.advanced_options.email_data_table_name
+            in_table_path = self._return_table_path(table_name)
+            with open(in_table_path) as in_table:
+                reader = csv.DictReader(in_table)
+                return self._validate_templates_from_table(reader, plaintext)
+        else:
+            template_text = self._read_template_text(plaintext)
+            try:
+                columns = self.load_input_table_columns_()
+                self._validate_template_text(template_text, columns)
+                return ValidationResult(valid_message, MessageType.SUCCESS)
+            except UserException as e:
+                return ValidationResult(str(e), MessageType.DANGER)
+
+    def __exit__(self):
+        self._client.smtp_server.close()
+
+    def test_smtp_server_connection_(self) -> ValidationResult:
+        connection_config = ConnectionConfig.load_from_dict(self.configuration.parameters['connection_config'])
+        try:
+            self.init_client(connection_config=connection_config)
+            return ValidationResult('✅ - Connection established successfully', MessageType.SUCCESS)
+        except Exception as e:
+            return ValidationResult(f"❌ - Connection couldn't be established. Error: {e}", MessageType.DANGER)
+
+    @sync_action('testConnection')
+    def test_smtp_server_connection(self) -> ValidationResult:
+        return self.test_smtp_server_connection_()
+
+    @sync_action("load_input_table_selection")
+    def load_input_table_selection(self) -> List[SelectElement]:
+        self._init_configuration()
+        return [SelectElement(table.destination) for table in self.configuration.tables_input_mapping]
+
+    def load_input_table_columns_(self) -> Union[List[str], ValidationResult]:
+        advanced_options = AdvancedEmailOptions.load_from_dict(self.configuration.parameters['advanced_options'])
+        table_name = advanced_options.email_data_table_name
+        if table_name is None:
+            message = "You must specify `Email Data Table Name` before loading columns"
+            return ValidationResult(message, MessageType.DANGER)
+        try:
+            table_id = next(table.source for table in self.configuration.tables_input_mapping
+                            if table.destination == table_name)
+            storage_url = f'https://{self.environment_variables.stack_id}' if self.environment_variables.stack_id \
+                else "https://connection.keboola.com"
+            tables = StorageTables(storage_url, self.environment_variables.token)
+            preview = tables.preview(table_id)
+            reader = csv.DictReader(StringIO(preview))
+            return reader.fieldnames
+        except Exception:
+            return ValidationResult("Couldn't fetch columns", MessageType.DANGER)
+
+    @sync_action('load_input_table_columns')
+    def load_input_table_columns(self) -> List[SelectElement]:
+        columns = self.load_input_table_columns_()
+        if isinstance(columns, ValidationResult):
+            return columns
+        return [SelectElement(column) for column in columns]
+
+    def validate_subject_(self) -> ValidationResult:
+        self._init_configuration()
+        subject_config = self.cfg.advanced_options.subject_config
+        message = VALID_SUBJECT_MESSAGE
+        if subject_config.subject_source == 'from_table':
+            subject_column = subject_config.subject_column
+            table_name = self.cfg.advanced_options.email_data_table_name
+            in_table_path = self._return_table_path(table_name)
+            with open(in_table_path) as in_table:
+                reader = csv.DictReader(in_table)
+                missing_columns = self._get_missing_columns_from_table(reader, subject_column)
+                if missing_columns:
+                    message = '❌ - Missing columns: ' + ', '.join(missing_columns)
+        else:
+            subject_template_text = subject_config.subject_template_definition
+            columns = self.load_input_table_columns_()
+            try:
+                self._validate_template_text(subject_template_text, columns)
+            except Exception as e:
+                message = str(e)
+        message_type = MessageType.SUCCESS if message == VALID_SUBJECT_MESSAGE else MessageType.DANGER
+        return ValidationResult(message, message_type)
+
+    @sync_action('validate_subject')
+    def validate_subject(self) -> ValidationResult:
+        return self.validate_subject_()
+
+    def validate_plaintext_template_(self) -> ValidationResult:
+        return self._validate_template(plaintext=True)
+
+    @sync_action('validate_plaintext_template')
+    def validate_plaintext_template(self) -> ValidationResult:
+        return self.validate_plaintext_template_()
+
+    def validate_html_template_(self) -> ValidationResult:
+        return self._validate_template(plaintext=False)
+
+    @sync_action('validate_html_template')
+    def validate_html_template(self) -> ValidationResult:
+        return self.validate_html_template_()
+
+    def validate_attachments_(self) -> ValidationResult:
+        self._init_configuration()
+        message = VALID_ATTACHMENTS_MESSAGE
+        try:
+            if self.cfg.advanced_options.attachments_config.attachments_source != 'all_input_files':
+                table_name = self.cfg.advanced_options.email_data_table_name
+                in_table_path = self._return_table_path(table_name)
+                expected_input_filenames = self._get_attachments_filenames_from_table(in_table_path)
+                input_filenames = set([file['name'] for file in self._list_files_in_sync_actions()])
+                input_tables = set([table.destination for table in self.configuration.tables_input_mapping])
+                missing_attachments = expected_input_filenames - input_filenames - input_tables
+                if missing_attachments:
+                    message = '❌ - Missing attachments: ' + ', '.join(missing_attachments)
+        except Exception as e:
+            message = f"❌ - Couldn't validate attachments. Error: {e}"
+        message_type = MessageType.SUCCESS if message == VALID_ATTACHMENTS_MESSAGE else MessageType.DANGER
+        return ValidationResult(message, message_type)
+
+    @sync_action('validate_attachments')
+    def validate_attachments(self) -> ValidationResult:
+        return self.validate_attachments_()
+
+    @sync_action("validate_config")
+    def validate_config(self) -> ValidationResult:
+        self._init_configuration()
+        # TODO: once sys.stdout is None handling is released, remove helper methods and use other sync actions directly
+        validation_methods = [
+            self.test_smtp_server_connection_,
+            self.validate_subject_,
+            self.validate_plaintext_template_]
+        if self.cfg.advanced_options.message_body_config.use_html_template:
+            validation_methods.insert(3, self.validate_html_template_)
+
+        image_parameters = self.configuration.image_parameters or {}
+        disable_attachments = image_parameters.get(KEY_DISABLE_ATTACHMENTS, False)
+        if not disable_attachments:
+            validation_methods.append(self.validate_attachments_)
+
+        messages = [validation_method().message for validation_method in validation_methods]
+
+        if any(message.startswith('❌') for message in messages):
+            message_type = MessageType.DANGER
+        else:
+            message_type = MessageType.SUCCESS
+
+        message = '\n\n'.join(messages)
+        return ValidationResult(message, message_type)
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        # this triggers the run method by default and is controlled by the configuration.action parameter
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /src/configuration.py
+================================================
+import dataclasses
+from dataclasses import dataclass
+from typing import List, Union
+import json
+
+from pyhocon import ConfigTree
+import dataconf
+
+
+class ConfigurationBase:
+    @staticmethod
+    def _convert_private_value(value: str):
+        return value.replace('"#', '"pswd_')
+
+    @staticmethod
+    def _convert_private_value_inv(value: str):
+        if value and value.startswith("pswd_"):
+            return value.replace("pswd_", "#", 1)
+        else:
+            return value
+
+    @classmethod
+    def load_from_dict(cls, configuration: dict):
+        """
+        Initialize the configuration dataclass object from dictionary.
+        Args:
+            configuration: Dictionary loaded from json configuration.
+
+        Returns:
+
+        """
+        json_conf = json.dumps(configuration, ensure_ascii=False)
+        json_conf = ConfigurationBase._convert_private_value(json_conf)
+        return dataconf.loads(json_conf, cls, ignore_unexpected=True)
+
+    @classmethod
+    def get_dataclass_required_parameters(cls) -> List[str]:
+        """
+        Return list of required parameters based on the dataclass definition (no default value)
+        Returns: List[str]
+
+        """
+        return [cls._convert_private_value_inv(f.name)
+                for f in dataclasses.fields(cls)
+                if f.default == dataclasses.MISSING
+                and f.default_factory == dataclasses.MISSING]
+
+    def __getitem__(self, item, default=None):
+        return getattr(self, item, default)
+
+    def get(self, item, default=None):
+        return getattr(self, item, default)
+
+
+@dataclass
+class OAuthConfig(ConfigurationBase):
+    sender_email_address: Union[str, None] = None
+    tenant_id: Union[str, None] = None
+    client_id: Union[str, None] = None
+    pswd_client_secret: Union[str, None] = None
+
+
+@dataclass
+class ProxyServerConfig(ConfigurationBase):
+    proxy_server_host: Union[str, None] = None
+    proxy_server_port: Union[int, None] = None
+    proxy_server_username: Union[str, None] = None
+    pswd_proxy_server_password: Union[str, None] = None
+
+
+@dataclass
+class CredentialsConfig(ConfigurationBase):
+    sender_email_address: Union[str, None] = None
+    pswd_sender_password: Union[str, None] = None
+    server_host: str = 'smtp.gmail.com'
+    server_port: int = 465
+    connection_protocol: str = 'SSL'
+    use_proxy_server: bool = False
+    proxy_server_config: ProxyServerConfig = dataclasses.field(default_factory=lambda: ConfigTree({}))
+    without_login: bool = False
+
+
+@dataclass
+class ConnectionConfig(ConfigurationBase):
+    use_oauth: bool = False
+    oauth_config: OAuthConfig = dataclasses.field(default_factory=lambda: ConfigTree({}))
+    creds_config: CredentialsConfig = dataclasses.field(default_factory=lambda: ConfigTree({}))
+
+
+@dataclass
+class BasicEmailOptions(ConfigurationBase):
+    """
+    recipient_email_addresses: comma-delimited list of recipient email addresses
+    subject: subject of the email
+    message_body: body of the email
+    """
+    recipient_email_addresses: Union[str, None] = None
+    subject: Union[str, None] = None
+    message_body: Union[str, None] = None
+    include_attachments: Union[bool, None] = None
+
+
+@dataclass
+class SubjectConfig(ConfigurationBase):
+    """
+    subject_source:
+    "from_table" -> "subject_column"
+    "from_template_definition" -> "subject_template_definition"
+    """
+    subject_source: Union[str, None] = None
+    subject_column: Union[str, None] = None
+    subject_template_definition: Union[str, None] = None
+
+
+@dataclass
+class MessageBodyConfig(ConfigurationBase):
+    """
+    message_body_source:
+    "from_table" -> "plaintext_template_column" + "html_template_column"
+    "from_template_file" -> "plaintext_template_filename" + "html_template_filename"
+    "from_template_definition" -> "plaintext_template_definition" + "html_template_definition"
+    """
+    message_body_source: Union[str, None] = None
+    use_html_template: bool = False
+    plaintext_template_column: Union[str, None] = None
+    html_template_column: Union[str, None] = None
+    plaintext_template_filename: Union[str, None] = None
+    html_template_filename: Union[str, None] = None
+    plaintext_template_definition: Union[str, None] = None
+    html_template_definition: Union[str, None] = None
+
+
+@dataclass
+class AttachmentsConfig(ConfigurationBase):
+    """
+    attachments_source:
+    "all_input_files"
+    "from_table" -> "attachments_column"
+    """
+    attachments_source: Union[str, None] = None
+    attachments_column: Union[str, None] = None
+
+
+@dataclass
+class AdvancedEmailOptions(ConfigurationBase):
+    email_data_table_name: Union[str, None] = None
+    recipient_email_address_column: Union[str, None] = None
+    subject_config: SubjectConfig = dataclasses.field(default_factory=lambda: ConfigTree({}))
+    message_body_config: MessageBodyConfig = dataclasses.field(default_factory=lambda: ConfigTree({}))
+    attachments_config: AttachmentsConfig = dataclasses.field(default_factory=lambda: ConfigTree({}))
+
+
+@dataclass
+class Configuration(ConfigurationBase):
+    connection_config: ConnectionConfig = dataclasses.field(default_factory=lambda: ConfigTree({}))
+    configuration_type: Union[str, None] = None
+    basic_options: BasicEmailOptions = dataclasses.field(default_factory=lambda: ConfigTree({}))
+    advanced_options: AdvancedEmailOptions = dataclasses.field(default_factory=lambda: ConfigTree({}))
+    continue_on_error: bool = True
+    dry_run: bool = False
+
+
+================================================
+File: /src/stack_overrides.py
+================================================
+from dataclasses import dataclass, field
+from typing import List
+
+
+@dataclass
+class AllowedHosts:
+    host: str
+    port: int
+
+
+@dataclass
+class StackOverridesParameters:
+    allowed_hosts: List[AllowedHosts] = field(default_factory=list)
+    allowed_sender_email_addresses: List[str] = field(default_factory=list)
+    address_whitelist: List[str] = field(default_factory=list)
+    disable_attachments: bool = False
+
+
+================================================
+File: /src/client.py
+================================================
+import logging
+from typing import Union, Dict, List
+import os
+import re
+import json
+
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
+
+import smtplib
+import socket
+import socks
+from keboola.component import UserException
+from O365 import Account, EnvTokenBackend
+import msal
+
+KEY_UNENCRYPTED = 'Unencrypted'
+
+KEY_TLS = 'TLS'
+
+KEY_SSL = 'SSL'
+
+
+class SMTPClient:
+    """
+    Client for sending emails
+    """
+
+    def __init__(self, sender_email_address: str, password: str, server_host: str, server_port: int,
+                 proxy_server_host: Union[str, None] = None, proxy_server_port: Union[int, None] = None,
+                 proxy_server_username: Union[str, None] = None, proxy_server_password: Union[str, None] = None,
+                 connection_protocol: str = 'SSL', use_oauth: bool = False, tenant_id: Union[str, None] = None,
+                 client_id: Union[str, None] = None, client_secret: Union[str, None] = None,
+                 address_whitelist: List[str] = None, disable_attachments: bool = False,
+                 without_login: bool = False) -> None:
+
+        self.sender_email_address = sender_email_address
+        self.password = password
+        self.server_host = server_host
+        self.server_port = server_port
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.without_login = without_login
+
+        # Customizations
+        self.address_whitelist = address_whitelist
+        self.disable_attachments = disable_attachments
+
+        if proxy_server_host:
+            socks.setdefaultproxy(proxy_type=socks.PROXY_TYPE_SOCKS5, addr=proxy_server_host, port=proxy_server_port,
+                                  username=proxy_server_username, password=proxy_server_password)
+            socket.socket = socks.socksocket
+            socks.wrapmodule(smtplib)
+
+        if use_oauth:
+            logging.info('Using O365 authentication to SMTP server')
+            self.init_smtp_server = self._init_o365_smtp_server
+            self.send_email = self.send_email_via_o365_oauth
+        elif connection_protocol == KEY_SSL:
+            logging.info('Using SSL communication to SMTP server')
+            self.init_smtp_server = self._init_ssl_smtp_server
+            self.send_email = self._send_email_via_ssl_server
+        elif connection_protocol == KEY_TLS:
+            logging.info('Using TLS communication to SMTP server')
+            self.init_smtp_server = self._init_tls_smtp_server
+            self.send_email = self._send_email_via_tls_server
+        elif connection_protocol == KEY_UNENCRYPTED:
+            logging.info('Using Unencrypted communication to SMTP server')
+            self.init_smtp_server = self._init_unencrypted_smtp_server
+            self.send_email = self._send_email_via_unencrypted_server
+        else:
+            raise UserException(f'Invalid connection protocol: {connection_protocol}')
+
+    def build_email(self, *, recipient_email_address: str, subject: str, rendered_plaintext_message: str,
+                    rendered_html_message: Union[str, None] = None,
+                    attachments_paths_by_filename: Dict[str, str] = None) -> MIMEMultipart:
+        """
+        Prepares email message including html version (if selected) and adds attachments (if they exist)
+        """
+        if self.address_whitelist:
+            self.check_email_mask(recipient_email_address)
+
+        email_ = MIMEMultipart('mixed')
+        email_['From'] = self.sender_email_address
+        email_['To'] = recipient_email_address
+        email_['Subject'] = subject
+
+        email_message = MIMEMultipart('alternative')
+        email_message.attach(MIMEText(rendered_plaintext_message, 'plain'))
+        if rendered_html_message is not None:
+            email_message.attach(MIMEText(rendered_html_message, 'html'))
+
+        email_.attach(email_message)
+
+        if attachments_paths_by_filename and not self.disable_attachments:
+            for attachment_filename, attachment_path in attachments_paths_by_filename.items():
+                with open(attachment_path, 'rb') as file:
+                    attachment = MIMEBase('application', 'octet-stream')
+                    attachment.set_payload(file.read())
+                    encoders.encode_base64(attachment)
+                    attachment.add_header(
+                        'Content-Disposition', f'attachment; filename={attachment_filename}')
+                    email_.attach(attachment)
+        return email_
+
+    def _login(self, server):
+        if not self.without_login:
+            server.login(self.sender_email_address, self.password)
+        logging.info('Connection to SMTP without login')
+
+    def _init_unencrypted_smtp_server(self) -> None:
+        server = smtplib.SMTP(self.server_host, self.server_port)
+        self._login(server)
+        self.smtp_server = server
+
+    def _send_email_via_unencrypted_server(self, email: MIMEMultipart, **kwargs) -> None:
+        self.smtp_server.send_message(email)
+
+    def _init_tls_smtp_server(self) -> None:
+        server = smtplib.SMTP(self.server_host, self.server_port)
+        server.starttls()
+        self._login(server)
+        self.smtp_server = server
+
+    def _send_email_via_tls_server(self, email: MIMEMultipart, **kwargs) -> None:
+        self.smtp_server.send_message(email)
+
+    def _init_ssl_smtp_server(self) -> None:
+        server = smtplib.SMTP_SSL(host=self.server_host, port=self.server_port)
+        self._login(server)
+        self.smtp_server = server
+
+    def _send_email_via_ssl_server(self, email: MIMEMultipart, **kwargs) -> None:
+        self.smtp_server.send_message(email)
+
+    def _init_o365_smtp_server(self) -> None:
+        def get_access_token() -> Dict[str, Union[str, int]]:
+            authority = f"https://login.microsoftonline.com/{self.tenant_id}"
+            app = msal.ConfidentialClientApplication(self.client_id, authority=authority,
+                                                     client_credential=self.client_secret)
+            result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+            if "access_token" in result:
+                return result
+            raise Exception(f"Failed to acquire token: {result.get('error')}")
+
+        access_token_result = get_access_token()
+        os.environ['O365TOKEN'] = json.dumps(access_token_result)
+        account = Account(credentials=(self.client_id, self.client_secret), auth_flow_type='credentials',
+                          tenant_id=self.tenant_id, token_backend=EnvTokenBackend())
+        account.authenticate()
+        self.smtp_server = account
+
+    def send_email_via_o365_oauth(self, email: MIMEMultipart, message_body: str,
+                                  attachments_paths: List[str],
+                                  html_message_body: Union[str, None] = None, **kwargs) -> None:
+        email_ = self.smtp_server.new_message(resource=self.sender_email_address)
+        email_.to.add(email['To'])
+        email_.subject = email['Subject']
+        email_.body = html_message_body if html_message_body is not None else message_body
+
+        if not self.disable_attachments:
+            for attachment in attachments_paths:
+                email_.attachments.add(attachment)
+        email_.send()
+
+    def check_email_mask(self, email: str) -> None:
+        """
+        Checks whether the provided email or a comma-separated list of emails matches any of the
+        patterns (masks) in the address whitelist. The masks may contain '*' as a wildcard character,
+        which is translated into a regex pattern to match zero or more characters.
+
+        Args:
+            email (str): The email address or a comma-separated list of email addresses
+                         to be checked against the whitelist.
+
+        Raises:
+            UserException: If any of the emails do not match any of the masks in the whitelist.
+
+        """
+        emails = [e.strip() for e in email.split(",")]
+
+        for email in emails:
+            matched = False
+            for mask in self.address_whitelist:
+                _mask = re.escape(mask).replace(r'\*', '.*')
+
+                pattern = rf"^{_mask}$"
+
+                if re.match(pattern, email):
+                    matched = True
+                    break
+
+            if not matched:
+                raise UserException(f"Email '{email}' does not match any of the allowed masks.")
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+            - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:$TEST_TAG
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:test
+#            - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP <config_id> test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/logger
+================================================
+gelf
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+This component enables users to send emails with custom subject, message body and attachments from Keboola platform via SMTP protocol.
+
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+SMTP (Simple Mail Transfer Protocol) is the backbone of email communication, enabling the transfer of messages between servers and ensuring reliable email delivery across networks.
+
+================================================
+File: /component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+    "type": "object",
+    "title": "Connection Config",
+    "required": [
+        "connection_config"
+    ],
+    "properties": {
+        "connection_config": {
+            "title": "Connection Config",
+            "type": "object",
+            "propertyOrder": 1,
+            "properties": {
+                "use_oauth": {
+                    "type": "boolean",
+                    "format": "checkbox",
+                    "title": "Use O365 OAuth",
+                    "description": "if checked - authenticate via OAuth",
+                    "default": false,
+                    "propertyOrder": 1
+                },
+                "oauth_config": {
+                    "title": "OAuth Config",
+                    "type": "object",
+                    "propertyOrder": 2,
+                    "options": {
+                        "dependencies": {
+                            "use_oauth": true
+                        }
+                    },
+                    "properties": {
+                        "sender_email_address": {
+                            "type": "string",
+                            "title": "Sender Email Address",
+                            "propertyOrder": 1
+                        },
+                        "tenant_id": {
+                            "type": "string",
+                            "title": "Directory (tenant) ID",
+                            "propertyOrder": 2
+                        },
+                        "client_id": {
+                            "type": "string",
+                            "title": "Application (client) ID",
+                            "propertyOrder": 3
+                        },
+                        "#client_secret": {
+                            "type": "string",
+                            "title": "Application (client) Secret",
+                            "propertyOrder": 4
+                        }
+                    }
+                },
+                "creds_config": {
+                    "title": "Credentials Config",
+                    "type": "object",
+                    "propertyOrder": 2,
+                    "format": "grid-strict",
+                    "options": {
+                        "dependencies": {
+                            "use_oauth": false
+                        }
+                    },
+                    "properties": {
+                        "sender_email_address": {
+                            "type": "string",
+                            "title": "Sender Email Address",
+                            "propertyOrder": 2,
+                            "options": {
+                                "grid_columns": 6
+                            }
+                        },
+                        "#sender_password": {
+                            "type": "string",
+                            "format": "password",
+                            "title": "Sender App Password",
+                            "propertyOrder": 3,
+                            "options": {
+                                "grid_columns": 6
+                            }
+                        },
+                        "server_host": {
+                            "type": "string",
+                            "title": "SMTP Server Host",
+                            "propertyOrder": 4,
+                            "options": {
+                                "grid_columns": 6
+                            }
+                        },
+                        "server_port": {
+                            "type": "integer",
+                            "title": "SMTP Server Port (typically 25, 465, 587)",
+                            "default": 465,
+                            "propertyOrder": 5,
+                            "options": {
+                                "grid_columns": 6
+                            }
+                        },
+                        "connection_protocol": {
+                            "title": "Connection Protocol",
+                            "type": "string",
+                            "enum": [
+                                "SSL",
+                                "TLS",
+                                "Unencrypted"
+                            ],
+                            "propertyOrder": 6
+                        },
+                        "use_proxy_server": {
+                            "type": "boolean",
+                            "format": "checkbox",
+                            "title": "Use Proxy Server",
+                            "description": "if checked - connection to the SMTP server will be established via your proxy server",
+                            "default": false,
+                            "propertyOrder": 7
+                        },
+                        "without_login": {
+                            "type": "boolean",
+                            "format": "checkbox",
+                            "title": "Use connection without login",
+                            "description": "if checked - connection to the SMTP server will be established without login, password will be ignored",
+                            "default": false,
+                            "propertyOrder": 8
+                        },
+                        "proxy_server_config": {
+                            "title": "Proxy Server Config",
+                            "type": "object",
+                            "format": "grid-strict",
+                            "propertyOrder": 9,
+                            "options": {
+                                "dependencies": {
+                                    "use_proxy_server": true
+                                }
+                            },
+                            "properties": {
+                                "proxy_server_host": {
+                                    "type": "string",
+                                    "title": "Proxy Server Host",
+                                    "propertyOrder": 1,
+                                    "options": {
+                                        "grid_columns": 6
+                                    }
+                                },
+                                "proxy_server_port": {
+                                    "type": "integer",
+                                    "title": "Proxy Server Port",
+                                    "propertyOrder": 2,
+                                    "options": {
+                                        "grid_columns": 6
+                                    }
+                                },
+                                "proxy_server_username": {
+                                    "type": "string",
+                                    "title": "Username",
+                                    "propertyOrder": 3,
+                                    "options": {
+                                        "grid_columns": 6
+                                    }
+                                },
+                                "#proxy_server_password": {
+                                    "type": "string",
+                                    "title": "Password",
+                                    "propertyOrder": 4,
+                                    "options": {
+                                        "grid_columns": 6
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "test_smtp_server_connection": {
+                    "type": "button",
+                    "format": "sync-action",
+                    "propertyOrder": 9,
+                    "options": {
+                        "async": {
+                            "label": "TEST SMTP SERVER CONNECTION",
+                            "action": "testConnection",
+                            "cache": false
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{
+  "type": "object",
+  "title": "SMTP sender configuration",
+  "properties": {
+    "configuration_type": {
+      "title": "Configuration Type",
+      "type": "string",
+      "enum": ["basic", "advanced"],
+      "propertyOrder": 1,
+      "options": {
+        "enum_titles": ["Basic", "Advanced"]
+      }
+    },
+    "basic_options": {
+      "title": "Basic Options",
+      "type": "object",
+      "propertyOrder": 2,
+      "options": {"dependencies": {"configuration_type": "basic"}},
+      "properties": {
+        "recipient_email_addresses": {
+          "title": "Recipient Email Addresses",
+          "type": "string",
+          "options": {
+            "tooltip": "Enter comma delimited list of recipient email addresses"
+          },
+          "propertyOrder": 1
+        },
+        "subject": {
+          "propertyOrder": 2,
+          "type": "string",
+          "title": "Subject",
+          "default": "Example subject",
+          "format": "textarea",
+          "options": {
+            "input_height": "100px"
+          }
+        },
+        "message_body": {
+          "propertyOrder": 3,
+          "type": "string",
+          "title": "Message Body",
+          "default": "Example message body.",
+          "format": "textarea",
+          "options": {
+            "input_height": "100px"
+          }
+        },
+        "include_attachments": {
+          "title": "Include Attachments",
+          "type": "boolean",
+          "format": "checkbox",
+          "description": "if checked - all tables and files in input mapping will be used as attachments",
+          "default": true,
+          "propertyOrder": 4
+        }
+      }
+    },
+    "advanced_options": {
+      "title": "Advanced Options",
+      "type": "object",
+      "propertyOrder": 3,
+      "options": {"dependencies": {"configuration_type": "advanced"}},
+      "properties": {
+        "email_data_table_name": {
+          "type": "string",
+          "title": "Email Data Table Name",
+          "description": "name of the table with recipient email addresses, placeholders, other columns depending on your configuration",
+          "items": {
+            "enum": [],
+            "type": "string"
+          },
+          "enum": [],
+          "format": "select",
+          "uniqueItems": true,
+          "propertyOrder": 1,
+          "options": {
+            "async": {
+              "label": "Re-load tables",
+              "action": "load_input_table_selection",
+              "autoload": []
+            }
+          }
+        },
+        "recipient_email_address_column": {
+          "type": "string",
+          "title": "Recipient Email Address Column",
+          "items": {
+            "enum": [],
+            "type": "string"
+          },
+          "enum": [],
+          "format": "select",
+          "uniqueItems": true,
+          "propertyOrder": 2,
+          "options": {
+            "async": {
+              "label": "Re-load columns",
+              "action": "load_input_table_columns",
+              "autoload": ["parameters.advanced_options.email_data_table_name"]
+            }
+          }
+        },
+        "subject_config": {
+          "title": "Subject Config",
+          "type": "object",
+          "propertyOrder": 3,
+          "properties": {
+            "subject_source": {
+              "title": "Subject Source",
+              "type": "string",
+              "enum": ["from_table", "from_template_definition"],
+              "options": {
+                "enum_titles": ["From Table", "From Template Definition"],
+                "tooltip": "**From Table** - specify column which contains subject template/text in Jinja2 format \n- example use case - You want to have different subject for different recipients.\n\n**From Template Definition** - paste the subject template/text into the text area field \n- example use case - You want all recipients to receive similar subject template/text"
+              },
+              "propertyOrder": 1
+            },
+            "subject_column": {
+              "type": "string",
+              "title": "Subject Column",
+              "enum": [],
+              "items": {
+                "enum": [],
+                "type": "string"
+              },
+              "format": "select",
+              "uniqueItems": true,
+              "propertyOrder": 2,
+              "options": {
+                "async": {
+                  "label": "Re-load columns",
+                  "action": "load_input_table_columns",
+                  "autoload": ["parameters.advanced_options.email_data_table_name"]
+                },
+                "dependencies": {"subject_source": "from_table"}
+              }
+            },
+            "subject_template_definition": {
+              "propertyOrder": 3,
+              "type": "string",
+              "title": "Plaintext Subject Template",
+              "default": "Example subject",
+              "format": "textarea",
+              "options": {
+                "input_height": "100px",
+                "dependencies": {"subject_source":  "from_template_definition"}
+              }
+            },
+            "validate_subject": {
+                "type": "button",
+                "format": "sync-action",
+                "description": "Checks, whether all placeholders in your subject template are contained in the input table",
+                "propertyOrder": 7,
+                "options": {
+                  "async": {
+                    "label": "VALIDATE SUBJECT",
+                    "action": "validate_subject"
+                  }
+                }
+              }
+            }
+        },
+        "message_body_config": {
+          "title": "Message Body Config",
+          "type": "object",
+          "propertyOrder": 4,
+          "properties": {
+            "message_body_source": {
+              "title": "Message Body Source",
+              "type": "string",
+              "enum": ["from_table", "from_template_file", "from_template_definition"],
+              "options": {
+                "enum_titles": ["From Table", "From Template File", "From Template Definition"],
+                "tooltip": "**From Table** - specify column which contains template in Jinja2 format \n- example use case - You want to have different template/message for different recipients.\n\n**From Template File** - specify input file name containing the template in Jinja2 format \n- example use case - you want each recipient to receive similar template (with differently filled placeholders), and have an orchestration which spawns this template, so that this configuration has the template updated automatically\n\n**From Template Definition** - paste the template text into the text area field \n- example use case - You want all recipients to receive similar template and it will not be changed often."
+              },
+              "propertyOrder": 1
+            },
+            "use_html_template": {
+              "type": "boolean",
+              "format": "checkbox",
+              "title": "Use HTML Template",
+              "description": "HTML version is the primary displayed message, if recipients inbox doesn't support HTML, the message defaults to the plaintext version",
+              "default": true,
+              "propertyOrder": 7
+            },
+            "plaintext_template_column": {
+              "type": "string",
+              "title": "Plaintext Message Template Column",
+              "enum": [],
+              "items": {
+                "enum": [],
+                "type": "string"
+              },
+              "format": "select",
+              "uniqueItems": true,
+              "propertyOrder": 2,
+              "options": {
+                "async": {
+                  "label": "Re-load columns",
+                  "action": "load_input_table_columns",
+                  "autoload": ["parameters.advanced_options.email_data_table_name"]
+                },
+                "dependencies": {"message_body_source": "from_table"}
+              }
+            },
+            "html_template_column": {
+              "type": "string",
+              "title": "HTML Message Template Column",
+              "enum": [],
+              "items": {
+                "enum": [],
+                "type": "string"
+              },
+              "format": "select",
+              "uniqueItems": true,
+              "propertyOrder": 8,
+              "options": {
+                "async": {
+                  "label": "Re-load columns",
+                  "action": "load_input_table_columns",
+                  "autoload": ["parameters.advanced_options.email_data_table_name"]
+                },
+                "dependencies": {
+                  "use_html_template": true,
+                  "message_body_source": "from_table"
+                }
+              }
+            },
+            "plaintext_template_filename": {
+              "type": "string",
+              "title": "Plaintext Template Filename",
+              "default": "template.txt",
+              "propertyOrder": 4,
+              "options": {
+                "dependencies": {"message_body_source": "from_template_file"}
+              }
+            },
+            "html_template_filename": {
+              "type": "string",
+              "title": "HTML Template Filename",
+              "default": "template.html",
+              "propertyOrder": 8,
+              "options": {
+                "dependencies": {
+                  "use_html_template": true,
+                  "message_body_source": "from_template_file"}
+              }
+            },
+            "plaintext_template_definition": {
+              "propertyOrder": 6,
+              "type": "string",
+              "title": "Plaintext Message Body Template",
+              "default": "Example message body.",
+              "format": "textarea",
+              "options": {
+                "input_height": "100px",
+                "dependencies": {"message_body_source": "from_template_definition"}
+              }
+            },
+            "validate_plaintext_template": {
+              "type": "button",
+              "format": "sync-action",
+              "description": "Checks, whether all placeholders in your plaintext template are contained in the input table",
+              "propertyOrder": 7,
+              "options": {
+                "async": {
+                  "label": "VALIDATE PLAINTEXT TEMPLATE",
+                  "action": "validate_plaintext_template"
+                }
+              }
+            },
+            "html_template_definition": {
+              "propertyOrder": 8,
+              "type": "string",
+              "title": "HTML Message Body Template",
+              "format": "textarea",
+              "default": "<h3>Example message body title</h3><p>Example message body paragraph.</p>",
+              "options": {
+                "input_height": "100px",
+                "dependencies": {
+                  "use_html_template": true,
+                  "message_body_source": "from_template_definition"}
+              }
+            },
+            "validate_html_template": {
+              "type": "button",
+              "format": "sync-action",
+              "description": "Checks, whether all placeholders in your plaintext template are contained in the input table",
+              "propertyOrder": 9,
+              "options": {
+                "async": {
+                  "label": "VALIDATE HTML TEMPLATE",
+                  "action": "validate_html_template"
+                },
+                "dependencies": {
+                  "use_html_template": true
+                }
+              }
+            }
+          }
+        },
+        "attachments_config": {
+          "title": "Attachments Config",
+          "type": "object",
+          "propertyOrder": 5,
+          "properties": {
+            "attachments_source": {
+              "title": "Attachments Source",
+              "type": "string",
+              "propertyOrder": 1,
+              "enum": ["from_table", "all_input_files"],
+              "options": {
+                "enum_titles": ["From Table", "All Input Files and Tables"],
+                "tooltip": "**From Table** - column expects json list of attachment filenames in input mapping, associated with specific recipients \n- example use case - you want to have control over who receives what - everybody could receive newsletter associated pdf, but certain recipients are eligible for a special offer included in this newsletter\n\n**All Input Files** - all recipients will receive all non-template files in the input mapping"
+              }
+            },
+            "attachments_column": {
+              "type": "string",
+              "title": "Attachments Column",
+              "enum": [],
+              "description": "column expects json list of attachment filenames in input mapping, associated with specific recipients",
+              "items": {
+                "enum": [],
+                "type": "string"
+              },
+              "format": "select",
+              "uniqueItems": true,
+              "propertyOrder": 2,
+              "options": {
+                "async": {
+                  "label": "Re-load columns",
+                  "action": "load_input_table_columns",
+                  "autoload": ["parameters.advanced_options.email_data_table_name"]
+                },
+                "dependencies": {"attachments_source":  "from_table"}
+              }
+            },
+            "validate_attachments": {
+              "type": "button",
+              "format": "sync-action",
+              "description": "Validates All attachments are present in file input mapping (excluding the template files)",
+              "propertyOrder": 3,
+              "options": {
+                "async": {
+                  "label": "VALIDATE ATTACHMENTS",
+                  "action": "validate_attachments"
+                },
+                "dependencies": {"attachments_source":  "from_table"}
+              }
+            }
+          }
+        },
+        "validate_config": {
+          "type": "button",
+          "format": "sync-action",
+          "description": "Validates the whole config",
+          "propertyOrder": 8,
+          "options": {
+            "async": {
+              "label": "VALIDATE CONFIG",
+              "action": "validate_config"
+            }
+          }
+        }
+      }
+    },
+    "dry_run": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Dry run",
+      "description": "if checked - only builds emails, but doesn't send them (it's useful because it will output results table containing what would be sent)",
+      "default": false,
+      "propertyOrder": 6
+    },
+    "continue_on_error": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Continue On Error",
+      "description": "if checked - component doesn't crash on invalid emails, but tries to send the rest of them",
+      "default": true,
+      "propertyOrder": 7
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "connection_config": {
+      "sender_email_address": "<sender_email_address>",
+      "sender_password": "<sender_password>",
+      "server_host": "smtp.gmail.com",
+      "server_port": 465,
+      "connection_protocol": "SSL"
+    },
+    "recipient_email_address_column": "recipient_email_address",
+    "subject_config": {
+      "subject_source": "from_table",
+      "subject_column": "subject"
+    },
+    "message_body_config": {
+      "message_body_source": "from_template_file",
+      "plaintext_template_filename": "template.txt",
+      "html_template_filename": "template.html"
+    },
+    "attachments_config": {
+      "attachments_source": "from_table",
+      "attachments_column": "attachments"
+    },
+    "dry_run": false
+  },
+  "action":"run",
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"XXXXX-TOKEN\"}",
+        "oauthVersion": "2.0",
+        "appKey": "12345",
+        "#appSecret": "123qwe-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+subject,recipient_email_address,customer_tier,discount_percentage,recipient_name,attachments
+Hello {{recipient_name}} - custom attachments,samuelhavelka@seznam.cz,gold,30,Sam,'["test_jpeg.jpeg","test_pdf.pdf"]'
+Hi {{recipient_name}} - custom attachments,samuelhavelka@seznam.cz,silver,20,Tom,'["test_json.json","test_xls.xls"]'
+Ola {{recipient_name}} - custom attachments,samuelhavelka@seznam.cz,bronze,10,Peter,'["test_txt.txt"]'
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "name": "test.csv",
+    "columns": ["subject", "recipient_email_address", "customer_tier", "discount_percentage", "recipient_name", "attachments"]
+}
+
+================================================
+File: /component_config/sample-config/in/files/test_json.json
+================================================
+{"a": 1}
+
+================================================
+File: /component_config/sample-config/in/files/template.txt
+================================================
+Hello {{recipient_name}}!
+Since you are our {{customer_tier}} tier customer, we would like to offer you {{discount_percentage}}% discount on our whole sortiment.
+
+================================================
+File: /component_config/sample-config/in/files/template.html
+================================================
+<!DOCTYPE html>
+<html lang="cz">
+<body>
+<h3>Hello {{recipient_name}}!</h3>
+<p>Since you are our {{customer_tier}} tier customer, we would like to offer you {{discount_percentage}}% discount on our whole sortiment.</p>
+</body>
+</html>
+
+================================================
+File: /component_config/sample-config/in/files/test_csv.csv
+================================================
+"col1","col2"
+"val1","val2"
+
+================================================
+File: /component_config/sample-config/in/files/test_txt.txt
+================================================
+abc
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+fi
+
+echo "Updating logger settings"
+
+value=`cat component_config/logger`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} logger --value="$value"
+else
+    echo "logger type is empty!"
+fi
+
+echo "Updating logger configuration"
+value=`cat component_config/loggerConfiguration.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} loggerConfiguration --value="$value"
+else
+    echo "loggerConfiguration is empty!"
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.component==1.4.4
+kbcstorage==0.7.2
+dataconf==2.3.0
+Jinja2==3.1.3
+frozendict==2.4.0
+PySocks==1.7.1
+O365==2.0.33
+msal==1.26.0
+
+================================================
+File: /custom_stack_override.txt
+================================================
+For some stack is overridden config schemas and some other stack parameters. Link: https://github.com/keboola/infrastructure-plugin-update-components/blob/master/stacks
+
+================================================
+File: /TEMPLATE_README.md
+================================================
+# KBC Component Python template
+
+Python template for KBC Component creation. Defines the default structure and all Bitbucket pipeline CI scripts for automatic deployment.
+
+Use as a starting point when creating a new component.
+
+Example uses [keboola.component](https://pypi.org/project/keboola.component) library providing useful methods for KBC related tasks 
+and boilerplate methods often needed by components, for more details see [documentation](https://github.com/keboola/python-component/blob/main/README.md)
+
+*NOTE: Previously the template was based on top of the deprecated [keboola-python-util-lib library](https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/src/master/)*
+
+**Table of contents:**  
+  
+[TOC]
+
+# Recommended component architecture
+It is recommended to use the [keboola.component library](https://pypi.org/project/keboola.component), 
+for each component. Major advantage is that it reduces the boilerplate code replication, the developer can focus on core component logic 
+and not on boilerplate tasks. If anything is missing in the library, please fork and create a pull request with additional changes, 
+so we can all benefit from it
+
+**Base components on [CommonInterface](https://htmlpreview.github.io/?https://raw.githubusercontent.com/keboola/python-component/main/docs/api-html/component/interface.html#keboola.component.interface.CommonInterface)**
+
+- No need to write configuration processing and validation code each time
+- No need to setup logging environment manually
+- No need to write code to store manifests, write statefile, retrieve dates based on relative period, and many more.
+- The main focus can be the core component logic, which increases the code readability for new comers.
+
+**Base Client on [HtttpClient](https://pypi.org/project/keboola.http-client/)**
+
+- No need to write HTTP request handling over and over again
+- Covers basic authentication, retry strategy, headers, default parameters
+
+
+## Architecture using the template
+
+![picture](docs/imgs/architecture.png)
+
+## Example component
+This template contains functional example of an [hello-world component](https://bitbucket.org/kds_consulting_team/kbc-python-template/src/master/src/component.py), 
+it can be run with [sample configuration](https://bitbucket.org/kds_consulting_team/kbc-python-template/src/master/data/) and it produces valid results. 
+It is advisable to use this structure as a base for new components. Especially the `component.py` module, which should only 
+contain the base logic necessary for communication with KBC interface, processing parameters, collecting results
+ and calling targeted API service methods. 
+
+
+# Creating a new component
+Clone this repository into new folder and remove git history
+```bash
+git clone https://bitbucket.org/kds_consulting_team/kbc-python-template.git my-new-component
+cd my-new-component
+rm -rf .git
+git init
+git remote add origin PATH_TO_YOUR_BB_REPO
+git add .
+git commit -m 'initial'
+git push -u origin master
+```
+
+**Method #2:**
+
+Copy the contents of the template folder into your clone empty repository
+
+```bash
+git clone PATH_TO_YOUR_BB_REPO my-new-component
+# now copy the contents of the template into the my-new-component dir
+cd my-new-component
+git add .
+git commit -m 'initial'
+git push -u origin master
+```
+
+# Setting up the CI
+ - Bitbucket: Enable [pipelines](https://confluence.atlassian.com/bitbucket/get-started-with-bitbucket-pipelines-792298921.html) in the repository.
+    - For Github: Check that the [workflows are enabled](https://docs.github.com/en/actions/managing-workflow-runs/disabling-and-enabling-a-workflow).
+    The actions are present in `.github/workflows/` folder. 
+ - Set `KBC_DEVELOPERPORTAL_APP` env variable (dev portal app id)
+ 
+ In case it is not set on the account level, set also other required dev portal env variables:
+ 
+ - `KBC_DEVELOPERPORTAL_PASSWORD` - service account password
+ - `KBC_DEVELOPERPORTAL_USERNAME` - service account username
+ - `KBC_DEVELOPERPORTAL_VENDOR` - dev portal vendor
+ - `KBC_STORAGE_TOKEN` - (optional) in case you wish to run KBC automated tests
+  
+ 
+ ![picture](docs/imgs/ci_variable.png)
+ 
+The script execution is defined in three stages:
+
+## Default stage
+This script is executed on push to any branch except the master branch. It executes basic build and code quality steps. Following steps are performed:
+Build docker image
+Execute flake8 lint tests
+Execute python unittest
+(Optional) Push image with tag :test into the AWS repository for manual testing in KBC
+If any of the above steps results in non 0 status, the build will fail. It is impossible to merge branches that fail to build into the master branch.
+
+## Master stage
+This script is executed on any push or change in the master branch. It performs every step as the default stage. Additionally, 
+the `./scripts/update_dev_portal_properties.sh` script is executed. 
+This script propagates all changes in the Component configuration files (component_config folder) to the Developer portal.
+Currently these Dev Portal configuration parameters are supported:
+
+ - `configSchema.json`
+ - `configRowSchema.json`
+ - `component_short_description.md`
+ - `component_long_description.md`    
+
+The choice to include this script directly in the master branch was made to simplify ad-hoc changes of the component configuration parameters. For instance if you wish to slightly modify the configuration schema without affecting the code itself, it is possible to simply push the changes directly into the master and these will be automatically propagated to the production without rebuilding the image itself. Solely Developer Portal configuration metadata is deployed at this stage.
+
+## Tagged commit stage
+Whenever a tagged commit is added, or tag created this script gets executed. This is a deployment phase, so a successful build results in new code being deployed in KBC production.
+At this stage all steps present in the default and master stage are executed. Additionally, 
+`deploy.sh` script that pushes the newly built image / tag into the ECR repository and KBC production is executed.
+The deploy script is executed only after all tests and proper build steps passed. 
+Moreover, the `deploy.sh` script will be executed **only in the master branch**. In other words if you create a tagged commit in another branch, the pipeline gets triggered but deployment script will fail, because it is not triggered within a master branch. This is to prevent accidental deployment from a feature branch.
+
+ 
+# GELF logging
+
+The template automatically chooses between STDOUT and GELF logger based on the Developer Portal configuration.
+
+To fully leverage the benefits such as outputting the `Stack Trace` into the log event detail (available by clicking on the log event) 
+log exceptions using `logger.exception(ex)`.
+
+**TIP:** When the logger verbosity is set to `verbose` you may leverage `extra` fields to log the detailed message in the detail of the log event by adding extra fields to you messages:
+
+```python
+logging.error(f'{error}. See log detail for full query. ',
+                         extra={"failed_query": json.dumps(query)})
+```
+
+Recommended [GELF logger setup](https://developers.keboola.com/extend/common-interface/logging/#setting-up) (Developer Portal) to allow debug mode logging:
+
+```json
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+``` 
+ 
+# Development
+ 
+This example contains runnable container with simple unittest. For local testing it is useful to include `data` folder in the root
+and use docker-compose commands to run the container or execute tests. 
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path:
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone https://bitbucket.org:kds_consulting_team/kbc-python-template.git my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+## Testing
+
+The preset pipeline scripts contain sections allowing pushing testing image into the ECR repository and automatic 
+testing in a dedicated project. These sections are by default commented out. 
+
+**Running KBC tests on deploy step, before deployment**
+
+Uncomment following section in the deployment step in `bitbucket-pipelines.yml` file:
+
+```yaml
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+```
+
+Make sure that you have `KBC_STORAGE_TOKEN` env. variable set, containing appropriate storage token with access 
+to your KBC project. Also make sure to create a functional testing configuration and replace the `BASE_KBC_CONFIG` placeholder with its id.
+
+**Pushing testing image for manual KBC tests**
+
+In some cases you may wish to execute a testing version of your component manually prior to publishing. For instance to test various
+configurations on it. For that it may be convenient to push the `test` image on every push either to master, or any branch.
+
+To achieve that simply uncomment appropriate sections in `bitbucket-pipelines.yml` file, either in master branch step or in `default` step.
+
+```yaml
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+```
+ 
+ Once the build is finished, you may run such configuration in any KBC project as many times as you want by using [run-job](https://kebooladocker.docs.apiary.io/#reference/run/create-a-job-with-image/run-job) API call, using the `test` image tag.
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.11-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# SMTP Sender Application
+
+- Component enabling users to send emails with custom subject, message body and attachments from keboola platform
+
+## Config fields
+
+### Connection Config
+
+**o365 outlook via oauth**
+
+ - **Sender Email Address**
+ - **Client ID** - app needs to be registered in `Microsoft Entra ID` in Azure portal under `App registrations` (under API permissions you need to add application type permissins: `Mail.Send`, `Mail.ReadWrite` and `User.Read.All`)
+ - **Client Secret** - needs to be generated under `Certificates & secrets` tab
+ - **Tenant ID** - can be found in the overview tab of your app
+
+**SSL**
+
+ - **Sender Email Address** - Sender Email Address
+ - **Sender App Password** - certain SMTP server providers require you to generate an app password instead of the account one (typically when MFA is enabled)
+ - **SMTP Server Host** - SMTP Server Host
+ - **SMTP Server Port** - SMTP Server Port
+ - **Connection Protocol** - specifies, whether to connect via SSL or TLS
+ - **Use Proxy Server** - Use Proxy Server
+ - **Proxy Server Config**
+   - **Proxy Server Host** - Proxy Server Host
+   - **Proxy Server Port** - Proxy Server Host
+   - **Proxy Server Username** - Proxy Server Username
+   - **Proxy Server Password** - Proxy Server Password
+
+### Configuration types:
+
+### Basic
+
+It allows user to send specific subject and message body with or without attachments to a list of recipients
+
+- **Recipient Email Addresses** - comma delimited list of email addresses
+- **Subject** - subject literal
+- **Message Body** - message body literal
+- **Include Attachments** - checkbox indicating, whether to attach files and table in input mapping
+
+### Advanced
+
+As opposed to the basic configuration option you need to provide table with **Recipient Email Address Column** and potentially other columns corresponding to column names in `From Table` source options and columns containing values for placeholders in your subject and message body templates
+It lets you choose from multiple sourcing options for subject, message body and attachments. It enables user to include html message body version with the plaintext version as a backup
+
+- **Email Data Table Name** - dynamically loaded selection of the table containing recipient email addresses, subject and message body template placeholder values and custom attachment filenames (if selected)
+- **Recipient Email Address Column** - Recipient email address column name
+
+- **Subject Config**
+ - **Subject Source** - `From Table`, `From Template Definition`
+ - **Subject Column** - Subject column name (Subject Source = `From Table`)
+ - **Plaintext Subject Template** - Jinja2 formatted subject (Subject Source = `From Template Definition`)
+
+**Message Body Config**
+
+- **Message Body Source** - `From Table`,`From Template File`, `From Template Definition`
+- **Use HTML Alternative** - Checkbox indicating, whether you want to provide HTML version of message body
+- **Plaintext Message Body Column** - Plaintext message body column name (Message Body Source = `From Table`)
+- **HTML Message Body Column** - HTML message body column name (Message Body Source = `From Table`)
+- **Plaintext Template File** - Plaintext message body template filename (Message Body Source = `From Template File`)
+- **HTML Template File** - HTML message body template filename (Message Body Source = `From Template File`)
+- **Plaintext Message Body Template** - Jinja2 formatted plaintext message body (Message Body Source = `From Template Definition`)
+- **HTML Message Body Template** - Jinja2 formatted html message body (Message Body Source = `From Template Definition`)
+
+**Attachments Config**
+
+- **Attachments Source** - `From Table`, `All Input Files`
+- **Attachments Column** - Attachments column name - json list containing input file names and table names, so that each recipient can receive a specific subset of attachments (Attachments Source = `From Table`)
+- **Shared attachments** - if checked, all non-template files in the files input mapping and tables from table input mapping will be attached to the email for all recipients (Attachments Source = `All Input Files`)
+ - arbitrary number of attachment files - attachments can be of any file type or simply tables in input mapping (certain SMTP server providers forbid certain file types since they are considered potentially dangerous)
+
+**Dry Run** - if checked - emails are built, but not sent
+**Continue On Error** - if not checked - first unsendable email will crash the component - results table will still be populated with sent emails detail
+
+## Required Input Tables
+
+ - `arbitrary_table_name` - should be selected in `Email Data Table Name` field
+
+ **columns:**
+ 
+ - recipient_email_address
+ - subject_column (depends on config)
+ - plaintext_template_column (depends on config)
+ - html_template_column (depends on config)
+ - attachments_column (depends on config)
+ - columns with names corresponding to placeholder names in your template(s)
+
+## Output Table
+
+ - `results` - gives you detail on each attempted recipient
+
+ **columns:**
+ 
+ - `status` - `OK` or `ERROR`
+ - `recipient_email_address` - recipient_email_address
+ - `sender_email_address` - sender_email_address
+ - `subject` - subject
+ - `plaintext_message_body` - plaintext_message_body
+ - `html_message_body` - html_message_body
+ - `attachment_filenames` - attachment_filenames
+ - `error_message` - error_message
+
+## Sync Actions
+
+ - `TEST SMTP SERVER CONNECTION` - tests, whether connection to the SMTP server can be established
+ - `VALIDATE SUBJECT` - validates, that all placeholders in the provided subject template are present in the input table
+ - `VALIDATE PLAINTEXT TEMPLATE` - validates, that all placeholders in the provided message body plaintext template are present in the input table
+ - `VALIDATE HTML TEMPLATE` - validates, that all placeholders in the provided message body HTML template are present in the input table
+ - `VALIDATE ATTACHMENTS` - validates, that all attachment files are present in the file input mapping
+ - `VALIDATE CONFIG` - runs all tests and validations above and provides detail
+
+

@@ -1,0 +1,1414 @@
+Directory structure:
+└── kds_consulting_team-kds-team.ex-liveagent/
+    ├── .travis.yml
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── liveagent/
+    │   │   ├── component.py
+    │   │   ├── utils.py
+    │   │   ├── client.py
+    │   │   └── result.py
+    │   └── main.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       └── in/
+    │           └── state.json
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /.travis.yml
+================================================
+sudo: false
+
+services:
+  - docker
+
+jobs:
+  include:
+    - stage: tests
+      script:
+        - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+        - docker run $APP_IMAGE python -m unittest discover
+      # push test image to ECR - uncomment for testing before deployment
+      #  - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+      #  - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+      #  - docker tag $APP_IMAGE:latest $REPOSITORY:test
+      #  - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+      #  - docker push $REPOSITORY:test
+      #  - docker pull quay.io/keboola/syrup-cli:latest
+    - stage: deploy_dev_portal
+      if: branch = master
+      script: "./scripts/update_dev_portal_properties.sh"
+    - stage: deploy
+      if: tag IS present AND  branch = master
+      script: "./deploy.sh"
+
+
+before_script:
+  - export APP_IMAGE=keboola-component
+  - docker -v
+  - docker build -t $APP_IMAGE .
+
+
+after_success:
+  - docker images
+
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    venv,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/liveagent/component.py
+================================================
+import dateparser
+import logging
+from kbc.env_handler import KBCEnvHandler
+from liveagent.utils import Parameters
+from liveagent.client import LiveAgentClient, ClientException
+from liveagent.result import LiveAgentWriter
+
+# configuration variables
+KEY_API_TOKEN = '#token'
+KEY_API_TOKEN_V1 = '#token_v1'
+KEY_ORGANIZATION = 'organization'
+KEY_OBJECTS = 'objects'
+KEY_DATE = 'date'
+KEY_DATE_FROM = 'from'
+KEY_DATE_UNTIL = 'until'
+KEY_INCREMENTAL = 'incremental_load'
+KEY_DEBUG = 'debug'
+KEY_FAIL_ON_ERROR = 'fail_on_error'
+
+MANDATORY_PARS = [KEY_API_TOKEN, KEY_ORGANIZATION, KEY_OBJECTS]
+MANDATORY_IMAGE_PARS = []
+
+APP_VERSION = '0.2.1'
+SUPPORTED_ENDPOINTS = ["agents", "calls", "companies", "contacts", "departments", "tags", "tickets", "tickets_messages",
+                       "tickets_history"]
+SUPPORTED_ENDPOINTS_V1 = ["agent_report", "agent_availability", "conversations", "agent_availability_chats",
+                          "calls_availability", "ranking_agents_report"]
+
+
+class UserException(Exception):
+    pass
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self):
+
+        super().__init__(mandatory_params=MANDATORY_PARS, log_level='INFO')
+        logging.info(f'Running version {APP_VERSION}.')
+
+        if self.cfg_params.get(KEY_DEBUG) is True:
+            logger = logging.getLogger()
+            logger.setLevel(logging.DEBUG)
+
+        try:
+            self.validate_config(MANDATORY_PARS)
+            self.validate_image_parameters(MANDATORY_IMAGE_PARS)
+        except ValueError as e:
+            raise UserException(e)
+
+        self.parameters = Parameters()
+        self.parameters.token = self.cfg_params[KEY_API_TOKEN]
+        self.parameters.token_v1 = self.cfg_params.get(KEY_API_TOKEN_V1, None)
+        self.parameters.objects = self.cfg_params[KEY_OBJECTS]
+        self.parameters.organization = self.cfg_params[KEY_ORGANIZATION]
+        self.parameters.date_object = self.cfg_params.get(KEY_DATE, {})
+        self.parameters.incremental = self.cfg_params.get(bool(KEY_INCREMENTAL), True)
+        self.parameters.fail_on_error = self.cfg_params.get(KEY_FAIL_ON_ERROR, False)
+
+        self.check_objects()
+        self.parse_dates()
+
+        self.client = LiveAgentClient(self.parameters.token, self.parameters.token_v1, self.parameters.organization,
+                                      self.parameters.date_from, self.parameters.date_until,
+                                      self.parameters.fail_on_error)
+
+    def parse_dates(self):
+
+        date_from = self.parameters.date_object.get(KEY_DATE_FROM, '30 days ago')
+        date_until = self.parameters.date_object.get(KEY_DATE_UNTIL, 'now')
+
+        date_from_parsed = dateparser.parse(date_from)
+        date_until_parsed = dateparser.parse(date_until)
+
+        if any([date_from_parsed is None, date_until_parsed is None]):
+            raise UserException(
+                "Date values could not be parsed. Please, refer to documentation for correct specification.")
+
+        else:
+            self.parameters.date_from = date_from_parsed.strftime('%Y-%m-%d %H:%M:%S')
+            self.parameters.date_until = date_until_parsed.strftime('%Y-%m-%d %H:%M:%S')
+
+            # self.parameters.date_from_iso = date_from_parsed.strftime('%Y-%m-%d')
+            # self.parameters.date_to_iso = date_until_parsed.strftime('%Y-%m-%d')
+
+            self.parameters.date_chunks = self.split_dates_to_chunks(
+                date_from_parsed, date_until_parsed, 0, '%Y-%m-%d')
+
+            logging.debug(f"Date from: {self.parameters.date_from}.")
+            logging.debug(f"Date until: {self.parameters.date_until}.")
+
+    def check_objects(self):
+
+        if not self.parameters.objects:
+            raise UserException("No objects to download were specified.")
+
+        _unsupported = []
+        for obj in self.parameters.objects:
+
+            if obj not in SUPPORTED_ENDPOINTS and obj not in SUPPORTED_ENDPOINTS_V1:
+                _unsupported += [obj]
+
+            if obj in SUPPORTED_ENDPOINTS_V1:
+                if self.parameters.token_v1 is None or self.parameters.token_v1 == '':
+                    raise UserException(f"Missing API V1 token for API V1 endpoint {obj}.")
+
+        if len(_unsupported) > 0:
+            raise UserException(
+                f"Unsupported endpoints specified: {_unsupported}. Must be one of {SUPPORTED_ENDPOINTS}.")
+
+    def run(self):
+
+        _objects = self.parameters.objects
+        _incremental = self.parameters.incremental
+
+        logging.info(f"Downloading data from {self.parameters.date_from} to {self.parameters.date_until}.")
+
+        for obj in _objects:
+
+            logging.info(f"Downloading {obj} data.")
+
+            _writer = LiveAgentWriter(self.tables_out_path, obj, _incremental)
+
+            if obj not in ['tickets_messages', 'tickets', *SUPPORTED_ENDPOINTS_V1]:
+
+                try:
+                    _api_results = eval(f'self.client.get_{obj}()')
+                except ClientException as c_ex:
+                    raise UserException(c_ex) from c_ex
+                _writer.writerows(_api_results)
+
+            elif obj == 'agent_availability':
+
+                try:
+                    _api_results = self.client.get_agent_availability_tickets(self.parameters.date_from,
+                                                                              self.parameters.date_until)
+                except ClientException as c_ex:
+                    raise UserException(c_ex) from c_ex
+
+                _writer.writerows(_api_results)
+
+            elif obj == 'agent_availability_chats':
+
+                try:
+                    _api_results = self.client.get_agent_availability_chats(self.parameters.date_from,
+                                                                            self.parameters.date_until)
+                except ClientException as c_ex:
+                    raise UserException(c_ex) from c_ex
+
+                _writer.writerows(_api_results)
+
+            elif obj == 'calls_availability':
+
+                try:
+                    _api_results = self.client.get_calls_availability(self.parameters.date_from,
+                                                                      self.parameters.date_until)
+                except ClientException as c_ex:
+                    raise UserException(c_ex) from c_ex
+
+                _writer.writerows(_api_results)
+
+            elif obj == 'conversations':
+
+                try:
+                    _api_results = self.client.get_conversations(self.parameters.date_from)
+                except ClientException as c_ex:
+                    raise UserException(c_ex) from c_ex
+                _writer.writerows(_api_results)
+
+            elif obj == 'agent_report':
+                for dt in self.parameters.date_chunks:
+                    date = dt['start_date']
+                    start = date + ' 00:00:00'
+                    end = date + ' 23:59:59'
+                    try:
+                        _api_results = self.client.get_agent_report(date_from=start, date_to=end)
+                    except ClientException as c_ex:
+                        raise UserException(c_ex) from c_ex
+                    _writer.writerows(_api_results, parentDict={'date': date})
+
+            elif obj == 'ranking_agents_report':
+                for dt in self.parameters.date_chunks:
+                    date = dt['start_date']
+                    start = date + ' 00:00:00'
+                    end = date + ' 23:59:59'
+                    try:
+                        _api_results = self.client.get_ranking_agents_report(date_from=start, date_to=end)
+                    except ClientException as c_ex:
+                        raise UserException(c_ex) from c_ex
+                    _writer.writerows(_api_results, parentDict={'date': date})
+
+            elif obj in ['tickets_messages', 'tickets']:
+                pass
+
+            else:
+                raise UserException(f"Unknown object {obj}.")
+
+        if 'tickets' in _objects or 'tickets_messages' in _objects:
+
+            logging.info("Downloading ticket data.")
+
+            _writer_tickets = LiveAgentWriter(self.tables_out_path, 'tickets', _incremental)
+            try:
+                _api_results = self.client.get_tickets()
+            except ClientException as c_ex:
+                raise UserException(c_ex) from c_ex
+            _writer_tickets.writerows(_api_results)
+
+            if 'tickets_messages' in _objects:
+
+                ticket_ids = [t['id'] for t in _api_results]
+
+                logging.info(f"The component will process messages for {len(ticket_ids)} tickets.")
+
+                _writer_messages = LiveAgentWriter(self.tables_out_path, 'tickets_messages', _incremental)
+                _writer_content = LiveAgentWriter(self.tables_out_path, 'tickets_messages_content',
+                                                  _incremental)
+
+                _out_messages = []
+                _out_contents = []
+
+                for tid in ticket_ids:
+                    try:
+                        _messages = self.client.get_ticket_messages(tid)
+
+                    except ClientException as c_ex:
+                        raise UserException(c_ex) from c_ex
+
+                    for msg in _messages:
+                        msg['ticket_id'] = tid
+                        msg_id = msg['id']
+
+                        _out_messages += [msg]
+
+                        for cont in msg['messages']:
+                            cont['message_id'] = msg_id
+                            _out_contents += [cont]
+
+                _writer_messages.writerows(_out_messages)
+                _writer_content.writerows(_out_contents)
+
+
+================================================
+File: /src/liveagent/utils.py
+================================================
+class Parameters:
+    pass
+
+
+class Writers:
+    pass
+
+
+================================================
+File: /src/liveagent/client.py
+================================================
+import logging
+import re
+from retry import retry
+from urllib.parse import urljoin
+from typing import Dict, List
+from keboola.http_client import HttpClient
+from liveagent.utils import Parameters
+
+LADESK_URL_REGEXP = r'[\w\.]*ladesk.com[/(api)(v3)]*'
+LADESK_URL = 'https://{}.ladesk.com/api/'
+
+PAGE_LIMIT = 500
+DATE_FILTER_FIELD_CALLS = 'dateCreated'
+DATE_FILTER_FIELD_CHATS = 'date_created'
+DATE_FILTER_FIELD_COMPS = 'datechanged'
+DATE_FILTER_FIELD_CONTS = 'datechanged'
+DATE_FILTER_FIELD_TCKTS = 'date_changed'
+DATE_FILTER_FIELD_MESGS = 'datecreated'
+DATE_FILTER_FIELD_HSTRY = 'date_from'
+
+
+class ClientException(Exception):
+    pass
+
+
+class LiveAgentClient(HttpClient):
+
+    def __init__(self, token_v3: str, token_v1: str, organization: str, date_from: str, date_until: str,
+                 fail_on_error: bool = True):
+
+        self.parameters = Parameters()
+        self.parameters.token_v3 = token_v3
+        self.parameters.token_v1 = token_v1
+        self.parameters.organization = organization
+        self.parameters.date_from = date_from
+        self.parameters.date_until = date_until
+        self.parameters.fail_on_error = fail_on_error
+
+        self.check_organization()
+        super().__init__(base_url=self.parameters.url, auth_header={
+            'apikey': self.parameters.token_v3,
+            'accept': 'application/json',
+            'content-type': 'application/json'
+        }, status_forcelist=(502, 504), max_retries=3)
+
+    def check_organization(self):
+
+        url_match = re.match(LADESK_URL_REGEXP, self.parameters.organization, flags=re.I)
+
+        if url_match is not None:
+            raise ClientException(''.join(["Organization was not provided in the correct format. Please, provide only ",
+                                           "organization name, without \"ladesk.com\".\n",
+                                           f"Given: {self.parameters.organization}."]))
+
+        else:
+            self.parameters.url = LADESK_URL.format(str(self.parameters.organization))
+            logging.debug(f"Organization URL: {self.parameters.url}.")
+
+    def get_agents(self) -> List:
+
+        return self._get_paged_request('v3/agents')
+
+    def get_calls(self) -> List:
+
+        par_calls = {
+            '_filters': self._create_filter_expresssion(DATE_FILTER_FIELD_CALLS)
+        }
+
+        return self._get_paged_request('v3/calls', parameters=par_calls, method='cursor')
+
+    def get_chats(self) -> List:
+
+        par_chats = {
+            '_filters': self._create_filter_expresssion(DATE_FILTER_FIELD_CHATS)
+        }
+
+        return self._get_paged_request('v3/chats', parameters=par_chats)
+
+    def get_companies(self) -> List:
+
+        par_companies = {
+            '_filters': self._create_filter_expresssion(DATE_FILTER_FIELD_COMPS)
+        }
+
+        return self._get_paged_request('v3/companies', parameters=par_companies)
+
+    def get_contacts(self) -> List:
+
+        par_contacts = {
+            '_filters': self._create_filter_expresssion(DATE_FILTER_FIELD_CONTS)
+        }
+
+        return self._get_paged_request('v3/contacts', parameters=par_contacts)
+
+    def get_departments(self) -> List:
+
+        return self._get_paged_request('v3/departments')
+
+    def get_tags(self) -> List:
+
+        return self._get_paged_request('v3/tags')
+
+    def get_tickets(self) -> List:
+
+        par_tickets = {
+            '_filters': self._create_filter_expression_tickets_v3(DATE_FILTER_FIELD_TCKTS)
+        }
+
+        return self._get_paged_request('v3/tickets', parameters=par_tickets)
+
+    def get_ticket_messages(self, ticket_id: str) -> List:
+
+        par_messages = {
+            '_filters': self._create_filter_expresssion(DATE_FILTER_FIELD_MESGS)
+        }
+
+        return self._get_paged_request(f'v3/tickets/{ticket_id}/messages', parameters=par_messages)
+
+    def get_tickets_history(self) -> List:
+
+        par_tickets_history = {
+            "_filters": self._create_filter_expresssion(DATE_FILTER_FIELD_HSTRY)
+        }
+
+        return self._get_paged_request('v3/tickets/history', parameters=par_tickets_history, method='cursor')
+
+    def get_agent_report(self, date_from: str, date_to: str) -> List:
+
+        columns = 'id,contactid,firstname,lastname,worktime,answers,answers_ph,newAnswerAvgTime,' + \
+                  'newAnswerAvgTimeSla,nextAnswerAvgTime,nextAnswerAvgTimeSla,calls,calls_ph,missed_calls,' + \
+                  'missed_calls_ph,call_seconds,call_seconds_ph,chats,chats_ph,chat_answers,chat_answers_ph,' + \
+                  'missed_chats,missed_chats_ph,chat_pickup,chatPickupAvgTime,chatAvgTime,not_ranked,not_ranked_p,' + \
+                  'not_ranked_ph,rewards,rewards_p,rewards_ph,punishments,' \
+                  'punishments_p,punishments_ph,created_tickets,' + \
+                  'resolved_tickets,u_chats,u_calls,notes,firstAssignAvgTime,' \
+                  'firstAssignAvgTimeSla,firstResolveAvgTime,' + \
+                  'firstResolveAvgTimeSla,calls_outgoing,call_outgoing_seconds,call_outgoing_avg_time,' + \
+                  'call_pickup_avg_time,call_avg_time,calls_internal,' \
+                  'call_internal_avg_time,call_internal_seconds,o_calls'
+
+        par_agent_report = {
+            'date_from': date_from,
+            'date_to': date_to,
+            'apikey': self.parameters.token_v1,
+            'columns': columns
+        }
+
+        return self._get_paged_request('reports/agents', parameters=par_agent_report,
+                                       method='limit', result_key='agents')
+
+    def get_ranking_agents_report(self, date_from: str, date_to: str) -> List:
+
+        columns = 'id,rankingType,datecreated,conversationid,agentcontactid,agentEmail,agent,contactid,' + \
+                  'requesterEmail,requester,comment'
+
+        par_ranking_agents_report = {
+            'date_from': date_from,
+            'date_to': date_to,
+            'apikey': self.parameters.token_v1,
+            'columns': columns
+        }
+
+        return self._get_paged_request('reports/ranking', parameters=par_ranking_agents_report,
+                                       method='limit', result_key='ranks')
+
+    def get_agent_availability_tickets(self, date_from: str, date_to: str) -> List:
+
+        columns = 'id,userid,firstname,lastname,contactid,departmentid,department_name,hours_online,from_date,to_date'
+
+        par_agent_availability = {
+            'date_from': date_from,
+            'date_to': date_to,
+            'apikey': self.parameters.token_v1,
+            'columns': columns
+        }
+
+        return self._get_paged_request('reports/tickets/agentsavailability', result_key='agentsavailability',
+                                       parameters=par_agent_availability, method='limit')
+
+    def get_agent_availability_chats(self, date_from: str, date_to: str) -> List:
+
+        columns = 'id,userid,firstname,lastname,contactid,departmentid,department_name,hours_online,from_date,to_date'
+
+        par_agent_availability = {
+            'date_from': date_from,
+            'date_to': date_to,
+            'apikey': self.parameters.token_v1,
+            'columns': columns
+        }
+
+        return self._get_paged_request('reports/chats/agentsavailability', result_key='agentsavailability',
+                                       parameters=par_agent_availability, method='limit')
+
+    def get_calls_availability(self, date_from: str, date_to: str) -> List:
+
+        par_calls_availability = {
+            'date_from': date_from,
+            'date_to': date_to,
+            'apikey': self.parameters.token_v1
+        }
+
+        return self._get_paged_request('reports/calls/availability', result_key='availability',
+                                       parameters=par_calls_availability, method='limit')
+
+    def get_conversations(self, date_from: str) -> List:
+
+        par_conversations = {
+            'datechanged': f'gt:{date_from}',
+            'apikey': self.parameters.token_v1,
+            'channel_type': 'E,B,M,I,C,W,F,A,T,Q,S'
+        }
+
+        logging.debug(f"Conversations parameters: {par_conversations}")
+
+        return self._get_paged_request('conversations', result_key='conversations',
+                                       parameters=par_conversations, method='limit',
+                                       limit_param='limit', offset_param='offset')
+
+    def _create_filter_expresssion(self, filter_field):
+
+        _expr = f"[[\"{filter_field}\",\">=\",\"{self.parameters.date_from}\"]," + \
+                f"[\"{filter_field}\",\"<=\",\"{self.parameters.date_until}\"]]"
+
+        # logging.debug(f"Expression: {_expr}.")
+
+        return _expr
+
+    def _create_filter_expression_tickets_v3(self, filter_field):
+
+        _expr = f"[[\"{filter_field}\",\"D>=\",\"{self.parameters.date_from}\"]," + \
+                f"[\"{filter_field}\",\"D<=\",\"{self.parameters.date_until}\"]]"
+
+        logging.debug(f"Expression: {_expr}.")
+
+        return _expr
+
+    @retry(Exception, tries=3, delay=2)
+    def _get_paged_request(self, endpoint: str, parameters: Dict = None,
+                           result_key: str = None, method: str = 'page', limit_size: int = 1000,
+                           limit_param: str = 'limitcount', offset_param: str = 'limitfrom') -> List:
+
+        url_endpoint = urljoin(self.base_url, endpoint)
+
+        if method == 'page':
+
+            if parameters is None:
+                parameters = {}
+            par_endpoint = {**parameters, **{'_perPage': PAGE_LIMIT}}
+
+            results = []
+            results_complete = False
+            _page = 0
+
+            while not results_complete:
+
+                _page += 1
+                par_page = {**par_endpoint, **{'_page': _page}}
+
+                rsp_page = self.get_raw(endpoint_path=url_endpoint, params=par_page, is_absolute_path=True)
+
+                if rsp_page.status_code == 200:
+
+                    if result_key is None:
+                        res_page = rsp_page.json()
+
+                    else:
+                        try:
+                            res_page = rsp_page.json()[result_key]
+                        except KeyError:
+                            raise ClientException(f"Key {result_key} not found in response.")
+
+                    results += res_page
+
+                    if len(res_page) < PAGE_LIMIT:
+                        return results
+
+                else:
+                    return self.handle_error(f"Could not download paginated data for endpoint {endpoint}.\n "
+                                             f"Received: {rsp_page.status_code} - {rsp_page.text}.", results)
+
+        elif method == 'cursor':
+            results = []
+            results_complete = False
+            _cursor = None
+
+            while not results_complete:
+
+                par_page = {**parameters, **{'_cursor': _cursor, '_perPage': PAGE_LIMIT}}
+                rsp_page = self.get_raw(endpoint_path=url_endpoint, params=par_page, is_absolute_path=True)
+
+                if rsp_page.status_code == 200:
+
+                    if result_key is None:
+                        res_page = rsp_page.json()
+
+                    else:
+                        try:
+                            res_page = rsp_page.json()[result_key]
+
+                        except KeyError:
+                            raise ClientException(f"Key {result_key} not found in response.")
+
+                    results += res_page
+
+                    _cursor = rsp_page.headers.get('next_page_cursor', None)
+                    if _cursor is None:
+                        return results
+
+                    else:
+                        continue
+
+                else:
+                    return self.handle_error(f"Could not download paginated data for endpoint {endpoint}.\n"
+                                             f"Received: {rsp_page.status_code} - {rsp_page.text}.", results)
+
+        elif method == 'limit':
+            results = []
+            results_complete = False
+            limit = limit_size
+            offset = 0
+
+            while not results_complete:
+
+                par_page = {**parameters, **{limit_param: limit, offset_param: offset}}
+                rsp_page = self.get_raw(endpoint_path=url_endpoint, params=par_page, is_absolute_path=True)
+
+                if rsp_page.status_code == 200:
+
+                    _js = rsp_page.json()
+                    _res = _js['response'][result_key]
+
+                    results += _res
+
+                    if len(_res) < limit:
+                        return results
+
+                    else:
+                        offset += limit
+
+                else:
+                    return self.handle_error(f"Could not download paginated data for endpoint {endpoint}.\n"
+                                             f"Received: {rsp_page.status_code} - {rsp_page.text}.", results)
+        else:
+            raise ClientException(f"Unsupported pagination method {method}.")
+
+    def handle_error(self, msg: str, results: list):
+        if self.parameters.fail_on_error:
+            raise ClientException(msg)
+        logging.warning(msg)
+        return results
+
+
+================================================
+File: /src/liveagent/result.py
+================================================
+import os
+import csv
+import json
+
+FIELDS_AGENTS = ['id', 'name', 'email', 'role', 'avatar_url', 'online_status', 'status', 'gender']
+FIELDS_R_AGENTS = FIELDS_AGENTS
+PK_AGENTS = ['id']
+JSON_AGENTS = []
+
+FIELDS_CALLS = ['id', 'ticketId', 'type', 'fromNumber', 'fromName', 'toNumber', 'toName', 'viaNumber', 'dateCreated',
+                'dateAnswered', 'dateFinished', 'callDuration']
+FIELDS_R_CALLS = ['id', 'ticket_id', 'type', 'from_number', 'from_name', 'to_number', 'to_name', 'via_number',
+                  'date_created', 'date_answered', 'date_finished', 'call_duration']
+PK_CALLS = ['id']
+JSON_CALLS = []
+
+FIELDS_CHATS = ['id', 'subject', 'preview', 'date_created', 'chat_order', 'status_date_started', 'tags', 'rstatus',
+                'firstname', 'lastname', 'system_name', 'avatar_url', 'countrycode', 'city', 'departmentId', 'agentId',
+                'status', 'emails']
+FIELDS_R_CHATS = ['id', 'subject', 'preview', 'chat_order', 'status_date_started', 'tags', 'rstatus', 'first_name',
+                  'last_name', 'system_name', 'avatar_url', 'country_code', 'city', 'department_id', 'agent_id',
+                  'status', 'emails']
+PK_CHATS = ['id']
+JSON_CHATS = ['tags', 'emails']
+
+FIELDS_COMPANIES = ['id', 'name', 'system_name', 'description', 'avatar_url', 'type', 'date_created', 'date_changed',
+                    'language', 'city', 'countrycode', 'ip', 'emails', 'phones', 'groups']
+FIELDS_R_COMPANIES = ['id', 'name', 'system_name', 'description', 'avatar_url', 'type', 'date_created', 'date_changed',
+                      'language', 'city', 'country_code', 'ip', 'emails', 'phones', 'groups']
+PK_COMPANIES = ['id']
+JSON_COMPANIES = ['emails', 'phones', 'groups']
+
+FIELDS_CONTACTS = ['id', 'company_id', 'firstname', 'lastname', 'system_name', 'description', 'avatar_url', 'gender',
+                   'language', 'city', 'countrycode', 'ip', 'emails', 'phones', 'groups', 'custom_fields',
+                   'type', 'date_created', 'date_changed']
+FIELDS_R_CONTACTS = ['id', 'company_id', 'first_name', 'last_name', 'system_name', 'description', 'avatar_url',
+                     'gender', 'language', 'city', 'country_code', 'ip', 'emails', 'phones', 'groups', 'custom_fields',
+                     'type', 'date_created', 'date_changed']
+PK_CONTACTS = ['id']
+JSON_CONTACTS = ['emails', 'phones', 'groups', 'custom_fields']
+
+FIELDS_DEPARTMENTS = ['department_id', 'agent_count', 'name', 'online_status', 'agent_ids', 'mailaccount_id']
+FIELDS_R_DEPARTMENTS = FIELDS_DEPARTMENTS
+PK_DEPARTMENTS = ['department_id']
+JSON_DEPARTMENTS = ['agent_ids']
+
+FIELDS_TAGS = ['id', 'name', 'color', 'background_color', 'is_public']
+FIELDS_R_TAGS = FIELDS_TAGS
+PK_TAGS = ['id']
+JSON_TAGS = []
+
+FIELDS_TICKETS = ['id', 'owner_contactid', 'owner_email', 'owner_name', 'departmentid', 'agentid', 'status', 'tags',
+                  'code', 'channel_type', 'date_created', 'date_changed', 'date_resolved', 'date_due',
+                  'date_deleted', 'last_activity', 'last_activity_public', 'public_access_urlcode',
+                  'subject', 'custom_fields']
+FIELDS_R_TICKETS = ['id', 'owner_contact_id', 'owner_email', 'owner_name', 'department_id', 'agent_id', 'status',
+                    'tags', 'code', 'channel_type', 'date_created', 'date_changed', 'date_resolved', 'date_due',
+                    'date_deleted', 'last_activity', 'last_activity_public', 'public_access_urlcode',
+                    'subject', 'custom_fields']
+PK_TICKETS = ['id']
+JSON_TICKETS = ['tags', 'custom_fields']
+
+FIELDS_TICKETS_MESSAGES = ['id', 'parent_id', 'ticket_id', 'userid', 'user_full_name', 'type', 'status', 'datecreated',
+                           'datefinished', 'sort_order', 'mail_msg_id', 'pop3_msg_id']
+FIELDS_R_TICKETS_MESSAGES = ['id', 'parent_id', 'ticket_id', 'user_id', 'user_full_name', 'type', 'status',
+                             'date_created', 'date_finished', 'sort_order', 'mail_msg_id', 'pop3_msg_id']
+PK_TICKETS_MESSAGES = ['id', 'ticket_id']
+JSON_TICKETS_MESSAGES = []
+
+FIELDS_TICKETS_HISTORY = ['id', 'conversation_id', 'conversation_code', 'department_id', 'agent_id', 'status',
+                          'date_from', 'date_to', 'elapsed_time']
+FIELDS_R_TICKETS_HISTORY = FIELDS_TICKETS_HISTORY
+PK_TICKETS_HISTORY = ['id']
+JSON_TICKETS_HISTORY = []
+
+FIELDS_TICKETS_MESSAGES_CONTENT = ['id', 'message_id', 'userid', 'type', 'datecreated', 'format',
+                                   'message', 'visibility']
+FIELDS_R_TICKETS_MESSAGES_CONTENT = ['id', 'message_id', 'user_id', 'type', 'date_created', 'format',
+                                     'message', 'visibility']
+PK_TICKETS_MESSAGES_CONTENT = ['id', 'message_id']
+JSON_TICKETS_MESSAGES_CONTENT = []
+
+FIELDS_AGENT_AVAILABILITY = ['id', 'userid', 'from_date', 'to_date', 'firstname', 'lastname',
+                             'contactid', 'departmentid', 'department_name', 'hours_online']
+FIELDS_R_AGENT_AVAILABILITY = ['id', 'agent_id', 'date_from', 'date_to', 'first_name', 'last_name',
+                               'contact_id', 'department_id', 'department_name', 'hours_online']
+PK_AGENT_AVAILABILITY = ['id', 'agent_id']
+JSON_AGENT_AVAILABILITY = []
+
+FIELDS_AGENT_AVAILABILITY_CHATS = ['id', 'userid', 'from_date', 'to_date', 'firstname', 'lastname',
+                                   'contactid', 'departmentid', 'department_name', 'hours_online']
+FIELDS_R_AGENT_AVAILABILITY_CHATS = ['id', 'agent_id', 'date_from', 'date_to', 'first_name', 'last_name',
+                                     'contact_id', 'department_id', 'department_name', 'hours_online']
+PK_AGENT_AVAILABILITY_CHATS = ['id', 'agent_id']
+JSON_AGENT_AVAILABILITY_CHATS = []
+
+FIELDS_AGENT_REPORT = ['id', 'date', 'contactid', 'firstname', 'lastname', 'worktime', 'answers', 'answers_ph',
+                       'newAnswerAvgTime', 'newAnswerAvgTimeSla', 'nextAnswerAvgTime', 'nextAnswerAvgTimeSla',
+                       'calls', 'calls_ph', 'missed_calls', 'missed_calls_ph', 'call_seconds', 'call_seconds_ph',
+                       'chats', 'chats_ph', 'chat_answers', 'chat_answers_ph', 'missed_chats', 'missed_chats_ph',
+                       'chat_pickup', 'chatPickupAvgTime', 'chatAvgTime', 'not_ranked', 'not_ranked_p',
+                       'not_ranked_ph', 'rewards', 'rewards_p', 'rewards_ph', 'punishments', 'punishments_p',
+                       'punishments_ph', 'created_tickets', 'resolved_tickets', 'u_chats', 'u_calls', 'notes',
+                       'firstAssignAvgTime', 'firstAssignAvgTimeSla', 'firstResolveAvgTime', 'firstResolveAvgTimeSla',
+                       'calls_outgoing', 'call_outgoing_seconds', 'call_outgoing_avg_time', 'call_pickup_avg_time',
+                       'call_avg_time', 'calls_internal', 'call_internal_avg_time', 'call_internal_seconds', 'o_calls']
+FIELDS_R_AGENT_REPORT = ['agent_id', 'date', 'contact_id', 'first_name', 'last_name', 'work_time', 'answers',
+                         'answers_ph', 'new_answer_avg_time', 'new_answer_avg_time_sla', 'next_answer_avg_time',
+                         'next_answer_avg_time_sla', 'calls', 'calls_ph', 'missed_calls', 'missed_calls_ph',
+                         'call_seconds', 'call_seconds_ph', 'chats', 'chats_ph', 'chat_answers', 'chat_answers_ph',
+                         'missed_chats', 'missed_chats_ph', 'chat_pickup', 'chat_pickup_avg_time', 'chat_avg_time',
+                         'not_ranked', 'not_ranked_p', 'not_ranked_ph', 'rewards', 'rewards_p', 'rewards_ph',
+                         'punishments', 'punishments_p', 'punishments_ph', 'created_tickets', 'resolved_tickets',
+                         'u_chats', 'u_calls', 'notes', 'first_assign_avg_time', 'first_assign_avg_time_sla',
+                         'first_resolve_avg_time', 'first_resolve_avg_time_sla', 'calls_outgoing',
+                         'call_outgoing_seconds', 'call_outgoing_avg_time', 'call_pickup_avg_time', 'call_avg_time',
+                         'calls_internal', 'call_internal_avg_time', 'call_internal_seconds', 'o_calls']
+PK_AGENT_REPORT = ['agent_id', 'date']
+JSON_AGENT_REPORT = []
+
+FIELDS_RANKING_AGENTS_REPORT = ['id', "rankingType", "datecreated", 'conversationid', 'agentcontactid', 'agentEmail',
+                                'agent', 'contactid', 'requesterEmail', 'requester', 'comment']
+JSON_RANKING_AGENTS_REPORT = []
+PK_RANKING_AGENTS_REPORT = ["id"]
+FIELDS_R_RANKING_AGENTS_REPORT = ['id', "ranking_type", "date_created", 'conversation_id', 'agent_contact_id',
+                                  'agent_email', 'agent', 'contact_id', 'requester_email', 'requester', 'comment']
+
+FIELDS_CONVERSATIONS = ['conversationid', 'code', 'datecreated', 'datechanged', 'datedue', 'departmentid',
+                        'departmentname', 'status', 'ownername', 'owneremail', 'subject', 'preview', 'publicurlcode',
+                        'tags', 'channel_type', 'messagegroupsin', 'messagegroupsout']
+FIELDS_R_CONVERSATIONS = ['id', 'code', 'date_created', 'date_changed', 'date_due', 'department_id',
+                          'department_name', 'status', 'owner_name', 'owner_email', 'subject', 'preview',
+                          'public_url_code', 'tags', 'channel_type', 'message_groups_in', 'message_groups_out']
+PK_CONVERSATIONS = ['id']
+JSON_CONVERSATIONS = []
+
+FIELDS_CALLS_AVAILABILITY = ['date', 'mins', 'pct']
+FIELDS_R_CALLS_AVAILABILITY = ['date', 'minutes', 'percentage']
+PK_CALLS_AVAILABILITY = ['date']
+JSON_CALLS_AVAILABILITY = []
+
+
+class LiveAgentWriter:
+
+    def __init__(self, tableOutPath, tableName, incremental):
+
+        self.paramPath = tableOutPath
+        self.paramTableName = tableName
+        self.paramTable = tableName + '.csv'
+        self.paramTablePath = os.path.join(self.paramPath, self.paramTable)
+        self.paramFields = eval(f'FIELDS_{tableName.upper().replace("-", "_")}')
+        self.paramJsonFields = eval(f'JSON_{tableName.upper().replace("-", "_")}')
+        self.paramPrimaryKey = eval(f'PK_{tableName.upper().replace("-", "_")}')
+        self.paramFieldsRenamed = eval(f'FIELDS_R_{tableName.upper().replace("-", "_")}')
+        self.paramIncremental = incremental
+
+        self.createManifest()
+        self.createWriter()
+
+    def createManifest(self):
+
+        template = {
+            'incremental': self.paramIncremental,
+            'primary_key': self.paramPrimaryKey,
+            'columns': self.paramFieldsRenamed
+        }
+
+        path = self.paramTablePath + '.manifest'
+
+        with open(path, 'w') as manifest:
+            json.dump(template, manifest)
+
+    def createWriter(self):
+
+        self.writer = csv.DictWriter(open(self.paramTablePath, 'w'), fieldnames=self.paramFields,
+                                     restval='', extrasaction='ignore', quotechar='\"', quoting=csv.QUOTE_ALL)
+
+    def writerows(self, listToWrite, parentDict=None):
+
+        for row in listToWrite:
+
+            row_f = self.flatten_json(x=row)
+
+            if self.paramJsonFields != []:
+                for field in self.paramJsonFields:
+                    row_f[field] = json.dumps(row[field])
+
+            _dictToWrite = {}
+
+            for key, value in row_f.items():
+
+                if key in self.paramFields:
+                    _dictToWrite[key] = value
+
+                else:
+                    continue
+
+            if parentDict is not None:
+                _dictToWrite = {**_dictToWrite, **parentDict}
+
+            self.writer.writerow(_dictToWrite)
+
+    def flatten_json(self, x, out=None, name=''):
+        if out is None:
+            out = dict()
+
+        if type(x) is dict:
+            for a in x:
+                self.flatten_json(x[a], out, name + a + '_')
+        else:
+            out[name[:-1]] = x
+
+        return out
+
+
+================================================
+File: /src/main.py
+================================================
+from liveagent.component import Component, UserException
+import logging
+
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        comp.run()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - echo 'Pushing test image to repo. [tag=test]'
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# LiveAgent (Ladesk) extractor
+
+This extractor allows to download data from LiveAgent.
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+LiveAgent is a multi-channel customer service software that offers 175+ help desk and live chat features.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Parameters",
+  "required": [
+    "#token",
+    "#token_v1",
+    "organization",
+    "objects",
+    "date",
+    "incremental_load"
+  ],
+  "properties": {
+    "#token": {
+      "type": "string",
+      "format": "password",
+      "title": "API Token (for API v3)",
+      "propertyOrder": 100,
+      "description": "An API token which will be used in authentication for API v3. You can generate an API key by navigating to Configuration > System > API."
+    },
+    "#token_v1": {
+      "type": "string",
+      "format": "password",
+      "title": "API Token (for API v1)",
+      "propertyOrder": 150,
+      "description": "An API token which will be used in authentication for API v1. You can obtain an API key by navigating to Configuration > System > API."
+    },
+    "organization": {
+      "type": "string",
+      "title": "Organization Name",
+      "description": "Organization name, which is located in the URL. Usually, the URL is in format https://<ORGANIZATION>.ladesk.com, and only the organization name needs to be provided.",
+      "propertyOrder": 200
+    },
+    "objects": {
+      "title": "Objects to download",
+      "description": "A list of objects for which statistics will be downloaded. One or multiple objects can be specified.",
+      "type": "array",
+      "format": "select",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "agents",
+          "calls",
+          "companies",
+          "contacts",
+          "departments",
+          "tags",
+          "tickets",
+          "tickets_messages",
+          "tickets_history",
+          "agent_report",
+          "ranking_agents_report",
+          "agent_availability",
+          "agent_availability_chats",
+          "calls_availability",
+          "conversations"
+        ],
+        "type": "string",
+        "options": {
+          "enum_titles": [
+            "Agents (v3)",
+            "Calls (v3)",
+            "Companies (v3)",
+            "Contacts (v3)",
+            "Departments (v3)",
+            "Tags (v3)",
+            "Tickets (v3)",
+            "Tickets Messages (v3)",
+            "Tickets History (v3)",
+            "Agent Report (v1)",
+            "Ranking Agents Report (v1)",
+            "Agent Availability for Tickets (v1)",
+            "Agent Availability for Chats (v1)",
+            "Calls Availability (v1)",
+            "Conversations (v1)"
+          ]
+        }
+      },
+      "default": [
+        "agents",
+        "calls",
+        "contacts",
+        "tickets"
+      ],
+      "propertyOrder": 300
+    },
+    "date": {
+      "type": "object",
+      "title": "Date settings",
+      "description": "Setting date range for which the statistics will be downloaded.",
+      "format": "grid",
+      "required": [
+        "from",
+        "until"
+      ],
+      "properties": {
+        "from": {
+          "type": "string",
+          "title": "Start Date",
+          "default": "30 days ago",
+          "propertyOrder": 100,
+          "description": "Start date, from which the extractor will download data. Can be specified absolutely in format YYYY-MM-DD or relatively like 4 hours ago, 10 days ago, 3 months ago, etc."
+        },
+        "until": {
+          "type": "string",
+          "title": "End Date",
+          "default": "today",
+          "propertyOrder": 200,
+          "description": "End date, to which the extractor will download data. Can be specified absolutely in format YYYY-MM-DD or relatively like 4 hours ago, 10 days ago, 3 months ago, etc."
+        }
+      },
+      "propertyOrder": 400
+    },
+    "incremental_load": {
+      "type": "number",
+      "format": "text",
+      "enum": [
+        1,
+        0
+      ],
+      "uniqueItems": true,
+      "title": "Load Type",
+      "default": 1,
+      "options": {
+        "enum_titles": [
+          "Incremental Load",
+          "Full Load"
+        ]
+      },
+      "propertyOrder": 500
+    },
+      "fail_on_error": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Fail on error",
+      "default": true,
+      "propertyOrder": 600,
+        "description": "If set to false, entities that cannot be processed will not result in error, but will be skipped instead."
+    }
+  }
+}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "#token": "<TOKEN>",
+    "organization": "keboola",
+    "objects": [
+      "agents",
+      "calls",
+      "tickets",
+      "departments",
+      "tags"
+    ],
+    "date": {
+      "from": "30 days ago",
+      "until": "today"
+    },
+    "incremental_load": 1
+  },
+  "image_parameters": {}
+}
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.9.zip#egg=kbc
+keboola.http-client
+retry
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.6-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/main.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+

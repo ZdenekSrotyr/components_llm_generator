@@ -1,0 +1,1335 @@
+Directory structure:
+└── kds_consulting_team-kds-team.app-powerbi-refresh/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   └── component.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── tables/
+    │       │   │   ├── test.csv
+    │       │   │   └── test.csv.manifest
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── run.bat
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.1.1**
+
+- fix requirements
+- add src folder to path for tests
+
+**0.1.0**
+
+- src folder structure
+- remove dependency on handler lib - import the code directly to enable modifications until its released
+
+**0.0.2**
+
+- add dependency to base lib
+- basic tests
+
+**0.0.1**
+
+- add utils scripts
+- move kbc tests directly to pipelines file
+- use uptodate base docker image
+- add changelog
+
+
+================================================
+File: /src/component.py
+================================================
+"""
+Template Component main class.
+
+"""
+
+import json
+import logging
+import time
+from datetime import datetime  # noqa
+from typing import Union
+import requests
+import backoff
+
+from kbc.result import KBCTableDef  # noqa
+from kbc.result import ResultWriter  # noqa
+from keboola.component.base import ComponentBase, sync_action
+from keboola.component.exceptions import UserException
+from requests import RequestException
+
+# configuration variables
+KEY_DATASET = 'dataset_list'
+KEY_WORKSPACE = 'workspace'
+
+STATE_AUTH_ID = "auth_id"
+STATE_REFRESH_TOKEN = "#refresh_token"
+REQUIRED_PARAMETERS = []
+
+
+class Component(ComponentBase):
+    def __init__(self):
+        super().__init__()
+
+        self._header = None
+        self.dataset_array = None
+        self.authorization = None
+        self.oauth_token = None
+        self.refresh_token = None
+        self.validate_configuration_parameters(REQUIRED_PARAMETERS)
+
+        parameters = self.configuration.parameters
+
+        self.workspace = parameters.get("workspace")
+        self.wait = parameters.get("wait", "No") == "Yes"
+        self.timeout = time.time() + parameters.get("timeout", 7200)
+        self.interval = parameters.get("interval")
+        self.alldatasets = parameters.get("alldatasets", "No") == "Yes"
+
+        self.success_list = []
+        self.failed_list = []
+        self.requestid_array = []
+
+    def _client_init(self):
+        self.authorization = self.configuration.config_data["authorization"]
+        access_token, self.refresh_token = self.get_oauth_token()
+        self.write_state_file({
+                    STATE_REFRESH_TOKEN: self.refresh_token,
+                    STATE_AUTH_ID: self.authorization.get("oauth_api", {}).get("credentials", {}).get("id", "")
+                    })
+
+        self.header = access_token
+
+    def run(self):
+        self._client_init()
+        self.load_datasets()
+        self.check_dataset_inputs()
+
+        group_url = f"groups/{self.workspace}" if self.workspace else ""
+
+        logging.info(f"Processing datasets: {self.dataset_array}")
+        for dataset in self.dataset_array:
+            dataset_id = dataset["dataset_input"]
+            logging.info(f"Refreshing dataset {dataset_id}")
+            response = self.refresh_dataset(group_url, dataset_id)
+            if response:
+                self.success_list.append(dataset_id)
+                self.requestid_array.append([dataset_id, response.headers["RequestId"]])
+            else:
+                self.failed_list.append(dataset_id)
+
+        if self.wait:
+            logging.debug(f"Waiting for dataset refreshes to finish. Timeout: {self.timeout}")
+            self.check_status(group_url)
+        else:
+            logging.info(f"List refreshed: {self.success_list}")
+
+        if self.failed_list:
+            raise UserException(f"Any of dataset refreshes finished with error. {self.failed_list}")
+
+        logging.info("PowerBI Refresh finished")
+
+    @property
+    def header(self):
+        return self._header
+
+    @header.setter
+    def header(self, access_token):
+        self._header = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}"
+        }
+
+    def load_datasets(self):
+        """
+        This exists for compatibility with the old configuration scheme that was refactored in KCOFAC-2294-refactor-ux.
+        Returns:
+            None
+        """
+        dataset_list = self.configuration.parameters.get("dataset_list")
+        datasets = self.configuration.parameters.get("datasets")  # old field
+
+        if not dataset_list:
+            if not datasets:
+                raise UserException(
+                    "To refresh Power BI datasets, you must specify datasets in Configuration Parameters.")
+        else:
+            datasets = dataset_list
+
+        if isinstance(datasets[0], str):
+            self.dataset_array = [{"dataset_input": item} for item in datasets]
+        elif isinstance(datasets[0], dict):
+            self.dataset_array = datasets
+
+    def get_oauth_token(self):
+        """Returns access token and refresh token."""
+        config = self.authorization
+
+        if not config.get("oauth_api"):
+            raise UserException("In order for the component to process PowerBI refresh, please authenticate.")
+
+        credentials = config["oauth_api"]["credentials"]
+        client_id = credentials["appKey"]
+        client_secret = credentials["#appSecret"]
+        encrypted_data = json.loads(credentials["#data"])
+        state_file = self.get_state_file()
+        refresh_token = state_file.get(STATE_REFRESH_TOKEN, [])
+        auth_id = state_file.get(STATE_AUTH_ID, [])
+
+        refresh_token = self._get_refresh_token(auth_id, refresh_token, encrypted_data, credentials)
+        response = self._request_new_token(client_id, client_secret, refresh_token)
+
+        return response["access_token"], response["refresh_token"]
+
+    @staticmethod
+    def _get_refresh_token(auth_id, refresh_token, encrypted_data, credentials):
+        """Determines the correct refresh token to use."""
+        if not auth_id and refresh_token:  # TODO: remove after few weeks
+            logging.info("Refresh token loaded from state file")
+        elif refresh_token and auth_id == credentials.get("id", ""):
+            logging.info("Refresh token loaded from state file")
+        else:
+            refresh_token = encrypted_data["refresh_token"]
+            logging.info("Refresh token loaded from authorization")
+
+        return refresh_token
+
+    @staticmethod
+    def _request_new_token(client_id, client_secret, refresh_token):
+        """Requests a new access token using the refresh token."""
+        url = "https://login.microsoftonline.com/common/oauth2/token"
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        payload = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "refresh_token",
+            "resource": "https://analysis.windows.net/powerbi/api",
+            "refresh_token": refresh_token
+        }
+
+        response = requests.post(url, headers=headers, data=payload)
+        if response.status_code != 200:
+            raise UserException(
+                f"Unable to refresh access token. Status code: {response.status_code} "
+                f"Reason: {response.reason}, message: {response.json()}"
+            )
+
+        return response.json()
+
+    @backoff.on_exception(backoff.expo, Exception, max_tries=3)
+    def refresh_dataset(self, group_url, dataset) -> Union[requests.models.Response, bool]:
+        refresh_url = f"https://api.powerbi.com/v1.0/myorg/{group_url}/datasets/{dataset}/refreshes"
+        # https://learn.microsoft.com/en-us/rest/api/power-bi/datasets/refresh-dataset-in-group#limitations
+        payload = {"notifyOption": "MailOnFailure"}
+
+        try:
+            r = requests.post(refresh_url, headers=self.header, data=payload)
+            if r.status_code == 202:
+                logging.info(f"Dataset {dataset} refresh accepted by PowerBI API.")
+                return r
+            msg = json.loads(r.text)
+            logging.error(
+                f"Failed to refresh dataset: error code: {msg['error']['code']} "
+                f"message: {msg['error']['message']}")
+            return False
+
+        except Exception as e:
+            logging.error(f"Dataset refresh failed. Exception: {e}")
+            return False
+
+    def refresh_status(self, dataset_id, group_url):
+        """
+        Uses https://learn.microsoft.com/en-us/rest/api/power-bi/datasets/get-refresh-history
+        to get refresh history. Not available for Onedrive and probably Sharepoint data sources (returns 404).
+        Args:
+            dataset_id: str, id of the dataset
+            group_url: str, workspace id
+
+        Returns:
+            response
+        """
+        refresh_url = f"https://api.powerbi.com/v1.0/myorg/{group_url}/datasets/{dataset_id}/refreshes"
+        return self._get_request(refresh_url)
+
+    @backoff.on_exception(backoff.expo, RequestException, max_tries=3)
+    def _get_request(self, url):
+        response = requests.get(url=url, headers=self.header)
+
+        if response.status_code == 403:
+            try:
+                error_message = response.json()
+                if error_message.get('error', {}).get('code') == 'TokenExpired':
+                    access_token, _ = self.get_oauth_token()
+                    self.header = access_token
+                    response = requests.get(url=url, headers=self.header)
+            except ValueError:
+                raise UserException(f"Request for url {url} failed with status code: {response.status_code}"
+                                    f" and message: {response.text}")
+
+        return response
+
+    def process_status(self, request, request_list, success_list, running_list):
+        if request.status_code != 200:
+            raise UserException(f"Failed to refresh dataset with ID: {request_list[0]} "
+                                f"with status code: {request.status_code} and message: "
+                                f"{request.text}")
+
+        selected_status = [f['status'] for f in request.json()['value'] if request_list[1] in f['requestId']]
+
+        if not selected_status:
+            logging.error(f"Refresh request has been successful but the component cannot obtain refresh "
+                          f"status for dataset refresh with id {request_list[1]}")
+            self.requestid_array.remove([request_list[0], request_list[1]])
+            return
+
+        status = selected_status[0]
+
+        if status == "Completed":
+            success_list.append(request_list[0])
+            self.requestid_array.remove([request_list[0], request_list[1]])
+        elif status == "Failed":
+            self.failed_list.append(request_list[0])
+            self.requestid_array.remove([request_list[0], request_list[1]])
+            if not self.alldatasets:
+                content = json.loads(request.content)
+                raise UserException(f"Dataset {self.failed_list} finished with error "
+                                    f"{content['value'][1]['serviceExceptionJson']}")
+        elif status == "Disabled":
+            logging.info(f"Dataset {request_list[0]} is disabled")
+            self.requestid_array.remove([request_list[0], request_list[1]])
+        elif status == "Unknown":
+            running_list.append(request_list[0])
+        else:
+            raise UserException(f"Unknown error in dataset {request_list[0]}")
+
+    def check_status(self, group_url) -> None:
+        while self.requestid_array != [] and time.time() < self.timeout:
+            running_list = []
+            success_list = []
+            for requestid in self.requestid_array:
+
+                try:
+                    request = self.refresh_status(requestid[0], group_url)
+                except RequestException as e:
+                    raise UserException(f"Refresh status check failed with exception: {e}")
+
+                self.process_status(request, requestid, success_list, running_list)
+                logging.info(f"Running: {running_list}")
+                logging.info(f"Refreshed: {success_list}")
+                logging.info(f"Failed to refresh: {self.failed_list}")
+            if self.requestid_array:
+                time.sleep(self.interval)
+
+    def check_dataset_inputs(self) -> None:
+        """
+        Validates the dataset inputs.
+
+        Raises:
+            UserException: If the dataset configuration is missing or if any of the dataset IDs are empty.
+        """
+        if not self.dataset_array:
+            raise UserException("Dataset configuration is missing. Please specify datasets.")
+
+        for dataset in self.dataset_array:
+            if not dataset["dataset_input"]:
+                raise UserException("Dataset IDs cannot be empty. Please enter Dataset ID.")
+
+    @sync_action("selectWorkspace")
+    def get_workspaces(self):
+        self._client_init()
+        refresh_url = "https://api.powerbi.com/v1.0/myorg/groups"
+        response = self._get_request(refresh_url)
+
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            raise UserException(f"Error while fetching workspaces: {e}")
+
+        workspaces = [{"label": val["name"], "value": val["id"]} for val in response.json().get("value")]
+
+        # Adding the Default Workspace element
+        default_workspace = {"label": "Default Workspace", "value": ""}
+        workspaces.insert(0, default_workspace)
+
+        return workspaces
+
+    @sync_action("selectDataset")
+    def get_datasets(self):
+        self._client_init()
+        group_url = f"groups/{self.workspace}" if self.workspace else ""
+        refresh_url = f"https://api.powerbi.com/v1.0/myorg/{group_url}/datasets"
+        response = self._get_request(refresh_url)
+
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            raise UserException(f"Error while fetching datasets: {e}")
+
+        return [{"label": val["name"], "value": val["id"]} for val in response.json().get("value")]
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        # this triggers the run method by default and is controlled by the configuration.action parameter
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - echo 'Pushing test image to repo. [tag=test]'
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+The main purpose of 'PowerBI Refresh' application is to refresh the configured datasets within a PowerBI Workspace. Be aware! Each 'PowerBI Refresh' application's configuration can only work with one PowerBI Workspace, meaning that if you want to refresh PowerBI datasets from another PowerBI Workspaces, you will have to create a new 'PowerBI Refresh' configuration to send "refresh" requests to the PowerBI Workspace.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+The main purpose of 'PowerBI Refresh' application is to refresh the configured datasets within a PowerBI Workspace.
+Be aware! Each 'PowerBI Refresh' application's configuration can only work with one PowerBI Workspace, meaning that if you want to refresh PowerBI datasets from another PowerBI Workspaces, you will have to create a new 'PowerBI Refresh' configuration to send "refresh" requests to the PowerBI Workspace.
+
+## Parameters
+
+1. PowerBI Workspace
+    - The PowerBI Workspace where the user wants to refresh their dataset
+    - Please leave this blank if the user is exporting the dataset into the signed in account's "My Workspace"
+
+2. PowerBI Datasets
+    - IDs of the PowerBI Datasets within the configured workspace the user wish to refresh
+	
+3. Wait for end
+	- Check dataset refresh status after refresh request
+	
+4. Wait for all datasets
+	- End job with error if any of datasets finish with failed status (Works only when "Wait for end" is Yes)
+	
+5. Interval
+	- Status check interval (Works only when "Wait for end" is Yes)
+	
+6. Timeout
+	- Status check timeout (Works only when "Wait for end" is Yes) - maximum is 2 hours!
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Refreshing PowerBI's datasets
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+   "type":"object",
+   "title":"PowerBI Refresh Configuration",
+   "required":[],
+   "properties":{
+      "workspace":{
+         "type":"string",
+         "format": "select",
+         "title":"PowerBI Workspace",
+         "description":"Please leave this blank or set to Default Workspace if you want to refresh a dataset that is not assigned to a workspace.",
+         "options": {
+           "async": {
+             "label": "Load Workspaces",
+             "action": "selectWorkspace"
+           }
+         },
+         "items": {
+           "enum": [
+           ],
+           "type": "string"
+         },
+         "enum": [
+         ],
+         "propertyOrder":200,
+         "default":""
+      },
+      "dataset_list":{
+         "type":"array",
+         "title":"PowerBI Datasets",
+         "propertyOrder":300,
+         "format":"select",
+         "description":"Use this field to fetch available datasets accessible with your credentials.",
+         "uniqueItems":true,
+         "options":{
+            "async":{
+               "label":"Re-load Dataset names",
+               "action":"selectDataset"
+            }
+         },
+         "items": {
+           "enum": [],
+           "type": "string"
+         }
+      },
+      "wait":{
+         "enum":[
+            "Yes",
+            "No"
+         ],
+         "type":"string",
+         "title":"Wait for refresh jobs to finish.",
+         "description":"Poll dataset refresh status and wait until it's finished. If set to No, the component execution ends as soon as the refresh jobs are triggered.",
+         "required":true,
+         "default":"No",
+         "propertyOrder":400
+      },
+      "alldatasets":{
+         "enum":[
+            "Yes",
+            "No"
+         ],
+         "type":"string",
+         "title":"Wait for all datasets to finish",
+         "description":"End job with error if any of datasets finish with failed status.",
+         "default":"No",
+         "required":true,
+         "propertyOrder":450,
+         "options":{
+            "dependencies":{
+               "wait":"Yes"
+            }
+         }
+      },
+      "interval":{
+         "type":"integer",
+         "title":"Refresh job status polling interval (s)",
+         "default":30,
+         "description":"Check for status after specified amount of seconds.",
+         "propertyOrder":500,
+         "options":{
+            "dependencies":{
+               "wait":"Yes"
+            }
+         }
+      },
+      "timeout":{
+         "type":"integer",
+         "title":"Refresh job status polling timeout",
+         "default":3600,
+         "description":"Poll statuses of triggered jobs for specified amount of seconds. The component ends after the timeout value. Maximum is 2 hours!",
+         "propertyOrder":550,
+         "options":{
+            "dependencies":{
+               "wait":"Yes"
+            }
+         }
+      }
+   }
+}
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.0.zip#egg=kbc
+keboola.component==1.4.4
+mock
+freezegun
+requests==2.32.3
+backoff
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.12-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install --upgrade pip
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+Copyright (c) 2018 Keboola DS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+
+=============
+
+Refreshing PowerBI's datasets
+
+The main purpose of 'PowerBI Refresh' application is to refresh the configured datasets within a PowerBI Workspace. Be aware! Each 'PowerBI Refresh' application's configuration can only work with one PowerBI Workspace, meaning that if you want to refresh PowerBI datasets from another PowerBI Workspaces, you will have to create a new 'PowerBI Refresh' configuration to send "refresh" requests to the PowerBI Workspace.
+
+**Table of contents:**
+
+[TOC]
+
+Functionality notes
+===================
+a) The more detailed information about the refresh status can be found in the Datasource/Semantic Model under Refresh > Refresh History > Show
+
+b) The credentials used for the datasource connection in Power BI Desktop are not transferred to Power BI Online when publishing the report. It is necessary to set them again in the Data Source/Semantic Model under File > Settings > Data source credentials.
+
+Prerequisites
+=============
+
+- oauth2 Authorization
+- ID of the Dataset
+
+Supported endpoints
+===================
+
+If you need more endpoints, please submit your request to
+[ideas.keboola.com](https://ideas.keboola.com/)
+
+Configuration
+=============
+
+### PowerBI Refresh Configuration
+ - PowerBI Workspace (workspace) - [REQ] Please leave this blank if user is trying to export into the signed-in account's workspace
+ - PowerBI Datasets (datasets) - [REQ] Please enter the 'ID' of the dataset. Note: Not the 'Name' of the dataset
+ - Wait for end (wait) - [OPT] Check dataset refresh status after refresh request
+ - Wait for all datasets (alldatasets) - [OPT] End job with error if any of datasets finish with failed status (Works only when "Wait for end" is Yes)
+ - Interval (interval) - [OPT] Status check interval (Works only when "Wait for end" is Yes)
+ - Timeout (timeout) - [OPT] Status check timeout (Works only when "Wait for end" is Yes)
+
+
+
+
+Sample Configuration
+=============
+```json
+{
+   "parameters": {
+      "datasets": [
+         {
+            "dataset_input": "xxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxx"
+         }
+      ],
+      "workspace": "",
+      "wait": true,
+      "timeout": 3600,
+      "interval": 30,
+      "alldatasets": false
+   }
+}
+```
+
+Output
+======
+
+Log output
+
+Development
+-----------
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path in
+the `docker-compose.yml` file:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clone this repository, init the workspace and run the component with following command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose build
+docker-compose run --rm dev
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run the test suite and lint check using this command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose run --rm test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Integration
+===========
+
+For information about deployment and integration with KBC, please refer to the
+[deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/)
+

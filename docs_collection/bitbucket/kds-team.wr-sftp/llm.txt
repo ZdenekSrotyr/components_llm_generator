@@ -1,0 +1,1367 @@
+Directory structure:
+└── kds_consulting_team-kds-team.wr-sftp/
+    ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── src/
+    │   └── component.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_data_timestamp/
+    │   │   ├── config.json
+    │   │   └── in/
+    │   │       ├── state.json
+    │   │       ├── tables/
+    │   │       │   ├── test.csv
+    │   │       │   └── test.csv.manifest
+    │   │       └── files/
+    │   │           ├── test2.csv.manifest
+    │   │           └── test2.csv
+    │   ├── test_data/
+    │   │   ├── config.json
+    │   │   └── in/
+    │   │       ├── state.json
+    │   │       ├── tables/
+    │   │       │   ├── test.csv
+    │   │       │   └── test.csv.manifest
+    │   │       └── files/
+    │   │           ├── test2.csv.manifest
+    │   │           └── test2.csv
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── configRowSchema.json
+    ├── scripts/
+    │   ├── update_dev_portal_properties.sh
+    │   ├── run_kbc_tests.ps1
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
+    └── README.md
+
+================================================
+File: /flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+    venv/
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/component.py
+================================================
+'''
+Created on 10. 10. 2018
+
+@author: david esner
+'''
+import logging
+import os
+import socket
+from datetime import datetime
+from io import StringIO
+from typing import Callable
+
+import backoff
+import paramiko
+from keboola.component.base import sync_action, ComponentBase
+
+MAX_RETRIES = 6
+
+KEY_USER = 'user'
+KEY_PASSWORD = '#pass'
+KEY_HOSTNAME = 'hostname'
+KEY_PORT = 'port'
+KEY_REMOTE_PATH = 'path'
+KEY_APPENDDATE = 'append_date'
+KEY_APPENDDATE_FORMAT = 'append_date_format'
+KEY_PRIVATE_KEY = '#private_key'
+# img parameter names
+KEY_HOSTNAME_IMG = 'sftp_host'
+KEY_PORT_IMG = 'sftp_port'
+
+KEY_DISABLED_ALGORITHMS = 'disabled_algorithms'
+KEY_BANNER_TIMEOUT = 'banner_timeout'
+
+KEY_DEBUG = 'debug'
+PASS_GROUP = [KEY_PRIVATE_KEY, KEY_PASSWORD]
+
+REQUIRED_PARAMETERS = [KEY_USER, PASS_GROUP, KEY_REMOTE_PATH]
+
+APP_VERSION = '1.0.0'
+
+
+def backoff_hdlr(details):
+    logging.warning("Backing off {wait:0.1f} seconds after {tries} tries "
+                    "calling function {target}".format(**details))
+
+
+def giving_up_hdlr(details):
+    raise UserException("Too many retries, giving up calling {target}".format(**details))
+
+
+class UserException(Exception):
+    pass
+
+
+class Component(ComponentBase):
+    def __init__(self):
+        super().__init__()
+
+        self._connection: paramiko.Transport = None
+        self._sftp_client: paramiko.SFTPClient = None
+        logging.getLogger("paramiko").level = logging.CRITICAL
+
+    def validate_connection_configuration(self):
+        try:
+            self.validate_configuration_parameters(REQUIRED_PARAMETERS)
+            if self.configuration.image_parameters:
+                self.validate_image_parameters([KEY_HOSTNAME_IMG, KEY_PORT_IMG])
+            else:
+                self.validate_configuration_parameters([KEY_PORT, KEY_HOSTNAME])
+        except ValueError as err:
+            raise UserException(err) from err
+
+    def run(self):
+        '''
+        Main execution code
+        '''
+        self.validate_connection_configuration()
+        params = self.configuration.parameters
+        pkey = self.get_private_key(params[KEY_PRIVATE_KEY])
+        port = self.configuration.image_parameters.get(KEY_PORT_IMG) or params[KEY_PORT]
+        host = self.configuration.image_parameters.get(KEY_HOSTNAME_IMG) or params[KEY_HOSTNAME]
+
+        if params.get(KEY_DISABLED_ALGORITHMS, False):
+            disabled_algorithms = eval(params[KEY_DISABLED_ALGORITHMS])
+        else:
+            disabled_algorithms = {}
+
+        banner_timeout = params.get(KEY_BANNER_TIMEOUT, 15)
+
+        self.connect_to_server(port,
+                               host,
+                               params[KEY_USER],
+                               params[KEY_PASSWORD],
+                               pkey,
+                               disabled_algorithms,
+                               banner_timeout)
+        try:
+            in_tables = self.get_input_tables_definitions()
+            in_files = self.get_input_files_definitions(only_latest_files=True)
+
+            for fl in in_tables + in_files:
+                self._upload_file(fl)
+        except Exception:
+            raise
+        finally:
+            self._close_connection()
+
+        logging.info("Done.")
+
+    @backoff.on_exception(backoff.expo,
+                          (ConnectionError, FileNotFoundError, IOError, paramiko.SSHException),
+                          max_tries=MAX_RETRIES, on_backoff=backoff_hdlr, factor=2, on_giveup=giving_up_hdlr)
+    def connect_to_server(self, port, host, user, password, pkey, disabled_algorithms, banner_timeout):
+        try:
+            conn = paramiko.Transport((host, port), disabled_algorithms=disabled_algorithms)
+            conn.banner_timeout = banner_timeout
+            conn.connect(username=user, password=password, pkey=pkey)
+        except paramiko.ssh_exception.AuthenticationException as e:
+            raise UserException('Connection failed: recheck your authentication and host URL parameters') from e
+        except socket.gaierror as e:
+            raise UserException('Connection failed: recheck your host URL and port parameters') from e
+
+        sftp = paramiko.SFTPClient.from_transport(conn)
+
+        self._connection = conn
+        self._sftp_client = sftp
+
+    def _close_connection(self):
+        try:
+            if self._sftp_client:
+                self._sftp_client.close()
+            if self._connection:
+                self._connection.close()
+        except Exception as e:
+            logging.warning(f"Failed to close connection: {e}")
+
+    def get_private_key(self, keystring):
+        pkey = None
+        if keystring:
+            keyfile = StringIO(keystring)
+            try:
+                pkey = self._parse_private_key(keyfile)
+            except (paramiko.SSHException, IndexError) as e:
+                logging.exception("Private Key is invalid")
+                raise UserException("Failed to parse private Key") from e
+        return pkey
+
+    @staticmethod
+    def _parse_private_key(keyfile):
+        # try all versions of encryption keys
+        pkey = None
+        failed = False
+        try:
+            pkey = paramiko.RSAKey.from_private_key(keyfile)
+        except paramiko.SSHException:
+            logging.warning("RSS Private key invalid, trying DSS.")
+            failed = True
+        # DSS
+        if failed:
+            try:
+                pkey = paramiko.DSSKey.from_private_key(keyfile)
+                failed = False
+            except (paramiko.SSHException, IndexError):
+                logging.warning("DSS Private key invalid, trying ECDSAKey.")
+                failed = True
+        # ECDSAKey
+        if failed:
+            try:
+                pkey = paramiko.ECDSAKey.from_private_key(keyfile)
+                failed = False
+            except (paramiko.SSHException, IndexError):
+                logging.warning("ECDSAKey Private key invalid, trying Ed25519Key.")
+                failed = True
+        # Ed25519Key
+        if failed:
+            try:
+                pkey = paramiko.Ed25519Key.from_private_key(keyfile)
+            except (paramiko.SSHException, IndexError) as e:
+                logging.warning("Ed25519Key Private key invalid.")
+                raise e
+        return pkey
+
+    def _upload_file(self, input_file):
+        params = self.configuration.parameters
+
+        destination = self.get_output_destination(input_file)
+        logging.info(f"File Source: {input_file.full_path}")
+        logging.info(f"File Destination: {destination}")
+        try:
+            self._try_to_execute_sftp_operation(self._sftp_client.put, input_file.full_path, destination)
+        except FileNotFoundError as e:
+            raise UserException(
+                f"Destination path: '{params[KEY_REMOTE_PATH]}' in SFTP Server not found,"
+                f" recheck the remote destination path") from e
+        except PermissionError as e:
+            raise UserException(
+                f"Permission Error: you do not have permissions to write to '{params[KEY_REMOTE_PATH]}',"
+                f" choose a different directory on the SFTP server") from e
+
+    def get_output_destination(self, input_file):
+        params = self.configuration.parameters
+
+        timestamp_suffix = ''
+        if params[KEY_APPENDDATE]:
+            timestamp = datetime.utcnow().strftime(params.get(KEY_APPENDDATE_FORMAT, '%Y%m%d%H%M%S'))
+            timestamp_suffix = f"_{timestamp}"
+
+        file_path = params[KEY_REMOTE_PATH]
+        if file_path[-1] != "/":
+            file_path = f"{file_path}/"
+
+        filename, file_extension = os.path.splitext(os.path.basename(input_file.name))
+        return file_path + filename + timestamp_suffix + file_extension
+
+    @backoff.on_exception(backoff.expo,
+                          (ConnectionError, IOError, paramiko.SSHException),
+                          max_tries=MAX_RETRIES, on_backoff=backoff_hdlr, factor=2, on_giveup=giving_up_hdlr)
+    def _try_to_execute_sftp_operation(self, operation: Callable, *args):
+        return operation(*args)
+
+    @sync_action('testConnection')
+    def test_connection(self):
+        if self.configuration.image_parameters:
+            self.validate_image_parameters([KEY_HOSTNAME_IMG, KEY_PORT_IMG])
+        else:
+            self.validate_configuration_parameters([KEY_PORT, KEY_HOSTNAME])
+        params = self.configuration.parameters
+        pkey = self.get_private_key(params[KEY_PRIVATE_KEY])
+        port = self.configuration.image_parameters.get(KEY_PORT_IMG) or params[KEY_PORT]
+        host = self.configuration.image_parameters.get(KEY_HOSTNAME_IMG) or params[KEY_HOSTNAME]
+        banner_timeout = params.get(KEY_BANNER_TIMEOUT, 15)
+
+        if params.get(KEY_DISABLED_ALGORITHMS, False):
+            disabled_algorithms = eval(params[KEY_DISABLED_ALGORITHMS])
+        else:
+            disabled_algorithms = {}
+        try:
+            self.connect_to_server(port,
+                                   host,
+                                   params[KEY_USER],
+                                   params[KEY_PASSWORD],
+                                   pkey,
+                                   disabled_algorithms,
+                                   banner_timeout)
+
+        except Exception:
+            raise
+        finally:
+            self._close_connection()
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        # this triggers the run method by default and is controlled by the configuration.action parameter
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+            - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:$TEST_TAG
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: /tests/test_data_timestamp/config.json
+================================================
+{
+  "parameters": {
+    "port": 22,
+    "user": "fakeuser",
+    "#pass": "fakepass",
+    "hostname": "fakehost",
+    "#private_key": "",
+    "path": "/path/",
+    "append_date": "true",
+    "append_date_format": "%Y-%m-%d-%H:%M:%S"
+  }
+}
+
+
+================================================
+File: /tests/test_data_timestamp/in/state.json
+================================================
+{
+
+}
+
+================================================
+File: /tests/test_data_timestamp/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /tests/test_data_timestamp/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /tests/test_data_timestamp/in/files/test2.csv.manifest
+================================================
+{
+    "id": 75807657,
+    "created": "2015-01-14T00:47:00+0100",
+    "is_public": false,
+    "is_sliced": false,
+    "is_encrypted": true,
+    "name": "test2.csv",
+    "size_bytes": 563416,
+    "tags": [
+        "tag1",
+        "tag2"
+    ],
+    "max_age_days": 15
+}
+
+================================================
+File: /tests/test_data_timestamp/in/files/test2.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /tests/test_data/config.json
+================================================
+{
+  "parameters": {
+            "port": 22,
+            "user": "fakeuser",
+            "#pass": "fakepass",
+            "hostname": "fakehost",
+            "#private_key": "" ,
+            "path": "/path/",
+            "append_date": "true"
+        }
+}
+
+
+================================================
+File: /tests/test_data/in/state.json
+================================================
+{
+
+}
+
+================================================
+File: /tests/test_data/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /tests/test_data/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: /tests/test_data/in/files/test2.csv.manifest
+================================================
+{
+    "id": 75807657,
+    "created": "2015-01-14T00:47:00+0100",
+    "is_public": false,
+    "is_sliced": false,
+    "is_encrypted": true,
+    "name": "test2.csv",
+    "size_bytes": 563416,
+    "tags": [
+        "tag1",
+        "tag2"
+    ],
+    "max_age_days": 15
+}
+
+================================================
+File: /tests/test_data/in/files/test2.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import os
+import unittest
+from os import path
+from os.path import dirname
+
+import mock
+from freezegun import freeze_time
+
+from src.component import Component
+
+TEST_DIR = path.join(dirname(path.realpath(__file__)), 'test_data')
+TEST_DIR_TIMESTAMP = path.join(dirname(path.realpath(__file__)), 'test_data_timestamp')
+
+
+class TestComponent(unittest.TestCase):
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': TEST_DIR})
+    def setUp(self):
+        self.comp = Component()
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+    @freeze_time("2010-10-10")
+    def test_get_output_destination(self):
+        input_table = self.comp.get_input_tables_definitions()[0]
+        output_destination = self.comp.get_output_destination(input_table)
+        self.assertEqual(output_destination, "/path/test_20101010000000.csv")
+
+    @freeze_time("2010-10-10")
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': TEST_DIR_TIMESTAMP})
+    def test_get_output_destination_custom(self):
+        comp = Component()
+        input_table = comp.get_input_tables_definitions()[0]
+        output_destination = comp.get_output_destination(input_table)
+        self.assertEqual(output_destination, "/path/test_2010-10-10-00:00:00.csv")
+
+    def test_parse_private_key_throws_error_on_invalid_key(self):
+        with self.assertRaises(IndexError):
+            self.comp.get_private_key("key")
+
+    def test_parse_private_key_throws_error_on_invalid_key(self):
+        key = self.comp.get_private_key(
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEogIBAAKCAQEAsH4Y5UUUCHiD7OkNEjHhZeqOnbIv2/Sr3jzz+DrkGvAlEGwT"
+            "\n7btrqWuqZT/cX3x1B0wiMqu3zMC+78Gy5bdNau7BJpN5FjwAzzDKVArR47ZIlyKO\nKGhRvafq2pZGQh9YUYsECzA2yoJdJTMfc"
+            "/D1x1K6BGSXd7hnFDNtyMiXu9/7KRQ8\nHNZ8R78BNp7lrzV0fLMC/61n5mmXxXTVS2z6JCr8fSxNaYEEqt2aZra6Rl6c9D7O"
+            "\njA15PcvXqojqSNhsrN9bslPX+F/16aUzqtCDwJcsEIrY8e6SpvDhbJeXr+wDccqf"
+            "\nz4HFmPqFCNU4jm7qQdDfuFOW9BCVSTcX74vOcwIDAQABAoIBAETmpW90HVMFQXOO\ns"
+            "+SjhnwUKuMTei2jgik7oH8K9pwxnjagCtOndGtqtdXbLXw1iTZ1GXCwqwuLP783\n3lBh1B5n4Q3fSslMWYCJaqOOqcv9EK+39Ml"
+            "/mFGzKTN2sS0FMaR74fNAOlOquxRX\ntfK8YicTe71VS/CYE93GChj1fo8ARpKfgaUrtJ3bqNcJjuiNwcSaOug3BE+Vtode"
+            "\nqsxVEcMxM9tZd61iqJ6kSrOLUZKaXGimTRS5zCb9cyjhTm7YBQtFFATS/NHNk7lq"
+            "\n1vfNVWMgVa7afLWgbd7C6xWUZ1wbpWK5F8fdYeUrwZ37fja9Pl1AnuVS7UvdVJvZ"
+            "\ntp7UXDECgYEA5LnU4Ynw0QDH7oNhcw2WGs9NzRja6aU2QPLCfBrNbZ8e8pU34Koz"
+            "\n7f3B5uyNA7uf1G9dNNJNsT2e33OKURggojz03qlD5HdetqxDzJ6LweE3LFikwGgy\nV5z2AK6CsMIl46YoEz1wI"
+            "+sO1QmcrjKp2dcxxaeexGuYe3xAZ77kHrkCgYEAxYnF\nsJjyeosDIhULGUxBe2nbFaNnS4yI0W8dyif4MJz9zMPFNPS"
+            "/xAZXZIM30fV1XDIL\nrYbj+9K7ptV2dJt8aDd7T3WtBtt74jSPRorep9Ur+va0M3Phjrnimu/GoHZfuCGK"
+            "\nXrGyHjTxeRZfkkVSciinKkFbSzIkbVFZFMiYIIsCgYB4hWckFNBdAQFYr8fYnS8c\nH2IKkW9AsDp"
+            "/TKuoQ2M9wRvIjVItQuIsJItYyAqiDepxQOEnJS2lGCgv7CzVAFap\nxl7tONm6eB"
+            "/jN7BeEKjp12eAKZFehUkJm36Q62OYCiV26CWzxarickiVfwQdUjrn"
+            "\nu5nRYbqqG1v0rYsuX4rKmQKBgFDJAVIxmqjHBScBGCLmbrk8F18IDox1Etcj7Djq\nk7O94IXHYnU"
+            "/ytUuCruOdlulWLO1u9Thn4czLY8TKXiSxhQQ7JsYcwSk6kseV6Hv\n1RMqOOxPzG5ma85k8umOOdsRzh+Nh"
+            "/smDMQRvtdYcQlu1ELfoU3EoMNl5EPYyueX\nCa/1AoGAZpHrBNdvroylQnwx7zKfr6SjZXF5ILRc6HfaZqGymGOTdoYIKSC3wQhW"
+            "\nPwSfz6myqmw5xduj1QGNPrFFX5xjsTk6YKvbsFP75YnWEWrCCvFS3CFh337VqKSz\no/Jn20IHb/dgZLP5Ff+QeqtbN"
+            "/0hBvJeqp7LX3Rdd0EOq1q9OpE=\n-----END RSA PRIVATE KEY-----")
+        self.assertEqual(key.size, 2048)
+
+    def test_get_private_key_with_none(self):
+        key = self.comp.get_private_key("")
+        self.assertEqual(key, None)
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+This component allows you to write tables and files from storage to any SFTP repository. 
+To connect you need credentials to log in to the SFTP server.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+**NOTE** that when using file input mapping, only the latest files matching the specified tag will be uploaded.
+
+================================================
+File: /component_config/component_short_description.md
+================================================
+Transfer tables and files to any SFTP repository.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "SFTP writer",
+  "required": [
+    "hostname",
+    "port",
+    "user",
+    "#pass",
+    "#private_key"
+  ],
+  "properties": {
+    "port": {
+      "type": "integer",
+      "default": 22,
+      "title": "SFTP host port",
+      "propertyOrder": 20
+    },
+    "user": {
+      "type": "string",
+      "title": "SFTP user name",
+      "propertyOrder": 30
+    },
+    "#pass": {
+      "type": "string",
+      "title": "SFTP password",
+      "format": "password",
+      "propertyOrder": 40
+    },
+    "#private_key": {
+      "type": "string",
+      "format": "textarea",
+      "description": "Your SSH private key, including the BEGIN RSA .. part. If used, the password is ignored.",
+      "title": "SSH private key",
+      "propertyOrder": 50
+    },
+    "hostname": {
+      "type": "string",
+      "title": "SFTP host URL",
+      "propertyOrder": 10
+    },
+    "disabled_algorithms": {
+      "type": "string",
+      "title": "Algorithms to disable (Optional)",
+      "description": "The disabled_algorithms for example: \"{'pubkeys': ['rsa-sha2-256', 'rsa-sha2-512']}\" Find additional details at <a href='https://docs.paramiko.org/en/latest/api/transport.html?highlight=disabled_algorithms'>Paramiko documentation</a>.",
+      "propertyOrder": 60
+    },
+    "banner_timeout": {
+      "type": "integer",
+      "default": 15,
+      "title": "Banner timeout (Optional)",
+      "description": "Timeout in seconds to wait for SSH banner, default value is 15. This parameter can solve issues related to establishing a connection, caused, for example, by server overload or high network latency.",
+      "propertyOrder": 70
+    },
+    "test_connection": {
+      "type": "button",
+      "format": "test-connection",
+      "propertyOrder": 500
+    }
+  }
+}
+
+
+================================================
+File: /component_config/configRowSchema.json
+================================================
+{
+  "type": "object",
+  "title": "SFTP writer",
+  "required": [
+    "path",
+    "append_date",
+    "append_date_format"
+  ],
+  "properties": {
+    "path": {
+      "type": "string",
+      "title": "Remote destination path",
+      "description": "e.g. /home/user/sftp/",
+      "propertyOrder": 60
+    },
+    "append_date": {
+      "type": "number",
+      "title": "Append timestamp",
+      "description": "Appends timestamp to result file name",
+      "propertyOrder": 5200,
+      "enum": [
+        0,
+        1
+      ],
+      "default": 0,
+      "options": {
+        "enum_titles": [
+          "No",
+          "Yes"
+        ]
+      }
+    },
+    "append_date_format": {
+      "type": "string",
+      "title": "Date format of appended timestamp",
+      "description": "Date format as used in strftime() function",
+      "propertyOrder": 5300,
+      "options": {
+        "dependencies": {
+          "append_date": 1
+        }
+      },
+      "default": "%Y%m%d%H%M%S"
+    }
+  }
+}
+
+
+================================================
+File: /scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: /scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+paramiko>=2.7.2
+backoff
+mock
+freezegun
+keboola.component==1.4.4
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.10
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /README.md
+================================================
+# SFTP writer
+
+SFTP writer component allowing writing tables and files from KBC storage to SFTP repository. Pkey and password authentication 
+methods are supported.
+
+**Table of contents:**  
+  
+[TOC]
+
+# Functionality
+
+The components allows to write tables or files from the KBC Storage to any SFTP repository.
+
+**NOTE** that only the latest files matching the specified tag will be uploaded.
+
+# Configuration
+ 
+## SFTP host URL
+
+Your SFTP host URL
+
+## SFTP host port
+
+SFTP port - by default `22`.
+
+## SFTP user name
+
+Your SFTP user name.
+
+## SFTP password
+
+Password of the SFTP user. Use if you wan't to use the password authentication method.
+
+## SSH private key
+
+Your SSH private key, including the `BEGIN RSA ..` part. If used, the password is ignored.
+
+## Algorithms to disable (optional)
+
+The disabled_algorithms for example: "{'pubkeys': ['rsa-sha2-256', 'rsa-sha2-512']}" Find additional details at [Paramiko documentation](https://docs.paramiko.org/en/latest/api/transport.html?highlight=disabled_algorithms).
+
+## Banner timeout (optional)
+
+Timeout in seconds to wait for SSH banner, default value is 15. This parameter can solve issues related to establishing a connection, caused, for example, by server overload or high network latency.
+
+
+
+### Remote destination path
+
+Remote destination path. e.g. existing remote folder, where all files will be stored. ex. `/home/user/mysftpfolder/`
+
+### Append timestamp
+
+If set to true, a current timestamp will be appended to the resulting file, e.g. `test.csv` will be stored as 
+ `test_YYYYMMDDHHMiSS.csv`
+
+ 
+# Development
+ 
+This example contains runnable container with simple unittest. For local testing it is useful to include `data` folder in the root
+and use docker-compose commands to run the container or execute tests. 
+
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to your custom path:
+```yaml
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+```
+
+Clone this repository, init the workspace and run the component with following command:
+
+```
+git clone https://bitbucket.org:kds_consulting_team/kds-team.wr-simple-sftp.git my-new-component
+cd my-new-component
+docker-compose build
+docker-compose run --rm dev
+```
+
+Run the test suite and lint check using this command:
+
+```
+docker-compose run --rm test
+```
+
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
+

@@ -1,0 +1,5598 @@
+Directory structure:
+└── keboola-wr-snowflake-workspace/
+    ├── docker/
+    │   ├── php-prod.ini
+    │   ├── snowflake/
+    │   │   ├── snowflake-policy.pol
+    │   │   └── simba.snowflake.ini
+    │   └── composer-install.sh
+    ├── deploy.sh
+    ├── phpcs.xml
+    ├── docker-compose.yml
+    ├── src/
+    │   ├── Config.php
+    │   ├── Component.php
+    │   ├── Configuration/
+    │   │   ├── TestConnectionConfigDefinition.php
+    │   │   └── ConfigDefinition.php
+    │   ├── run.php
+    │   └── Writer/
+    │       └── Snowflake.php
+    ├── composer.lock
+    ├── phpstan.neon
+    ├── tests/
+    │   ├── phpunit/
+    │   │   ├── WriterTest.php
+    │   │   ├── data/
+    │   │   │   └── sales.csv
+    │   │   └── bootstrap.php
+    │   └── functional/
+    │       ├── DatadirTestProvider.php
+    │       ├── test-connection/
+    │       │   ├── expected-stdout
+    │       │   ├── expected-stderr
+    │       │   ├── source/
+    │       │   │   └── data/
+    │       │   │       └── config.json
+    │       │   └── expected-code
+    │       ├── simple-write/
+    │       │   ├── expected-stdout
+    │       │   ├── expected/
+    │       │   │   └── data/
+    │       │   │       └── out/
+    │       │   │           ├── db-dump/
+    │       │   │           │   ├── .gitkeep
+    │       │   │           │   └── sales.csv
+    │       │   │           ├── tables/
+    │       │   │           │   └── .gitkeep
+    │       │   │           └── files/
+    │       │   │               └── .gitkeep
+    │       │   ├── expected-stderr
+    │       │   ├── source/
+    │       │   │   └── data/
+    │       │   │       ├── config.json
+    │       │   │       └── in/
+    │       │   │           └── tables/
+    │       │   │               └── sales.csv
+    │       │   └── expected-code
+    │       ├── DatadirTest.php
+    │       └── filter-data/
+    │           ├── expected-stdout
+    │           ├── expected/
+    │           │   └── data/
+    │           │       └── out/
+    │           │           ├── db-dump/
+    │           │           │   ├── .gitkeep
+    │           │           │   └── sales.csv
+    │           │           ├── tables/
+    │           │           │   └── .gitkeep
+    │           │           └── files/
+    │           │               └── .gitkeep
+    │           ├── expected-stderr
+    │           ├── source/
+    │           │   └── data/
+    │           │       ├── config.json
+    │           │       └── in/
+    │           │           └── tables/
+    │           │               └── sales.csv
+    │           └── expected-code
+    ├── phpunit.xml.dist
+    ├── .github/
+    │   └── workflows/
+    │       └── push.yml
+    ├── composer.json
+    ├── .dockerignore
+    ├── Dockerfile
+    └── README.md
+
+================================================
+File: /docker/php-prod.ini
+================================================
+; Recommended production values
+display_errors = Off
+display_startup_errors = Off
+error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
+html_errors = On
+log_errors = On
+max_input_time = 60
+output_buffering = 4096
+register_argc_argv = Off
+request_order = "GP"
+session.gc_divisor = 1000
+session.sid_bits_per_character = 5
+short_open_tag = Off
+track_errors = Off
+variables_order = "GPCS"
+
+; Custom
+date.timezone = UTC
+memory_limit = -1
+
+
+================================================
+File: /docker/snowflake/snowflake-policy.pol
+================================================
+<?xml version="1.0"?>
+<!DOCTYPE Policy SYSTEM "http://www.debian.org/debsig/1.0/policy.dtd">
+<Policy xmlns="https://www.debian.org/debsig/1.0/">
+    <Origin Name="Snowflake Computing" id="630D9F3CAB551AF3" Description="Snowflake ODBC Driver DEB package"/>
+    <Selection>
+        <Required Type="origin" File="debsig.gpg" id="630D9F3CAB551AF3"/>
+    </Selection>
+    <Verification MinOptional="0">
+        <Required Type="origin" File="debsig.gpg" id="630D9F3CAB551AF3"/>
+    </Verification>
+</Policy>
+
+================================================
+File: /docker/snowflake/simba.snowflake.ini
+================================================
+[Driver]
+DriverManagerEncoding=UTF-16
+DriverLocale=en-US
+ErrorMessagesPath=/usr/lib/snowflake/odbc/ErrorMessages/
+LogNamespace=
+LogPath=/tmp
+ODBCInstLib=libodbcinst.so
+#LogLevel=6
+CABundleFile=/usr/lib/snowflake/odbc/lib/cacert.pem
+DisableOCSPCheck=true
+
+================================================
+File: /docker/composer-install.sh
+================================================
+#!/bin/sh
+
+EXPECTED_SIGNATURE=$(curl -s https://composer.github.io/installer.sig)
+php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+ACTUAL_SIGNATURE=$(php -r "echo hash_file('SHA384', 'composer-setup.php');")
+
+if [ "$EXPECTED_SIGNATURE" != "$ACTUAL_SIGNATURE" ]
+then
+    >&2 echo 'ERROR: Invalid installer signature'
+    rm composer-setup.php
+    exit 1
+fi
+
+php composer-setup.php --quiet --install-dir=/usr/local/bin/ --filename=composer
+RESULT=$?
+rm composer-setup.php
+exit $RESULT
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/bash
+set -e
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TRAVIS_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TRAVIS_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TRAVIS_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TRAVIS_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TRAVIS_TAG} is not allowed."
+fi
+
+
+================================================
+File: /phpcs.xml
+================================================
+<?xml version="1.0"?>
+<ruleset name="Project">
+    <rule ref="vendor/keboola/coding-standard/src/ruleset.xml"/>
+</ruleset>
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: '3'
+services:
+  app: &mainApp
+    build:
+      context: .
+    image: keboola/wr-snowflake-workspace
+    environment:
+      - KBC_URL
+      - KBC_TOKEN
+  dev:
+    <<: *mainApp
+    volumes:
+      - ./:/code
+      - ./data:/data
+
+
+================================================
+File: /src/Config.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\DbWriter\SnowflakeWorkspace;
+
+use Keboola\Component\Config\BaseConfig;
+use Keboola\Component\UserException;
+
+class Config extends BaseConfig
+{
+    public function getStorageApiUrl(): string
+    {
+        $url = getenv('KBC_URL');
+        if (!$url) {
+            throw new UserException('Missing KBC API url');
+        }
+        return $url;
+    }
+
+    public function getStorageApiToken(): string
+    {
+        $token = getenv('KBC_TOKEN');
+        if (!$token) {
+            throw new UserException('Missing KBC API token');
+        }
+        return $token;
+    }
+
+    public function getWorkspaceId(): string
+    {
+        return $this->getValue(['parameters', 'workspaceId']);
+    }
+
+    public function getTableId(): string
+    {
+        return $this->getValue(['parameters', 'tableId']);
+    }
+
+    public function getDbName(): string
+    {
+        return $this->getValue(['parameters', 'dbName']);
+    }
+
+    public function getItems(): array
+    {
+        return $this->getValue(['parameters', 'items']);
+    }
+
+    public function isIncremental(): bool
+    {
+        return (bool) $this->getValue(['parameters', 'incremental']);
+    }
+}
+
+
+================================================
+File: /src/Component.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\DbWriter\SnowflakeWorkspace;
+
+use Keboola\Component\BaseComponent;
+use Keboola\Component\UserException;
+use Keboola\DbWriter\SnowflakeWorkspace\Configuration\ConfigDefinition;
+use Keboola\DbWriter\SnowflakeWorkspace\Configuration\TestConnectionConfigDefinition;
+use Keboola\DbWriter\SnowflakeWorkspace\Writer\Snowflake;
+use Keboola\StorageApi\Client;
+use Psr\Log\LoggerInterface;
+
+class Component extends BaseComponent
+{
+    private const ACTION_RUN = 'run';
+
+    private const ACTION_TEST_CONNECTION = 'testConnection';
+
+    private Client $client;
+
+    public function __construct(LoggerInterface $logger)
+    {
+        parent::__construct($logger);
+
+        /** @var Config $config */
+        $config = $this->getConfig();
+        $this->client = new Client([
+            'url' => $config->getStorageApiUrl(),
+            'token' => $config->getStorageApiToken(),
+        ]);
+    }
+
+    protected function run(): void
+    {
+        /** @var Config $config */
+        $config = $this->getConfig();
+
+        $writer = new Snowflake($this->client, $config);
+
+        $writer->runAction();
+    }
+
+    public function testConnectionAction(): array
+    {
+        /** @var Config $config */
+        $config = $this->getConfig();
+
+        $writer = new Snowflake($this->client, $config);
+
+        return $writer->testConnectionAction();
+    }
+
+    protected function getSyncActions(): array
+    {
+        return [
+            self::ACTION_TEST_CONNECTION => 'testConnectionAction',
+        ];
+    }
+
+    protected function getConfigClass(): string
+    {
+        return Config::class;
+    }
+
+    protected function getConfigDefinitionClass(): string
+    {
+        $action = $this->getRawConfig()['action'] ?? self::ACTION_RUN;
+        switch ($action) {
+            case self::ACTION_RUN:
+                return ConfigDefinition::class;
+            case self::ACTION_TEST_CONNECTION:
+                return TestConnectionConfigDefinition::class;
+            default:
+                throw new UserException(sprintf('Unexpected action "%s"', $action));
+        }
+    }
+}
+
+
+================================================
+File: /src/Configuration/TestConnectionConfigDefinition.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\DbWriter\SnowflakeWorkspace\Configuration;
+
+use Keboola\Component\Config\BaseConfigDefinition;
+use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
+
+class TestConnectionConfigDefinition extends BaseConfigDefinition
+{
+    protected function getParametersDefinition(): ArrayNodeDefinition
+    {
+        $parametersNode = parent::getParametersDefinition();
+        // @formatter:off
+        /** @noinspection NullPointerExceptionInspection */
+        $parametersNode
+            ->children()
+                ->scalarNode('workspaceId')->end()
+            ->end()
+        ;
+        // @formatter:on
+        return $parametersNode;
+    }
+}
+
+
+================================================
+File: /src/Configuration/ConfigDefinition.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\DbWriter\SnowflakeWorkspace\Configuration;
+
+use Keboola\Component\Config\BaseConfigDefinition;
+use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
+
+class ConfigDefinition extends BaseConfigDefinition
+{
+    protected function getParametersDefinition(): ArrayNodeDefinition
+    {
+        $parametersNode = parent::getParametersDefinition();
+        // @formatter:off
+        /** @noinspection NullPointerExceptionInspection */
+        $parametersNode
+            ->children()
+                ->scalarNode('workspaceId')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+                ->scalarNode('tableId')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+                ->scalarNode('dbName')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+                ->booleanNode('incremental')
+                    ->defaultValue(false)
+                ->end()
+                ->arrayNode('items')
+                    ->prototype('array')
+                        ->children()
+                            ->scalarNode('name')
+                                ->isRequired()
+                                ->cannotBeEmpty()
+                            ->end()
+                            ->scalarNode('dbName')
+                                ->isRequired()
+                                ->cannotBeEmpty()
+                            ->end()
+                            ->scalarNode('type')
+                                ->isRequired()
+                                ->cannotBeEmpty()
+                            ->end()
+                            ->scalarNode('size')->end()
+                            ->scalarNode('nullable')->end()
+                            ->scalarNode('default')->end()
+                        ->end()
+                    ->end()
+                ->end()
+            ->end()
+        ;
+        // @formatter:on
+        return $parametersNode;
+    }
+}
+
+
+================================================
+File: /src/run.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+use Keboola\Component\UserException;
+use Keboola\Component\Logger;
+use Keboola\DbWriter\SnowflakeWorkspace\Component;
+
+require __DIR__ . '/../vendor/autoload.php';
+
+$logger = new Logger();
+try {
+    $app = new Component($logger);
+    $app->execute();
+    exit(0);
+} catch (UserException $e) {
+    $logger->error($e->getMessage());
+    exit(1);
+} catch (\Throwable $e) {
+    $logger->critical(
+        get_class($e) . ':' . $e->getMessage(),
+        [
+            'errFile' => $e->getFile(),
+            'errLine' => $e->getLine(),
+            'errCode' => $e->getCode(),
+            'errTrace' => $e->getTraceAsString(),
+            'errPrevious' => is_object($e->getPrevious()) ? get_class($e->getPrevious()) : '',
+        ]
+    );
+    exit(2);
+}
+
+
+================================================
+File: /src/Writer/Snowflake.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\DbWriter\SnowflakeWorkspace\Writer;
+
+use Keboola\Component\UserException;
+use Keboola\DbWriter\SnowflakeWorkspace\Config;
+use Keboola\StorageApi\Client;
+use Keboola\StorageApi\ClientException;
+use Keboola\StorageApi\Workspaces;
+
+class Snowflake
+{
+    private Client $client;
+
+    private Config $config;
+
+    public function __construct(Client $client, Config $config)
+    {
+        $this->config = $config;
+        $this->client = $client;
+    }
+
+    public function testConnectionAction(): array
+    {
+        $workspaces = new Workspaces($this->client);
+
+        try {
+            $workspaces->getWorkspace($this->config->getWorkspaceId());
+        } catch (ClientException $clientException) {
+            throw new UserException($clientException->getMessage(), 0, $clientException);
+        }
+
+        return [
+            'status' => 'success',
+        ];
+    }
+
+    public function runAction(): void
+    {
+        $workspaces = new Workspaces($this->client);
+
+        $columns = [];
+        foreach ($this->config->getItems() as $item) {
+            $columns[] = [
+                'source' => $item['name'],
+                'destination' => $item['dbName'],
+                'type' => $item['type'],
+                'length' => $item['size'],
+                'nullable' => $item['nullable'],
+                'convertEmptyValuesToNull' => $item['nullable'],
+            ];
+        }
+
+        $options = [
+            'input' => [
+                [
+                    'source' => $this->config->getTableId(),
+                    'destination' => $this->config->getDbName(),
+                    'incremental' => $this->config->isIncremental(),
+                    'columns' => $columns,
+                ],
+            ],
+        ];
+
+        $inputMappingTable = $this->config->getInputTables()[0] ?? false;
+        if ($inputMappingTable) {
+            $options['input'][0] += [
+                'whereColumn' => $this->config->getInputTables()[0]['where_column'],
+                'whereValues' => $this->config->getInputTables()[0]['where_values'],
+                'whereOperator' => $this->config->getInputTables()[0]['where_operator'],
+            ];
+        }
+
+        if ($this->config->isIncremental()) {
+            $options['input'][0]['days'] = 'adaptive';
+        }
+
+        try {
+            $workspaces->loadWorkspaceData($this->config->getWorkspaceId(), $options);
+        } catch (ClientException $clientException) {
+            throw new UserException($clientException->getMessage(), 0, $clientException);
+        }
+    }
+}
+
+
+================================================
+File: /composer.lock
+================================================
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state",
+        "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+        "This file is @generated automatically"
+    ],
+    "content-hash": "64a27d3e231f4eeb914d9d42f420b7b3",
+    "packages": [
+        {
+            "name": "aws/aws-sdk-php",
+            "version": "3.145.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/aws/aws-sdk-php.git",
+                "reference": "df5406b49f4f5774045e51e8fecc75717c4d6454"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/aws/aws-sdk-php/zipball/df5406b49f4f5774045e51e8fecc75717c4d6454",
+                "reference": "df5406b49f4f5774045e51e8fecc75717c4d6454",
+                "shasum": ""
+            },
+            "require": {
+                "ext-json": "*",
+                "ext-pcre": "*",
+                "ext-simplexml": "*",
+                "guzzlehttp/guzzle": "^5.3.3|^6.2.1|^7.0",
+                "guzzlehttp/promises": "^1.0",
+                "guzzlehttp/psr7": "^1.4.1",
+                "mtdowling/jmespath.php": "^2.5",
+                "php": ">=5.5"
+            },
+            "require-dev": {
+                "andrewsville/php-token-reflection": "^1.4",
+                "aws/aws-php-sns-message-validator": "~1.0",
+                "behat/behat": "~3.0",
+                "doctrine/cache": "~1.4",
+                "ext-dom": "*",
+                "ext-openssl": "*",
+                "ext-pcntl": "*",
+                "ext-sockets": "*",
+                "nette/neon": "^2.3",
+                "paragonie/random_compat": ">= 2",
+                "phpunit/phpunit": "^4.8.35|^5.4.3",
+                "psr/cache": "^1.0",
+                "psr/simple-cache": "^1.0",
+                "sebastian/comparator": "^1.2.3"
+            },
+            "suggest": {
+                "aws/aws-php-sns-message-validator": "To validate incoming SNS notifications",
+                "doctrine/cache": "To use the DoctrineCacheAdapter",
+                "ext-curl": "To send requests using cURL",
+                "ext-openssl": "Allows working with CloudFront private distributions and verifying received SNS messages",
+                "ext-sockets": "To use client-side monitoring"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "3.0-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Aws\\": "src/"
+                },
+                "files": [
+                    "src/functions.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "Apache-2.0"
+            ],
+            "authors": [
+                {
+                    "name": "Amazon Web Services",
+                    "homepage": "http://aws.amazon.com"
+                }
+            ],
+            "description": "AWS SDK for PHP - Use Amazon Web Services in your PHP project",
+            "homepage": "http://aws.amazon.com/sdkforphp",
+            "keywords": [
+                "amazon",
+                "aws",
+                "cloud",
+                "dynamodb",
+                "ec2",
+                "glacier",
+                "s3",
+                "sdk"
+            ],
+            "time": "2020-07-02T18:12:35+00:00"
+        },
+        {
+            "name": "guzzlehttp/guzzle",
+            "version": "6.5.5",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/guzzle/guzzle.git",
+                "reference": "9d4290de1cfd701f38099ef7e183b64b4b7b0c5e"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/guzzle/guzzle/zipball/9d4290de1cfd701f38099ef7e183b64b4b7b0c5e",
+                "reference": "9d4290de1cfd701f38099ef7e183b64b4b7b0c5e",
+                "shasum": ""
+            },
+            "require": {
+                "ext-json": "*",
+                "guzzlehttp/promises": "^1.0",
+                "guzzlehttp/psr7": "^1.6.1",
+                "php": ">=5.5",
+                "symfony/polyfill-intl-idn": "^1.17.0"
+            },
+            "require-dev": {
+                "ext-curl": "*",
+                "phpunit/phpunit": "^4.8.35 || ^5.7 || ^6.4 || ^7.0",
+                "psr/log": "^1.1"
+            },
+            "suggest": {
+                "psr/log": "Required for using the Log middleware"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "6.5-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "GuzzleHttp\\": "src/"
+                },
+                "files": [
+                    "src/functions_include.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Michael Dowling",
+                    "email": "mtdowling@gmail.com",
+                    "homepage": "https://github.com/mtdowling"
+                }
+            ],
+            "description": "Guzzle is a PHP HTTP client library",
+            "homepage": "http://guzzlephp.org/",
+            "keywords": [
+                "client",
+                "curl",
+                "framework",
+                "http",
+                "http client",
+                "rest",
+                "web service"
+            ],
+            "time": "2020-06-16T21:01:06+00:00"
+        },
+        {
+            "name": "guzzlehttp/promises",
+            "version": "v1.3.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/guzzle/promises.git",
+                "reference": "a59da6cf61d80060647ff4d3eb2c03a2bc694646"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/guzzle/promises/zipball/a59da6cf61d80060647ff4d3eb2c03a2bc694646",
+                "reference": "a59da6cf61d80060647ff4d3eb2c03a2bc694646",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.5.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^4.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.4-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "GuzzleHttp\\Promise\\": "src/"
+                },
+                "files": [
+                    "src/functions_include.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Michael Dowling",
+                    "email": "mtdowling@gmail.com",
+                    "homepage": "https://github.com/mtdowling"
+                }
+            ],
+            "description": "Guzzle promises library",
+            "keywords": [
+                "promise"
+            ],
+            "time": "2016-12-20T10:07:11+00:00"
+        },
+        {
+            "name": "guzzlehttp/psr7",
+            "version": "1.6.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/guzzle/psr7.git",
+                "reference": "239400de7a173fe9901b9ac7c06497751f00727a"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/guzzle/psr7/zipball/239400de7a173fe9901b9ac7c06497751f00727a",
+                "reference": "239400de7a173fe9901b9ac7c06497751f00727a",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.4.0",
+                "psr/http-message": "~1.0",
+                "ralouphie/getallheaders": "^2.0.5 || ^3.0.0"
+            },
+            "provide": {
+                "psr/http-message-implementation": "1.0"
+            },
+            "require-dev": {
+                "ext-zlib": "*",
+                "phpunit/phpunit": "~4.8.36 || ^5.7.27 || ^6.5.8"
+            },
+            "suggest": {
+                "zendframework/zend-httphandlerrunner": "Emit PSR-7 responses"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.6-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "GuzzleHttp\\Psr7\\": "src/"
+                },
+                "files": [
+                    "src/functions_include.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Michael Dowling",
+                    "email": "mtdowling@gmail.com",
+                    "homepage": "https://github.com/mtdowling"
+                },
+                {
+                    "name": "Tobias Schultze",
+                    "homepage": "https://github.com/Tobion"
+                }
+            ],
+            "description": "PSR-7 message implementation that also provides common utility methods",
+            "keywords": [
+                "http",
+                "message",
+                "psr-7",
+                "request",
+                "response",
+                "stream",
+                "uri",
+                "url"
+            ],
+            "time": "2019-07-01T23:21:34+00:00"
+        },
+        {
+            "name": "keboola/common-exceptions",
+            "version": "1.0.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/keboola/common-exceptions.git",
+                "reference": "44bff6e6d1f8edfb81af7662bc231566dcecb241"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/keboola/common-exceptions/zipball/44bff6e6d1f8edfb81af7662bc231566dcecb241",
+                "reference": "44bff6e6d1f8edfb81af7662bc231566dcecb241",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.1"
+            },
+            "require-dev": {
+                "jakub-onderka/php-parallel-lint": "^1.0",
+                "keboola/coding-standard": ">=7.0.2",
+                "keboola/php-temp": "^1.0",
+                "phpstan/phpstan-shim": "^0.10.6",
+                "phpunit/phpunit": "^7.0"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Keboola\\CommonExceptions\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "Common exceptions shared between different applications",
+            "time": "2019-11-21T11:09:10+00:00"
+        },
+        {
+            "name": "keboola/csv",
+            "version": "1.1.4",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/keboola/php-csv.git",
+                "reference": "d7e257096c42eab09b54b7b46a905ca953a8eb6f"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/keboola/php-csv/zipball/d7e257096c42eab09b54b7b46a905ca953a8eb6f",
+                "reference": "d7e257096c42eab09b54b7b46a905ca953a8eb6f",
+                "shasum": ""
+            },
+            "require-dev": {
+                "phpunit/phpunit": "~3.7"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-0": {
+                    "Keboola\\Csv": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "Keboola CSV reader and writer",
+            "homepage": "http://keboola.com",
+            "time": "2016-04-21T20:46:22+00:00"
+        },
+        {
+            "name": "keboola/php-component",
+            "version": "8.1.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/keboola/php-component.git",
+                "reference": "49af27d934f09be2e11ea1becb2c98e75032b36b"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/keboola/php-component/zipball/49af27d934f09be2e11ea1becb2c98e75032b36b",
+                "reference": "49af27d934f09be2e11ea1becb2c98e75032b36b",
+                "shasum": ""
+            },
+            "require": {
+                "ext-json": "*",
+                "keboola/common-exceptions": "^1.0",
+                "monolog/monolog": "^2.0",
+                "php": "^7.3",
+                "symfony/config": "^5.0",
+                "symfony/filesystem": "^5.0",
+                "symfony/finder": "^5.0",
+                "symfony/serializer": "^5.0"
+            },
+            "require-dev": {
+                "devedge/sami-github": "^1.0",
+                "jakub-onderka/php-parallel-lint": "^1.0",
+                "keboola/coding-standard": ">=7.0.2",
+                "keboola/php-temp": "^2.0",
+                "phpstan/phpstan": "^0.12.14",
+                "phpunit/phpunit": "^9.0"
+            },
+            "type": "project",
+            "autoload": {
+                "psr-4": {
+                    "Keboola\\Component\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Keboola",
+                    "email": "devel@keboola.com"
+                }
+            ],
+            "description": "Helper classes for developing Keboola PHP components",
+            "keywords": [
+                "component",
+                "docker",
+                "keboola"
+            ],
+            "time": "2020-04-30T11:08:47+00:00"
+        },
+        {
+            "name": "keboola/storage-api-client",
+            "version": "10.14.4",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/keboola/storage-api-php-client.git",
+                "reference": "7d960a0d8008bbf8f283ea91182ad7348dd8529f"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/keboola/storage-api-php-client/zipball/7d960a0d8008bbf8f283ea91182ad7348dd8529f",
+                "reference": "7d960a0d8008bbf8f283ea91182ad7348dd8529f",
+                "shasum": ""
+            },
+            "require": {
+                "aws/aws-sdk-php": "~3.2",
+                "guzzlehttp/guzzle": "~6.0",
+                "keboola/csv": "~1.1.3",
+                "microsoft/azure-storage-blob": "^1.4",
+                "php": ">=5.6",
+                "psr/log": "~1.0",
+                "symfony/filesystem": "^5.0||^4.0||^3.0||~2.3",
+                "symfony/process": "^5.0||^4.0||^3.0||~2.3"
+            },
+            "require-dev": {
+                "apigen/apigen": "4.0.0-RC4",
+                "ext-pdo_pgsql": "*",
+                "keboola/php-csv-db-import": "^2.2",
+                "keboola/table-backend-utils": "^0.5",
+                "phpcompatibility/php-compatibility": "*",
+                "phpstan/phpstan-shim": "^0.9.2",
+                "phpunit/phpunit": "^5.6",
+                "squizlabs/php_codesniffer": "^3"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-0": {
+                    "Keboola\\StorageApi": "src/"
+                },
+                "files": [
+                    "src/Keboola/StorageApi/createSimpleJobPollDelay.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "Keboola Storage API PHP CLient",
+            "homepage": "http://keboola.com",
+            "time": "2020-07-03T05:14:16+00:00"
+        },
+        {
+            "name": "microsoft/azure-storage-blob",
+            "version": "1.5.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/Azure/azure-storage-blob-php.git",
+                "reference": "6a333cd28a3742c3e99e79042dc6510f9f917919"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/Azure/azure-storage-blob-php/zipball/6a333cd28a3742c3e99e79042dc6510f9f917919",
+                "reference": "6a333cd28a3742c3e99e79042dc6510f9f917919",
+                "shasum": ""
+            },
+            "require": {
+                "microsoft/azure-storage-common": "~1.4",
+                "php": ">=5.6.0"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "MicrosoftAzure\\Storage\\Blob\\": "src/Blob"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Azure Storage PHP Client Library",
+                    "email": "dmsh@microsoft.com"
+                }
+            ],
+            "description": "This project provides a set of PHP client libraries that make it easy to access Microsoft Azure Storage Blob APIs.",
+            "keywords": [
+                "azure",
+                "blob",
+                "php",
+                "sdk",
+                "storage"
+            ],
+            "time": "2020-01-02T07:18:59+00:00"
+        },
+        {
+            "name": "microsoft/azure-storage-common",
+            "version": "1.4.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/Azure/azure-storage-common-php.git",
+                "reference": "be4df800761d0d0fa91a9460c7f42517197d57a0"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/Azure/azure-storage-common-php/zipball/be4df800761d0d0fa91a9460c7f42517197d57a0",
+                "reference": "be4df800761d0d0fa91a9460c7f42517197d57a0",
+                "shasum": ""
+            },
+            "require": {
+                "guzzlehttp/guzzle": "~6.0",
+                "php": ">=5.6.0"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "MicrosoftAzure\\Storage\\Common\\": "src/Common"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Azure Storage PHP Client Library",
+                    "email": "dmsh@microsoft.com"
+                }
+            ],
+            "description": "This project provides a set of common code shared by Azure Storage Blob, Table, Queue and File PHP client libraries.",
+            "keywords": [
+                "azure",
+                "common",
+                "php",
+                "sdk",
+                "storage"
+            ],
+            "time": "2020-01-02T07:15:54+00:00"
+        },
+        {
+            "name": "monolog/monolog",
+            "version": "2.1.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/Seldaek/monolog.git",
+                "reference": "38914429aac460e8e4616c8cb486ecb40ec90bb1"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/Seldaek/monolog/zipball/38914429aac460e8e4616c8cb486ecb40ec90bb1",
+                "reference": "38914429aac460e8e4616c8cb486ecb40ec90bb1",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.2",
+                "psr/log": "^1.0.1"
+            },
+            "provide": {
+                "psr/log-implementation": "1.0.0"
+            },
+            "require-dev": {
+                "aws/aws-sdk-php": "^2.4.9 || ^3.0",
+                "doctrine/couchdb": "~1.0@dev",
+                "elasticsearch/elasticsearch": "^6.0",
+                "graylog2/gelf-php": "^1.4.2",
+                "php-amqplib/php-amqplib": "~2.4",
+                "php-console/php-console": "^3.1.3",
+                "php-parallel-lint/php-parallel-lint": "^1.0",
+                "phpspec/prophecy": "^1.6.1",
+                "phpunit/phpunit": "^8.5",
+                "predis/predis": "^1.1",
+                "rollbar/rollbar": "^1.3",
+                "ruflin/elastica": ">=0.90 <3.0",
+                "swiftmailer/swiftmailer": "^5.3|^6.0"
+            },
+            "suggest": {
+                "aws/aws-sdk-php": "Allow sending log messages to AWS services like DynamoDB",
+                "doctrine/couchdb": "Allow sending log messages to a CouchDB server",
+                "elasticsearch/elasticsearch": "Allow sending log messages to an Elasticsearch server via official client",
+                "ext-amqp": "Allow sending log messages to an AMQP server (1.0+ required)",
+                "ext-mbstring": "Allow to work properly with unicode symbols",
+                "ext-mongodb": "Allow sending log messages to a MongoDB server (via driver)",
+                "graylog2/gelf-php": "Allow sending log messages to a GrayLog2 server",
+                "mongodb/mongodb": "Allow sending log messages to a MongoDB server (via library)",
+                "php-amqplib/php-amqplib": "Allow sending log messages to an AMQP server using php-amqplib",
+                "php-console/php-console": "Allow sending log messages to Google Chrome",
+                "rollbar/rollbar": "Allow sending log messages to Rollbar",
+                "ruflin/elastica": "Allow sending log messages to an Elastic Search server"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "2.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Monolog\\": "src/Monolog"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Jordi Boggiano",
+                    "email": "j.boggiano@seld.be",
+                    "homepage": "http://seld.be"
+                }
+            ],
+            "description": "Sends your logs to files, sockets, inboxes, databases and various web services",
+            "homepage": "http://github.com/Seldaek/monolog",
+            "keywords": [
+                "log",
+                "logging",
+                "psr-3"
+            ],
+            "funding": [
+                {
+                    "url": "https://github.com/Seldaek",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/monolog/monolog",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-05-22T08:12:19+00:00"
+        },
+        {
+            "name": "mtdowling/jmespath.php",
+            "version": "2.5.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/jmespath/jmespath.php.git",
+                "reference": "52168cb9472de06979613d365c7f1ab8798be895"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/jmespath/jmespath.php/zipball/52168cb9472de06979613d365c7f1ab8798be895",
+                "reference": "52168cb9472de06979613d365c7f1ab8798be895",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.4.0",
+                "symfony/polyfill-mbstring": "^1.4"
+            },
+            "require-dev": {
+                "composer/xdebug-handler": "^1.2",
+                "phpunit/phpunit": "^4.8.36|^7.5.15"
+            },
+            "bin": [
+                "bin/jp.php"
+            ],
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "2.5-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "JmesPath\\": "src/"
+                },
+                "files": [
+                    "src/JmesPath.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Michael Dowling",
+                    "email": "mtdowling@gmail.com",
+                    "homepage": "https://github.com/mtdowling"
+                }
+            ],
+            "description": "Declaratively specify how to extract elements from a JSON document",
+            "keywords": [
+                "json",
+                "jsonpath"
+            ],
+            "time": "2019-12-30T18:03:34+00:00"
+        },
+        {
+            "name": "psr/http-message",
+            "version": "1.0.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/php-fig/http-message.git",
+                "reference": "f6561bf28d520154e4b0ec72be95418abe6d9363"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/php-fig/http-message/zipball/f6561bf28d520154e4b0ec72be95418abe6d9363",
+                "reference": "f6561bf28d520154e4b0ec72be95418abe6d9363",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.3.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.0.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Psr\\Http\\Message\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "PHP-FIG",
+                    "homepage": "http://www.php-fig.org/"
+                }
+            ],
+            "description": "Common interface for HTTP messages",
+            "homepage": "https://github.com/php-fig/http-message",
+            "keywords": [
+                "http",
+                "http-message",
+                "psr",
+                "psr-7",
+                "request",
+                "response"
+            ],
+            "time": "2016-08-06T14:39:51+00:00"
+        },
+        {
+            "name": "psr/log",
+            "version": "1.1.3",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/php-fig/log.git",
+                "reference": "0f73288fd15629204f9d42b7055f72dacbe811fc"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/php-fig/log/zipball/0f73288fd15629204f9d42b7055f72dacbe811fc",
+                "reference": "0f73288fd15629204f9d42b7055f72dacbe811fc",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.3.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.1.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Psr\\Log\\": "Psr/Log/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "PHP-FIG",
+                    "homepage": "http://www.php-fig.org/"
+                }
+            ],
+            "description": "Common interface for logging libraries",
+            "homepage": "https://github.com/php-fig/log",
+            "keywords": [
+                "log",
+                "psr",
+                "psr-3"
+            ],
+            "time": "2020-03-23T09:12:05+00:00"
+        },
+        {
+            "name": "ralouphie/getallheaders",
+            "version": "3.0.3",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/ralouphie/getallheaders.git",
+                "reference": "120b605dfeb996808c31b6477290a714d356e822"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/ralouphie/getallheaders/zipball/120b605dfeb996808c31b6477290a714d356e822",
+                "reference": "120b605dfeb996808c31b6477290a714d356e822",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.6"
+            },
+            "require-dev": {
+                "php-coveralls/php-coveralls": "^2.1",
+                "phpunit/phpunit": "^5 || ^6.5"
+            },
+            "type": "library",
+            "autoload": {
+                "files": [
+                    "src/getallheaders.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Ralph Khattar",
+                    "email": "ralph.khattar@gmail.com"
+                }
+            ],
+            "description": "A polyfill for getallheaders.",
+            "time": "2019-03-08T08:55:37+00:00"
+        },
+        {
+            "name": "symfony/config",
+            "version": "v5.1.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/config.git",
+                "reference": "b8623ef3d99fe62a34baf7a111b576216965f880"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/config/zipball/b8623ef3d99fe62a34baf7a111b576216965f880",
+                "reference": "b8623ef3d99fe62a34baf7a111b576216965f880",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.2.5",
+                "symfony/deprecation-contracts": "^2.1",
+                "symfony/filesystem": "^4.4|^5.0",
+                "symfony/polyfill-ctype": "~1.8",
+                "symfony/polyfill-php80": "^1.15"
+            },
+            "conflict": {
+                "symfony/finder": "<4.4"
+            },
+            "require-dev": {
+                "symfony/event-dispatcher": "^4.4|^5.0",
+                "symfony/finder": "^4.4|^5.0",
+                "symfony/messenger": "^4.4|^5.0",
+                "symfony/service-contracts": "^1.1|^2",
+                "symfony/yaml": "^4.4|^5.0"
+            },
+            "suggest": {
+                "symfony/yaml": "To use the yaml reference dumper"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "5.1-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Component\\Config\\": ""
+                },
+                "exclude-from-classmap": [
+                    "/Tests/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Fabien Potencier",
+                    "email": "fabien@symfony.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony Config Component",
+            "homepage": "https://symfony.com",
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-05-23T13:08:13+00:00"
+        },
+        {
+            "name": "symfony/deprecation-contracts",
+            "version": "v2.1.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/deprecation-contracts.git",
+                "reference": "dd99cb3a0aff6cadd2a8d7d7ed72c2161e218337"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/deprecation-contracts/zipball/dd99cb3a0aff6cadd2a8d7d7ed72c2161e218337",
+                "reference": "dd99cb3a0aff6cadd2a8d7d7ed72c2161e218337",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.1"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "2.1-dev"
+                }
+            },
+            "autoload": {
+                "files": [
+                    "function.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Nicolas Grekas",
+                    "email": "p@tchwork.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "A generic function and convention to trigger deprecation notices",
+            "homepage": "https://symfony.com",
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-05-27T08:34:37+00:00"
+        },
+        {
+            "name": "symfony/filesystem",
+            "version": "v5.1.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/filesystem.git",
+                "reference": "6e4320f06d5f2cce0d96530162491f4465179157"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/filesystem/zipball/6e4320f06d5f2cce0d96530162491f4465179157",
+                "reference": "6e4320f06d5f2cce0d96530162491f4465179157",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.2.5",
+                "symfony/polyfill-ctype": "~1.8"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "5.1-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Component\\Filesystem\\": ""
+                },
+                "exclude-from-classmap": [
+                    "/Tests/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Fabien Potencier",
+                    "email": "fabien@symfony.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony Filesystem Component",
+            "homepage": "https://symfony.com",
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-05-30T20:35:19+00:00"
+        },
+        {
+            "name": "symfony/finder",
+            "version": "v5.1.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/finder.git",
+                "reference": "4298870062bfc667cb78d2b379be4bf5dec5f187"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/finder/zipball/4298870062bfc667cb78d2b379be4bf5dec5f187",
+                "reference": "4298870062bfc667cb78d2b379be4bf5dec5f187",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.2.5"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "5.1-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Component\\Finder\\": ""
+                },
+                "exclude-from-classmap": [
+                    "/Tests/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Fabien Potencier",
+                    "email": "fabien@symfony.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony Finder Component",
+            "homepage": "https://symfony.com",
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-05-20T17:43:50+00:00"
+        },
+        {
+            "name": "symfony/polyfill-ctype",
+            "version": "v1.17.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/polyfill-ctype.git",
+                "reference": "2edd75b8b35d62fd3eeabba73b26b8f1f60ce13d"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/polyfill-ctype/zipball/2edd75b8b35d62fd3eeabba73b26b8f1f60ce13d",
+                "reference": "2edd75b8b35d62fd3eeabba73b26b8f1f60ce13d",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.3.3"
+            },
+            "suggest": {
+                "ext-ctype": "For best performance"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.17-dev"
+                },
+                "thanks": {
+                    "name": "symfony/polyfill",
+                    "url": "https://github.com/symfony/polyfill"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Polyfill\\Ctype\\": ""
+                },
+                "files": [
+                    "bootstrap.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Gert de Pagter",
+                    "email": "BackEndTea@gmail.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony polyfill for ctype functions",
+            "homepage": "https://symfony.com",
+            "keywords": [
+                "compatibility",
+                "ctype",
+                "polyfill",
+                "portable"
+            ],
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-06-06T08:46:27+00:00"
+        },
+        {
+            "name": "symfony/polyfill-intl-idn",
+            "version": "v1.17.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/polyfill-intl-idn.git",
+                "reference": "a57f8161502549a742a63c09f0a604997bf47027"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/polyfill-intl-idn/zipball/a57f8161502549a742a63c09f0a604997bf47027",
+                "reference": "a57f8161502549a742a63c09f0a604997bf47027",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.3.3",
+                "symfony/polyfill-mbstring": "^1.3",
+                "symfony/polyfill-php72": "^1.10"
+            },
+            "suggest": {
+                "ext-intl": "For best performance"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.17-dev"
+                },
+                "thanks": {
+                    "name": "symfony/polyfill",
+                    "url": "https://github.com/symfony/polyfill"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Polyfill\\Intl\\Idn\\": ""
+                },
+                "files": [
+                    "bootstrap.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Laurent Bassin",
+                    "email": "laurent@bassin.info"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony polyfill for intl's idn_to_ascii and idn_to_utf8 functions",
+            "homepage": "https://symfony.com",
+            "keywords": [
+                "compatibility",
+                "idn",
+                "intl",
+                "polyfill",
+                "portable",
+                "shim"
+            ],
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-06-06T08:46:27+00:00"
+        },
+        {
+            "name": "symfony/polyfill-mbstring",
+            "version": "v1.17.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/polyfill-mbstring.git",
+                "reference": "7110338d81ce1cbc3e273136e4574663627037a7"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/polyfill-mbstring/zipball/7110338d81ce1cbc3e273136e4574663627037a7",
+                "reference": "7110338d81ce1cbc3e273136e4574663627037a7",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.3.3"
+            },
+            "suggest": {
+                "ext-mbstring": "For best performance"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.17-dev"
+                },
+                "thanks": {
+                    "name": "symfony/polyfill",
+                    "url": "https://github.com/symfony/polyfill"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Polyfill\\Mbstring\\": ""
+                },
+                "files": [
+                    "bootstrap.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Nicolas Grekas",
+                    "email": "p@tchwork.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony polyfill for the Mbstring extension",
+            "homepage": "https://symfony.com",
+            "keywords": [
+                "compatibility",
+                "mbstring",
+                "polyfill",
+                "portable",
+                "shim"
+            ],
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-06-06T08:46:27+00:00"
+        },
+        {
+            "name": "symfony/polyfill-php72",
+            "version": "v1.17.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/polyfill-php72.git",
+                "reference": "f048e612a3905f34931127360bdd2def19a5e582"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/polyfill-php72/zipball/f048e612a3905f34931127360bdd2def19a5e582",
+                "reference": "f048e612a3905f34931127360bdd2def19a5e582",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.3.3"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.17-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Polyfill\\Php72\\": ""
+                },
+                "files": [
+                    "bootstrap.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Nicolas Grekas",
+                    "email": "p@tchwork.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony polyfill backporting some PHP 7.2+ features to lower PHP versions",
+            "homepage": "https://symfony.com",
+            "keywords": [
+                "compatibility",
+                "polyfill",
+                "portable",
+                "shim"
+            ],
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-05-12T16:47:27+00:00"
+        },
+        {
+            "name": "symfony/polyfill-php80",
+            "version": "v1.17.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/polyfill-php80.git",
+                "reference": "4a5b6bba3259902e386eb80dd1956181ee90b5b2"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/polyfill-php80/zipball/4a5b6bba3259902e386eb80dd1956181ee90b5b2",
+                "reference": "4a5b6bba3259902e386eb80dd1956181ee90b5b2",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.0.8"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.17-dev"
+                },
+                "thanks": {
+                    "name": "symfony/polyfill",
+                    "url": "https://github.com/symfony/polyfill"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Polyfill\\Php80\\": ""
+                },
+                "files": [
+                    "bootstrap.php"
+                ],
+                "classmap": [
+                    "Resources/stubs"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Ion Bazan",
+                    "email": "ion.bazan@gmail.com"
+                },
+                {
+                    "name": "Nicolas Grekas",
+                    "email": "p@tchwork.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony polyfill backporting some PHP 8.0+ features to lower PHP versions",
+            "homepage": "https://symfony.com",
+            "keywords": [
+                "compatibility",
+                "polyfill",
+                "portable",
+                "shim"
+            ],
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-06-06T08:46:27+00:00"
+        },
+        {
+            "name": "symfony/process",
+            "version": "v5.1.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/process.git",
+                "reference": "7f6378c1fa2147eeb1b4c385856ce9de0d46ebd1"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/process/zipball/7f6378c1fa2147eeb1b4c385856ce9de0d46ebd1",
+                "reference": "7f6378c1fa2147eeb1b4c385856ce9de0d46ebd1",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.2.5",
+                "symfony/polyfill-php80": "^1.15"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "5.1-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Component\\Process\\": ""
+                },
+                "exclude-from-classmap": [
+                    "/Tests/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Fabien Potencier",
+                    "email": "fabien@symfony.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony Process Component",
+            "homepage": "https://symfony.com",
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-05-30T20:35:19+00:00"
+        },
+        {
+            "name": "symfony/serializer",
+            "version": "v5.1.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/serializer.git",
+                "reference": "d1151fc0fd64b613f2a7012afc22d36b1341a5fd"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/serializer/zipball/d1151fc0fd64b613f2a7012afc22d36b1341a5fd",
+                "reference": "d1151fc0fd64b613f2a7012afc22d36b1341a5fd",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.2.5",
+                "symfony/polyfill-ctype": "~1.8",
+                "symfony/polyfill-php80": "^1.15"
+            },
+            "conflict": {
+                "phpdocumentor/type-resolver": "<0.2.1",
+                "symfony/dependency-injection": "<4.4",
+                "symfony/property-access": "<4.4",
+                "symfony/property-info": "<4.4",
+                "symfony/yaml": "<4.4"
+            },
+            "require-dev": {
+                "doctrine/annotations": "~1.0",
+                "doctrine/cache": "~1.0",
+                "phpdocumentor/reflection-docblock": "^3.2|^4.0",
+                "symfony/cache": "^4.4|^5.0",
+                "symfony/config": "^4.4|^5.0",
+                "symfony/dependency-injection": "^4.4|^5.0",
+                "symfony/error-handler": "^4.4|^5.0",
+                "symfony/http-foundation": "^4.4|^5.0",
+                "symfony/mime": "^4.4|^5.0",
+                "symfony/property-access": "^4.4|^5.0",
+                "symfony/property-info": "^4.4|^5.0",
+                "symfony/validator": "^4.4|^5.0",
+                "symfony/yaml": "^4.4|^5.0"
+            },
+            "suggest": {
+                "doctrine/annotations": "For using the annotation mapping. You will also need doctrine/cache.",
+                "doctrine/cache": "For using the default cached annotation reader and metadata cache.",
+                "psr/cache-implementation": "For using the metadata cache.",
+                "symfony/config": "For using the XML mapping loader.",
+                "symfony/mime": "For using a MIME type guesser within the DataUriNormalizer.",
+                "symfony/property-access": "For using the ObjectNormalizer.",
+                "symfony/property-info": "To deserialize relations.",
+                "symfony/yaml": "For using the default YAML mapping loader."
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "5.1-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Component\\Serializer\\": ""
+                },
+                "exclude-from-classmap": [
+                    "/Tests/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Fabien Potencier",
+                    "email": "fabien@symfony.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony Serializer Component",
+            "homepage": "https://symfony.com",
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-06-07T15:42:22+00:00"
+        }
+    ],
+    "packages-dev": [
+        {
+            "name": "doctrine/instantiator",
+            "version": "1.3.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/doctrine/instantiator.git",
+                "reference": "f350df0268e904597e3bd9c4685c53e0e333feea"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/doctrine/instantiator/zipball/f350df0268e904597e3bd9c4685c53e0e333feea",
+                "reference": "f350df0268e904597e3bd9c4685c53e0e333feea",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.1 || ^8.0"
+            },
+            "require-dev": {
+                "doctrine/coding-standard": "^6.0",
+                "ext-pdo": "*",
+                "ext-phar": "*",
+                "phpbench/phpbench": "^0.13",
+                "phpstan/phpstan-phpunit": "^0.11",
+                "phpstan/phpstan-shim": "^0.11",
+                "phpunit/phpunit": "^7.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.2.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Doctrine\\Instantiator\\": "src/Doctrine/Instantiator/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Marco Pivetta",
+                    "email": "ocramius@gmail.com",
+                    "homepage": "http://ocramius.github.com/"
+                }
+            ],
+            "description": "A small, lightweight utility to instantiate objects in PHP without invoking their constructors",
+            "homepage": "https://www.doctrine-project.org/projects/instantiator.html",
+            "keywords": [
+                "constructor",
+                "instantiate"
+            ],
+            "funding": [
+                {
+                    "url": "https://www.doctrine-project.org/sponsorship.html",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://www.patreon.com/phpdoctrine",
+                    "type": "patreon"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/doctrine%2Finstantiator",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-05-29T17:27:14+00:00"
+        },
+        {
+            "name": "keboola/coding-standard",
+            "version": "9.0.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/keboola/phpcs-standard.git",
+                "reference": "bcf9ac5f664aa3bf816902438c0a8a9187cd4ebb"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/keboola/phpcs-standard/zipball/bcf9ac5f664aa3bf816902438c0a8a9187cd4ebb",
+                "reference": "bcf9ac5f664aa3bf816902438c0a8a9187cd4ebb",
+                "shasum": ""
+            },
+            "require": {
+                "slevomat/coding-standard": "^4.8.6",
+                "squizlabs/php_codesniffer": "^3.2"
+            },
+            "type": "phpcodesniffer-standard",
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "Keboola coding standard",
+            "time": "2019-10-16T11:14:48+00:00"
+        },
+        {
+            "name": "keboola/datadir-tests",
+            "version": "5.0.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/keboola/datadir-tests.git",
+                "reference": "ed345fd3c841a99bb1911a62063fa2227f0128ae"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/keboola/datadir-tests/zipball/ed345fd3c841a99bb1911a62063fa2227f0128ae",
+                "reference": "ed345fd3c841a99bb1911a62063fa2227f0128ae",
+                "shasum": ""
+            },
+            "require": {
+                "keboola/php-temp": "^2.0",
+                "php": "^7.3",
+                "phpunit/phpunit": "^9.0",
+                "symfony/filesystem": "^5.0",
+                "symfony/finder": "^5.0",
+                "symfony/process": "^5.0"
+            },
+            "require-dev": {
+                "jakub-onderka/php-parallel-lint": "^1.0",
+                "keboola/coding-standard": "^9.0",
+                "phpstan/phpstan": "^0.12.14"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Keboola\\DatadirTests\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "Tool for functional testing of Keboola Connection components",
+            "time": "2020-03-19T14:06:05+00:00"
+        },
+        {
+            "name": "keboola/db-adapter-snowflake",
+            "version": "1.0.4",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/keboola/db-adapter-snowflake.git",
+                "reference": "9045ffb57777cc4a29c58a0ddf1c2f7864cf3de2"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/keboola/db-adapter-snowflake/zipball/9045ffb57777cc4a29c58a0ddf1c2f7864cf3de2",
+                "reference": "9045ffb57777cc4a29c58a0ddf1c2f7864cf3de2",
+                "shasum": ""
+            },
+            "require": {
+                "ext-odbc": "*",
+                "php": "^7.1"
+            },
+            "require-dev": {
+                "jakub-onderka/php-parallel-lint": "^1.0",
+                "keboola/coding-standard": ">=7.0.2",
+                "keboola/datadir-tests": "^2.0",
+                "keboola/php-temp": "^1.0",
+                "phpstan/phpstan-shim": "^0.10.6",
+                "phpunit/phpunit": "^7.0",
+                "symfony/process": "^4.0"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Keboola\\SnowflakeDbAdapter\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "time": "2020-01-22T09:55:57+00:00"
+        },
+        {
+            "name": "keboola/php-temp",
+            "version": "2.0.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/keboola/php-temp.git",
+                "reference": "cbdb4dd0dfe548d7bffd74a0e66294981aea49ce"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/keboola/php-temp/zipball/cbdb4dd0dfe548d7bffd74a0e66294981aea49ce",
+                "reference": "cbdb4dd0dfe548d7bffd74a0e66294981aea49ce",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.1",
+                "symfony/filesystem": ">2.8"
+            },
+            "require-dev": {
+                "infection/infection": "^0.12",
+                "jakub-onderka/php-parallel-lint": "^1.0",
+                "keboola/coding-standard": "^8.0",
+                "phpstan/phpstan-shim": "^0.11",
+                "phpunit/phpunit": "^7.0|^8.0"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Keboola\\Temp\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Keboola",
+                    "email": "devel@keboola.com"
+                }
+            ],
+            "description": "Temp library handles application temporary files",
+            "keywords": [
+                "filesystem",
+                "temp"
+            ],
+            "time": "2019-04-26T07:18:24+00:00"
+        },
+        {
+            "name": "myclabs/deep-copy",
+            "version": "1.10.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/myclabs/DeepCopy.git",
+                "reference": "969b211f9a51aa1f6c01d1d2aef56d3bd91598e5"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/myclabs/DeepCopy/zipball/969b211f9a51aa1f6c01d1d2aef56d3bd91598e5",
+                "reference": "969b211f9a51aa1f6c01d1d2aef56d3bd91598e5",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.1 || ^8.0"
+            },
+            "replace": {
+                "myclabs/deep-copy": "self.version"
+            },
+            "require-dev": {
+                "doctrine/collections": "^1.0",
+                "doctrine/common": "^2.6",
+                "phpunit/phpunit": "^7.1"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "DeepCopy\\": "src/DeepCopy/"
+                },
+                "files": [
+                    "src/DeepCopy/deep_copy.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "Create deep copies (clones) of your objects",
+            "keywords": [
+                "clone",
+                "copy",
+                "duplicate",
+                "object",
+                "object graph"
+            ],
+            "funding": [
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/myclabs/deep-copy",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-06-29T13:22:24+00:00"
+        },
+        {
+            "name": "phar-io/manifest",
+            "version": "1.0.3",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/phar-io/manifest.git",
+                "reference": "7761fcacf03b4d4f16e7ccb606d4879ca431fcf4"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/phar-io/manifest/zipball/7761fcacf03b4d4f16e7ccb606d4879ca431fcf4",
+                "reference": "7761fcacf03b4d4f16e7ccb606d4879ca431fcf4",
+                "shasum": ""
+            },
+            "require": {
+                "ext-dom": "*",
+                "ext-phar": "*",
+                "phar-io/version": "^2.0",
+                "php": "^5.6 || ^7.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.0.x-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Arne Blankerts",
+                    "email": "arne@blankerts.de",
+                    "role": "Developer"
+                },
+                {
+                    "name": "Sebastian Heuer",
+                    "email": "sebastian@phpeople.de",
+                    "role": "Developer"
+                },
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de",
+                    "role": "Developer"
+                }
+            ],
+            "description": "Component for reading phar.io manifest information from a PHP Archive (PHAR)",
+            "time": "2018-07-08T19:23:20+00:00"
+        },
+        {
+            "name": "phar-io/version",
+            "version": "2.0.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/phar-io/version.git",
+                "reference": "45a2ec53a73c70ce41d55cedef9063630abaf1b6"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/phar-io/version/zipball/45a2ec53a73c70ce41d55cedef9063630abaf1b6",
+                "reference": "45a2ec53a73c70ce41d55cedef9063630abaf1b6",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^5.6 || ^7.0"
+            },
+            "type": "library",
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Arne Blankerts",
+                    "email": "arne@blankerts.de",
+                    "role": "Developer"
+                },
+                {
+                    "name": "Sebastian Heuer",
+                    "email": "sebastian@phpeople.de",
+                    "role": "Developer"
+                },
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de",
+                    "role": "Developer"
+                }
+            ],
+            "description": "Library for handling version information and constraints",
+            "time": "2018-07-08T19:19:57+00:00"
+        },
+        {
+            "name": "php-parallel-lint/php-parallel-lint",
+            "version": "v1.2.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/php-parallel-lint/PHP-Parallel-Lint.git",
+                "reference": "474f18bc6cc6aca61ca40bfab55139de614e51ca"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/php-parallel-lint/PHP-Parallel-Lint/zipball/474f18bc6cc6aca61ca40bfab55139de614e51ca",
+                "reference": "474f18bc6cc6aca61ca40bfab55139de614e51ca",
+                "shasum": ""
+            },
+            "require": {
+                "ext-json": "*",
+                "php": ">=5.4.0"
+            },
+            "replace": {
+                "grogy/php-parallel-lint": "*",
+                "jakub-onderka/php-parallel-lint": "*"
+            },
+            "require-dev": {
+                "nette/tester": "^1.3 || ^2.0",
+                "php-parallel-lint/php-console-highlighter": "~0.3",
+                "squizlabs/php_codesniffer": "~3.0"
+            },
+            "suggest": {
+                "php-parallel-lint/php-console-highlighter": "Highlight syntax in code snippet"
+            },
+            "bin": [
+                "parallel-lint"
+            ],
+            "type": "library",
+            "autoload": {
+                "classmap": [
+                    "./"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-2-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Jakub Onderka",
+                    "email": "ahoj@jakubonderka.cz"
+                }
+            ],
+            "description": "This tool check syntax of PHP files about 20x faster than serial check.",
+            "homepage": "https://github.com/php-parallel-lint/PHP-Parallel-Lint",
+            "time": "2020-04-04T12:18:32+00:00"
+        },
+        {
+            "name": "phpdocumentor/reflection-common",
+            "version": "2.2.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/phpDocumentor/ReflectionCommon.git",
+                "reference": "1d01c49d4ed62f25aa84a747ad35d5a16924662b"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/phpDocumentor/ReflectionCommon/zipball/1d01c49d4ed62f25aa84a747ad35d5a16924662b",
+                "reference": "1d01c49d4ed62f25aa84a747ad35d5a16924662b",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.2 || ^8.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-2.x": "2.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "phpDocumentor\\Reflection\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Jaap van Otterdijk",
+                    "email": "opensource@ijaap.nl"
+                }
+            ],
+            "description": "Common reflection classes used by phpdocumentor to reflect the code structure",
+            "homepage": "http://www.phpdoc.org",
+            "keywords": [
+                "FQSEN",
+                "phpDocumentor",
+                "phpdoc",
+                "reflection",
+                "static analysis"
+            ],
+            "time": "2020-06-27T09:03:43+00:00"
+        },
+        {
+            "name": "phpdocumentor/reflection-docblock",
+            "version": "5.1.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/phpDocumentor/ReflectionDocBlock.git",
+                "reference": "cd72d394ca794d3466a3b2fc09d5a6c1dc86b47e"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/phpDocumentor/ReflectionDocBlock/zipball/cd72d394ca794d3466a3b2fc09d5a6c1dc86b47e",
+                "reference": "cd72d394ca794d3466a3b2fc09d5a6c1dc86b47e",
+                "shasum": ""
+            },
+            "require": {
+                "ext-filter": "^7.1",
+                "php": "^7.2",
+                "phpdocumentor/reflection-common": "^2.0",
+                "phpdocumentor/type-resolver": "^1.0",
+                "webmozart/assert": "^1"
+            },
+            "require-dev": {
+                "doctrine/instantiator": "^1",
+                "mockery/mockery": "^1"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "5.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "phpDocumentor\\Reflection\\": "src"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Mike van Riel",
+                    "email": "me@mikevanriel.com"
+                },
+                {
+                    "name": "Jaap van Otterdijk",
+                    "email": "account@ijaap.nl"
+                }
+            ],
+            "description": "With this component, a library can provide support for annotations via DocBlocks or otherwise retrieve information that is embedded in a DocBlock.",
+            "time": "2020-02-22T12:28:44+00:00"
+        },
+        {
+            "name": "phpdocumentor/type-resolver",
+            "version": "1.3.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/phpDocumentor/TypeResolver.git",
+                "reference": "e878a14a65245fbe78f8080eba03b47c3b705651"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/phpDocumentor/TypeResolver/zipball/e878a14a65245fbe78f8080eba03b47c3b705651",
+                "reference": "e878a14a65245fbe78f8080eba03b47c3b705651",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.2 || ^8.0",
+                "phpdocumentor/reflection-common": "^2.0"
+            },
+            "require-dev": {
+                "ext-tokenizer": "*"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-1.x": "1.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "phpDocumentor\\Reflection\\": "src"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Mike van Riel",
+                    "email": "me@mikevanriel.com"
+                }
+            ],
+            "description": "A PSR-5 based resolver of Class names, Types and Structural Element Names",
+            "time": "2020-06-27T10:12:23+00:00"
+        },
+        {
+            "name": "phpspec/prophecy",
+            "version": "v1.10.3",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/phpspec/prophecy.git",
+                "reference": "451c3cd1418cf640de218914901e51b064abb093"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/phpspec/prophecy/zipball/451c3cd1418cf640de218914901e51b064abb093",
+                "reference": "451c3cd1418cf640de218914901e51b064abb093",
+                "shasum": ""
+            },
+            "require": {
+                "doctrine/instantiator": "^1.0.2",
+                "php": "^5.3|^7.0",
+                "phpdocumentor/reflection-docblock": "^2.0|^3.0.2|^4.0|^5.0",
+                "sebastian/comparator": "^1.2.3|^2.0|^3.0|^4.0",
+                "sebastian/recursion-context": "^1.0|^2.0|^3.0|^4.0"
+            },
+            "require-dev": {
+                "phpspec/phpspec": "^2.5 || ^3.2",
+                "phpunit/phpunit": "^4.8.35 || ^5.7 || ^6.5 || ^7.1"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.10.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Prophecy\\": "src/Prophecy"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Konstantin Kudryashov",
+                    "email": "ever.zet@gmail.com",
+                    "homepage": "http://everzet.com"
+                },
+                {
+                    "name": "Marcello Duarte",
+                    "email": "marcello.duarte@gmail.com"
+                }
+            ],
+            "description": "Highly opinionated mocking framework for PHP 5.3+",
+            "homepage": "https://github.com/phpspec/prophecy",
+            "keywords": [
+                "Double",
+                "Dummy",
+                "fake",
+                "mock",
+                "spy",
+                "stub"
+            ],
+            "time": "2020-03-05T15:02:03+00:00"
+        },
+        {
+            "name": "phpstan/phpstan",
+            "version": "0.12.32",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/phpstan/phpstan.git",
+                "reference": "d03863f504c8432b3de4d1881f73f6acb8c0e67c"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/phpstan/phpstan/zipball/d03863f504c8432b3de4d1881f73f6acb8c0e67c",
+                "reference": "d03863f504c8432b3de4d1881f73f6acb8c0e67c",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.1"
+            },
+            "conflict": {
+                "phpstan/phpstan-shim": "*"
+            },
+            "bin": [
+                "phpstan",
+                "phpstan.phar"
+            ],
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "0.12-dev"
+                }
+            },
+            "autoload": {
+                "files": [
+                    "bootstrap.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "PHPStan - PHP Static Analysis Tool",
+            "funding": [
+                {
+                    "url": "https://github.com/ondrejmirtes",
+                    "type": "github"
+                },
+                {
+                    "url": "https://www.patreon.com/phpstan",
+                    "type": "patreon"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/phpstan/phpstan",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2020-07-01T11:57:52+00:00"
+        },
+        {
+            "name": "phpunit/php-code-coverage",
+            "version": "8.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/php-code-coverage.git",
+                "reference": "ca6647ffddd2add025ab3f21644a441d7c146cdc"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/php-code-coverage/zipball/ca6647ffddd2add025ab3f21644a441d7c146cdc",
+                "reference": "ca6647ffddd2add025ab3f21644a441d7c146cdc",
+                "shasum": ""
+            },
+            "require": {
+                "ext-dom": "*",
+                "ext-xmlwriter": "*",
+                "php": "^7.3",
+                "phpunit/php-file-iterator": "^3.0",
+                "phpunit/php-text-template": "^2.0",
+                "phpunit/php-token-stream": "^4.0",
+                "sebastian/code-unit-reverse-lookup": "^2.0",
+                "sebastian/environment": "^5.0",
+                "sebastian/version": "^3.0",
+                "theseer/tokenizer": "^1.1.3"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "suggest": {
+                "ext-pcov": "*",
+                "ext-xdebug": "*"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "8.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de",
+                    "role": "lead"
+                }
+            ],
+            "description": "Library that provides collection, processing, and rendering functionality for PHP code coverage information.",
+            "homepage": "https://github.com/sebastianbergmann/php-code-coverage",
+            "keywords": [
+                "coverage",
+                "testing",
+                "xunit"
+            ],
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-05-23T08:02:54+00:00"
+        },
+        {
+            "name": "phpunit/php-file-iterator",
+            "version": "3.0.3",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/php-file-iterator.git",
+                "reference": "8e282e5f5e2db5fb2271b3962ad69875c34a6f41"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/php-file-iterator/zipball/8e282e5f5e2db5fb2271b3962ad69875c34a6f41",
+                "reference": "8e282e5f5e2db5fb2271b3962ad69875c34a6f41",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "3.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de",
+                    "role": "lead"
+                }
+            ],
+            "description": "FilterIterator implementation that filters files based on a list of suffixes.",
+            "homepage": "https://github.com/sebastianbergmann/php-file-iterator/",
+            "keywords": [
+                "filesystem",
+                "iterator"
+            ],
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T11:50:37+00:00"
+        },
+        {
+            "name": "phpunit/php-invoker",
+            "version": "3.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/php-invoker.git",
+                "reference": "f6eedfed1085dd1f4c599629459a0277d25f9a66"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/php-invoker/zipball/f6eedfed1085dd1f4c599629459a0277d25f9a66",
+                "reference": "f6eedfed1085dd1f4c599629459a0277d25f9a66",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "ext-pcntl": "*",
+                "phpunit/phpunit": "^9.0"
+            },
+            "suggest": {
+                "ext-pcntl": "*"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "3.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de",
+                    "role": "lead"
+                }
+            ],
+            "description": "Invoke callables with a timeout",
+            "homepage": "https://github.com/sebastianbergmann/php-invoker/",
+            "keywords": [
+                "process"
+            ],
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T11:53:53+00:00"
+        },
+        {
+            "name": "phpunit/php-text-template",
+            "version": "2.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/php-text-template.git",
+                "reference": "6ff9c8ea4d3212b88fcf74e25e516e2c51c99324"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/php-text-template/zipball/6ff9c8ea4d3212b88fcf74e25e516e2c51c99324",
+                "reference": "6ff9c8ea4d3212b88fcf74e25e516e2c51c99324",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "2.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de",
+                    "role": "lead"
+                }
+            ],
+            "description": "Simple template engine.",
+            "homepage": "https://github.com/sebastianbergmann/php-text-template/",
+            "keywords": [
+                "template"
+            ],
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T11:55:37+00:00"
+        },
+        {
+            "name": "phpunit/php-timer",
+            "version": "5.0.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/php-timer.git",
+                "reference": "cc49734779cbb302bf51a44297dab8c4bbf941e7"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/php-timer/zipball/cc49734779cbb302bf51a44297dab8c4bbf941e7",
+                "reference": "cc49734779cbb302bf51a44297dab8c4bbf941e7",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.2"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "5.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de",
+                    "role": "lead"
+                }
+            ],
+            "description": "Utility class for timing",
+            "homepage": "https://github.com/sebastianbergmann/php-timer/",
+            "keywords": [
+                "timer"
+            ],
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T11:58:13+00:00"
+        },
+        {
+            "name": "phpunit/php-token-stream",
+            "version": "4.0.3",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/php-token-stream.git",
+                "reference": "5672711b6b07b14d5ab694e700c62eeb82fcf374"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/php-token-stream/zipball/5672711b6b07b14d5ab694e700c62eeb82fcf374",
+                "reference": "5672711b6b07b14d5ab694e700c62eeb82fcf374",
+                "shasum": ""
+            },
+            "require": {
+                "ext-tokenizer": "*",
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "4.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de"
+                }
+            ],
+            "description": "Wrapper around PHP's tokenizer extension.",
+            "homepage": "https://github.com/sebastianbergmann/php-token-stream/",
+            "keywords": [
+                "tokenizer"
+            ],
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-27T06:36:25+00:00"
+        },
+        {
+            "name": "phpunit/phpunit",
+            "version": "9.2.5",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/phpunit.git",
+                "reference": "ad7cc5ec3ab2597b329880e30442d9054526023b"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/phpunit/zipball/ad7cc5ec3ab2597b329880e30442d9054526023b",
+                "reference": "ad7cc5ec3ab2597b329880e30442d9054526023b",
+                "shasum": ""
+            },
+            "require": {
+                "doctrine/instantiator": "^1.2.0",
+                "ext-dom": "*",
+                "ext-json": "*",
+                "ext-libxml": "*",
+                "ext-mbstring": "*",
+                "ext-xml": "*",
+                "ext-xmlwriter": "*",
+                "myclabs/deep-copy": "^1.9.1",
+                "phar-io/manifest": "^1.0.3",
+                "phar-io/version": "^2.0.1",
+                "php": "^7.3",
+                "phpspec/prophecy": "^1.8.1",
+                "phpunit/php-code-coverage": "^8.0.1",
+                "phpunit/php-file-iterator": "^3.0",
+                "phpunit/php-invoker": "^3.0",
+                "phpunit/php-text-template": "^2.0",
+                "phpunit/php-timer": "^5.0",
+                "sebastian/code-unit": "^1.0.2",
+                "sebastian/comparator": "^4.0",
+                "sebastian/diff": "^4.0",
+                "sebastian/environment": "^5.0.1",
+                "sebastian/exporter": "^4.0",
+                "sebastian/global-state": "^4.0",
+                "sebastian/object-enumerator": "^4.0",
+                "sebastian/resource-operations": "^3.0",
+                "sebastian/type": "^2.1",
+                "sebastian/version": "^3.0"
+            },
+            "require-dev": {
+                "ext-pdo": "*",
+                "phpspec/prophecy-phpunit": "^2.0"
+            },
+            "suggest": {
+                "ext-soap": "*",
+                "ext-xdebug": "*"
+            },
+            "bin": [
+                "phpunit"
+            ],
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "9.2-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ],
+                "files": [
+                    "src/Framework/Assert/Functions.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de",
+                    "role": "lead"
+                }
+            ],
+            "description": "The PHP Unit Testing framework.",
+            "homepage": "https://phpunit.de/",
+            "keywords": [
+                "phpunit",
+                "testing",
+                "xunit"
+            ],
+            "funding": [
+                {
+                    "url": "https://phpunit.de/donate.html",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-22T07:10:55+00:00"
+        },
+        {
+            "name": "sebastian/code-unit",
+            "version": "1.0.5",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/code-unit.git",
+                "reference": "c1e2df332c905079980b119c4db103117e5e5c90"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/code-unit/zipball/c1e2df332c905079980b119c4db103117e5e5c90",
+                "reference": "c1e2df332c905079980b119c4db103117e5e5c90",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de",
+                    "role": "lead"
+                }
+            ],
+            "description": "Collection of value objects that represent the PHP code units",
+            "homepage": "https://github.com/sebastianbergmann/code-unit",
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T12:50:45+00:00"
+        },
+        {
+            "name": "sebastian/code-unit-reverse-lookup",
+            "version": "2.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/code-unit-reverse-lookup.git",
+                "reference": "ee51f9bb0c6d8a43337055db3120829fa14da819"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/code-unit-reverse-lookup/zipball/ee51f9bb0c6d8a43337055db3120829fa14da819",
+                "reference": "ee51f9bb0c6d8a43337055db3120829fa14da819",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "2.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de"
+                }
+            ],
+            "description": "Looks up which function or method a line of code belongs to",
+            "homepage": "https://github.com/sebastianbergmann/code-unit-reverse-lookup/",
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T12:04:00+00:00"
+        },
+        {
+            "name": "sebastian/comparator",
+            "version": "4.0.3",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/comparator.git",
+                "reference": "dcc580eadfaa4e7f9d2cf9ae1922134ea962e14f"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/comparator/zipball/dcc580eadfaa4e7f9d2cf9ae1922134ea962e14f",
+                "reference": "dcc580eadfaa4e7f9d2cf9ae1922134ea962e14f",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0",
+                "sebastian/diff": "^4.0",
+                "sebastian/exporter": "^4.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "4.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de"
+                },
+                {
+                    "name": "Jeff Welch",
+                    "email": "whatthejeff@gmail.com"
+                },
+                {
+                    "name": "Volker Dusch",
+                    "email": "github@wallbash.com"
+                },
+                {
+                    "name": "Bernhard Schussek",
+                    "email": "bschussek@2bepublished.at"
+                }
+            ],
+            "description": "Provides the functionality to compare PHP values for equality",
+            "homepage": "https://github.com/sebastianbergmann/comparator",
+            "keywords": [
+                "comparator",
+                "compare",
+                "equality"
+            ],
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T12:05:46+00:00"
+        },
+        {
+            "name": "sebastian/diff",
+            "version": "4.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/diff.git",
+                "reference": "1e90b4cf905a7d06c420b1d2e9d11a4dc8a13113"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/diff/zipball/1e90b4cf905a7d06c420b1d2e9d11a4dc8a13113",
+                "reference": "1e90b4cf905a7d06c420b1d2e9d11a4dc8a13113",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0",
+                "symfony/process": "^4.2 || ^5"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "4.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de"
+                },
+                {
+                    "name": "Kore Nordmann",
+                    "email": "mail@kore-nordmann.de"
+                }
+            ],
+            "description": "Diff implementation",
+            "homepage": "https://github.com/sebastianbergmann/diff",
+            "keywords": [
+                "diff",
+                "udiff",
+                "unidiff",
+                "unified diff"
+            ],
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-30T04:46:02+00:00"
+        },
+        {
+            "name": "sebastian/environment",
+            "version": "5.1.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/environment.git",
+                "reference": "0a757cab9d5b7ef49a619f1143e6c9c1bc0fe9d2"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/environment/zipball/0a757cab9d5b7ef49a619f1143e6c9c1bc0fe9d2",
+                "reference": "0a757cab9d5b7ef49a619f1143e6c9c1bc0fe9d2",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "suggest": {
+                "ext-posix": "*"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "5.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de"
+                }
+            ],
+            "description": "Provides functionality to handle HHVM/PHP environments",
+            "homepage": "http://www.github.com/sebastianbergmann/environment",
+            "keywords": [
+                "Xdebug",
+                "environment",
+                "hhvm"
+            ],
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T12:07:24+00:00"
+        },
+        {
+            "name": "sebastian/exporter",
+            "version": "4.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/exporter.git",
+                "reference": "571d721db4aec847a0e59690b954af33ebf9f023"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/exporter/zipball/571d721db4aec847a0e59690b954af33ebf9f023",
+                "reference": "571d721db4aec847a0e59690b954af33ebf9f023",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0",
+                "sebastian/recursion-context": "^4.0"
+            },
+            "require-dev": {
+                "ext-mbstring": "*",
+                "phpunit/phpunit": "^9.2"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "4.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de"
+                },
+                {
+                    "name": "Jeff Welch",
+                    "email": "whatthejeff@gmail.com"
+                },
+                {
+                    "name": "Volker Dusch",
+                    "email": "github@wallbash.com"
+                },
+                {
+                    "name": "Adam Harvey",
+                    "email": "aharvey@php.net"
+                },
+                {
+                    "name": "Bernhard Schussek",
+                    "email": "bschussek@gmail.com"
+                }
+            ],
+            "description": "Provides the functionality to export PHP variables for visualization",
+            "homepage": "http://www.github.com/sebastianbergmann/exporter",
+            "keywords": [
+                "export",
+                "exporter"
+            ],
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T12:08:55+00:00"
+        },
+        {
+            "name": "sebastian/global-state",
+            "version": "4.0.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/global-state.git",
+                "reference": "bdb1e7c79e592b8c82cb1699be3c8743119b8a72"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/global-state/zipball/bdb1e7c79e592b8c82cb1699be3c8743119b8a72",
+                "reference": "bdb1e7c79e592b8c82cb1699be3c8743119b8a72",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3",
+                "sebastian/object-reflector": "^2.0",
+                "sebastian/recursion-context": "^4.0"
+            },
+            "require-dev": {
+                "ext-dom": "*",
+                "phpunit/phpunit": "^9.0"
+            },
+            "suggest": {
+                "ext-uopz": "*"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "4.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de"
+                }
+            ],
+            "description": "Snapshotting of global state",
+            "homepage": "http://www.github.com/sebastianbergmann/global-state",
+            "keywords": [
+                "global state"
+            ],
+            "time": "2020-02-07T06:11:37+00:00"
+        },
+        {
+            "name": "sebastian/object-enumerator",
+            "version": "4.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/object-enumerator.git",
+                "reference": "074fed2d0a6d08e1677dd8ce9d32aecb384917b8"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/object-enumerator/zipball/074fed2d0a6d08e1677dd8ce9d32aecb384917b8",
+                "reference": "074fed2d0a6d08e1677dd8ce9d32aecb384917b8",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0",
+                "sebastian/object-reflector": "^2.0",
+                "sebastian/recursion-context": "^4.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "4.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de"
+                }
+            ],
+            "description": "Traverses array structures and object graphs to enumerate all referenced objects",
+            "homepage": "https://github.com/sebastianbergmann/object-enumerator/",
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T12:11:32+00:00"
+        },
+        {
+            "name": "sebastian/object-reflector",
+            "version": "2.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/object-reflector.git",
+                "reference": "127a46f6b057441b201253526f81d5406d6c7840"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/object-reflector/zipball/127a46f6b057441b201253526f81d5406d6c7840",
+                "reference": "127a46f6b057441b201253526f81d5406d6c7840",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "2.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de"
+                }
+            ],
+            "description": "Allows reflection of object attributes, including inherited and non-public ones",
+            "homepage": "https://github.com/sebastianbergmann/object-reflector/",
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T12:12:55+00:00"
+        },
+        {
+            "name": "sebastian/recursion-context",
+            "version": "4.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/recursion-context.git",
+                "reference": "062231bf61d2b9448c4fa5a7643b5e1829c11d63"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/recursion-context/zipball/062231bf61d2b9448c4fa5a7643b5e1829c11d63",
+                "reference": "062231bf61d2b9448c4fa5a7643b5e1829c11d63",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "4.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de"
+                },
+                {
+                    "name": "Jeff Welch",
+                    "email": "whatthejeff@gmail.com"
+                },
+                {
+                    "name": "Adam Harvey",
+                    "email": "aharvey@php.net"
+                }
+            ],
+            "description": "Provides functionality to recursively process PHP variables",
+            "homepage": "http://www.github.com/sebastianbergmann/recursion-context",
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T12:14:17+00:00"
+        },
+        {
+            "name": "sebastian/resource-operations",
+            "version": "3.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/resource-operations.git",
+                "reference": "0653718a5a629b065e91f774595267f8dc32e213"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/resource-operations/zipball/0653718a5a629b065e91f774595267f8dc32e213",
+                "reference": "0653718a5a629b065e91f774595267f8dc32e213",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "3.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de"
+                }
+            ],
+            "description": "Provides a list of PHP built-in functions that operate on resources",
+            "homepage": "https://www.github.com/sebastianbergmann/resource-operations",
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T12:16:22+00:00"
+        },
+        {
+            "name": "sebastian/type",
+            "version": "2.1.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/type.git",
+                "reference": "56b3ba194e0cbaaf3de7ccd353c289d7a84ed022"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/type/zipball/56b3ba194e0cbaaf3de7ccd353c289d7a84ed022",
+                "reference": "56b3ba194e0cbaaf3de7ccd353c289d7a84ed022",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.2"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "2.1-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de",
+                    "role": "lead"
+                }
+            ],
+            "description": "Collection of value objects that represent the types of the PHP type system",
+            "homepage": "https://github.com/sebastianbergmann/type",
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T12:17:54+00:00"
+        },
+        {
+            "name": "sebastian/version",
+            "version": "3.0.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sebastianbergmann/version.git",
+                "reference": "626586115d0ed31cb71483be55beb759b5af5a3c"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/sebastianbergmann/version/zipball/626586115d0ed31cb71483be55beb759b5af5a3c",
+                "reference": "626586115d0ed31cb71483be55beb759b5af5a3c",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.3 || ^8.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "3.0-dev"
+                }
+            },
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Sebastian Bergmann",
+                    "email": "sebastian@phpunit.de",
+                    "role": "lead"
+                }
+            ],
+            "description": "Library that helps with managing the version number of Git-hosted PHP projects",
+            "homepage": "https://github.com/sebastianbergmann/version",
+            "funding": [
+                {
+                    "url": "https://github.com/sebastianbergmann",
+                    "type": "github"
+                }
+            ],
+            "time": "2020-06-26T12:18:43+00:00"
+        },
+        {
+            "name": "slevomat/coding-standard",
+            "version": "4.8.7",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/slevomat/coding-standard.git",
+                "reference": "bff96313d8c7c2ba57a4edb13c1c141df8988c58"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/slevomat/coding-standard/zipball/bff96313d8c7c2ba57a4edb13c1c141df8988c58",
+                "reference": "bff96313d8c7c2ba57a4edb13c1c141df8988c58",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.1",
+                "squizlabs/php_codesniffer": "^3.4.0"
+            },
+            "require-dev": {
+                "jakub-onderka/php-parallel-lint": "1.0.0",
+                "phing/phing": "2.16.1",
+                "phpstan/phpstan": "0.9.2",
+                "phpstan/phpstan-phpunit": "0.9.4",
+                "phpstan/phpstan-strict-rules": "0.9",
+                "phpunit/phpunit": "7.5.1"
+            },
+            "type": "phpcodesniffer-standard",
+            "autoload": {
+                "psr-4": {
+                    "SlevomatCodingStandard\\": "SlevomatCodingStandard"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "Slevomat Coding Standard for PHP_CodeSniffer complements Consistence Coding Standard by providing sniffs with additional checks.",
+            "time": "2019-01-03T13:15:50+00:00"
+        },
+        {
+            "name": "squizlabs/php_codesniffer",
+            "version": "3.5.5",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/squizlabs/PHP_CodeSniffer.git",
+                "reference": "73e2e7f57d958e7228fce50dc0c61f58f017f9f6"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/squizlabs/PHP_CodeSniffer/zipball/73e2e7f57d958e7228fce50dc0c61f58f017f9f6",
+                "reference": "73e2e7f57d958e7228fce50dc0c61f58f017f9f6",
+                "shasum": ""
+            },
+            "require": {
+                "ext-simplexml": "*",
+                "ext-tokenizer": "*",
+                "ext-xmlwriter": "*",
+                "php": ">=5.4.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^4.0 || ^5.0 || ^6.0 || ^7.0"
+            },
+            "bin": [
+                "bin/phpcs",
+                "bin/phpcbf"
+            ],
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "3.x-dev"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Greg Sherwood",
+                    "role": "lead"
+                }
+            ],
+            "description": "PHP_CodeSniffer tokenizes PHP, JavaScript and CSS files and detects violations of a defined set of coding standards.",
+            "homepage": "https://github.com/squizlabs/PHP_CodeSniffer",
+            "keywords": [
+                "phpcs",
+                "standards"
+            ],
+            "time": "2020-04-17T01:09:41+00:00"
+        },
+        {
+            "name": "theseer/tokenizer",
+            "version": "1.1.3",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/theseer/tokenizer.git",
+                "reference": "11336f6f84e16a720dae9d8e6ed5019efa85a0f9"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/theseer/tokenizer/zipball/11336f6f84e16a720dae9d8e6ed5019efa85a0f9",
+                "reference": "11336f6f84e16a720dae9d8e6ed5019efa85a0f9",
+                "shasum": ""
+            },
+            "require": {
+                "ext-dom": "*",
+                "ext-tokenizer": "*",
+                "ext-xmlwriter": "*",
+                "php": "^7.0"
+            },
+            "type": "library",
+            "autoload": {
+                "classmap": [
+                    "src/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "BSD-3-Clause"
+            ],
+            "authors": [
+                {
+                    "name": "Arne Blankerts",
+                    "email": "arne@blankerts.de",
+                    "role": "Developer"
+                }
+            ],
+            "description": "A small library for converting tokenized PHP source code into XML and potentially other formats",
+            "time": "2019-06-13T22:48:21+00:00"
+        },
+        {
+            "name": "webmozart/assert",
+            "version": "1.9.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/webmozart/assert.git",
+                "reference": "9dc4f203e36f2b486149058bade43c851dd97451"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/webmozart/assert/zipball/9dc4f203e36f2b486149058bade43c851dd97451",
+                "reference": "9dc4f203e36f2b486149058bade43c851dd97451",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^5.3.3 || ^7.0",
+                "symfony/polyfill-ctype": "^1.8"
+            },
+            "conflict": {
+                "phpstan/phpstan": "<0.12.20",
+                "vimeo/psalm": "<3.9.1"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^4.8.36 || ^7.5.13"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Webmozart\\Assert\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Bernhard Schussek",
+                    "email": "bschussek@gmail.com"
+                }
+            ],
+            "description": "Assertions to validate method input/output with nice error messages.",
+            "keywords": [
+                "assert",
+                "check",
+                "validate"
+            ],
+            "time": "2020-06-16T10:16:42+00:00"
+        }
+    ],
+    "aliases": [],
+    "minimum-stability": "stable",
+    "stability-flags": [],
+    "prefer-stable": false,
+    "prefer-lowest": false,
+    "platform": {
+        "php": "^7.4",
+        "ext-json": "*"
+    },
+    "platform-dev": [],
+    "plugin-api-version": "1.1.0"
+}
+
+
+================================================
+File: /phpstan.neon
+================================================
+parameters:
+    checkMissingIterableValueType: false
+    ignoreErrors:
+        - '#Cannot call method end\(\) on Symfony\\Component\\Config\\Definition\\Builder\\NodeParentInterface\|null.#'
+        - '#Cannot call method scalarNode\(\) on Symfony\\Component\\Config\\Definition\\Builder\\NodeParentInterface\|null\.#'
+        - '#\$stack of function array_shift expects array, array<bool\|float\|int\|string, mixed\> given\.#'
+        - '#\$var of function count expects array\|Countable, array<bool\|float\|int\|string, mixed> given\.#'
+
+
+================================================
+File: /tests/phpunit/WriterTest.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\DbWriter\SnowflakeWorkspace\Tests;
+
+use Keboola\Csv\CsvFile;
+use Keboola\DbWriter\SnowflakeWorkspace\Config;
+use Keboola\DbWriter\SnowflakeWorkspace\Configuration\ConfigDefinition;
+use Keboola\DbWriter\SnowflakeWorkspace\Configuration\TestConnectionConfigDefinition;
+use Keboola\DbWriter\SnowflakeWorkspace\Writer\Snowflake;
+use Keboola\SnowflakeDbAdapter\Connection;
+use Keboola\StorageApi\Client;
+use Keboola\StorageApi\Workspaces;
+use Keboola\Temp\Temp;
+use PHPUnit\Framework\Assert;
+use PHPUnit\Framework\TestCase;
+
+class WriterTest extends TestCase
+{
+    private Client $client;
+
+    private array $workspace;
+
+    private ?string $bucketId;
+
+    private const BUCKET_NAME = 'wr-snowflake-workspace';
+
+    protected function setUp(): void
+    {
+        $this->bucketId = null;
+        $this->client = new Client([
+            'url' => getenv('KBC_URL'),
+            'token' => getenv('KBC_TOKEN'),
+        ]);
+
+        $this->prepareWorkspace();
+    }
+
+    private function prepareWorkspace(): void
+    {
+        $workspaces = new Workspaces($this->client);
+        $this->workspace = $workspaces->createWorkspace(['backend' => 'snowflake']);
+    }
+
+    private function prepareBucketAndTable(array $tableOptions = []): void
+    {
+        $bucket = $this->client->getBucketId(self::BUCKET_NAME, 'in');
+        if (!$bucket) {
+            $bucket = $this->client->createBucket(self::BUCKET_NAME, 'in');
+        }
+
+        $this->bucketId = (string) $bucket;
+
+        $csvFile = new CsvFile(__DIR__ . '/data/sales.csv');
+
+        $this->client->createTable($this->bucketId, 'sales', $csvFile, $tableOptions);
+    }
+
+    protected function tearDown(): void
+    {
+        // cleanup workspace
+        $workspaces = new Workspaces($this->client);
+        $workspaces->deleteWorkspace($this->workspace['id']);
+
+        // cleanup tables and bucket
+        if ($this->bucketId) {
+            foreach ($this->client->listTables($this->bucketId) as $table) {
+                $this->client->dropTable($table['id'], ['force' => 'force']);
+            }
+            $this->client->dropBucket($this->bucketId, ['force' => 'force']);
+        }
+    }
+
+    public function testConnection(): void
+    {
+        $config = new Config(
+            [
+                'action' => 'testConnection',
+                'parameters' => [
+                    'workspaceId' => (string) $this->workspace['id'],
+                ],
+            ],
+            new TestConnectionConfigDefinition()
+        );
+        $writer = new Snowflake($this->client, $config);
+        $result = $writer->testConnectionAction();
+
+        Assert::assertArrayHasKey('status', $result);
+        Assert::assertEquals('success', $result['status']);
+    }
+
+    public function testSimpleWrite(): void
+    {
+        $this->prepareBucketAndTable();
+
+        $config = new Config(
+            [
+                'data_dir' => __DIR__ . '/data/',
+                'parameters' => [
+                    'workspaceId' => (string) $this->workspace['id'],
+                    'tableId' => sprintf('%s.sales', $this->bucketId),
+                    'dbName' => 'sales',
+                    'items' => [
+                        [
+                            'name' => 'id',
+                            'dbName' => 'id',
+                            'type' => 'varchar',
+                            'size' => '255',
+                            'nullable' => false,
+                            'default' => '',
+                        ],
+                        [
+                            'name' => 'name',
+                            'dbName' => 'name',
+                            'type' => 'varchar',
+                            'size' => '255',
+                            'nullable' => false,
+                            'default' => '',
+                        ],
+                        [
+                            'name' => 'glasses',
+                            'dbName' => 'glasses',
+                            'type' => 'varchar',
+                            'size' => '255',
+                            'nullable' => false,
+                            'default' => '',
+                        ],
+                        [
+                            'name' => 'age',
+                            'dbName' => 'age',
+                            'type' => 'varchar',
+                            'size' => '10',
+                            'nullable' => false,
+                            'default' => '',
+                        ],
+                    ],
+                ],
+            ],
+            new ConfigDefinition()
+        );
+
+        $writer = new Snowflake($this->client, $config);
+        $writer->runAction();
+
+        $data = $this->getConnection()->fetchAll('select * from "sales";');
+
+        array_walk($data, function (&$item): void {
+            $item = array_values($item);
+        });
+
+        $expectedData = iterator_to_array(new CsvFile(__DIR__ . '/data/sales.csv'));
+        array_shift($expectedData); // shift header
+
+        Assert::assertEquals(count($expectedData), count($data));
+        Assert::assertEquals($expectedData, $data);
+    }
+
+    public function testIncrementalWrite(): void
+    {
+        $this->prepareBucketAndTable(['primaryKey' => 'id']);
+
+        $config = new Config(
+            [
+                'data_dir' => __DIR__ . '/data/',
+                'parameters' => [
+                    'workspaceId' => (string) $this->workspace['id'],
+                    'tableId' => sprintf('%s.sales', $this->bucketId),
+                    'dbName' => 'sales',
+                    'items' => [
+                        [
+                            'name' => 'id',
+                            'dbName' => 'id',
+                            'type' => 'varchar',
+                            'size' => '255',
+                            'nullable' => false,
+                            'default' => '',
+                        ],
+                        [
+                            'name' => 'name',
+                            'dbName' => 'name',
+                            'type' => 'varchar',
+                            'size' => '255',
+                            'nullable' => false,
+                            'default' => '',
+                        ],
+                        [
+                            'name' => 'glasses',
+                            'dbName' => 'glasses',
+                            'type' => 'varchar',
+                            'size' => '255',
+                            'nullable' => false,
+                            'default' => '',
+                        ],
+                        [
+                            'name' => 'age',
+                            'dbName' => 'age',
+                            'type' => 'varchar',
+                            'size' => '10',
+                            'nullable' => false,
+                            'default' => '',
+                        ],
+                    ],
+                ],
+            ],
+            new ConfigDefinition()
+        );
+
+        $writer = new Snowflake($this->client, $config);
+        $writer->runAction();
+
+        $dataBeforeIncrementalWrite = $this->getConnection()->fetchAll('select * from "sales";');
+
+        $temp = new Temp('incrementalWrite');
+        $tempFile = $temp->createTmpFile();
+        $incrementalData = [
+            [
+                'id' => '12',
+                'name' => 'Test incremental write',
+                'glasses' => 'no',
+                'age' => '33',
+            ],
+            [
+                'id' => '13',
+                'name' => 'Test incremental write 2',
+                'glasses' => 'yes',
+                'age' => '44',
+            ],
+        ];
+        $incrementalDataFile = new CsvFile($tempFile->getBasename());
+        $incrementalDataFile->writeRow([
+            'id',
+            'name',
+            'glasses',
+            'age',
+        ]);
+        foreach ($incrementalData as $item) {
+            $incrementalDataFile->writeRow($item);
+        }
+
+        $this->client->writeTable(
+            sprintf('%s.sales', $this->bucketId),
+            $incrementalDataFile,
+            [
+                'incremental' => true,
+            ]
+        );
+
+        $writer = new Snowflake($this->client, $config);
+        $writer->runAction();
+
+        $dataAfterIncrementalWrite = $this->getConnection()->fetchAll('select * from "sales";');
+
+        $dataDiff = array_values(
+            array_filter($dataAfterIncrementalWrite, function ($item) use ($dataBeforeIncrementalWrite) {
+                return !is_int(array_search($item['id'], array_column($dataBeforeIncrementalWrite, 'id')));
+            })
+        );
+
+        Assert::assertCount(10, $dataBeforeIncrementalWrite);
+        Assert::assertCount(12, $dataAfterIncrementalWrite);
+        Assert::assertEquals($incrementalData, $dataDiff);
+    }
+
+    private function getConnection(): Connection
+    {
+        $dbParams = array_filter($this->workspace['connection'], function ($key): bool {
+            return !in_array($key, ['backend']);
+        }, ARRAY_FILTER_USE_KEY);
+
+        return new Connection($dbParams);
+    }
+}
+
+
+================================================
+File: /tests/phpunit/data/sales.csv
+================================================
+"id","name","glasses","age"
+"0","Miro cillik","yes",""
+"1","Ondrej Hlavacek","no",""
+"2","Martin Halamicek","yes",22
+"3","Tomas Kacur","yes",""
+"4","Erik Zigo","no",""
+"5","Marc Raiser","sometimes",""
+"6","Petr Simecek","yes",""
+"7","Jakub Matejka","yes",""
+"8","Ondrej Popelka","no",""
+"11","Ondrej Jodas","yes",""
+
+================================================
+File: /tests/phpunit/bootstrap.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+require __DIR__ . '/../../vendor/autoload.php';
+
+
+================================================
+File: /tests/functional/DatadirTestProvider.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\DbWriter\SnowflakeWorkspace\FunctionalTests;
+
+use Keboola\DatadirTests\DatadirTestsFromDirectoryProvider;
+use Keboola\DatadirTests\DatadirTestSpecification;
+use Keboola\DatadirTests\DatadirTestSpecificationInterface;
+use Symfony\Component\Finder\SplFileInfo;
+
+class DatadirTestProvider extends DatadirTestsFromDirectoryProvider
+{
+    private string $testDirectory;
+
+    /** @var DatadirTestSpecification[][] */
+    protected array $datapoints;
+
+    public function __construct(string $testDirectory = 'tests/functional')
+    {
+        parent::__construct($testDirectory);
+        $this->testDirectory = $testDirectory;
+    }
+
+    /**
+     * @return DatadirTestSpecificationInterface[][]
+     */
+    public function __invoke(): array
+    {
+        $this->datapoints = [];
+        $this->processDirectory($this->testDirectory);
+        return $this->datapoints;
+    }
+
+    protected function processOneTest(SplFileInfo $testSuite): void
+    {
+        $workingDirectory = $testSuite->getPathname();
+
+        $name = $testSuite->getBasename();
+        $sourceDatadirDirectory = $workingDirectory . '/source/data';
+        $expectedStdoutFile = $workingDirectory . '/expected-stdout';
+        $expectedStderrFile = $workingDirectory . '/expected-stderr';
+        $expectedReturnCodeFile = $workingDirectory . '/expected-code';
+        $expectedReturnCode = null;
+        $expectedOutputDirectory = null;
+        $outTemplateDir = $workingDirectory . '/expected/data/out';
+
+        // Added, load stdout from file
+        if (file_exists($expectedStdoutFile)) {
+            $expectedStdout = (string) file_get_contents($expectedStdoutFile);
+        } else {
+            $expectedStdout = null;
+        }
+
+        // Added, load stderr from file
+        if (file_exists($expectedStderrFile)) {
+            $expectedStderr = (string) file_get_contents($expectedStderrFile);
+        } else {
+            $expectedStderr = ''; // expected empty stderr if file not specified
+        }
+
+        if (file_exists($expectedReturnCodeFile)) {
+            $returnCode = trim((string) file_get_contents($expectedReturnCodeFile));
+            if (preg_match('~^[012]$~', $returnCode)) {
+                $expectedReturnCode = (int) $returnCode;
+            } else {
+                throw new \InvalidArgumentException(sprintf(
+                    '%s: Expecting invalid return code (%s). Possible codes are: 0, 1, 2.',
+                    $name,
+                    $returnCode
+                ));
+            }
+        }
+
+        if (file_exists($outTemplateDir)) {
+            if (is_null($expectedReturnCode)) {
+                $expectedReturnCode = 0;
+            }
+            $expectedOutputDirectory = $outTemplateDir;
+        }
+
+        $this->datapoints[$name] = [
+            new DatadirTestSpecification(
+                $sourceDatadirDirectory,
+                $expectedReturnCode,
+                $expectedStdout,
+                $expectedStderr,
+                $expectedOutputDirectory
+            ),
+        ];
+    }
+}
+
+
+================================================
+File: /tests/functional/test-connection/expected-stdout
+================================================
+{"status":"success"}
+
+================================================
+File: /tests/functional/test-connection/source/data/config.json
+================================================
+{
+  "action": "testConnection",
+  "parameters": {
+    "workspaceId": "xxx"
+  }
+}
+
+
+================================================
+File: /tests/functional/test-connection/expected-code
+================================================
+0
+
+================================================
+File: /tests/functional/simple-write/expected/data/out/db-dump/sales.csv
+================================================
+"id","name","glasses","age"
+"0","Miro cillik","yes",""
+"1","Ondrej Hlavacek","no",""
+"2","Martin Halamicek","yes","22"
+"3","Tomas Kacur","yes",""
+"4","Erik Zigo","no",""
+"5","Marc Raiser","sometimes",""
+"6","Petr Simecek","yes",""
+"7","Jakub Matejka","yes",""
+"8","Ondrej Popelka","no",""
+"11","Ondrej Jodas","yes",""
+
+================================================
+File: /tests/functional/simple-write/source/data/config.json
+================================================
+{
+  "parameters": {
+    "workspaceId": "xxx",
+    "tableId": "xxx",
+    "dbName": "sales",
+    "items": [
+      {
+        "name": "id",
+        "dbName": "id",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "name",
+        "dbName": "name",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "glasses",
+        "dbName": "glasses",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "age",
+        "dbName": "age",
+        "type": "varchar",
+        "size": "10",
+        "nullable": false,
+        "default": ""
+      }
+    ]
+  }
+}
+
+
+================================================
+File: /tests/functional/simple-write/source/data/in/tables/sales.csv
+================================================
+"id","name","glasses","age"
+"0","Miro cillik","yes",""
+"1","Ondrej Hlavacek","no",""
+"2","Martin Halamicek","yes","22"
+"3","Tomas Kacur","yes",""
+"4","Erik Zigo","no",""
+"5","Marc Raiser","sometimes",""
+"6","Petr Simecek","yes",""
+"7","Jakub Matejka","yes",""
+"8","Ondrej Popelka","no",""
+"11","Ondrej Jodas","yes",""
+
+================================================
+File: /tests/functional/simple-write/expected-code
+================================================
+0
+
+================================================
+File: /tests/functional/DatadirTest.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\DbWriter\SnowflakeWorkspace\FunctionalTests;
+
+use Keboola\Csv\CsvFile;
+use Keboola\DatadirTests\DatadirTestCase;
+use Keboola\DatadirTests\DatadirTestSpecificationInterface;
+use Keboola\DatadirTests\DatadirTestsProviderInterface;
+use Keboola\SnowflakeDbAdapter\Connection;
+use Keboola\SnowflakeDbAdapter\QueryBuilder;
+use Keboola\StorageApi\Client;
+use Keboola\StorageApi\Workspaces;
+use Symfony\Component\Filesystem\Filesystem;
+
+class DatadirTest extends DatadirTestCase
+{
+    private Client $client;
+
+    private array $workspace;
+
+    private ?Connection $connection = null;
+
+    private ?string $bucketId = null;
+
+    private const BUCKET_NAME = 'wr-snowflake-workspace';
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->client = new Client([
+            'url' => getenv('KBC_URL'),
+            'token' => getenv('KBC_TOKEN'),
+        ]);
+        $workspaces = new Workspaces($this->client);
+        $this->workspace = $workspaces->createWorkspace(['backend' => 'snowflake']);
+    }
+
+    protected function tearDown(): void
+    {
+        // cleanup workspace
+        $workspaces = new Workspaces($this->client);
+        $workspaces->deleteWorkspace($this->workspace['id']);
+
+        // cleanup tables and bucket
+        if ($this->bucketId) {
+            foreach ($this->client->listTables($this->bucketId) as $table) {
+                $this->client->dropTable($table['id'], ['force' => 'force']);
+            }
+            $this->client->dropBucket($this->bucketId, ['force' => 'force']);
+        }
+    }
+
+    /**
+     * @dataProvider provideDatadirSpecifications
+     */
+    public function testDatadir(DatadirTestSpecificationInterface $specification): void
+    {
+        $tempDatadir = $this->getTempDatadir($specification);
+        $this->createBucketAndTable($tempDatadir->getTmpFolder());
+        $this->replacePartOfConfig($tempDatadir->getTmpFolder());
+
+        $process = $this->runScript($tempDatadir->getTmpFolder());
+
+        // Dump database data & create statement after running the script
+        $this->dumpAllTables($tempDatadir->getTmpFolder());
+
+        $this->assertMatchesSpecification($specification, $process, $tempDatadir->getTmpFolder());
+
+        $this->cleanupTables();
+    }
+
+    /**
+     * @return DatadirTestsProviderInterface[]
+     */
+    protected function getDataProviders(): array
+    {
+        return [
+            new DatadirTestProvider($this->getTestFileDir()),
+        ];
+    }
+
+    private function dumpAllTables(string $tempDatadir): void
+    {
+        // Create output dir
+        $dumpDir = $tempDatadir . '/out/db-dump';
+        $fs = new Filesystem();
+        $fs->mkdir($dumpDir, 0777);
+
+        $tables = $this->getConnection()->fetchAll(
+            sprintf(
+                'select * from "INFORMATION_SCHEMA"."TABLES" where "TABLE_SCHEMA" = %s;',
+                QueryBuilder::quote($this->workspace['connection']['schema'])
+            )
+        );
+
+        foreach ($tables as $table) {
+            $csv = new CsvFile(sprintf('%s/%s.csv', $dumpDir, $table['TABLE_NAME']));
+
+            $data = $this->getConnection()->fetchAll(
+                sprintf(
+                    'select * from %s.%s',
+                    QueryBuilder::quoteIdentifier($table['TABLE_SCHEMA']),
+                    QueryBuilder::quoteIdentifier($table['TABLE_NAME'])
+                )
+            );
+
+            // write header
+            $columns = array_keys(current($data));
+            $csv->writeRow($columns);
+
+            //write all data from snflk table
+            foreach ($data as $item) {
+                $csv->writeRow($item);
+            }
+        }
+    }
+
+    private function replacePartOfConfig(string $tempDataDir): void
+    {
+        $configFile = $tempDataDir . '/config.json';
+        $config = json_decode((string) file_get_contents($configFile), true);
+        $config['parameters'] = array_merge(
+            $config['parameters'],
+            [
+                'workspaceId' => (string) $this->workspace['id'],
+            ]
+        );
+        if (isset($config['parameters']['dbName'])) {
+            $config['parameters']['tableId'] = sprintf(
+                '%s.%s',
+                $this->bucketId,
+                $config['parameters']['dbName']
+            );
+        }
+        file_put_contents($configFile, json_encode($config));
+    }
+
+    private function cleanupTables(): void
+    {
+        $tables = $this->getConnection()->fetchAll(
+            sprintf(
+                'select * from "INFORMATION_SCHEMA"."TABLES" where "TABLE_SCHEMA" = %s;',
+                QueryBuilder::quote($this->workspace['connection']['schema'])
+            )
+        );
+
+        foreach ($tables as $table) {
+            $this->getConnection()->query(
+                sprintf(
+                    'DROP TABLE IF EXISTS %s.%s',
+                    QueryBuilder::quoteIdentifier($table['TABLE_SCHEMA']),
+                    QueryBuilder::quoteIdentifier($table['TABLE_NAME'])
+                )
+            );
+        }
+    }
+
+    private function getConnection(): Connection
+    {
+        if (!$this->connection) {
+            $dbParams = array_filter($this->workspace['connection'], function ($key): bool {
+                return !in_array($key, ['backend']);
+            }, ARRAY_FILTER_USE_KEY);
+            $this->connection = new Connection($dbParams);
+        }
+        return $this->connection;
+    }
+
+    private function createBucketAndTable(string $tempDatadir): void
+    {
+        $configFile = $tempDatadir . '/config.json';
+        $config = json_decode((string) file_get_contents($configFile), true);
+
+        if (isset($config['parameters']['dbName'])) {
+            $bucket = $this->client->getBucketId('c-' . self::BUCKET_NAME, 'in');
+            if (!$bucket) {
+                $bucket = $this->client->createBucket(self::BUCKET_NAME, 'in');
+            }
+            $this->bucketId = (string) $bucket;
+
+            $csvFile = new CsvFile(sprintf(
+                '%s/in/tables/%s.csv',
+                $tempDatadir,
+                $config['parameters']['dbName']
+            ));
+
+            $this->client->createTable($this->bucketId, $config['parameters']['dbName'], $csvFile);
+        }
+    }
+}
+
+
+================================================
+File: /tests/functional/filter-data/expected/data/out/db-dump/sales.csv
+================================================
+"id","name","glasses","age"
+"0","Miro cillik","yes",""
+"2","Martin Halamicek","yes","22"
+"3","Tomas Kacur","yes",""
+"6","Petr Simecek","yes",""
+"7","Jakub Matejka","yes",""
+"11","Ondrej Jodas","yes",""
+
+================================================
+File: /tests/functional/filter-data/source/data/config.json
+================================================
+{
+  "parameters": {
+    "workspaceId": "xxx",
+    "tableId": "xxx",
+    "dbName": "sales",
+    "items": [
+      {
+        "name": "id",
+        "dbName": "id",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "name",
+        "dbName": "name",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "glasses",
+        "dbName": "glasses",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "age",
+        "dbName": "age",
+        "type": "varchar",
+        "size": "10",
+        "nullable": false,
+        "default": ""
+      }
+    ]
+  },
+  "storage": {
+    "input": {
+      "tables": [
+        {
+          "where_column": "glasses",
+          "where_values": [
+            "yes"
+          ],
+          "where_operator": "eq"
+        }
+      ]
+    }
+  }
+}
+
+
+================================================
+File: /tests/functional/filter-data/source/data/in/tables/sales.csv
+================================================
+"id","name","glasses","age"
+"0","Miro cillik","yes",""
+"1","Ondrej Hlavacek","no",""
+"2","Martin Halamicek","yes","22"
+"3","Tomas Kacur","yes",""
+"4","Erik Zigo","no",""
+"5","Marc Raiser","sometimes",""
+"6","Petr Simecek","yes",""
+"7","Jakub Matejka","yes",""
+"8","Ondrej Popelka","no",""
+"11","Ondrej Jodas","yes",""
+
+================================================
+File: /tests/functional/filter-data/expected-code
+================================================
+0
+
+================================================
+File: /phpunit.xml.dist
+================================================
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit backupGlobals="false"
+         backupStaticAttributes="false"
+         colors="true"
+         convertErrorsToExceptions="true"
+         convertNoticesToExceptions="true"
+         convertWarningsToExceptions="true"
+         processIsolation="false"
+         stopOnFailure="false"
+         bootstrap="tests/phpunit/bootstrap.php">
+    <testsuite name="Main Test Suite">
+        <directory>tests/phpunit</directory>
+    </testsuite>
+</phpunit>
+
+
+================================================
+File: /.github/workflows/push.yml
+================================================
+name: GitHub Actions
+on: [ push ]
+concurrency: ci # shared KBC projects are used
+env:
+  # Name of the image
+  APP_IMAGE: keboola/wr-snowflake-workspace # must be same in docker-compose.yml
+
+  # Developer portal login
+  KBC_DEVELOPERPORTAL_VENDOR: "keboola"
+  KBC_DEVELOPERPORTAL_APP: "keboola.wr-snowflake-workspace"
+  KBC_DEVELOPERPORTAL_USERNAME: "keboola+wr_snowflake_workspace_gha"
+  KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+
+  KBC_TOKEN: ${{ secrets.KBC_TOKEN }}
+  KBC_URL: "https://connection.keboola.com/"
+
+  # DockerHub login
+  DOCKERHUB_USER: "keboolabot"
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      app_image_tag: ${{ steps.tag.outputs.app_image_tag }}
+      is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
+    steps:
+      -
+        name: Check out the repo
+        uses: actions/checkout@v3
+      -
+        name: Print Docker version
+        run: docker -v
+      -
+        name: Docker login
+        if: env.DOCKERHUB_TOKEN
+        run: docker login --username "$DOCKERHUB_USER" --password "$DOCKERHUB_TOKEN"
+      -
+        name: Build image
+        run: docker build -t $APP_IMAGE .
+      -
+        name: Set image tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
+          echo "Tag = '$TAG', is semantic tag = '$IS_SEMANTIC_TAG'"
+          echo "::set-output name=app_image_tag::$TAG"
+          echo "::set-output name=is_semantic_tag::$IS_SEMANTIC_TAG"
+      -
+        name: Push image to ECR
+        uses: keboola/action-push-to-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ env.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ steps.tag.outputs.app_image_tag }}
+          push_latest: ${{ steps.tag.outputs.is_semantic_tag }}
+          source_image: ${{ env.APP_IMAGE }}
+
+  tests:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Check out the repo
+        uses: actions/checkout@v3
+      -
+        name: Pull image from ECR
+        uses: keboola/action-pull-from-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ env.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.build.outputs.app_image_tag }}
+          target_image: ${{ env.APP_IMAGE}}
+          tag_as_latest: true
+      -
+        name: Run tests
+        run: |
+          docker run -e KBC_URL -e KBC_TOKEN ${{ env.APP_IMAGE }} composer ci
+
+  deploy:
+    needs:
+      - build
+      - tests
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && needs.build.outputs.is_semantic_tag == 'true'
+    steps:
+      -
+        name: Set tag in the Developer Portal
+        uses: keboola/action-set-tag-developer-portal@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ env.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.build.outputs.app_image_tag }}
+
+
+================================================
+File: /composer.json
+================================================
+{
+    "name": "keboola/my-component",
+    "description": "MyComponent description",
+    "license": "MIT",
+    "require": {
+        "php": "^7.4",
+        "ext-json": "*",
+        "keboola/php-component": "^8.1",
+        "keboola/storage-api-client": "^10.14",
+        "psr/log": "^1.1",
+        "symfony/config": "^5.1"
+    },
+    "require-dev": {
+        "keboola/coding-standard": ">=7.0.2",
+        "keboola/datadir-tests": "^5.0",
+        "keboola/db-adapter-snowflake": "1.0.4",
+        "keboola/php-temp": "^2.0",
+        "php-parallel-lint/php-parallel-lint": "^1.2",
+        "phpstan/phpstan": "^0.12.14",
+        "phpunit/phpunit": "^9.0",
+        "symfony/process": "^5.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "Keboola\\DbWriter\\SnowflakeWorkspace\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Keboola\\DbWriter\\SnowflakeWorkspace\\Tests\\": "tests/phpunit/",
+            "Keboola\\DbWriter\\SnowflakeWorkspace\\FunctionalTests\\": "tests/functional/"
+        }
+    },
+    "scripts": {
+        "tests-phpunit": "phpunit",
+        "tests-datadir": "phpunit tests/functional",
+        "tests": [
+            "@tests-phpunit",
+            "@tests-datadir"
+        ],
+
+        "phpstan": "phpstan analyse ./src ./tests --level=max --no-progress -c phpstan.neon",
+        "phpcs": "phpcs -n --ignore=vendor --extensions=php .",
+        "phpcbf": "phpcbf -n --ignore=vendor --extensions=php .",
+        "phplint": "parallel-lint -j 10 --exclude vendor .",
+        "build": [
+            "@phplint",
+            "@phpcs",
+            "@phpstan",
+            "@tests"
+        ],
+        "ci": [
+            "@composer validate --no-check-publish --no-check-all",
+            "@build"
+        ]
+    },
+    "config": {
+        "sort-packages": true,
+        "optimize-autoloader": true
+    }
+}
+
+
+================================================
+File: /.dockerignore
+================================================
+vendor/
+
+
+================================================
+File: /Dockerfile
+================================================
+FROM php:7.4-cli
+
+ARG SNOWFLAKE_ODBC_VERSION=2.25.9
+ARG SNOWFLAKE_GPG_KEY=630D9F3CAB551AF3
+ARG COMPOSER_FLAGS="--prefer-dist --no-interaction"
+ARG DEBIAN_FRONTEND=noninteractive
+ENV COMPOSER_ALLOW_SUPERUSER 1
+ENV COMPOSER_PROCESS_TIMEOUT 3600
+
+WORKDIR /code/
+
+COPY docker/php-prod.ini /usr/local/etc/php/php.ini
+COPY docker/composer-install.sh /tmp/composer-install.sh
+
+RUN apt-get update && apt-get install -y \
+        git \
+        locales \
+        unzip \
+        unixodbc \
+        unixodbc-dev \
+        libpq-dev \
+        debsig-verify \
+	&& rm -r /var/lib/apt/lists/* \
+	&& sed -i 's/^# *\(en_US.UTF-8\)/\1/' /etc/locale.gen \
+	&& locale-gen \
+	&& chmod +x /tmp/composer-install.sh \
+	&& /tmp/composer-install.sh
+
+RUN docker-php-ext-install pdo_pgsql pdo_mysql
+
+ENV LANGUAGE=en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+
+# Install PHP odbc extension
+# https://github.com/docker-library/php/issues/103
+RUN set -x \
+    && docker-php-source extract \
+    && cd /usr/src/php/ext/odbc \
+    && phpize \
+    && sed -ri 's@^ *test +"\$PHP_.*" *= *"no" *&& *PHP_.*=yes *$@#&@g' configure \
+    && ./configure --with-unixODBC=shared,/usr \
+    && docker-php-ext-install odbc \
+    && docker-php-source delete
+
+#snoflake download
+COPY docker/snowflake/snowflake-policy.pol /etc/debsig/policies/$SNOWFLAKE_GPG_KEY/generic.pol
+COPY docker/snowflake/simba.snowflake.ini /usr/lib/snowflake/odbc/lib/simba.snowflake.ini
+ADD https://sfc-repo.azure.snowflakecomputing.com/odbc/linux/$SNOWFLAKE_ODBC_VERSION/snowflake-odbc-$SNOWFLAKE_ODBC_VERSION.x86_64.deb /tmp/snowflake-odbc.deb
+
+# verify snowflake packages
+RUN mkdir -p ~/.gnupg \
+    && chmod 700 ~/.gnupg \
+    && echo "disable-ipv6" >> ~/.gnupg/dirmngr.conf \
+    && mkdir -p /usr/share/debsig/keyrings/$SNOWFLAKE_GPG_KEY \
+    && if ! gpg --keyserver hkp://keys.gnupg.net --recv-keys $SNOWFLAKE_GPG_KEY; then \
+           gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys $SNOWFLAKE_GPG_KEY;  \
+       fi \
+    && gpg --export $SNOWFLAKE_GPG_KEY > /usr/share/debsig/keyrings/$SNOWFLAKE_GPG_KEY/debsig.gpg \
+    && debsig-verify /tmp/snowflake-odbc.deb \
+    && gpg --batch --delete-key --yes $SNOWFLAKE_GPG_KEY \
+    && dpkg -i /tmp/snowflake-odbc.deb
+
+## Composer - deps always cached unless changed
+# First copy only composer files
+COPY composer.* /code/
+
+# Download dependencies, but don't run scripts or init autoloaders as the app is missing
+RUN composer install $COMPOSER_FLAGS --no-scripts --no-autoloader
+
+# Copy rest of the app
+COPY . /code/
+
+# Run normal composer - all deps are cached already
+RUN composer install $COMPOSER_FLAGS
+
+CMD ["php", "/code/src/run.php"]
+
+
+================================================
+File: /README.md
+================================================
+# Snowflake writer
+
+> Writes data from Keboola Connection Storage to Snowflake database
+
+# Options
+The configuration requires following properties:
+
+- `workspaceId` - string (required): workspace identifier from [List workspaces](https://keboola.docs.apiary.io/#reference/workspaces/workspaces-collection/list-workspaces)
+- `tableId` - string (required): table identifier from [List tables](https://keboola.docs.apiary.io/#reference/tables/list-tables/list-all-tables)
+- `dbName` - string (required): name of the table in database
+- `incremental` - bool (optional): incremental writes
+- `items` - array (required): list of columns
+    - `name` - string (required): name from csv file (in Keboola Connection Storage)
+    - `dbName` - string (required): name of the column in table
+    - `type` - string (required): column data type
+    - `size` - string (optional): column size
+    - `nullable` - string (optional): column can be null
+    - `default` - string (optional): default value of the column
+
+# Example configurations
+
+#### Simple write:
+```json
+{
+  "parameters": {
+    "workspaceId": "xyz",
+    "tableId": "in.bucket.table",
+    "dbName": "exampleTable",
+    "items": [
+      {
+        "name": "id",
+        "dbName": "id",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "name",
+        "dbName": "name",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "glasses",
+        "dbName": "glasses",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "age",
+        "dbName": "age",
+        "type": "varchar",
+        "size": "10",
+        "nullable": false,
+        "default": ""
+      }
+    ]
+  }
+}
+```
+
+#### Incremental write:
+
+for using incremental write, you must have defined primary key on the Keboola Connection Storage table
+
+```json
+{
+  "parameters": {
+    "workspaceId": "xyz",
+    "tableId": "in.bucket.table",
+    "dbName": "exampleTable",
+    "incremental": true,
+    "items": [
+      {
+        "name": "id",
+        "dbName": "id",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "name",
+        "dbName": "name",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "glasses",
+        "dbName": "glasses",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "age",
+        "dbName": "age",
+        "type": "varchar",
+        "size": "10",
+        "nullable": false,
+        "default": ""
+      }
+    ]
+  }
+}
+```
+
+### Filtering data
+```json
+{
+  "parameters": {
+    "workspaceId": "xyz",
+    "tableId": "in.bucket.table",
+    "dbName": "exampleTable",
+    "items": [
+      {
+        "name": "id",
+        "dbName": "id",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "name",
+        "dbName": "name",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "glasses",
+        "dbName": "glasses",
+        "type": "varchar",
+        "size": "255",
+        "nullable": false,
+        "default": ""
+      },
+      {
+        "name": "age",
+        "dbName": "age",
+        "type": "varchar",
+        "size": "10",
+        "nullable": false,
+        "default": ""
+      }
+    ]
+  },
+  "storage": {
+    "input": {
+      "tables": [
+        {
+          "where_column": "glasses",
+          "where_values": [
+            "yes"
+          ],
+          "where_operator": "eq"
+        }
+      ]
+    }
+  }
+}
+
+```
+
+## Development
+
+Clone this repository and init the workspace with following command::
+
+```
+git clone https://github.com/keboola/wr-snowflake-workspace
+cd wr-snowflake-workspace
+docker-compose build
+docker-compose run --rm dev composer install --no-scripts
+```
+
+Create `.env` file:
+
+```dotenv
+KBC_URL=
+KBC_TOKEN=
+```
+
+Run the test suite using this command:
+
+```
+docker-compose run --rm dev composer tests
+```
+ 
+
+
