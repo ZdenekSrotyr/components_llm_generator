@@ -227,6 +227,11 @@
 - Repository: https://github.com/keboola/component-adform
 - Description: None
 
+### component-rosnet
+- [Documentation](github/component-rosnet/llm.txt)
+- Repository: https://github.com/keboola/component-rosnet
+- Description: A KBC extractor for Rosnet API (https://api.rosnet.com)
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
