@@ -232,6 +232,11 @@
 - Repository: https://github.com/keboola/component-rosnet
 - Description: A KBC extractor for Rosnet API (https://api.rosnet.com)
 
+### component-embeddings-v2
+- [Documentation](github/component-embeddings-v2/llm.txt)
+- Repository: https://github.com/keboola/component-embeddings-v2
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
