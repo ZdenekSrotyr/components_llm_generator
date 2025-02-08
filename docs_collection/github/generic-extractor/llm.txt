@@ -5,7 +5,13 @@ Directory structure:
     │   ├── jsontest/
     │   │   ├── JsonTests.pl
     │   │   └── Dockerfile
-    │   └── composer-install.sh
+    │   ├── nginx/
+    │   │   └── default.conf
+    │   ├── composer-install.sh
+    │   └── keys/
+    │       ├── keys-to-config-json.py
+    │       └── genkeys.sh
+    ├── .python-version
     ├── apiary.apib
     ├── LICENSE
     ├── phpcs.xml
@@ -1866,6 +1872,7 @@ Directory structure:
     │   │           ├── orders.response
     │   │           ├── orders.request
     │   │           └── config.json
+    │   ├── requirements.in
     │   ├── requirements.txt
     │   ├── Dockerfile
     │   └── README.md
@@ -2041,6 +2048,28 @@ CMD ["perl", "JsonTests.pl", "prefork"]
 
 
 ================================================
+File: /docker/nginx/default.conf
+================================================
+server {
+    listen              443 ssl;
+    server_name         server.local;
+    ssl_certificate     /etc/nginx/server.crt;
+    ssl_certificate_key /etc/nginx/server.key;
+
+    ssl_client_certificate /etc/nginx/ca.crt;
+    ssl_verify_client      optional;
+
+    location / {
+        if ($ssl_client_verify != SUCCESS) {
+            return 403;
+        }
+
+        return 200 '{"name": "Nginx", "type": "server"}';
+    }
+}
+
+
+================================================
 File: /docker/composer-install.sh
 ================================================
 #!/bin/sh
@@ -2060,6 +2089,65 @@ php composer-setup.php --quiet --install-dir=/usr/local/bin/ --filename=composer
 RESULT=$?
 rm composer-setup.php
 exit $RESULT
+
+
+================================================
+File: /docker/keys/keys-to-config-json.py
+================================================
+#!/usr/bin/env python3
+
+import json
+
+
+with open("rootCA.crt") as f:
+    ca_cert = f.read()
+
+with open("client.crt") as f:
+    client_cert = f.read()
+
+with open("client.key") as f:
+    client_key = f.read()
+
+with open("config.json", "w") as f:
+    json.dump(
+        {
+            "api": {
+                "baseUrl": "https://server.local/",
+                "caCertificate": ca_cert,
+                "#clientCertificate": client_cert + client_key,
+            }
+        },
+        f,
+        indent=4,
+    )
+
+
+================================================
+File: /docker/keys/genkeys.sh
+================================================
+echo "creating rootCA"
+openssl genrsa -out rootCA.key 4096
+openssl req -x509 -new -nodes -key rootCA.key -subj "/C=CZ/ST=CZ/O=authority" -days 1024 -out rootCA.crt
+
+echo "creating server keys"
+openssl genrsa -out server.key 2048
+# SAN is required as it is the main place where modern clients check host name (in fact CN can be ignored -- and is by e.g. chrome or requests)
+openssl req -new  -key server.key -subj "/C=CZ/ST=CZ/O=mytest/CN=server.local" -addext "subjectAltName=DNS:server.local" -out server.csr
+# Extensions such as SAN are not coppied by default from CSR when creating the certificate, -copy_extensions is required (semi-recent addition to OpenSSL)
+openssl x509 -req -in server.csr -CA rootCA.crt -CAkey rootCA.key -CAcreateserial -out server.crt -days 500 -copy_extensions copy
+
+echo "creating client keys"
+openssl genrsa -out client.key 2048
+openssl req -new -key client.key -subj "/C=CZ/ST=CZ/O=mytest/CN=client.local" -addext "subjectAltName=DNS:client.local" -out client.csr
+openssl x509 -req -in client.csr -CA rootCA.crt -CAkey rootCA.key -CAcreateserial -out client.crt -days 500 -copy_extensions copy
+
+python3 keys-to-config-json.py
+
+
+================================================
+File: /.python-version
+================================================
+3.12
 
 
 ================================================
@@ -2252,7 +2340,6 @@ File: /phpcs.xml
 ================================================
 File: /docker-compose.yml
 ================================================
-version: '3'
 services:
   app: &app
     build: .
@@ -2289,6 +2376,15 @@ services:
     links:
       - jsontest:jsontest-behind-proxy
 
+  server.local:
+    image: nginx:alpine
+    ports:
+      - "443:443"
+    volumes:
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf
+      - ./docker/keys/server.crt:/etc/nginx/server.crt
+      - ./docker/keys/server.key:/etc/nginx/server.key
+      - ./docker/keys/rootCA.crt:/etc/nginx/ca.crt
 
 
 ================================================
@@ -34128,7 +34224,6 @@ max-line-length = 120
 ================================================
 File: /python-sync-actions/docker-compose.yml
 ================================================
-version: "2"
 services:
   # for development purposes
   dev:
@@ -34136,6 +34231,7 @@ services:
     volumes:
         - ./:/code
         - ./data:/data
+        - ../docker/keys:/code/keys
     environment:
       - KBC_DATADIR=./data
   test:
@@ -34165,11 +34261,24 @@ services:
     tty: true
     stdin_open: true
     ports:
-      - "8888:80"
+      - 8888:80
     volumes:
       - ./tests/calls:/examples/
     environment:
       - KBC_EXAMPLES_DIR=/examples/
+
+  # i was about to create a common network with the generic-extractor compose file
+  # to avoid duplication, but that would create an unnecessary dependency
+  server.local:
+    image: nginx:alpine
+    ports:
+      - "443:443"
+    volumes:
+      - ../docker/nginx/default.conf:/etc/nginx/conf.d/default.conf
+      - ../docker/keys/server.crt:/etc/nginx/server.crt
+      - ../docker/keys/server.key:/etc/nginx/server.key
+      - ../docker/keys/rootCA.crt:/etc/nginx/ca.crt
+
 
 ================================================
 File: /python-sync-actions/src/component.py
@@ -34180,22 +34289,22 @@ Template Component main class.
 """
 import copy
 import logging
+import tempfile
 from io import StringIO
-from typing import List
-
-import requests
-from requests.exceptions import JSONDecodeError
-from keboola.component.base import ComponentBase, sync_action
-from keboola.component.exceptions import UserException
+from typing import Any
 
 import configuration
+import requests
 from actions.curl import build_job_from_curl
 from actions.mapping import infer_mapping
-from configuration import Configuration, ConfigHelpers
-from http_generic.auth import AuthMethodBuilder, AuthBuilderError
+from configuration import ConfigHelpers, Configuration
+from http_generic.auth import AuthBuilderError, AuthMethodBuilder
 from http_generic.client import GenericHttpClient, HttpClientError
 from http_generic.pagination import PaginationBuilder
+from keboola.component.base import ComponentBase, sync_action
+from keboola.component.exceptions import UserException
 from placeholders_utils import PlaceholdersUtils
+from requests.exceptions import JSONDecodeError
 
 MAX_CHILD_CALLS = 20
 
@@ -34235,7 +34344,7 @@ class Component(ComponentBase):
 
         logging.info("Component initialized")
 
-        self._configurations: List[Configuration] = None
+        self._configurations: list[Configuration] = None
         self._configuration: Configuration = None
         self._client: GenericHttpClient = None
         self._parent_params = {}
@@ -34412,7 +34521,7 @@ class Component(ComponentBase):
 
         """
 
-        def find_array_property_path(response_data: dict, result_arrays: list = None) -> list[dict] | None:
+        def find_array_property_path(response_data: dict, result_arrays: list | None = None) -> list[dict] | None:
             """
             Travers all object and find the first array property, return None if there are two array properties
             Args:
@@ -34490,7 +34599,7 @@ class Component(ComponentBase):
 
         return query_parameters
 
-    def make_call(self) -> tuple[list, any, str, str]:
+    def make_call(self) -> tuple[list, Any, str, str]:
         """
         Make call to the API
         Returns:
@@ -34531,16 +34640,35 @@ class Component(ComponentBase):
             # build additional parameters
             query_parameters = {**api_cfg.default_query_parameters.copy(), **request_cfg.query_parameters.copy()}
             query_parameters = self._conf_helpers.fill_in_user_parameters(query_parameters, user_params)
-            ssl_verify = api_cfg.ssl_verification
             timeout = api_cfg.timeout
             # additional_params = self._build_request_parameters(additional_params_cfg)
 
             query_parameters = self._add_page_params(job, query_parameters)
 
-            request_parameters = {'params': query_parameters,
-                                  'headers': new_headers,
-                                  'verify': ssl_verify,
-                                  'timeout': timeout}
+            # if user provided CA certificate or client certificate & key, those will be written to a temp file and used
+            if not api_cfg.ca_cert:
+                ca_cert_file = ""
+            else:
+                with tempfile.NamedTemporaryFile("w", delete=False) as cafp:
+                    ca_cert_file = cafp.name
+                    cafp.write(api_cfg.ca_cert)
+
+            if not api_cfg.client_cert_key:
+                client_cert_key_file = ""
+            else:
+                with tempfile.NamedTemporaryFile("w", delete=False) as ccfp:
+                    client_cert_key_file = ccfp.name
+                    ccfp.write(api_cfg.client_cert_key)
+
+            verify = ca_cert_file if ca_cert_file else api_cfg.ssl_verify
+
+            request_parameters = {
+                "params": query_parameters,
+                "headers": new_headers,
+                "timeout": timeout,
+                "verify": verify,
+                "cert": client_cert_key_file,
+            }
 
             if job.request_content.content_type == configuration.ContentType.json:
                 request_parameters['json'] = job.request_content.body
@@ -34550,13 +34678,15 @@ class Component(ComponentBase):
             row_path = job.request_parameters.endpoint_path
 
             if job.request_parameters.placeholders:
-                placeholders = PlaceholdersUtils.get_params_for_child_jobs(job.request_parameters.placeholders,
-                                                                           self._parent_results, self._parent_params)
+                placeholders = PlaceholdersUtils.get_params_for_child_jobs(
+                    job.request_parameters.placeholders, self._parent_results, self._parent_params
+                )
                 self._parent_params = placeholders[0]
                 row_path = self._fill_placeholders(placeholders, job.request_parameters.endpoint_path)
 
-            self._final_response = self._client.send_request(method=job.request_parameters.method,
-                                                             endpoint_path=row_path, **request_parameters)
+            self._final_response = self._client.send_request(
+                method=job.request_parameters.method, endpoint_path=row_path, **request_parameters
+            )
 
             current_results = self._parse_data(self._final_response.json(), job.data_path)
 
@@ -34781,8 +34911,10 @@ class ApiConfig(ConfigurationBase):
     pagination: dict = field(default_factory=dict)
     authentication: Authentication = None
     retry_config: RetryConfig = field(default_factory=RetryConfig)
-    ssl_verification: bool = True
-    timeout: float = None
+    timeout: float | None = None
+    ssl_verify: bool = True  # toggles requests.[method](verify=True/False)
+    ca_cert: str = ""  # if provided, this value will be written to a temp file and used instead of ssl_verify
+    client_cert_key: str = ""  # client certificate bundled with private key (will also be written to a temp file)
 
 
 @dataclass
@@ -34896,8 +35028,9 @@ def convert_to_v2(configuration: dict) -> list[Configuration]:
     auth_method = configuration.get('config').get('__AUTH_METHOD')
 
     default_headers = _remove_auth_from_dict(default_headers_org, _return_ui_params(configuration), auth_method)
-    default_query_parameters = _remove_auth_from_dict(default_query_parameters_org, _return_ui_params(configuration),
-                                                      auth_method)
+    default_query_parameters = _remove_auth_from_dict(
+        default_query_parameters_org, _return_ui_params(configuration), auth_method
+    )
 
     pagination = {}
     if api_json.get('pagination', {}).get('scrollers'):
@@ -34905,8 +35038,25 @@ def convert_to_v2(configuration: dict) -> list[Configuration]:
     elif api_json.get('pagination'):
         pagination['common'] = api_json.get('pagination')
 
-    api_config = ApiConfig(base_url=base_url, default_headers=default_headers,
-                           default_query_parameters=default_query_parameters, pagination=pagination)
+    if ca_cert := api_json.get("caCertificate"):
+        ca_cert = ca_cert.strip()
+    else:
+        ca_cert = ""
+
+    if client_cert_key := api_json.get("#clientCertificate"):
+        client_cert_ley = client_cert_key.strip()
+    else:
+        client_cert_ley = ""
+
+    api_config = ApiConfig(
+        base_url=base_url,
+        default_headers=default_headers,
+        default_query_parameters=default_query_parameters,
+        pagination=pagination,
+        ssl_verify=api_json.get("ssl_verify", True),
+        ca_cert=ca_cert,
+        client_cert_key=client_cert_ley,
+    )
 
     api_config.retry_config = build_retry_config(configuration)
     api_config.authentication = AuthMethodConverter.convert(configuration)
@@ -35291,8 +35441,6 @@ class ConfigHelpers:
 ================================================
 File: /python-sync-actions/src/http_generic/client.py
 ================================================
-from typing import Tuple, Dict
-
 import requests
 from keboola.http_client import HttpClient
 from requests.adapters import HTTPAdapter
@@ -35312,12 +35460,12 @@ class HttpClientError(Exception):
 class GenericHttpClient(HttpClient):
 
     def __init__(self, base_url: str,
-                 default_http_header: Dict = None,
-                 default_params: Dict = None,
+                 default_http_header: dict = None,
+                 default_params: dict = None,
                  auth_method: AuthMethodBase = None,
                  max_retries: int = 10,
                  backoff_factor: float = 0.3,
-                 status_forcelist: Tuple[int, ...] = (500, 502, 504)
+                 status_forcelist: tuple[int, ...] = (500, 502, 504)
                  ):
         super().__init__(base_url=base_url, max_retries=max_retries, backoff_factor=backoff_factor,
                          status_forcelist=status_forcelist,
@@ -35335,6 +35483,7 @@ class GenericHttpClient(HttpClient):
             self._auth = self._auth_method.login()
 
     def send_request(self, method, endpoint_path, **kwargs):
+        resp = None
         try:
             resp = self._request_raw(method=method, endpoint_path=endpoint_path, is_absolute_path=False, **kwargs)
             resp.raise_for_status()
@@ -40299,12 +40448,12 @@ File: /python-sync-actions/tests/calls/007-page-params-pagenum/config.json
 
 
 ================================================
-File: /python-sync-actions/requirements.txt
+File: /python-sync-actions/requirements.in
 ================================================
-keboola.component==1.6.8
-dataconf==3.3.0
-keboola.http-client==1.0.1
-keboola.utils==1.1.0
+keboola.component
+dataconf
+keboola.http-client
+keboola.utils
 keboola.json-to-csv==0.0.12
 mock==5.1.0
 freezegun==1.5.1
@@ -40313,31 +40462,98 @@ python-dateutil==2.9.0.post0
 
 
 ================================================
+File: /python-sync-actions/requirements.txt
+================================================
+# This file was autogenerated by uv via the following command:
+#    uv pip compile requirements.txt --universal --output-file requirements.all
+certifi==2025.1.31
+    # via requests
+charset-normalizer==3.4.1
+    # via requests
+dataconf==3.3.0
+    # via -r requirements.txt
+dateparser==1.2.0
+    # via keboola-utils
+deprecated==1.2.18
+    # via keboola-component
+freezegun==1.5.1
+    # via -r requirements.txt
+idna==3.10
+    # via requests
+isodate==0.6.1
+    # via dataconf
+keboola-component==1.6.8
+    # via -r requirements.txt
+keboola-http-client==1.0.1
+    # via -r requirements.txt
+keboola-json-to-csv==0.0.12
+    # via -r requirements.txt
+keboola-utils==1.1.0
+    # via -r requirements.txt
+mock==5.1.0
+    # via -r requirements.txt
+nested-lookup==0.2.25
+    # via -r requirements.txt
+pygelf==0.4.2
+    # via keboola-component
+pyhocon==0.3.61
+    # via dataconf
+pyparsing==3.2.1
+    # via
+    #   dataconf
+    #   pyhocon
+python-dateutil==2.9.0.post0
+    # via
+    #   -r requirements.txt
+    #   dataconf
+    #   dateparser
+    #   freezegun
+pytz==2025.1
+    # via
+    #   dateparser
+    #   keboola-component
+    #   keboola-utils
+pyyaml==6.0.2
+    # via dataconf
+regex==2024.11.6
+    # via dateparser
+requests==2.32.3
+    # via keboola-http-client
+six==1.17.0
+    # via
+    #   isodate
+    #   nested-lookup
+    #   python-dateutil
+tzdata==2025.1 ; sys_platform == 'win32'
+    # via tzlocal
+tzlocal==5.2
+    # via dateparser
+urllib3==2.3.0
+    # via requests
+wrapt==1.17.2
+    # via deprecated
+
+
+================================================
 File: /python-sync-actions/Dockerfile
 ================================================
 FROM nikolaik/python-nodejs:python3.12-nodejs18
-ENV PYTHONIOENCODING utf-8
 
-COPY /src /code/src/
-COPY /tests /code/tests/
-COPY requirements.txt /code/requirements.txt
-COPY flake8.cfg /code/flake8.cfg
+RUN apt-get update && apt-get install -y curl
 
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential curl
-
-# Install curlconverter using npm
 RUN npm install --global curlconverter
-
 
 RUN pip install flake8
 
+COPY requirements.txt /code/requirements.txt
 RUN pip install -r /code/requirements.txt
 
+COPY flake8.cfg /code/flake8.cfg
 
+COPY /src /code/src/
+COPY /tests /code/tests/
 
 WORKDIR /code/
-
 
 CMD ["python", "-u", "/code/src/component.py"]
 
@@ -40724,7 +40940,7 @@ Example:
 
 ```
 https://yourDomain.zendesk.com/api/v2/
-```   
+```
 
 -- OR --
 
@@ -40843,7 +41059,7 @@ Moved to [new docs](https://developers.keboola.com/extend/generic-extractor/conf
 - **authentication.type**: `query`
 - **authentication.query.apiKey**: `{"attr": "apiKey"}`
     - this will look for the *apiKey* query parameter value in the config attribute named *apiKey*
-- **authentication.query.sig**: 
+- **authentication.query.sig**:
     ```
     {
         "function": "md5",
@@ -40864,7 +41080,7 @@ Moved to [new docs](https://developers.keboola.com/extend/generic-extractor/conf
             }
         ]
     }
-    ```   
+    ```
     - this will generate a *sig* parameter value from MD5 of merged configuration table attributes *apiKey* and *secret*, followed by current *time()* at the time of the request (time() being the PHP function)
     - Allowed functions are listed below in the *User functions* section
     - If you're using any config parameter by using `"attr": "parameterName"`, it has to be identical string to the one in the actual config, including eventual `#` if KBC Docker's encryption is used.
@@ -41163,7 +41379,7 @@ Moved to [new docs](https://developers.keboola.com/extend/generic-extractor/conf
     - sets which query parameter should contain the limit value (default to `limit`)
 - **pagination.offsetParam**(optional)
     - sets which query parameter should contain the offset value (default to `offset`)
-        
+
         ```
             "api": {
                 "pagination": {
@@ -41173,7 +41389,7 @@ Moved to [new docs](https://developers.keboola.com/extend/generic-extractor/conf
                     "offsetParam": "offset"
                 }
             }
-        ``` 
+        ```
 
 - **pagination.firstPageParams**(optional)
     - Whether or not include limit and offset params in the first request (default to `true`)
@@ -41464,7 +41680,7 @@ Moved to [new docs](https://developers.keboola.com/extend/generic-extractor/conf
                 }
             ]
         }
-        ```    
+        ```
     - **dataType**: Type of data returned by the endpoint. It also describes a table name, where the results will be stored
     - **dataField**: Allows to override which field of the response will be exported.
         - If there's multiple arrays in the response "root" the extractor may not know which array to export and fail
@@ -41537,7 +41753,7 @@ Moved to [new docs](https://developers.keboola.com/extend/generic-extractor/conf
                 "data": {"object": "can't really parse this!"}
             }
         ]
-        ```  
+        ```
 
         - To be able to work with such response, set `"responseFilter": "data"` - it should be a path within each object of the response array, **not** including the key of the response array
         - To filter values within nested arrays, use `"responseFilter": "data.array[].key"`
@@ -41913,15 +42129,78 @@ Best way to create and test new configurations is run extractor in docker contai
 # Running tests:
 ```
 docker compose run --rm tests
-``` 
+```
 
 or (with local source code and vendor copy)
 
 ```
 docker compose run --rm tests-local
-``` 
+```
 
-## License
+# Debugging mTLS support
+
+## Generating certificates
+
+Generate CA, server and client certificates:
+
+```
+# starting from project root
+cd docker/keys
+./genkeys.sh
+```
+
+The script also creates a `config.json` file with the following structure to be pasted into your own `config.json`:
+
+```
+"api": {
+    "baseUrl": "https://server.local/",
+    "caCertificate": "-- rootCA.crt --",
+    "#clientCertificate": "-- client.crt bundled with client.key --",
+}
+```
+
+## Testing in PHP
+
+```
+to be written…
+```
+
+## Testing in Python
+
+1. Run local nginx server:
+    ```
+    # starting from project root
+    cd python-sync-actions
+    docker compose up server.local
+    ```
+1. Create a `config.json` file in `python-sync-actions/data` with the following content:
+    ```
+    {
+        "parameters": {
+            "__SELECTED_JOB": "0",
+            "config": {
+                "jobs": [
+                    {
+                        "__NAME": "mTLS check",
+                        "endpoint": "",
+                        "method": "GET"
+                    }
+                ]
+            },
+            "api": {
+            }
+        }
+    }
+    ```
+1. Paste the `"api"` section generated in the `Generate certificates section` into the newly created config file.
+1. Run the python-sync-actions component:
+    ```
+    cd python-sync-actions
+    docker compose up dev
+    ```
+
+
+# License
 
 MIT licensed, see [LICENSE](./LICENSE) file.
 
