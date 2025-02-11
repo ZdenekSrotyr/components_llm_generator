@@ -1,51 +1,91 @@
 Directory structure:
 └── kds_consulting_team-kds-team.app-mailgun-v2/
-    ├── flake8.cfg
-    ├── deploy.sh
-    ├── docker-compose.yml
-    ├── change_log.md
-    ├── src/
-    │   ├── component.py
-    │   └── mailgun/
-    │       ├── client.py
-    │       └── result.py
-    ├── bitbucket-pipelines.yml
     ├── tests/
-    │   ├── test_component.py
-    │   └── __init__.py
+    │   ├── __init__.py
+    │   └── test_component.py
+    ├── change_log.md
+    ├── Dockerfile
+    ├── flake8.cfg
+    ├── src/
+    │   ├── mailgun/
+    │   │   ├── client.py
+    │   │   └── result.py
+    │   └── component.py
+    ├── LICENSE.md
+    ├── docs/
+    ├── requirements.txt
+    ├── bitbucket-pipelines.yml
     ├── component_config/
-    │   ├── component_long_description.md
-    │   ├── configuration_description.md
     │   ├── component_short_description.md
-    │   ├── stack_parameters.json
     │   ├── configSchema.json
+    │   ├── stack_parameters.json
+    │   ├── configuration_description.md
+    │   ├── component_long_description.md
     │   └── sample-config/
-    │       ├── config.json
     │       ├── in/
     │       │   ├── tables/
-    │       │   │   ├── mailing_list_questionnaire.csv
     │       │   │   ├── mailing_list_questionnaire.csv.manifest
-    │       │   │   ├── _tableattachment_list_questionnaire.csv.manifest
-    │       │   │   └── _tableattachment_list_questionnaire.csv
+    │       │   │   ├── mailing_list_questionnaire.csv
+    │       │   │   ├── _tableattachment_list_questionnaire.csv
+    │       │   │   └── _tableattachment_list_questionnaire.csv.manifest
     │       │   └── files/
-    │       │       ├── 445515655_questionnaire.html
     │       │       ├── 445515655_questionnaire.html.manifest
     │       │       ├── 452610617_questionnaire.html
+    │       │       ├── 445515655_questionnaire.html
     │       │       └── 452610617_questionnaire.html.manifest
-    │       └── out/
-    │           └── tables/
-    │               ├── messages.csv.manifest
-    │               ├── errors.csv
-    │               ├── errors.csv.manifest
-    │               └── messages.csv
+    │       ├── out/
+    │       │   └── tables/
+    │       │       ├── messages.csv
+    │       │       ├── messages.csv.manifest
+    │       │       ├── errors.csv
+    │       │       └── errors.csv.manifest
+    │       └── config.json
+    ├── deploy.sh
+    ├── docker-compose.yml
     ├── scripts/
-    │   ├── update_dev_portal_properties.sh
-    │   └── build_n_test.sh
-    ├── requirements.txt
-    ├── docs/
-    ├── Dockerfile
-    ├── LICENSE.md
+    │   ├── build_n_test.sh
+    │   └── update_dev_portal_properties.sh
     └── README.md
+
+================================================
+File: /change_log.md
+================================================
+**0.1.0**
+Added configuration description
+Added long and short descriptions
+Tweaked documentation
+Added example configuration
+
+**0.0.4**
+Added check for emails larger than 25MB.
+Added documentation.
+Added check for invalid html template.
+Errors loading incrementally to storage.
+
+**0.0.2**
+Configuration Schema added
+
+**0.0.1**
+First working version of the application
+Allows users to send any file from storage or file storage
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.9-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+RUN pip install -r /code/requirements.txt
+WORKDIR /code/
+
+
+CMD ["python3", "-u", "/code/src/component.py"]
+
 
 ================================================
 File: /flake8.cfg
@@ -71,121 +111,162 @@ max-line-length = 120
 
 
 ================================================
-File: /deploy.sh
+File: /src/mailgun/client.py
 ================================================
-#!/bin/sh
-set -e
+import os
+import logging
+from keboola.http_client import HttpClient
+from keboola.component.exceptions import UserException
+from requests.exceptions import JSONDecodeError
 
-env
 
-# compatibility with travis and bitbucket
-if [ ! -z ${BITBUCKET_TAG} ]
-then
-	echo "assigning bitbucket tag"
-	export TAG="$BITBUCKET_TAG"
-elif [ ! -z ${TRAVIS_TAG} ]
-then
-	echo "assigning travis tag"
-	export TAG="$TRAVIS_TAG"
-elif [ ! -z ${GITHUB_TAG} ]
-then
-	echo "assigning github tag"
-	export TAG="$GITHUB_TAG"
-else
-	echo No Tag is set!
-	exit 1
-fi
+REGION_URLS = {
+    'US': 'https://api.mailgun.net/v3',
+    'EU': 'https://api.eu.mailgun.net/v3'
+}
 
-echo "Tag is '${TAG}'"
 
-#check if deployment is triggered only in master
-if [ ${BITBUCKET_BRANCH} != "master" ]; then
-               echo Deploy on tagged commit can be only executed in master!
-               exit 1
-fi
+class AuthenticationError(Exception):
+    pass
 
-# Obtain the component repository and log in
-echo "Obtain the component repository and log in"
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
 
-echo "Set credentials"
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+class MailgunClientException(Exception):
+    pass
 
-# Push to the repository
-echo "Push to the repository"
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${TAG}
-docker push ${REPOSITORY}:latest
 
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
-fi
+class MailgunClient(HttpClient):
+
+    def __init__(self, param_token, param_domain, param_from_name, param_region, param_from_email='postmaster'):
+        if param_region not in REGION_URLS:
+            raise MailgunClientException(f"Unknown region {param_region}. "
+                                         f"Allowed values are: {list(REGION_URLS.keys())}.")
+
+        base_url = os.path.join(REGION_URLS[param_region], param_domain)
+
+        super().__init__(base_url, auth=('api', param_token))
+        self._validate_authentication()
+
+        if param_from_name is None:
+            self.param_from_id = f'{param_from_email}@{param_domain}'
+        else:
+            self.param_from_id = ' '.join([param_from_name, f'<{param_from_email}@{param_domain}>'])
+
+    def _validate_authentication(self):
+
+        req_url = os.path.join(self.base_url, 'events')
+        req_headers = {'accept': 'application/json'}
+        req_params = {'limit': 1}
+
+        validation_request = self.get_raw(req_url, headers=req_headers, params=req_params)
+        _val_sc = validation_request.status_code
+
+        try:
+            _val_js = validation_request.json()
+        except JSONDecodeError as e:
+            raise AuthenticationError(f"Cannot authenticate. Details: "
+                                      f"{validation_request.text} \n"
+                                      f"{e}") from e
+
+        if _val_sc == 200:
+            logging.info("Authentication successful.")
+        else:
+            raise UserException("Authentication was not successful. Please check the credentials.\n"
+                                "Response received: %s - %s." % (_val_sc, _val_js))
+
+    def send_message(self, msg_object):
+
+        req_body = {
+            'from': self.param_from_id,
+            'to': msg_object.email,
+            'subject': msg_object.subject,
+            'html': msg_object.html,
+            'text': msg_object.text
+        }
+
+        if msg_object.delivery_time is not None:
+            req_body['o:deliverytime'] = msg_object.delivery_time
+
+        if msg_object.cc is not None:
+            req_body['cc'] = msg_object.cc
+
+        if msg_object.bcc is not None:
+            req_body['bcc'] = msg_object.bcc
+
+        if msg_object.tags:
+            req_body['o:tag'] = msg_object.tags
+
+        if msg_object.custom_fields is not None:
+            req_body = {**msg_object.custom_fields, **req_body}
+
+        logging.debug(f"Body: {req_body}")
+
+        req_files = []
+        for path in msg_object.attachments:
+            req_files += [('attachment', (os.path.basename(path).replace('_tableattachment_', ''),
+                                          open(path, 'rb').read()))]
+
+        logging.debug(f"Attachments: {req_files}")
+
+        req_url = os.path.join(self.base_url, 'messages')
+        req_send_message = self.post_raw(req_url, files=req_files, data=req_body, is_absolute_path=True)
+        message_sc, message_js = req_send_message.status_code, req_send_message.json()
+
+        logging.debug("Message response:")
+        logging.debug(message_js)
+
+        return message_sc, message_js
 
 
 ================================================
-File: /docker-compose.yml
+File: /src/mailgun/result.py
 ================================================
-version: "2"
-services:
-  # for development purposes
-  dev:
-    build: .
-    volumes:
-        - ./:/code
-        - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-  test:
-    # Use to run flake8 and unittests checks
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-    command:
-      - /bin/sh
-      - /code/scripts/build_n_test.sh
+import csv
+import json
+import os
 
-================================================
-File: /change_log.md
-================================================
-**0.1.0**
-Added configuration description
-Added long and short descriptions
-Tweaked documentation
-Added example configuration
 
-**0.0.4**
-Added check for emails larger than 25MB.
-Added documentation.
-Added check for invalid html template.
-Errors loading incrementally to storage.
+class MailgunWriter:
 
-**0.0.2**
-Configuration Schema added
+    def __init__(self, data_path, table_name, table_fields, primary_keys, incremental=True):
 
-**0.0.1**
-First working version of the application
-Allows users to send any file from storage or file storage
+        self.writer = None
+        self.var_table_path = None
+        self.param_data_path = data_path
+        self.param_table_name = table_name
+        self.param_table_fields = table_fields
+        self.param_pk = primary_keys
+        self.param_incremental = incremental
+
+        self.run()
+
+    def run(self):
+        self.create_writer()
+        self.create_manifest()
+
+    def create_manifest(self):
+
+        _template = {'incremental': self.param_incremental,
+                     'primary_key': self.param_pk}
+
+        _man_path = self.var_table_path + '.manifest'
+
+        with open(_man_path, 'w') as man_file:
+            json.dump(_template, man_file)
+
+    def create_writer(self):
+
+        self.var_table_path = os.path.join(
+            self.param_data_path, self.param_table_name) + '.csv'
+
+        self.writer = csv.DictWriter(open(self.var_table_path, 'w'), fieldnames=self.param_table_fields,
+                                     restval='', extrasaction='ignore', quotechar='\"',
+                                     quoting=csv.QUOTE_ALL)
+
+        self.writer.writeheader()
+
+    def writerow(self, write_dict):
+        self.writer.writerow(write_dict)
+
 
 ================================================
 File: /src/component.py
@@ -600,162 +681,37 @@ if __name__ == "__main__":
 
 
 ================================================
-File: /src/mailgun/client.py
+File: /LICENSE.md
 ================================================
-import os
-import logging
-from keboola.http_client import HttpClient
-from keboola.component.exceptions import UserException
-from requests.exceptions import JSONDecodeError
+The MIT License (MIT)
 
+Copyright (c) 2020 Keboola DS, http://keboola.com
 
-REGION_URLS = {
-    'US': 'https://api.mailgun.net/v3',
-    'EU': 'https://api.eu.mailgun.net/v3'
-}
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
 
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-class AuthenticationError(Exception):
-    pass
-
-
-class MailgunClientException(Exception):
-    pass
-
-
-class MailgunClient(HttpClient):
-
-    def __init__(self, param_token, param_domain, param_from_name, param_region, param_from_email='postmaster'):
-        if param_region not in REGION_URLS:
-            raise MailgunClientException(f"Unknown region {param_region}. "
-                                         f"Allowed values are: {list(REGION_URLS.keys())}.")
-
-        base_url = os.path.join(REGION_URLS[param_region], param_domain)
-
-        super().__init__(base_url, auth=('api', param_token))
-        self._validate_authentication()
-
-        if param_from_name is None:
-            self.param_from_id = f'{param_from_email}@{param_domain}'
-        else:
-            self.param_from_id = ' '.join([param_from_name, f'<{param_from_email}@{param_domain}>'])
-
-    def _validate_authentication(self):
-
-        req_url = os.path.join(self.base_url, 'events')
-        req_headers = {'accept': 'application/json'}
-        req_params = {'limit': 1}
-
-        validation_request = self.get_raw(req_url, headers=req_headers, params=req_params)
-        _val_sc = validation_request.status_code
-
-        try:
-            _val_js = validation_request.json()
-        except JSONDecodeError as e:
-            raise AuthenticationError(f"Cannot authenticate. Details: "
-                                      f"{validation_request.text} \n"
-                                      f"{e}") from e
-
-        if _val_sc == 200:
-            logging.info("Authentication successful.")
-        else:
-            raise UserException("Authentication was not successful. Please check the credentials.\n"
-                                "Response received: %s - %s." % (_val_sc, _val_js))
-
-    def send_message(self, msg_object):
-
-        req_body = {
-            'from': self.param_from_id,
-            'to': msg_object.email,
-            'subject': msg_object.subject,
-            'html': msg_object.html,
-            'text': msg_object.text
-        }
-
-        if msg_object.delivery_time is not None:
-            req_body['o:deliverytime'] = msg_object.delivery_time
-
-        if msg_object.cc is not None:
-            req_body['cc'] = msg_object.cc
-
-        if msg_object.bcc is not None:
-            req_body['bcc'] = msg_object.bcc
-
-        if msg_object.tags:
-            req_body['o:tag'] = msg_object.tags
-
-        if msg_object.custom_fields is not None:
-            req_body = {**msg_object.custom_fields, **req_body}
-
-        logging.debug(f"Body: {req_body}")
-
-        req_files = []
-        for path in msg_object.attachments:
-            req_files += [('attachment', (os.path.basename(path).replace('_tableattachment_', ''),
-                                          open(path, 'rb').read()))]
-
-        logging.debug(f"Attachments: {req_files}")
-
-        req_url = os.path.join(self.base_url, 'messages')
-        req_send_message = self.post_raw(req_url, files=req_files, data=req_body, is_absolute_path=True)
-        message_sc, message_js = req_send_message.status_code, req_send_message.json()
-
-        logging.debug("Message response:")
-        logging.debug(message_js)
-
-        return message_sc, message_js
-
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 ================================================
-File: /src/mailgun/result.py
+File: /requirements.txt
 ================================================
-import csv
-import json
-import os
-
-
-class MailgunWriter:
-
-    def __init__(self, data_path, table_name, table_fields, primary_keys, incremental=True):
-
-        self.writer = None
-        self.var_table_path = None
-        self.param_data_path = data_path
-        self.param_table_name = table_name
-        self.param_table_fields = table_fields
-        self.param_pk = primary_keys
-        self.param_incremental = incremental
-
-        self.run()
-
-    def run(self):
-        self.create_writer()
-        self.create_manifest()
-
-    def create_manifest(self):
-
-        _template = {'incremental': self.param_incremental,
-                     'primary_key': self.param_pk}
-
-        _man_path = self.var_table_path + '.manifest'
-
-        with open(_man_path, 'w') as man_file:
-            json.dump(_template, man_file)
-
-    def create_writer(self):
-
-        self.var_table_path = os.path.join(
-            self.param_data_path, self.param_table_name) + '.csv'
-
-        self.writer = csv.DictWriter(open(self.var_table_path, 'w'), fieldnames=self.param_table_fields,
-                                     restval='', extrasaction='ignore', quotechar='\"',
-                                     quoting=csv.QUOTE_ALL)
-
-        self.writer.writeheader()
-
-    def writerow(self, write_dict):
-        self.writer.writerow(write_dict)
-
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.7.zip#egg=kbc
+keboola.component==1.4.4
+keboola.http_client==1.0.0
+requests==2.31.0
 
 ================================================
 File: /bitbucket-pipelines.yml
@@ -833,32 +789,80 @@ pipelines:
             - ./deploy.sh
 
 ================================================
-File: /component_config/component_long_description.md
+File: /component_config/component_short_description.md
 ================================================
-# Mailgun
+Mailgun is an email automation service. It offers a complete cloud-based email service for sending, receiving and tracking email sent through your websites and applications.
 
-Mailgun is an email automation service. It offers a complete cloud-based email service for sending, receiving and tracking email sent through your websites and applications. This component allows to connect Mailgun with Keboola platform, for sending automation.
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+    "title": "Parameters",
+    "type": "object",
+    "required": [
+        "#apiToken",
+        "domainName",
+        "domainRegion",
+        "fromName"
+    ],
+    "properties": {
+        "#apiToken": {
+            "type": "string",
+            "format": "password",
+            "title": "API Key",
+            "description": "API key for authentication purposes. See <a target='_blank' href='https://help.mailgun.com/hc/en-us/articles/203380100-Where-Can-I-Find-My-API-Key-and-SMTP-Credentials-'>Mailgun documentation</a> for more information.",
+            "propertyOrder": 100,
+            "minLength": 1
+        },
+        "domainName": {
+            "type": "string",
+            "title": "Domain",
+            "description": "Mailgun domain; either sandbox or production version. E.g. johndoe@<b>mydomain.com</b> </br>If sandbox domain is used, please make sure, that all recipients are registered as <a target='_blank' href='https://help.mailgun.com/hc/en-us/articles/217531258-Authorized-Recipients'>authorized recipients</a>.",
+            "propertyOrder": 200,
+            "minLength": 1
+        },
+        "domainRegion": {
+            "type": "string",
+            "enum": [
+                "US",
+                "EU"
+            ],
+            "title": "Region",
+            "description": "Region, where the domain is located.",
+            "default": "US",
+            "uniqueItems": true,
+            "propertyOrder": 300
+        },
+        "fromName": {
+            "type": "string",
+            "title": "Sender Name",
+            "description": "Name to be displayed as email signature of the sender. E.g. '<b>John Doe</b>'",
+            "propertyOrder": 400
+        },
+        "fromEmail": {
+            "type": "string",
+            "title": "Sender's Local Part of Address",
+            "description": "Local part of sender's email. Allows customization of the first part of sending email address. E.g. <b>johndoe</b> @mydomain.com",
+            "propertyOrder": 500
+        },
+        "validation_button": {
+            "type": "button",
+            "format": "test-connection",
+            "propertyOrder": 350,
+            "options": {
+                "async": {
+                    "label": "TEST CONNECTION",
+                    "action": "test_api_key"
+                }
+            }
+        }
+    }
+}
 
-To successfully operate the component, following parameters are required:
-
-- a private API key for Mailgun,
-- a Mailgun domain.
-
-If you're unsure on where to find the API key, follow the steps mentioned in the [documentation](https://help.mailgun.com/hc/en-us/articles/203380100-Where-Can-I-Find-My-API-Key-and-SMTP-Credentials-) on how to obtain the API key. When it comes to Mailgun domains, upon registering each user is provisioned a sandbox domain. The sandbox domain can only send email to [**authorized recipients**](https://help.mailgun.com/hc/en-us/articles/217531258-Authorized-Recipients). The limit is 5 authorized recipients per sandbox domain. It is therefore highly recommended to [register your own domain with Mailgun](https://help.mailgun.com/hc/en-us/articles/202256730-How-do-I-pick-a-domain-name-for-my-Mailgun-account-) to not be limited by sandbox restrictions.
-
-##### Pricing
-
-Note that Mailgun is a paid service and is subject to [Mailgun's Terms Of Service](https://www.mailgun.com/terms/). By default, each domain can send up to 10 000 emails per month for free. For more information about pricing, please visit [Mailgun's pricing explorer](https://www.mailgun.com/pricing).
-
-## Changes from previous version
-
-With a new version of Mailgun component, there were some changes, which make this version non-backwards compatible and hence some effort is required to migrate. Major changes include:
-
-1. A region can be specified in the configuration (see [Parameters](https://bitbucket.org/kds_consulting_team/kds-team.app-mailgun-v2/src/master/README.md#markdown-header-parameters))
-2. Changed column names for input table and support of more Mailgun features (see [Mailing list](https://bitbucket.org/kds_consulting_team/kds-team.app-mailgun-v2/src/master/README.md#markdown-header-mailing-list))
-3. Sending tabular attachments straight from Keboola storage (see [Table input mapping](https://bitbucket.org/kds_consulting_team/kds-team.app-mailgun-v2/src/master/README.md#markdown-header-table-input-mapping))
-4. Improved specification of attachments and templates and automatic selection of latest available file (see [Path specification to template or file attachment](https://bitbucket.org/kds_consulting_team/kds-team.app-mailgun-v2/src/master/README.md#markdown-header-path-specification-to-template-or-file-attachment))
-5. Subject, plain-text or html template are now customized using `{{COLUMN_NAME}}` tags, instead of `%(COLUMN_NAME)s` as before (see [Email customization](https://bitbucket.org/kds_consulting_team/kds-team.app-mailgun-v2/src/master/README.md#markdown-header-email-customization))
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
 
 ================================================
 File: /component_config/configuration_description.md
@@ -1080,101 +1084,32 @@ _tableattachment_table1.csv, graph.png, report.pdf
 ```
 
 ================================================
-File: /component_config/component_short_description.md
+File: /component_config/component_long_description.md
 ================================================
-Mailgun is an email automation service. It offers a complete cloud-based email service for sending, receiving and tracking email sent through your websites and applications.
+# Mailgun
 
-================================================
-File: /component_config/stack_parameters.json
-================================================
-{}
+Mailgun is an email automation service. It offers a complete cloud-based email service for sending, receiving and tracking email sent through your websites and applications. This component allows to connect Mailgun with Keboola platform, for sending automation.
 
-================================================
-File: /component_config/configSchema.json
-================================================
-{
-    "title": "Parameters",
-    "type": "object",
-    "required": [
-        "#apiToken",
-        "domainName",
-        "domainRegion",
-        "fromName"
-    ],
-    "properties": {
-        "#apiToken": {
-            "type": "string",
-            "format": "password",
-            "title": "API Key",
-            "description": "API key for authentication purposes. See <a target='_blank' href='https://help.mailgun.com/hc/en-us/articles/203380100-Where-Can-I-Find-My-API-Key-and-SMTP-Credentials-'>Mailgun documentation</a> for more information.",
-            "propertyOrder": 100,
-            "minLength": 1
-        },
-        "domainName": {
-            "type": "string",
-            "title": "Domain",
-            "description": "Mailgun domain; either sandbox or production version. E.g. johndoe@<b>mydomain.com</b> </br>If sandbox domain is used, please make sure, that all recipients are registered as <a target='_blank' href='https://help.mailgun.com/hc/en-us/articles/217531258-Authorized-Recipients'>authorized recipients</a>.",
-            "propertyOrder": 200,
-            "minLength": 1
-        },
-        "domainRegion": {
-            "type": "string",
-            "enum": [
-                "US",
-                "EU"
-            ],
-            "title": "Region",
-            "description": "Region, where the domain is located.",
-            "default": "US",
-            "uniqueItems": true,
-            "propertyOrder": 300
-        },
-        "fromName": {
-            "type": "string",
-            "title": "Sender Name",
-            "description": "Name to be displayed as email signature of the sender. E.g. '<b>John Doe</b>'",
-            "propertyOrder": 400
-        },
-        "fromEmail": {
-            "type": "string",
-            "title": "Sender's Local Part of Address",
-            "description": "Local part of sender's email. Allows customization of the first part of sending email address. E.g. <b>johndoe</b> @mydomain.com",
-            "propertyOrder": 500
-        },
-        "validation_button": {
-            "type": "button",
-            "format": "test-connection",
-            "propertyOrder": 350,
-            "options": {
-                "async": {
-                    "label": "TEST CONNECTION",
-                    "action": "test_api_key"
-                }
-            }
-        }
-    }
-}
+To successfully operate the component, following parameters are required:
 
-================================================
-File: /component_config/sample-config/config.json
-================================================
-{
-  "parameters": {
-    "#apiToken": "<TOKEN>",
-    "domainName": "<DOMAIN_URL>",
-    "domainRegion": "US",
-    "fromName": "Keboola Mailgun Integration",
-    "fromEmail": "postmaster"
-  },
-  "image_parameters": {},
-  "storage": {}
-}
+- a private API key for Mailgun,
+- a Mailgun domain.
 
-================================================
-File: /component_config/sample-config/in/tables/mailing_list_questionnaire.csv
-================================================
-"ID","name","email","text","subject","attachments","html_file"
-"1234","Testy McTestFace","testymctestface@gmail.com","","Hello {{name}}!","_tableattachment_list_questionnaire.csv, i.png","questionnaire.html"
+If you're unsure on where to find the API key, follow the steps mentioned in the [documentation](https://help.mailgun.com/hc/en-us/articles/203380100-Where-Can-I-Find-My-API-Key-and-SMTP-Credentials-) on how to obtain the API key. When it comes to Mailgun domains, upon registering each user is provisioned a sandbox domain. The sandbox domain can only send email to [**authorized recipients**](https://help.mailgun.com/hc/en-us/articles/217531258-Authorized-Recipients). The limit is 5 authorized recipients per sandbox domain. It is therefore highly recommended to [register your own domain with Mailgun](https://help.mailgun.com/hc/en-us/articles/202256730-How-do-I-pick-a-domain-name-for-my-Mailgun-account-) to not be limited by sandbox restrictions.
+
+##### Pricing
+
+Note that Mailgun is a paid service and is subject to [Mailgun's Terms Of Service](https://www.mailgun.com/terms/). By default, each domain can send up to 10 000 emails per month for free. For more information about pricing, please visit [Mailgun's pricing explorer](https://www.mailgun.com/pricing).
+
+## Changes from previous version
+
+With a new version of Mailgun component, there were some changes, which make this version non-backwards compatible and hence some effort is required to migrate. Major changes include:
+
+1. A region can be specified in the configuration (see [Parameters](https://bitbucket.org/kds_consulting_team/kds-team.app-mailgun-v2/src/master/README.md#markdown-header-parameters))
+2. Changed column names for input table and support of more Mailgun features (see [Mailing list](https://bitbucket.org/kds_consulting_team/kds-team.app-mailgun-v2/src/master/README.md#markdown-header-mailing-list))
+3. Sending tabular attachments straight from Keboola storage (see [Table input mapping](https://bitbucket.org/kds_consulting_team/kds-team.app-mailgun-v2/src/master/README.md#markdown-header-table-input-mapping))
+4. Improved specification of attachments and templates and automatic selection of latest available file (see [Path specification to template or file attachment](https://bitbucket.org/kds_consulting_team/kds-team.app-mailgun-v2/src/master/README.md#markdown-header-path-specification-to-template-or-file-attachment))
+5. Subject, plain-text or html template are now customized using `{{COLUMN_NAME}}` tags, instead of `%(COLUMN_NAME)s` as before (see [Email customization](https://bitbucket.org/kds_consulting_team/kds-team.app-mailgun-v2/src/master/README.md#markdown-header-email-customization))
 
 ================================================
 File: /component_config/sample-config/in/tables/mailing_list_questionnaire.csv.manifest
@@ -1252,6 +1187,19 @@ File: /component_config/sample-config/in/tables/mailing_list_questionnaire.csv.m
 }
 
 ================================================
+File: /component_config/sample-config/in/tables/mailing_list_questionnaire.csv
+================================================
+"ID","name","email","text","subject","attachments","html_file"
+"1234","Testy McTestFace","testymctestface@gmail.com","","Hello {{name}}!","_tableattachment_list_questionnaire.csv, i.png","questionnaire.html"
+
+================================================
+File: /component_config/sample-config/in/tables/_tableattachment_list_questionnaire.csv
+================================================
+"ID","name","email","html_file","subject","attachments","delivery"
+AS:ldaglasdfas;'dl ;akvlad';ls ;kma ;sd ;kaf
+fasljdaskda;'slflknsD ;LF'KASKD AJNFVLLSA;D,ALK
+
+================================================
 File: /component_config/sample-config/in/tables/_tableattachment_list_questionnaire.csv.manifest
 ================================================
 {
@@ -1327,25 +1275,6 @@ File: /component_config/sample-config/in/tables/_tableattachment_list_questionna
 }
 
 ================================================
-File: /component_config/sample-config/in/tables/_tableattachment_list_questionnaire.csv
-================================================
-"ID","name","email","html_file","subject","attachments","delivery"
-AS:ldaglasdfas;'dl ;akvlad';ls ;kma ;sd ;kaf
-fasljdaskda;'slflknsD ;LF'KASKD AJNFVLLSA;D,ALK
-
-================================================
-File: /component_config/sample-config/in/files/445515655_questionnaire.html
-================================================
-<!DOCTYPE html>
-<html>
-
-<body>
-    <p>Hello {{name}},</p>
-</body>
-
-</html>
-
-================================================
 File: /component_config/sample-config/in/files/445515655_questionnaire.html.manifest
 ================================================
 {
@@ -1377,6 +1306,18 @@ File: /component_config/sample-config/in/files/452610617_questionnaire.html
 </html>
 
 ================================================
+File: /component_config/sample-config/in/files/445515655_questionnaire.html
+================================================
+<!DOCTYPE html>
+<html>
+
+<body>
+    <p>Hello {{name}},</p>
+</body>
+
+</html>
+
+================================================
 File: /component_config/sample-config/in/files/452610617_questionnaire.html.manifest
 ================================================
 {
@@ -1392,6 +1333,13 @@ File: /component_config/sample-config/in/files/452610617_questionnaire.html.mani
     "max_age_days": 0,
     "size_bytes": 2482
 }
+
+================================================
+File: /component_config/sample-config/out/tables/messages.csv
+================================================
+"message_id","date","specification","html_file_used","attachments_sent"
+"20200201132125.1.74AAB19741F2684B@sandbox15d3020e03ca4f8db4895fca549a8b3a.mailgun.org","1580563285000","{""ID"": ""1234"", ""name"": ""Testy McTestFace"", ""email"": ""testymctestface@gmail.com"", ""text"": """", ""subject"": ""Hello {{name}}!"", ""attachments"": ""_tableattachment_list_questionnaire.csv, i.png"", ""html_file"": ""questionnaire.html""}","/data/in/files/452610617_questionnaire.html","[""/data/in/tables/_tableattachment_list_questionnaire.csv"",""/data/in/files/i.png""]"
+
 
 ================================================
 File: /component_config/sample-config/out/tables/messages.csv.manifest
@@ -1410,11 +1358,123 @@ File: /component_config/sample-config/out/tables/errors.csv.manifest
 {"incremental": true, "primary_key": ["request_id"]}
 
 ================================================
-File: /component_config/sample-config/out/tables/messages.csv
+File: /component_config/sample-config/config.json
 ================================================
-"message_id","date","specification","html_file_used","attachments_sent"
-"20200201132125.1.74AAB19741F2684B@sandbox15d3020e03ca4f8db4895fca549a8b3a.mailgun.org","1580563285000","{""ID"": ""1234"", ""name"": ""Testy McTestFace"", ""email"": ""testymctestface@gmail.com"", ""text"": """", ""subject"": ""Hello {{name}}!"", ""attachments"": ""_tableattachment_list_questionnaire.csv, i.png"", ""html_file"": ""questionnaire.html""}","/data/in/files/452610617_questionnaire.html","[""/data/in/tables/_tableattachment_list_questionnaire.csv"",""/data/in/files/i.png""]"
+{
+  "parameters": {
+    "#apiToken": "<TOKEN>",
+    "domainName": "<DOMAIN_URL>",
+    "domainRegion": "US",
+    "fromName": "Keboola Mailgun Integration",
+    "fromEmail": "postmaster"
+  },
+  "image_parameters": {},
+  "storage": {}
+}
 
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
 
 ================================================
 File: /scripts/update_dev_portal_properties.sh
@@ -1488,66 +1548,6 @@ else
     echo "shortDescription is empty!"
     exit 1
 fi
-
-================================================
-File: /scripts/build_n_test.sh
-================================================
-#!/bin/sh
-set -e
-
-flake8 --config=flake8.cfg
-python -m unittest discover
-
-================================================
-File: /requirements.txt
-================================================
-https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.7.zip#egg=kbc
-keboola.component==1.4.4
-keboola.http_client==1.0.0
-requests==2.31.0
-
-================================================
-File: /Dockerfile
-================================================
-FROM python:3.8.9-slim
-ENV PYTHONIOENCODING utf-8
-
-COPY . /code/
-
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
-RUN pip install flake8
-RUN pip install -r /code/requirements.txt
-WORKDIR /code/
-
-
-CMD ["python3", "-u", "/code/src/component.py"]
-
-
-================================================
-File: /LICENSE.md
-================================================
-The MIT License (MIT)
-
-Copyright (c) 2020 Keboola DS, http://keboola.com
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files, to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished
-to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
 
 ================================================
 File: /README.md

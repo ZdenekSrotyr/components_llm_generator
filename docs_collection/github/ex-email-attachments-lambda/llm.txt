@@ -1,31 +1,48 @@
 Directory structure:
 └── keboola-ex-email-attachments-lambda/
+    ├── .eslintrc.json
     ├── LICENSE
-    ├── docker-compose.yml
+    ├── cf-stack.json
+    ├── serverless.yml
+    ├── Dockerfile
     ├── src/
     │   ├── handler.js
     │   └── lib/
     │       └── email.js
     ├── .babelrc
-    ├── cf-stack.json
-    ├── test/
-    │   ├── func.js
-    │   ├── email
-    │   ├── email-cc
-    │   ├── handler.js
-    │   ├── lib/
-    │   │   └── email.js
-    │   └── email-multiple-to
-    ├── serverless.yml
+    ├── .dockerignore
+    ├── docker-compose.yml
+    ├── package.json
+    ├── README.md
+    ├── webpack.config.js
     ├── .github/
     │   └── workflows/
     │       └── build_deploy.yml
-    ├── .eslintrc.json
-    ├── package.json
-    ├── .dockerignore
-    ├── Dockerfile
-    ├── webpack.config.js
-    └── README.md
+    └── test/
+        ├── handler.js
+        ├── lib/
+        │   └── email.js
+        ├── func.js
+        ├── email-multiple-to
+        ├── email
+        └── email-cc
+
+================================================
+File: /.eslintrc.json
+================================================
+{
+  "extends": [
+    "@keboola/node"
+  ],
+  "plugins": [
+    "import"
+  ],
+  "env": {
+    "node": true,
+    "mocha": true
+  }
+}
+
 
 ================================================
 File: /LICENSE
@@ -51,217 +68,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
-================================================
-File: /docker-compose.yml
-================================================
-version: "2"
-
-services:
-  app: &app
-    build:
-      context: .
-      dockerfile: ./Dockerfile
-    image: keboola/ex-email-attachments-lambda
-    environment:
-      AWS_ACCESS_KEY_ID:
-      AWS_SECRET_ACCESS_KEY:
-      CLOUDFORMATION_ROLE_ARN:
-      LAMBDA_EXECUTION_ROLE_ARN:
-      DYNAMO_TABLE:
-      EMAIL_DOMAIN:
-      KEBOOLA_STACK:
-      REGION:
-      S3_BUCKET:
-      SERVICE_NAME:
-      STAGE:
-
-  dev:
-    <<: *app
-    volumes:
-      - .:/code
-
-  test-app:
-    <<: *app
-    links:
-      - localstack
-    environment:
-      AWS_ACCESS_KEY_ID: accessKey
-      AWS_SECRET_ACCESS_KEY: secretKey
-      DYNAMO_ENDPOINT: http://localstack:4566
-      DYNAMO_TABLE: emails
-      EMAIL_DOMAIN: import.test.keboola.com
-      REGION: us-east-1
-      S3_BUCKET: emails
-      S3_ENDPOINT: http://localstack:4566
-    command: yarn test-unit
-
-  test-func:
-    <<: *app
-    command: yarn test-func
-
-  deploy:
-    <<: *app
-    command: sh -c 'serverless deploy'
-
-  localstack:
-    image: localstack/localstack:1.4.0
-    ports:
-      - "4566:4566"
-    environment:
-      - "SERVICES=s3,dynamodb"
-
-
-================================================
-File: /src/handler.js
-================================================
-import _ from 'lodash';
-import aws from 'aws-sdk';
-import moment from 'moment';
-import bluebird from 'bluebird';
-import createError from 'http-errors';
-import errorLogger from '@keboola/middy-error-logger';
-import { install } from 'source-map-support';
-import middy from 'middy';
-
-import getRecipientFromEmail from './lib/email';
-
-install();
-process.env.BLUEBIRD_LONG_STACK_TRACES = 1;
-global.Promise = bluebird;
-
-let s3 = new aws.S3({});
-let dynamo = new aws.DynamoDB({ region: process.env.REGION });
-
-export const setS3 = (client) => {
-  s3 = client;
-};
-export const setDynamo = (client) => {
-  dynamo = client;
-};
-
-const getFileName = (mail) => `${mail.address}-${moment().toISOString()}`;
-
-const moveFile = (s3Client, bucket, from, to) => s3Client.copyObject({
-  CopySource: `${bucket}/${from}`,
-  Bucket: bucket,
-  Key: to,
-}).promise()
-  .then(() => s3.deleteObject({ Bucket: bucket, Key: from }).promise());
-
-const handlerFunction = async (event) => {
-  if (!_.has(event, 'Records') || !event.Records.length
-    || !_.has(event.Records[0], 's3') || !_.has(event.Records[0].s3, 'bucket')
-    || !_.has(event.Records[0].s3, 'object')
-    || !_.has(event.Records[0].s3.bucket, 'name')
-    || !_.has(event.Records[0].s3.object, 'key')) {
-    throw Error(`Event is missing. See: ${JSON.stringify(event)}`);
-  }
-  // eslint-disable-next-line no-console
-  console.log('Event', JSON.stringify(event));
-  const bucket = event.Records[0].s3.bucket.name;
-  const sourceKey = event.Records[0].s3.object.key;
-  const path = sourceKey.split('/');
-
-  if (path[0] !== '_incoming') {
-    return { statusCode: 200, body: '' };
-  }
-  if (!_.startsWith(event.Records[0].eventName, 'ObjectCreated:')) {
-    throw Error(`Wrong event triggered. See: ${JSON.stringify(event)}`);
-  }
-
-  // 1) Read the mail from s3
-  const data = await s3.getObject({ Bucket: bucket, Key: sourceKey }).promise()
-    .catch((err) => {
-      if (err.code === 'NotFound' || err.code === 'Forbidden') {
-        throw createError(404, `Uploaded file ${sourceKey} was not found in s3`);
-      }
-      throw err;
-    });
-
-  // 2) Parse destination address from the file and check its existence in Dynamo
-  const mail = await getRecipientFromEmail(data.Body, process.env.EMAIL_DOMAIN);
-  const res = await dynamo.getItem({
-    Key: {
-      Project: { N: mail.project },
-      Config: { S: mail.config },
-    },
-    TableName: process.env.DYNAMO_TABLE,
-  }).promise();
-  if (!_.has(res, 'Item.Email.S')) {
-    throw createError(422, `Email ${mail.address} not valid`);
-  }
-  if (res.Item.Email.S !== mail.address) {
-    throw createError(422, `Email ${mail.address} not valid`);
-  }
-  await moveFile(s3, bucket, sourceKey, `${mail.project}/${mail.config}/${getFileName(mail)}`)
-    .catch((err) => {
-      if (_.has(err, 'statusCode') && err.statusCode === 422) {
-        return moveFile(s3, bucket, `_incoming/${path[1]}`, `_invalid/${getFileName(mail)}`);
-      }
-      throw err;
-    });
-  return { statusCode: 200, body: '' };
-};
-
-// eslint-disable-next-line
-export const handler = middy(handlerFunction)
-  .use(errorLogger());
-
-
-================================================
-File: /src/lib/email.js
-================================================
-import _ from 'lodash';
-import { simpleParser } from 'mailparser';
-import createError from 'http-errors';
-
-export default function getRecipientFromEmail(rawEmail, domain) {
-  return simpleParser(rawEmail)
-    .then((email) => {
-      const recipients = email.to.value;
-      if (_.has(email, 'cc')) {
-        recipients.push(...email.cc.value);
-      }
-      if (_.has(email, 'bcc')) {
-        recipients.push(...email.bcc.value);
-      }
-      // eslint-disable-next-line no-console
-      console.log('recipients', recipients);
-
-      let res;
-      recipients.forEach((item) => {
-        if (_.endsWith(item.address, domain)) {
-          const addressParts = _.split(item.address, '-');
-          if (_.size(addressParts) >= 3) {
-            res = {
-              address: item.address,
-              project: addressParts[0],
-              config: addressParts[1],
-            };
-          }
-        }
-      });
-      if (res) {
-        return res;
-      }
-      throw createError(422, 'Invalid email address');
-    });
-}
-
-
-================================================
-File: /.babelrc
-================================================
-{
-  "presets": [
-    "@babel/env"
-  ],
-  "plugins": [
-    "@babel/plugin-transform-runtime"
-  ]
-}
-
 
 ================================================
 File: /cf-stack.json
@@ -749,6 +555,689 @@ File: /cf-stack.json
 
 
 ================================================
+File: /serverless.yml
+================================================
+service: "${env:SERVICE_NAME}"
+frameworkVersion: '3'
+
+custom:
+  webpack:
+    webpackConfig: 'webpack.config.js'
+    includeModules: true
+    forceExclude:
+      - aws-sdk
+      - serverless
+    packager: 'yarn'
+
+plugins:
+  - serverless-webpack
+
+provider:
+  name: aws
+  region: ${env:REGION}
+  stage: ${env:STAGE}
+  runtime: nodejs16.x
+  memorySize: 512
+  timeout: 30
+  versionFunctions: false
+  deploymentBucket:
+    name: "${env:SERVICE_NAME}-${env:REGION}-deployment"
+  environment:
+    DYNAMO_TABLE: ${env:DYNAMO_TABLE}
+    S3_BUCKET: ${env:S3_BUCKET}
+    EMAIL_DOMAIN: ${env:EMAIL_DOMAIN}
+  iam:
+    deploymentRole: ${env:CLOUDFORMATION_ROLE_ARN}
+    role: ${env:LAMBDA_EXECUTION_ROLE_ARN}
+  stackTags:
+    KeboolaStack: ${env:KEBOOLA_STACK}
+  iamRoleStatements:
+    -  Effect: "Allow"
+       Action:
+         - "s3:PutBucketNotification"
+       Resource:
+         - "arn:aws:s3:::${env:S3_BUCKET}"
+
+package:
+  patterns:
+    - src/handler.js
+    - node_modules/**
+    - '!.env'
+    - '!docker-compose.yml'
+    - '!Dockerfile'
+    - '!package.json'
+    - '!yarn.lock'
+
+functions:
+  s3Handler:
+    handler: src/handler.handler
+    tags:
+      KeboolaStack: ${env:KEBOOLA_STACK}
+    events:
+      -
+        existingS3:
+          bucket: "${env:S3_BUCKET}"
+          events:
+            - "s3:ObjectCreated:*"
+          rules:
+            - prefix: _incoming/
+          existing: true
+
+
+================================================
+File: /Dockerfile
+================================================
+FROM node:16
+
+WORKDIR /code
+
+RUN npm install -g serverless@3.38
+
+COPY package.json yarn.lock ./
+RUN yarn install
+
+COPY . ./
+
+
+================================================
+File: /src/handler.js
+================================================
+import _ from 'lodash';
+import aws from 'aws-sdk';
+import moment from 'moment';
+import bluebird from 'bluebird';
+import createError from 'http-errors';
+import errorLogger from '@keboola/middy-error-logger';
+import { install } from 'source-map-support';
+import middy from 'middy';
+
+import getRecipientFromEmail from './lib/email';
+
+install();
+process.env.BLUEBIRD_LONG_STACK_TRACES = 1;
+global.Promise = bluebird;
+
+let s3 = new aws.S3({});
+let dynamo = new aws.DynamoDB({ region: process.env.REGION });
+
+export const setS3 = (client) => {
+  s3 = client;
+};
+export const setDynamo = (client) => {
+  dynamo = client;
+};
+
+const getFileName = (mail) => `${mail.address}-${moment().toISOString()}`;
+
+const moveFile = (s3Client, bucket, from, to) => s3Client.copyObject({
+  CopySource: `${bucket}/${from}`,
+  Bucket: bucket,
+  Key: to,
+}).promise()
+  .then(() => s3.deleteObject({ Bucket: bucket, Key: from }).promise());
+
+const handlerFunction = async (event) => {
+  if (!_.has(event, 'Records') || !event.Records.length
+    || !_.has(event.Records[0], 's3') || !_.has(event.Records[0].s3, 'bucket')
+    || !_.has(event.Records[0].s3, 'object')
+    || !_.has(event.Records[0].s3.bucket, 'name')
+    || !_.has(event.Records[0].s3.object, 'key')) {
+    throw Error(`Event is missing. See: ${JSON.stringify(event)}`);
+  }
+  // eslint-disable-next-line no-console
+  console.log('Event', JSON.stringify(event));
+  const bucket = event.Records[0].s3.bucket.name;
+  const sourceKey = event.Records[0].s3.object.key;
+  const path = sourceKey.split('/');
+
+  if (path[0] !== '_incoming') {
+    return { statusCode: 200, body: '' };
+  }
+  if (!_.startsWith(event.Records[0].eventName, 'ObjectCreated:')) {
+    throw Error(`Wrong event triggered. See: ${JSON.stringify(event)}`);
+  }
+
+  // 1) Read the mail from s3
+  const data = await s3.getObject({ Bucket: bucket, Key: sourceKey }).promise()
+    .catch((err) => {
+      if (err.code === 'NotFound' || err.code === 'Forbidden') {
+        throw createError(404, `Uploaded file ${sourceKey} was not found in s3`);
+      }
+      throw err;
+    });
+
+  // 2) Parse destination address from the file and check its existence in Dynamo
+  const mail = await getRecipientFromEmail(data.Body, process.env.EMAIL_DOMAIN);
+  const res = await dynamo.getItem({
+    Key: {
+      Project: { N: mail.project },
+      Config: { S: mail.config },
+    },
+    TableName: process.env.DYNAMO_TABLE,
+  }).promise();
+  if (!_.has(res, 'Item.Email.S')) {
+    throw createError(422, `Email ${mail.address} not valid`);
+  }
+  if (res.Item.Email.S !== mail.address) {
+    throw createError(422, `Email ${mail.address} not valid`);
+  }
+  await moveFile(s3, bucket, sourceKey, `${mail.project}/${mail.config}/${getFileName(mail)}`)
+    .catch((err) => {
+      if (_.has(err, 'statusCode') && err.statusCode === 422) {
+        return moveFile(s3, bucket, `_incoming/${path[1]}`, `_invalid/${getFileName(mail)}`);
+      }
+      throw err;
+    });
+  return { statusCode: 200, body: '' };
+};
+
+// eslint-disable-next-line
+export const handler = middy(handlerFunction)
+  .use(errorLogger());
+
+
+================================================
+File: /src/lib/email.js
+================================================
+import _ from 'lodash';
+import { simpleParser } from 'mailparser';
+import createError from 'http-errors';
+
+export default function getRecipientFromEmail(rawEmail, domain) {
+  return simpleParser(rawEmail)
+    .then((email) => {
+      const recipients = email.to.value;
+      if (_.has(email, 'cc')) {
+        recipients.push(...email.cc.value);
+      }
+      if (_.has(email, 'bcc')) {
+        recipients.push(...email.bcc.value);
+      }
+      // eslint-disable-next-line no-console
+      console.log('recipients', recipients);
+
+      let res;
+      recipients.forEach((item) => {
+        if (_.endsWith(item.address, domain)) {
+          const addressParts = _.split(item.address, '-');
+          if (_.size(addressParts) >= 3) {
+            res = {
+              address: item.address,
+              project: addressParts[0],
+              config: addressParts[1],
+            };
+          }
+        }
+      });
+      if (res) {
+        return res;
+      }
+      throw createError(422, 'Invalid email address');
+    });
+}
+
+
+================================================
+File: /.babelrc
+================================================
+{
+  "presets": [
+    "@babel/env"
+  ],
+  "plugins": [
+    "@babel/plugin-transform-runtime"
+  ]
+}
+
+
+================================================
+File: /.dockerignore
+================================================
+.git
+.github
+.idea
+docker-compose.yml
+Dockerfile
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+
+services:
+  app: &app
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    image: keboola/ex-email-attachments-lambda
+    environment:
+      AWS_ACCESS_KEY_ID:
+      AWS_SECRET_ACCESS_KEY:
+      CLOUDFORMATION_ROLE_ARN:
+      LAMBDA_EXECUTION_ROLE_ARN:
+      DYNAMO_TABLE:
+      EMAIL_DOMAIN:
+      KEBOOLA_STACK:
+      REGION:
+      S3_BUCKET:
+      SERVICE_NAME:
+      STAGE:
+
+  dev:
+    <<: *app
+    volumes:
+      - .:/code
+
+  test-app:
+    <<: *app
+    links:
+      - localstack
+    environment:
+      AWS_ACCESS_KEY_ID: accessKey
+      AWS_SECRET_ACCESS_KEY: secretKey
+      DYNAMO_ENDPOINT: http://localstack:4566
+      DYNAMO_TABLE: emails
+      EMAIL_DOMAIN: import.test.keboola.com
+      REGION: us-east-1
+      S3_BUCKET: emails
+      S3_ENDPOINT: http://localstack:4566
+    command: yarn test-unit
+
+  test-func:
+    <<: *app
+    command: yarn test-func
+
+  deploy:
+    <<: *app
+    command: sh -c 'serverless deploy'
+
+  localstack:
+    image: localstack/localstack:1.4.0
+    ports:
+      - "4566:4566"
+    environment:
+      - "SERVICES=s3,dynamodb"
+
+
+================================================
+File: /package.json
+================================================
+{
+  "name": "email-attachments-lambda",
+  "author": "Jakub Matejka <jakub@keboola.com>",
+  "license": "MIT",
+  "version": "1.0.0",
+  "description": "Lambda handler for Keboola Email attachments extractor",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/keboola/ex-email-attachments-lambda.git"
+  },
+  "dependencies": {
+    "@babel/runtime": "^7.4.5",
+    "@keboola/middy-error-logger": "^1.0.3",
+    "bluebird": "^3.4.7",
+    "http-errors": "^1.7.2",
+    "lodash": "^4.17.4",
+    "mailparser": "^3.2.0",
+    "middy": "^0.27.0",
+    "moment": "^2.20.1",
+    "source-map-support": "^0.5.12"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.1.2",
+    "@babel/plugin-transform-runtime": "^7.1.0",
+    "@babel/preset-env": "^7.1.0",
+    "@babel/register": "^7.0.0",
+    "@keboola/eslint-config-node": "^2.0.0",
+    "aws-sdk": "^2.49.0",
+    "babel-core": "^7.0.0-bridge.0",
+    "babel-eslint": "^10.0.1",
+    "babel-loader": "^8.0.5",
+    "eslint": "^7.29.0",
+    "eslint-plugin-import": "^2.14.0",
+    "mocha": "^9.0.1",
+    "serverless": "^3.38.0",
+    "serverless-webpack": "^5.3.0",
+    "sleep-promise": "^9.1.0",
+    "unexpected": "^12.0.3",
+    "uniqid": "^5.0.3",
+    "webpack": "^5.40.0",
+    "webpack-node-externals": "^3.0.0"
+  },
+  "scripts": {
+    "test-unit": "./node_modules/.bin/mocha --bail --exit --timeout 0 --require @babel/register --require source-map-support test/handler.js test/lib",
+    "test-func": "./node_modules/.bin/mocha --bail --exit --timeout 0 --require @babel/register --require source-map-support test/func.js",
+    "lint": "./node_modules/.bin/eslint src test"
+  }
+}
+
+
+================================================
+File: /README.md
+================================================
+# Lambda handler for Email attachments extractor
+
+[![serverless](http://public.serverless.com/badges/v3.svg)](http://www.serverless.com)
+
+Lambda handler for Email attachments extractor. See [keboola/ex-email-attachments](https://github.com/keboola/ex-email-attachments) for more details.
+
+## Installation
+
+1. Download git repository: `git clone git@github.com:keboola/ex-email-attachments-lambda.git`
+2. Create a stack [cf-stack.json](https://github.com/keboola/ex-email-attachments-lambda/blob/master/cf-stack.json) with IAM policies and user groups for deployment and functional testing. You will need to fill parameters:
+    - `ServiceName` - should be the same as `SERVICE_NAME` env var (e.g. `dev-ex-email-attachments-lambda`), and should be unique across all instances
+    - `Stage` - one of: `dev`, `test`, `prod` (again, should be the same as `STAGE` env var)
+    - `DynamoTable` - name of the DynamoDB table created by the extractor
+    - `S3Bucket` - name of the S3 bucket created by the extractor
+3. Create an IAM user for deployment (e.g. `dev-ex-email-attachments-lambda-deploy`) and assign it to the group created in previous step. Create AWS credentials.
+4. Create an IAM user for testing (e.g. `dev-ex-email-attachments-lambda-testing`) and assign it to the group created in previous step. Create AWS credentials.
+5. Create `.env` file from template [.env.template](https://github.com/keboola/ex-email-attachments-lambda/blob/master/.env.template)
+6. Run `docker-compose run --rm dev-deploy`
+
+### CI and deployment
+
+CI is configured on GitHub Action. Deployment is run automatically after releasing a version on GitHub.
+
+
+================================================
+File: /webpack.config.js
+================================================
+const nodeExternals = require('webpack-node-externals');
+const path = require('path');
+const slsw = require('serverless-webpack');
+
+module.exports = {
+  mode: process.env.STAGE === 'prod' ? 'production' : 'development',
+  entry: slsw.lib.entries,
+  target: 'node',
+  devtool: 'source-map',
+  externals: [nodeExternals({
+    modulesFromFile: true,
+  })],
+  module: {
+    rules: [
+      {
+        test: /\.js$/,
+        include: __dirname,
+        exclude: /node_modules/,
+        use: {
+          loader: 'babel-loader',
+          options: {
+            presets: ['@babel/env'],
+            plugins: ['@babel/plugin-transform-runtime'],
+          },
+        },
+      },
+    ],
+  },
+  plugins: [],
+  output: {
+    libraryTarget: 'commonjs',
+    path: path.join(__dirname, '.webpack'),
+    filename: '[name].js',
+  },
+};
+
+
+================================================
+File: /.github/workflows/build_deploy.yml
+================================================
+name: Build & Deploy
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFORMATION_ROLE_ARN: arn:aws:iam::061240556736:role/ci-ex-email-attachments-us-east-1-sls-cf
+      LAMBDA_EXECUTION_ROLE_ARN: arn:aws:iam::061240556736:role/ci-ex-email-attachments-us-east-1-sls-exec
+      DYNAMO_TABLE: ci-ex-email-attachments-us-east-1-emails
+      EMAIL_DOMAIN: import.testing.keboola.com
+      KEBOOLA_STACK: ex-email-attachments
+      REGION: us-east-1
+      S3_BUCKET: ci-ex-email-attachments-us-east-1-emails
+      SERVICE_NAME: ci-ex-email-attachments
+      STAGE: test
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build image
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          load: true
+          tags: keboola/ex-email-attachments-lambda
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run unit tests
+        run: docker-compose run --rm test-app
+
+      - name: Deploy to CI testing
+        run: docker-compose run --rm deploy
+        env:
+          AWS_ACCESS_KEY_ID: [REDACTED]
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CI_DEPLOY_AWS_SECRET_ACCESS_KEY }}
+
+      - name: Run functional tests
+        run: docker-compose run --rm test-func
+        env:
+          AWS_ACCESS_KEY_ID: [REDACTED]
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CI_TEST_AWS_SECRET_ACCESS_KEY }}
+
+  deploy:
+    if: github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: [REDACTED]
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.PROD_DEPLOY_AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build image
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          load: true
+          tags: keboola/ex-email-attachments-lambda
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to production (US)
+        run: docker-compose run --rm deploy
+        env:
+          CLOUDFORMATION_ROLE_ARN: arn:aws:iam::147946154733:role/ex-email-attachments-us-east-1-sls-cf
+          LAMBDA_EXECUTION_ROLE_ARN: arn:aws:iam::147946154733:role/ex-email-attachments-us-east-1-sls-exec
+          DYNAMO_TABLE: ex-email-attachments-us-east-1-emails
+          EMAIL_DOMAIN: import.keboola.com
+          KEBOOLA_STACK: ex-email-attachments
+          REGION: us-east-1
+          S3_BUCKET: ex-email-attachments-us-east-1-emails
+          SERVICE_NAME: ex-email-attachments
+          STAGE: prod
+
+      - name: Deploy to production (EU)
+        run: docker-compose run --rm deploy
+        env:
+          CLOUDFORMATION_ROLE_ARN: arn:aws:iam::147946154733:role/ex-email-attachments-eu-central-1-sls-cf
+          LAMBDA_EXECUTION_ROLE_ARN: arn:aws:iam::147946154733:role/ex-email-attachments-eu-central-1-sls-exec
+          DYNAMO_TABLE: ex-email-attachments-eu-central-1-emails
+          EMAIL_DOMAIN: import.eu-central-1.keboola.com
+          KEBOOLA_STACK: ex-email-attachments
+          REGION: eu-central-1
+          S3_BUCKET: ex-email-attachments-eu-central-1-emails
+          SERVICE_NAME: ex-email-attachments
+          STAGE: prod
+
+
+================================================
+File: /test/handler.js
+================================================
+import _ from 'lodash';
+import expect from 'unexpected';
+import fs from 'fs';
+import aws from 'aws-sdk';
+import Promise from 'bluebird';
+import uniqid from 'uniqid';
+import { handler, setDynamo, setS3 } from '../src/handler';
+
+aws.config.setPromisesDependency(Promise);
+
+const s3 = new aws.S3({
+  s3ForcePathStyle: true,
+  endpoint: new aws.Endpoint(process.env.S3_ENDPOINT),
+  sslEnabled: false,
+});
+setS3(s3);
+
+const dynamo = new aws.DynamoDB({
+  region: process.env.REGION,
+  endpoint: process.env.DYNAMO_ENDPOINT,
+});
+setDynamo(dynamo);
+
+describe('Handler', () => {
+  before(() => dynamo.deleteTable({ TableName: process.env.DYNAMO_TABLE }).promise()
+    .catch(() => null)
+    .then(() => dynamo.createTable({
+      TableName: process.env.DYNAMO_TABLE,
+      AttributeDefinitions: [
+        { AttributeName: 'Project', AttributeType: 'N' },
+        { AttributeName: 'Config', AttributeType: 'S' },
+      ],
+      KeySchema: [
+        { AttributeName: 'Project', KeyType: 'HASH' },
+        { AttributeName: 'Config', KeyType: 'RANGE' },
+      ],
+      ProvisionedThroughput: { ReadCapacityUnits: 1, WriteCapacityUnits: 1 },
+    }).promise())
+    .then(() => s3.createBucket({ Bucket: process.env.S3_BUCKET }).promise()));
+
+  const incomingFile = `test_${Math.random()}`;
+  const incomingKey = `_incoming/${incomingFile}`;
+  const projectId = _.random(1, 128);
+  const config = uniqid();
+  const email = `${projectId}-${config}-1234@import.test.keboola.com`;
+  const file = _.replace(fs.readFileSync(`${__dirname}/email`), '{{EMAIL}}', email);
+
+  it('Handle', () => dynamo.putItem({
+    Item: {
+      Project: { N: `${projectId}` },
+      Config: { S: config },
+      Email: { S: email },
+    },
+    TableName: process.env.DYNAMO_TABLE,
+  }).promise()
+    .then(() => s3.putObject({
+      Body: file,
+      Bucket: process.env.S3_BUCKET,
+      Key: incomingKey,
+    }).promise())
+    .then(() => handler({
+      Records: [
+        {
+          eventName: 'ObjectCreated:Put',
+          s3: {
+            bucket: {
+              name: process.env.S3_BUCKET,
+            },
+            object: {
+              key: incomingKey,
+            },
+          },
+        },
+      ],
+    }, {}, () => expect(s3.headObject({ Bucket: process.env.S3_BUCKET, Key: incomingKey }).promise(), 'to be rejected')
+      .then(() => s3.listObjects({ Bucket: process.env.S3_BUCKET, Prefix: `${projectId}/${config}/${email}` }).promise())
+      .then((res) => {
+        expect(res, 'to have key', 'Contents');
+        expect(res.Contents, 'to have length', 1);
+        return res.Contents[0].Key;
+      })
+      .then((key) => s3.deleteObject({ Bucket: process.env.S3_BUCKET, Key: key }).promise())
+      .then(() => dynamo.deleteItem({
+        Key: {
+          Project: { N: `${projectId}` },
+          Config: { S: config },
+        },
+        TableName: process.env.DYNAMO_TABLE,
+      }).promise()))));
+});
+
+
+================================================
+File: /test/lib/email.js
+================================================
+import _ from 'lodash';
+import expect from 'unexpected';
+import fs from 'fs';
+import uniqid from 'uniqid';
+
+import getRecipientFromEmail from '../../src/lib/email';
+
+describe('email', () => {
+  let projectId;
+  let config;
+  let email;
+
+  beforeEach(() => {
+    projectId = _.random(1, 128);
+    config = uniqid();
+    email = `${projectId}-${config}-${uniqid()}@import.test.keboola.com`;
+  });
+
+  it('check in To', () => getRecipientFromEmail(
+    _.replace(fs.readFileSync(`${__dirname}/../email`), '{{EMAIL}}', email),
+    process.env.EMAIL_DOMAIN
+  )
+    .then((res) => {
+      expect(res, 'to have key', 'address');
+      expect(res.address, 'to be', email);
+      expect(res, 'to have key', 'project');
+      expect(res.project, 'to be', `${projectId}`);
+      expect(res, 'to have key', 'config');
+      expect(res.config, 'to be', config);
+    }));
+
+  it('check in multiple To', () => getRecipientFromEmail(
+    _.replace(fs.readFileSync(`${__dirname}/../email-multiple-to`), '{{EMAIL}}', email),
+    process.env.EMAIL_DOMAIN
+  )
+    .then((res) => {
+      expect(res, 'to have key', 'address');
+      expect(res.address, 'to be', email);
+      expect(res, 'to have key', 'project');
+      expect(res.project, 'to be', `${projectId}`);
+      expect(res, 'to have key', 'config');
+      expect(res.config, 'to be', config);
+    }));
+
+  it('check in Cc', () => getRecipientFromEmail(
+    _.replace(fs.readFileSync(`${__dirname}/../email-cc`), '{{EMAIL}}', email),
+    process.env.EMAIL_DOMAIN
+  )
+    .then((res) => {
+      expect(res, 'to have key', 'address');
+      expect(res.address, 'to be', email);
+      expect(res, 'to have key', 'project');
+      expect(res.project, 'to be', `${projectId}`);
+      expect(res, 'to have key', 'config');
+      expect(res.config, 'to be', config);
+    }));
+});
+
+
+================================================
 File: /test/func.js
 ================================================
 import _ from 'lodash';
@@ -804,6 +1293,158 @@ describe('Functional test', () => {
       TableName: process.env.DYNAMO_TABLE,
     }).promise()));
 });
+
+
+================================================
+File: /test/email-multiple-to
+================================================
+Return-Path: <test@keboola.com>
+Received: from mail-wm0-f46.google.com (mail-wm0-f46.google.com [74.125.82.46])
+ by inbound-smtp.eu-west-1.amazonaws.com with SMTP id f3u5akod30enk979a0s57vep6b9ourvlv4985f01
+ for 313-5a392b308694a@import.test.keboola.com;
+ Tue, 19 Dec 2017 15:07:54 +0000 (UTC)
+Received-SPF: permerror (spfCheck: Error in processing SPF Record) client-ip=74.125.82.46; envelope-from=test@keboola.com; helo=mail-wm0-f46.google.com;
+Authentication-Results: amazonses.com;
+ spf=permerror (spfCheck: Error in processing SPF Record) client-ip=74.125.82.46; envelope-from=test@keboola.com; helo=mail-wm0-f46.google.com;
+ dkim=pass header.i=@keboola-com.20150623.gappssmtp.com;
+X-SES-RECEIPT: AEFBQUFBQUFBQUFHYnRpQUpKeEtiSU1YQ0k0MzlPeEU0bmFid2RpR0R0RXJ2aGpIamlRNzRaSklZK0FLeVZzQ0ZFaE9XakhWdHhVcFNBS2tpckYvSDliVHM2RlgrdWd5bEMza054bG05OEt1NmdwV1l5YjVXRkcrK2hnMHpWMEFnNmdWNDBOTmw3SjlvU1Z0cW5wSWdqenhzM0ZoUkJoODErMlpWdm5MRmpFRFJTeEkxeHVxZStjOXc2WjNNbXVWZUtWVkxyS0FuVWltQUdqQzNseVVNWXd2U0tObmJRSDRBcVdpVkd3cTF0T2FWRmpBS0N3NmN4QU1KdGJRbDhnaW9KMzdZWUYwRnZ0M3VCMEZEcFlocVZUVXhTTlhKZTd5R2pFQUdOTlI4SU1rZmRsMzRoRTZCdWR4eEVQcExURW5aN0JWdEVZWDJjSjQ9
+X-SES-DKIM-SIGNATURE: a=rsa-sha256; q=dns/txt; b=OK6DWDU4FuKzyUzM48iKFx+92yKtEWg4Rk5fQo4BlGuG0QqZeMGoiLrIB1InH2Pul6MDGrFE0uL8aqYWfilZDVD+GK6nUqCuD4R9ggpG8qgPZTQG+qAmWRbcdKhKw/dqgM763Io0WxxIMjLPPSEvvPskLdkq2XaqeGUig0NGQ+U=; c=relaxed/simple; s=shh3fegwg5fppqsuzphvschd53n6ihuv; d=amazonses.com; t=1513696075; v=1; bh=aTQnkumdtbJiGBBLqD5F+fjlo83C4AjUxH6S7gDFayw=; h=From:To:Cc:Bcc:Subject:Date:Message-ID:MIME-Version:Content-Type:X-SES-RECEIPT;
+Received: by mail-wm0-f46.google.com with SMTP id y82so11788759wmg.1
+        for <313-5a392b308694a@import.test.keboola.com>; Tue, 19 Dec 2017 07:07:54 -0800 (PST)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=keboola-com.20150623.gappssmtp.com; s=20150623;
+        h=date:from:to:message-id:in-reply-to:references:subject:mime-version;
+        bh=7pOt0o+zUj7JntCkM0QXIgbACeye97ijWcI3/Qot1IM=;
+        b=ABz37TqAuxTgN3t2sxSS7rim28FM3mAVQ8wPQMmwqiUbNPutQ4KyfxV6+oVZ70N66X
+         eYgiEUhW8lGOXXwwzby0Eks1aT08E/QwsVqJriwtcsG4ciRDKZyZ8JW02GWD5goU6Lun
+         J1ebQnY9rdjwJozOBzt5Rl9caGroD1EZqQZ5JS87bAXBxJnPVhbf+SIXP9XM3pq6aBoB
+         pAuaohSz5jYnQhqSvWNmAmJX6nwwpxJDcRJEN6NxKc/kD1Y1AbzUdEWX59n2rLoZehYV
+         l/v5ZlLU0YiK6/oH7dzdHL6ux0jfEkv2s/v/tkbtBwmvPQ73LMtucq2t3Tnbasuwo/bJ
+         12mw==
+X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=1e100.net; s=20161025;
+        h=x-gm-message-state:date:from:to:message-id:in-reply-to:references
+         :subject:mime-version;
+        bh=7pOt0o+zUj7JntCkM0QXIgbACeye97ijWcI3/Qot1IM=;
+        b=lkCsQDTOe2+oNlLMHBSodgkE9M4L9GBvh6KRWtP+oDn3KPZyV9tIxeRFJ+bjanPfW7
+         uYw8/e+5VwLvEYxmJPWkclXZNZYhLPmyERb/H2hpToUPuDNWBbnj2TIxisrWH1O0X8ae
+         +B0ncnr6q302nVTkUYZ1VJvCwCFfYlyQ+Bi3GuJ70Lva4RJ4UAzCVmLWZDeym4bZA+NM
+         qwy8Kvi5gWpe6Vqx3JiMdLBQpDuEFBwsR3IQaNeC30rAjVcnah00AAXfZip7DNPEYWge
+         Ym/9ukbe58imPocdNgoluTLRdPc3KjEIs9uaG8L00Bg11hsUdfeH4/J8xFuYneF8dd65
+         qbCA==
+X-Gm-Message-State: AKGB3mKFQAKDdzChOOZNkK6vOquCmpU6R38aWqw36uTVe4MpPrPCo+ir
+	wWDAYIqk5fWr2Ehrdx/KlAEW+zeYkX+C8A==
+X-Google-Smtp-Source: ACJfBovoyjehirHb7vbDcR7vqqEf0JXreLN0Z5QmwLIFk5rMC6+HebFs71+mYoNLHdhXBAxZEqa3MQ==
+X-Received: by 10.80.170.136 with SMTP id q8mr980128edc.134.1513696074144;
+        Tue, 19 Dec 2017 07:07:54 -0800 (PST)
+Return-Path: <test@keboola.com>
+Received: from [10.0.1.8] (ip-78-45-129-24.net.upcbroadband.cz. [78.45.129.24])
+        by smtp.gmail.com with ESMTPSA id t23sm13503149edb.70.2017.12.19.07.07.51
+        for <313-5a392b308694a@import.test.keboola.com>
+        (version=TLS1_2 cipher=ECDHE-RSA-AES128-GCM-SHA256 bits=128/128);
+        Tue, 19 Dec 2017 07:07:52 -0800 (PST)
+Date: Tue, 19 Dec 2017 16:07:40 +0100
+From: Test <test@keboola.com>
+To: "Test1, Test2 / Test + Test3 / PRG ZV-C"
+	<user1@test.com>, Name Surname
+	<user2@test3.com>, "Importer"
+	<{{EMAIL}}>
+Message-ID: <7bac924c-d316-4379-9497-486c8712e039@Spark>
+In-Reply-To: <b5ab5b8d-9b84-4f9c-a43f-3c79ced6e2cc@Spark>
+References: <9bebd73c-544d-4e31-a7b4-7c8d3d6c5d3d@Spark>
+ <0f85e001-ae01-4c6e-aa87-7a6ea0306bfb@Spark>
+ <06c62dc0-2d59-4d85-9940-7bbae1d4a4ee@Spark>
+ <fe9e96b9-dcfe-449f-b28d-8195d8a3b4ff@Spark>
+ <cd4902ed-2c45-44fc-bada-b15cc0ade175@Spark>
+ <9c29aeec-63a3-4e8e-9020-8eacb5d12b99@Spark>
+ <b5ab5b8d-9b84-4f9c-a43f-3c79ced6e2cc@Spark>
+Subject: test
+X-Readdle-Message-ID: 7bac924c-d316-4379-9497-486c8712e039@Spark
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="5a392b45_625558ec_449"
+
+--5a392b45_625558ec_449
+Content-Type: multipart/alternative; boundary="5a392b45_2ae8944a_449"
+
+--5a392b45_2ae8944a_449
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+Content-Disposition: inline
+
+Sending the test file..
+
+
+--5a392b45_2ae8944a_449
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+Content-Disposition: inline
+
+<html xmlns=3D=22http://www.w3.org/1999/xhtml=22>
+<head>
+<title></title>
+</head>
+<body>
+<div name=3D=22messageBodySection=22 style=3D=22font-size: 14px; font-fam=
+ily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>Sending the test=
+ file..</div>
+<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
+mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22><br />
+<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
+0px; border-left: thin solid =231abc9c;=22>
+<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
+mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
+<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
+0px; border-left: thin solid =23e67e22;=22>
+<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
+mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
+<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
+0px; border-left: thin solid =233498db;=22>
+<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
+mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
+<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
+0px; border-left: thin solid =23d35400;=22>
+<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
+mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
+<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
+0px; border-left: thin solid =2334495e;=22>
+<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
+mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
+<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
+0px; border-left: thin solid =232ecc71;=22>
+<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
+mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
+<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
+0px; border-left: thin solid =239b59b6;=22></blockquote>
+</div>
+</blockquote>
+</div>
+</blockquote>
+</div>
+</blockquote>
+</div>
+</blockquote>
+</div>
+</blockquote>
+</div>
+</blockquote>
+</div>
+</body>
+</html>
+
+--5a392b45_2ae8944a_449--
+
+--5a392b45_625558ec_449
+Content-Type: application/octet-stream
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment;
+ filename="=?utf-8?Q?out.c=5Fmain.categories.csv?="
+
+ImlkIiwibmFtZSIsIm9yZGVyIgoiYzEiLCJDYXRlZ29yeSAxIiwiMSIKImMyIiwiQ2F0ZWdvcnkg
+MiIsIjIiCiJjMyIsIkNhdGVnb3J5IDMiLCIzIgoiYzQiLCJDYXRlZ29yeSA0IiwiNCIKImM1Iiwi
+Q2F0ZWdvcnkgNSIsIjUiCg==
+
+--5a392b45_625558ec_449--
+
 
 
 ================================================
@@ -1104,646 +1745,5 @@ Q2F0ZWdvcnkgNSIsIjUiCg==
 
 --5a392b45_625558ec_449--
 
-
-
-================================================
-File: /test/handler.js
-================================================
-import _ from 'lodash';
-import expect from 'unexpected';
-import fs from 'fs';
-import aws from 'aws-sdk';
-import Promise from 'bluebird';
-import uniqid from 'uniqid';
-import { handler, setDynamo, setS3 } from '../src/handler';
-
-aws.config.setPromisesDependency(Promise);
-
-const s3 = new aws.S3({
-  s3ForcePathStyle: true,
-  endpoint: new aws.Endpoint(process.env.S3_ENDPOINT),
-  sslEnabled: false,
-});
-setS3(s3);
-
-const dynamo = new aws.DynamoDB({
-  region: process.env.REGION,
-  endpoint: process.env.DYNAMO_ENDPOINT,
-});
-setDynamo(dynamo);
-
-describe('Handler', () => {
-  before(() => dynamo.deleteTable({ TableName: process.env.DYNAMO_TABLE }).promise()
-    .catch(() => null)
-    .then(() => dynamo.createTable({
-      TableName: process.env.DYNAMO_TABLE,
-      AttributeDefinitions: [
-        { AttributeName: 'Project', AttributeType: 'N' },
-        { AttributeName: 'Config', AttributeType: 'S' },
-      ],
-      KeySchema: [
-        { AttributeName: 'Project', KeyType: 'HASH' },
-        { AttributeName: 'Config', KeyType: 'RANGE' },
-      ],
-      ProvisionedThroughput: { ReadCapacityUnits: 1, WriteCapacityUnits: 1 },
-    }).promise())
-    .then(() => s3.createBucket({ Bucket: process.env.S3_BUCKET }).promise()));
-
-  const incomingFile = `test_${Math.random()}`;
-  const incomingKey = `_incoming/${incomingFile}`;
-  const projectId = _.random(1, 128);
-  const config = uniqid();
-  const email = `${projectId}-${config}-1234@import.test.keboola.com`;
-  const file = _.replace(fs.readFileSync(`${__dirname}/email`), '{{EMAIL}}', email);
-
-  it('Handle', () => dynamo.putItem({
-    Item: {
-      Project: { N: `${projectId}` },
-      Config: { S: config },
-      Email: { S: email },
-    },
-    TableName: process.env.DYNAMO_TABLE,
-  }).promise()
-    .then(() => s3.putObject({
-      Body: file,
-      Bucket: process.env.S3_BUCKET,
-      Key: incomingKey,
-    }).promise())
-    .then(() => handler({
-      Records: [
-        {
-          eventName: 'ObjectCreated:Put',
-          s3: {
-            bucket: {
-              name: process.env.S3_BUCKET,
-            },
-            object: {
-              key: incomingKey,
-            },
-          },
-        },
-      ],
-    }, {}, () => expect(s3.headObject({ Bucket: process.env.S3_BUCKET, Key: incomingKey }).promise(), 'to be rejected')
-      .then(() => s3.listObjects({ Bucket: process.env.S3_BUCKET, Prefix: `${projectId}/${config}/${email}` }).promise())
-      .then((res) => {
-        expect(res, 'to have key', 'Contents');
-        expect(res.Contents, 'to have length', 1);
-        return res.Contents[0].Key;
-      })
-      .then((key) => s3.deleteObject({ Bucket: process.env.S3_BUCKET, Key: key }).promise())
-      .then(() => dynamo.deleteItem({
-        Key: {
-          Project: { N: `${projectId}` },
-          Config: { S: config },
-        },
-        TableName: process.env.DYNAMO_TABLE,
-      }).promise()))));
-});
-
-
-================================================
-File: /test/lib/email.js
-================================================
-import _ from 'lodash';
-import expect from 'unexpected';
-import fs from 'fs';
-import uniqid from 'uniqid';
-
-import getRecipientFromEmail from '../../src/lib/email';
-
-describe('email', () => {
-  let projectId;
-  let config;
-  let email;
-
-  beforeEach(() => {
-    projectId = _.random(1, 128);
-    config = uniqid();
-    email = `${projectId}-${config}-${uniqid()}@import.test.keboola.com`;
-  });
-
-  it('check in To', () => getRecipientFromEmail(
-    _.replace(fs.readFileSync(`${__dirname}/../email`), '{{EMAIL}}', email),
-    process.env.EMAIL_DOMAIN
-  )
-    .then((res) => {
-      expect(res, 'to have key', 'address');
-      expect(res.address, 'to be', email);
-      expect(res, 'to have key', 'project');
-      expect(res.project, 'to be', `${projectId}`);
-      expect(res, 'to have key', 'config');
-      expect(res.config, 'to be', config);
-    }));
-
-  it('check in multiple To', () => getRecipientFromEmail(
-    _.replace(fs.readFileSync(`${__dirname}/../email-multiple-to`), '{{EMAIL}}', email),
-    process.env.EMAIL_DOMAIN
-  )
-    .then((res) => {
-      expect(res, 'to have key', 'address');
-      expect(res.address, 'to be', email);
-      expect(res, 'to have key', 'project');
-      expect(res.project, 'to be', `${projectId}`);
-      expect(res, 'to have key', 'config');
-      expect(res.config, 'to be', config);
-    }));
-
-  it('check in Cc', () => getRecipientFromEmail(
-    _.replace(fs.readFileSync(`${__dirname}/../email-cc`), '{{EMAIL}}', email),
-    process.env.EMAIL_DOMAIN
-  )
-    .then((res) => {
-      expect(res, 'to have key', 'address');
-      expect(res.address, 'to be', email);
-      expect(res, 'to have key', 'project');
-      expect(res.project, 'to be', `${projectId}`);
-      expect(res, 'to have key', 'config');
-      expect(res.config, 'to be', config);
-    }));
-});
-
-
-================================================
-File: /test/email-multiple-to
-================================================
-Return-Path: <test@keboola.com>
-Received: from mail-wm0-f46.google.com (mail-wm0-f46.google.com [74.125.82.46])
- by inbound-smtp.eu-west-1.amazonaws.com with SMTP id f3u5akod30enk979a0s57vep6b9ourvlv4985f01
- for 313-5a392b308694a@import.test.keboola.com;
- Tue, 19 Dec 2017 15:07:54 +0000 (UTC)
-Received-SPF: permerror (spfCheck: Error in processing SPF Record) client-ip=74.125.82.46; envelope-from=test@keboola.com; helo=mail-wm0-f46.google.com;
-Authentication-Results: amazonses.com;
- spf=permerror (spfCheck: Error in processing SPF Record) client-ip=74.125.82.46; envelope-from=test@keboola.com; helo=mail-wm0-f46.google.com;
- dkim=pass header.i=@keboola-com.20150623.gappssmtp.com;
-X-SES-RECEIPT: AEFBQUFBQUFBQUFHYnRpQUpKeEtiSU1YQ0k0MzlPeEU0bmFid2RpR0R0RXJ2aGpIamlRNzRaSklZK0FLeVZzQ0ZFaE9XakhWdHhVcFNBS2tpckYvSDliVHM2RlgrdWd5bEMza054bG05OEt1NmdwV1l5YjVXRkcrK2hnMHpWMEFnNmdWNDBOTmw3SjlvU1Z0cW5wSWdqenhzM0ZoUkJoODErMlpWdm5MRmpFRFJTeEkxeHVxZStjOXc2WjNNbXVWZUtWVkxyS0FuVWltQUdqQzNseVVNWXd2U0tObmJRSDRBcVdpVkd3cTF0T2FWRmpBS0N3NmN4QU1KdGJRbDhnaW9KMzdZWUYwRnZ0M3VCMEZEcFlocVZUVXhTTlhKZTd5R2pFQUdOTlI4SU1rZmRsMzRoRTZCdWR4eEVQcExURW5aN0JWdEVZWDJjSjQ9
-X-SES-DKIM-SIGNATURE: a=rsa-sha256; q=dns/txt; b=OK6DWDU4FuKzyUzM48iKFx+92yKtEWg4Rk5fQo4BlGuG0QqZeMGoiLrIB1InH2Pul6MDGrFE0uL8aqYWfilZDVD+GK6nUqCuD4R9ggpG8qgPZTQG+qAmWRbcdKhKw/dqgM763Io0WxxIMjLPPSEvvPskLdkq2XaqeGUig0NGQ+U=; c=relaxed/simple; s=shh3fegwg5fppqsuzphvschd53n6ihuv; d=amazonses.com; t=1513696075; v=1; bh=aTQnkumdtbJiGBBLqD5F+fjlo83C4AjUxH6S7gDFayw=; h=From:To:Cc:Bcc:Subject:Date:Message-ID:MIME-Version:Content-Type:X-SES-RECEIPT;
-Received: by mail-wm0-f46.google.com with SMTP id y82so11788759wmg.1
-        for <313-5a392b308694a@import.test.keboola.com>; Tue, 19 Dec 2017 07:07:54 -0800 (PST)
-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
-        d=keboola-com.20150623.gappssmtp.com; s=20150623;
-        h=date:from:to:message-id:in-reply-to:references:subject:mime-version;
-        bh=7pOt0o+zUj7JntCkM0QXIgbACeye97ijWcI3/Qot1IM=;
-        b=ABz37TqAuxTgN3t2sxSS7rim28FM3mAVQ8wPQMmwqiUbNPutQ4KyfxV6+oVZ70N66X
-         eYgiEUhW8lGOXXwwzby0Eks1aT08E/QwsVqJriwtcsG4ciRDKZyZ8JW02GWD5goU6Lun
-         J1ebQnY9rdjwJozOBzt5Rl9caGroD1EZqQZ5JS87bAXBxJnPVhbf+SIXP9XM3pq6aBoB
-         pAuaohSz5jYnQhqSvWNmAmJX6nwwpxJDcRJEN6NxKc/kD1Y1AbzUdEWX59n2rLoZehYV
-         l/v5ZlLU0YiK6/oH7dzdHL6ux0jfEkv2s/v/tkbtBwmvPQ73LMtucq2t3Tnbasuwo/bJ
-         12mw==
-X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
-        d=1e100.net; s=20161025;
-        h=x-gm-message-state:date:from:to:message-id:in-reply-to:references
-         :subject:mime-version;
-        bh=7pOt0o+zUj7JntCkM0QXIgbACeye97ijWcI3/Qot1IM=;
-        b=lkCsQDTOe2+oNlLMHBSodgkE9M4L9GBvh6KRWtP+oDn3KPZyV9tIxeRFJ+bjanPfW7
-         uYw8/e+5VwLvEYxmJPWkclXZNZYhLPmyERb/H2hpToUPuDNWBbnj2TIxisrWH1O0X8ae
-         +B0ncnr6q302nVTkUYZ1VJvCwCFfYlyQ+Bi3GuJ70Lva4RJ4UAzCVmLWZDeym4bZA+NM
-         qwy8Kvi5gWpe6Vqx3JiMdLBQpDuEFBwsR3IQaNeC30rAjVcnah00AAXfZip7DNPEYWge
-         Ym/9ukbe58imPocdNgoluTLRdPc3KjEIs9uaG8L00Bg11hsUdfeH4/J8xFuYneF8dd65
-         qbCA==
-X-Gm-Message-State: AKGB3mKFQAKDdzChOOZNkK6vOquCmpU6R38aWqw36uTVe4MpPrPCo+ir
-	wWDAYIqk5fWr2Ehrdx/KlAEW+zeYkX+C8A==
-X-Google-Smtp-Source: ACJfBovoyjehirHb7vbDcR7vqqEf0JXreLN0Z5QmwLIFk5rMC6+HebFs71+mYoNLHdhXBAxZEqa3MQ==
-X-Received: by 10.80.170.136 with SMTP id q8mr980128edc.134.1513696074144;
-        Tue, 19 Dec 2017 07:07:54 -0800 (PST)
-Return-Path: <test@keboola.com>
-Received: from [10.0.1.8] (ip-78-45-129-24.net.upcbroadband.cz. [78.45.129.24])
-        by smtp.gmail.com with ESMTPSA id t23sm13503149edb.70.2017.12.19.07.07.51
-        for <313-5a392b308694a@import.test.keboola.com>
-        (version=TLS1_2 cipher=ECDHE-RSA-AES128-GCM-SHA256 bits=128/128);
-        Tue, 19 Dec 2017 07:07:52 -0800 (PST)
-Date: Tue, 19 Dec 2017 16:07:40 +0100
-From: Test <test@keboola.com>
-To: "Test1, Test2 / Test + Test3 / PRG ZV-C"
-	<user1@test.com>, Name Surname
-	<user2@test3.com>, "Importer"
-	<{{EMAIL}}>
-Message-ID: <7bac924c-d316-4379-9497-486c8712e039@Spark>
-In-Reply-To: <b5ab5b8d-9b84-4f9c-a43f-3c79ced6e2cc@Spark>
-References: <9bebd73c-544d-4e31-a7b4-7c8d3d6c5d3d@Spark>
- <0f85e001-ae01-4c6e-aa87-7a6ea0306bfb@Spark>
- <06c62dc0-2d59-4d85-9940-7bbae1d4a4ee@Spark>
- <fe9e96b9-dcfe-449f-b28d-8195d8a3b4ff@Spark>
- <cd4902ed-2c45-44fc-bada-b15cc0ade175@Spark>
- <9c29aeec-63a3-4e8e-9020-8eacb5d12b99@Spark>
- <b5ab5b8d-9b84-4f9c-a43f-3c79ced6e2cc@Spark>
-Subject: test
-X-Readdle-Message-ID: 7bac924c-d316-4379-9497-486c8712e039@Spark
-MIME-Version: 1.0
-Content-Type: multipart/mixed; boundary="5a392b45_625558ec_449"
-
---5a392b45_625558ec_449
-Content-Type: multipart/alternative; boundary="5a392b45_2ae8944a_449"
-
---5a392b45_2ae8944a_449
-Content-Type: text/plain; charset="utf-8"
-Content-Transfer-Encoding: 7bit
-Content-Disposition: inline
-
-Sending the test file..
-
-
---5a392b45_2ae8944a_449
-Content-Type: text/html; charset="utf-8"
-Content-Transfer-Encoding: quoted-printable
-Content-Disposition: inline
-
-<html xmlns=3D=22http://www.w3.org/1999/xhtml=22>
-<head>
-<title></title>
-</head>
-<body>
-<div name=3D=22messageBodySection=22 style=3D=22font-size: 14px; font-fam=
-ily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>Sending the test=
- file..</div>
-<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
-mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22><br />
-<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
-0px; border-left: thin solid =231abc9c;=22>
-<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
-mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
-<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
-0px; border-left: thin solid =23e67e22;=22>
-<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
-mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
-<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
-0px; border-left: thin solid =233498db;=22>
-<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
-mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
-<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
-0px; border-left: thin solid =23d35400;=22>
-<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
-mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
-<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
-0px; border-left: thin solid =2334495e;=22>
-<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
-mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
-<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
-0px; border-left: thin solid =232ecc71;=22>
-<div name=3D=22messageReplySection=22 style=3D=22font-size: 14px; font-fa=
-mily: -apple-system, BlinkMacSystem=46ont, sans-serif;=22>
-<blockquote type=3D=22cite=22 style=3D=22margin: 5px 5px; padding-left: 1=
-0px; border-left: thin solid =239b59b6;=22></blockquote>
-</div>
-</blockquote>
-</div>
-</blockquote>
-</div>
-</blockquote>
-</div>
-</blockquote>
-</div>
-</blockquote>
-</div>
-</blockquote>
-</div>
-</body>
-</html>
-
---5a392b45_2ae8944a_449--
-
---5a392b45_625558ec_449
-Content-Type: application/octet-stream
-Content-Transfer-Encoding: base64
-Content-Disposition: attachment;
- filename="=?utf-8?Q?out.c=5Fmain.categories.csv?="
-
-ImlkIiwibmFtZSIsIm9yZGVyIgoiYzEiLCJDYXRlZ29yeSAxIiwiMSIKImMyIiwiQ2F0ZWdvcnkg
-MiIsIjIiCiJjMyIsIkNhdGVnb3J5IDMiLCIzIgoiYzQiLCJDYXRlZ29yeSA0IiwiNCIKImM1Iiwi
-Q2F0ZWdvcnkgNSIsIjUiCg==
-
---5a392b45_625558ec_449--
-
-
-
-================================================
-File: /serverless.yml
-================================================
-service: "${env:SERVICE_NAME}"
-frameworkVersion: '3'
-
-custom:
-  webpack:
-    webpackConfig: 'webpack.config.js'
-    includeModules: true
-    forceExclude:
-      - aws-sdk
-      - serverless
-    packager: 'yarn'
-
-plugins:
-  - serverless-webpack
-
-provider:
-  name: aws
-  region: ${env:REGION}
-  stage: ${env:STAGE}
-  runtime: nodejs16.x
-  memorySize: 512
-  timeout: 30
-  versionFunctions: false
-  deploymentBucket:
-    name: "${env:SERVICE_NAME}-${env:REGION}-deployment"
-  environment:
-    DYNAMO_TABLE: ${env:DYNAMO_TABLE}
-    S3_BUCKET: ${env:S3_BUCKET}
-    EMAIL_DOMAIN: ${env:EMAIL_DOMAIN}
-  iam:
-    deploymentRole: ${env:CLOUDFORMATION_ROLE_ARN}
-    role: ${env:LAMBDA_EXECUTION_ROLE_ARN}
-  stackTags:
-    KeboolaStack: ${env:KEBOOLA_STACK}
-  iamRoleStatements:
-    -  Effect: "Allow"
-       Action:
-         - "s3:PutBucketNotification"
-       Resource:
-         - "arn:aws:s3:::${env:S3_BUCKET}"
-
-package:
-  patterns:
-    - src/handler.js
-    - node_modules/**
-    - '!.env'
-    - '!docker-compose.yml'
-    - '!Dockerfile'
-    - '!package.json'
-    - '!yarn.lock'
-
-functions:
-  s3Handler:
-    handler: src/handler.handler
-    tags:
-      KeboolaStack: ${env:KEBOOLA_STACK}
-    events:
-      -
-        existingS3:
-          bucket: "${env:S3_BUCKET}"
-          events:
-            - "s3:ObjectCreated:*"
-          rules:
-            - prefix: _incoming/
-          existing: true
-
-
-================================================
-File: /.github/workflows/build_deploy.yml
-================================================
-name: Build & Deploy
-on: [push]
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    env:
-      CLOUDFORMATION_ROLE_ARN: arn:aws:iam::061240556736:role/ci-ex-email-attachments-us-east-1-sls-cf
-      LAMBDA_EXECUTION_ROLE_ARN: arn:aws:iam::061240556736:role/ci-ex-email-attachments-us-east-1-sls-exec
-      DYNAMO_TABLE: ci-ex-email-attachments-us-east-1-emails
-      EMAIL_DOMAIN: import.testing.keboola.com
-      KEBOOLA_STACK: ex-email-attachments
-      REGION: us-east-1
-      S3_BUCKET: ci-ex-email-attachments-us-east-1-emails
-      SERVICE_NAME: ci-ex-email-attachments
-      STAGE: test
-    steps:
-      - name: Check out the repo
-        uses: actions/checkout@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Build image
-        uses: docker/build-push-action@v3
-        with:
-          context: .
-          load: true
-          tags: keboola/ex-email-attachments-lambda
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Run unit tests
-        run: docker-compose run --rm test-app
-
-      - name: Deploy to CI testing
-        run: docker-compose run --rm deploy
-        env:
-          AWS_ACCESS_KEY_ID: [REDACTED]
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.CI_DEPLOY_AWS_SECRET_ACCESS_KEY }}
-
-      - name: Run functional tests
-        run: docker-compose run --rm test-func
-        env:
-          AWS_ACCESS_KEY_ID: [REDACTED]
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.CI_TEST_AWS_SECRET_ACCESS_KEY }}
-
-  deploy:
-    if: github.ref == 'refs/heads/master'
-    needs: build
-    runs-on: ubuntu-latest
-    env:
-      AWS_ACCESS_KEY_ID: [REDACTED]
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.PROD_DEPLOY_AWS_SECRET_ACCESS_KEY }}
-    steps:
-      - name: Check out the repo
-        uses: actions/checkout@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Build image
-        uses: docker/build-push-action@v3
-        with:
-          context: .
-          load: true
-          tags: keboola/ex-email-attachments-lambda
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Deploy to production (US)
-        run: docker-compose run --rm deploy
-        env:
-          CLOUDFORMATION_ROLE_ARN: arn:aws:iam::147946154733:role/ex-email-attachments-us-east-1-sls-cf
-          LAMBDA_EXECUTION_ROLE_ARN: arn:aws:iam::147946154733:role/ex-email-attachments-us-east-1-sls-exec
-          DYNAMO_TABLE: ex-email-attachments-us-east-1-emails
-          EMAIL_DOMAIN: import.keboola.com
-          KEBOOLA_STACK: ex-email-attachments
-          REGION: us-east-1
-          S3_BUCKET: ex-email-attachments-us-east-1-emails
-          SERVICE_NAME: ex-email-attachments
-          STAGE: prod
-
-      - name: Deploy to production (EU)
-        run: docker-compose run --rm deploy
-        env:
-          CLOUDFORMATION_ROLE_ARN: arn:aws:iam::147946154733:role/ex-email-attachments-eu-central-1-sls-cf
-          LAMBDA_EXECUTION_ROLE_ARN: arn:aws:iam::147946154733:role/ex-email-attachments-eu-central-1-sls-exec
-          DYNAMO_TABLE: ex-email-attachments-eu-central-1-emails
-          EMAIL_DOMAIN: import.eu-central-1.keboola.com
-          KEBOOLA_STACK: ex-email-attachments
-          REGION: eu-central-1
-          S3_BUCKET: ex-email-attachments-eu-central-1-emails
-          SERVICE_NAME: ex-email-attachments
-          STAGE: prod
-
-
-================================================
-File: /.eslintrc.json
-================================================
-{
-  "extends": [
-    "@keboola/node"
-  ],
-  "plugins": [
-    "import"
-  ],
-  "env": {
-    "node": true,
-    "mocha": true
-  }
-}
-
-
-================================================
-File: /package.json
-================================================
-{
-  "name": "email-attachments-lambda",
-  "author": "Jakub Matejka <jakub@keboola.com>",
-  "license": "MIT",
-  "version": "1.0.0",
-  "description": "Lambda handler for Keboola Email attachments extractor",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/keboola/ex-email-attachments-lambda.git"
-  },
-  "dependencies": {
-    "@babel/runtime": "^7.4.5",
-    "@keboola/middy-error-logger": "^1.0.3",
-    "bluebird": "^3.4.7",
-    "http-errors": "^1.7.2",
-    "lodash": "^4.17.4",
-    "mailparser": "^3.2.0",
-    "middy": "^0.27.0",
-    "moment": "^2.20.1",
-    "source-map-support": "^0.5.12"
-  },
-  "devDependencies": {
-    "@babel/core": "^7.1.2",
-    "@babel/plugin-transform-runtime": "^7.1.0",
-    "@babel/preset-env": "^7.1.0",
-    "@babel/register": "^7.0.0",
-    "@keboola/eslint-config-node": "^2.0.0",
-    "aws-sdk": "^2.49.0",
-    "babel-core": "^7.0.0-bridge.0",
-    "babel-eslint": "^10.0.1",
-    "babel-loader": "^8.0.5",
-    "eslint": "^7.29.0",
-    "eslint-plugin-import": "^2.14.0",
-    "mocha": "^9.0.1",
-    "serverless": "^3.38.0",
-    "serverless-webpack": "^5.3.0",
-    "sleep-promise": "^9.1.0",
-    "unexpected": "^12.0.3",
-    "uniqid": "^5.0.3",
-    "webpack": "^5.40.0",
-    "webpack-node-externals": "^3.0.0"
-  },
-  "scripts": {
-    "test-unit": "./node_modules/.bin/mocha --bail --exit --timeout 0 --require @babel/register --require source-map-support test/handler.js test/lib",
-    "test-func": "./node_modules/.bin/mocha --bail --exit --timeout 0 --require @babel/register --require source-map-support test/func.js",
-    "lint": "./node_modules/.bin/eslint src test"
-  }
-}
-
-
-================================================
-File: /.dockerignore
-================================================
-.git
-.github
-.idea
-docker-compose.yml
-Dockerfile
-
-
-================================================
-File: /Dockerfile
-================================================
-FROM node:16
-
-WORKDIR /code
-
-RUN npm install -g serverless@3.38
-
-COPY package.json yarn.lock ./
-RUN yarn install
-
-COPY . ./
-
-
-================================================
-File: /webpack.config.js
-================================================
-const nodeExternals = require('webpack-node-externals');
-const path = require('path');
-const slsw = require('serverless-webpack');
-
-module.exports = {
-  mode: process.env.STAGE === 'prod' ? 'production' : 'development',
-  entry: slsw.lib.entries,
-  target: 'node',
-  devtool: 'source-map',
-  externals: [nodeExternals({
-    modulesFromFile: true,
-  })],
-  module: {
-    rules: [
-      {
-        test: /\.js$/,
-        include: __dirname,
-        exclude: /node_modules/,
-        use: {
-          loader: 'babel-loader',
-          options: {
-            presets: ['@babel/env'],
-            plugins: ['@babel/plugin-transform-runtime'],
-          },
-        },
-      },
-    ],
-  },
-  plugins: [],
-  output: {
-    libraryTarget: 'commonjs',
-    path: path.join(__dirname, '.webpack'),
-    filename: '[name].js',
-  },
-};
-
-
-================================================
-File: /README.md
-================================================
-# Lambda handler for Email attachments extractor
-
-[![serverless](http://public.serverless.com/badges/v3.svg)](http://www.serverless.com)
-
-Lambda handler for Email attachments extractor. See [keboola/ex-email-attachments](https://github.com/keboola/ex-email-attachments) for more details.
-
-## Installation
-
-1. Download git repository: `git clone git@github.com:keboola/ex-email-attachments-lambda.git`
-2. Create a stack [cf-stack.json](https://github.com/keboola/ex-email-attachments-lambda/blob/master/cf-stack.json) with IAM policies and user groups for deployment and functional testing. You will need to fill parameters:
-    - `ServiceName` - should be the same as `SERVICE_NAME` env var (e.g. `dev-ex-email-attachments-lambda`), and should be unique across all instances
-    - `Stage` - one of: `dev`, `test`, `prod` (again, should be the same as `STAGE` env var)
-    - `DynamoTable` - name of the DynamoDB table created by the extractor
-    - `S3Bucket` - name of the S3 bucket created by the extractor
-3. Create an IAM user for deployment (e.g. `dev-ex-email-attachments-lambda-deploy`) and assign it to the group created in previous step. Create AWS credentials.
-4. Create an IAM user for testing (e.g. `dev-ex-email-attachments-lambda-testing`) and assign it to the group created in previous step. Create AWS credentials.
-5. Create `.env` file from template [.env.template](https://github.com/keboola/ex-email-attachments-lambda/blob/master/.env.template)
-6. Run `docker-compose run --rm dev-deploy`
-
-### CI and deployment
-
-CI is configured on GitHub Action. Deployment is run automatically after releasing a version on GitHub.
 
 

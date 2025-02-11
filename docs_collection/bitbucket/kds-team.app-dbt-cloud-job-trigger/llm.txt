@@ -1,51 +1,91 @@
 Directory structure:
 └── kds_consulting_team-kds-team.app-dbt-cloud-job-trigger/
-    ├── .travis.yml
-    ├── flake8.cfg
-    ├── deploy.sh
-    ├── docker-compose.yml
-    ├── src/
-    │   ├── component.py
-    │   ├── mapping.py
-    │   └── client.py
-    ├── bitbucket-pipelines.yml
     ├── tests/
-    │   ├── test_component.py
-    │   └── __init__.py
-    ├── component_config/
-    │   ├── logger
-    │   ├── component_long_description.md
-    │   ├── configuration_description.md
-    │   ├── component_short_description.md
-    │   ├── loggerConfiguration.json
-    │   ├── configSchema.json
-    │   ├── configRowSchema.json
-    │   └── sample-config/
-    │       ├── config.json
-    │       ├── in/
-    │       │   ├── state.json
-    │       │   ├── tables/
-    │       │   │   ├── test.csv
-    │       │   │   └── test.csv.manifest
-    │       │   └── files/
-    │       │       └── order1.xml
-    │       └── out/
-    │           ├── tables/
-    │           │   └── test.csv
-    │           └── files/
-    │               └── order1.xml
-    ├── scripts/
-    │   ├── update_dev_portal_properties.sh
-    │   ├── run_kbc_tests.ps1
-    │   ├── run.bat
-    │   ├── build_n_run.ps1
-    │   └── build_n_test.sh
-    ├── requirements.txt
+    │   ├── __init__.py
+    │   └── test_component.py
+    ├── .travis.yml
+    ├── Dockerfile
+    ├── flake8.cfg
+    ├── src/
+    │   ├── client.py
+    │   ├── mapping.py
+    │   └── component.py
+    ├── LICENSE.md
     ├── docs/
     │   └── imgs/
-    ├── Dockerfile
-    ├── LICENSE.md
+    ├── requirements.txt
+    ├── bitbucket-pipelines.yml
+    ├── component_config/
+    │   ├── component_short_description.md
+    │   ├── configSchema.json
+    │   ├── configuration_description.md
+    │   ├── configRowSchema.json
+    │   ├── component_long_description.md
+    │   ├── sample-config/
+    │   │   ├── in/
+    │   │   │   ├── tables/
+    │   │   │   │   ├── test.csv
+    │   │   │   │   └── test.csv.manifest
+    │   │   │   ├── state.json
+    │   │   │   └── files/
+    │   │   │       └── order1.xml
+    │   │   ├── out/
+    │   │   │   ├── tables/
+    │   │   │   │   └── test.csv
+    │   │   │   └── files/
+    │   │   │       └── order1.xml
+    │   │   └── config.json
+    │   ├── loggerConfiguration.json
+    │   └── logger
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── scripts/
+    │   ├── build_n_test.sh
+    │   ├── update_dev_portal_properties.sh
+    │   ├── build_n_run.ps1
+    │   ├── run.bat
+    │   └── run_kbc_tests.ps1
     └── README.md
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
 
 ================================================
 File: /.travis.yml
@@ -92,6 +132,32 @@ deploy:
 
 
 ================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.6-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
 File: /flake8.cfg
 ================================================
 [flake8]
@@ -117,99 +183,224 @@ max-line-length = 120
 
 
 ================================================
-File: /deploy.sh
+File: /src/client.py
 ================================================
-#!/bin/sh
-set -e
+import backoff
+import requests
+import os
+from pathlib import Path
+import logging
 
-env
+from requests.exceptions import HTTPError
+from keboola.component.exceptions import UserException
 
-# compatibility with travis and bitbucket
-if [ ! -z ${BITBUCKET_TAG} ]
-then
-	echo "assigning bitbucket tag"
-	export TAG="$BITBUCKET_TAG"
-elif [ ! -z ${TRAVIS_TAG} ]
-then
-	echo "assigning travis tag"
-	export TAG="$TRAVIS_TAG"
-elif [ ! -z ${GITHUB_TAG} ]
-then
-	echo "assigning github tag"
-	export TAG="$GITHUB_TAG"
-else
-	echo No Tag is set!
-	exit 1
-fi
 
-echo "Tag is '${TAG}'"
+class DbtClient:
 
-#check if deployment is triggered only in master
-if [ ${BITBUCKET_BRANCH} != "master" ]; then
-               echo Deploy on tagged commit can be only executed in master!
-               exit 1
-fi
+    def __init__(self, account_id, job_id, api_key, base_url):
+        self.account_id = account_id
+        self.job_id = job_id
+        self.api_key = api_key
+        self.base_url = base_url
 
-# Obtain the component repository and log in
-echo "Obtain the component repository and log in"
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+        self.auth_headers = {'Authorization': f"Token {api_key}"}
 
-echo "Set credentials"
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+    def fetch_artifact(self, job_run_id: int, artifact: str) -> None:
+        """
+        Gets available artifacts and stores them in temp folder.
+        Args:
+            artifact: Path to artifact
+            job_run_id: Job run ID
+        """
+        res = requests.get(
+            url=f"{self.base_url}/api/v2/accounts/{self.account_id}/runs/{job_run_id}/artifacts/{artifact}",
+            headers=self.auth_headers
+        )
+        if res.status_code == 200:
+            self.store_artifact(artifact, res.text)
+            logging.info(f"Stored artifact: {artifact}")
+        else:
+            logging.warning(f"Cannot save {artifact}: {res.text}")
 
-# Push to the repository
-echo "Push to the repository"
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${TAG}
-docker push ${REPOSITORY}:latest
+    @staticmethod
+    def store_artifact(artifact: str, file: str) -> None:
+        """
+        Stores file in data/temp folder
+        Args:
+            artifact: filename
+            file: string content to be stored
+        """
+        cwd = Path(os.getcwd())
+        root_dir = cwd.parent.absolute()
+        temp_dir = os.path.join(root_dir, "data", "artifacts", "out", "current")
 
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
-fi
+        full_path = Path(os.path.join(temp_dir, artifact))
+        parent_dir = full_path.parent.absolute()
+        if not os.path.exists(parent_dir):
+            os.makedirs(parent_dir)
+
+        with open(full_path, "w") as f:
+            f.write(file)
+
+    def trigger_job(self, cause: str) -> dict:
+        """
+        Triggers the dbt job.
+        Returns dictionary with data field from response.
+
+        Args:
+            cause: String identifier which will be sent along with job trigger request.
+        """
+        res = requests.post(
+            url=f"{self.base_url}/api/v2/accounts/{self.account_id}/jobs/{self.job_id}/run/",
+            headers=self.auth_headers,
+            json={
+                # Optionally pass a description that can be viewed within the dbt Cloud API.
+                # See the API docs for additional parameters that can be passed in,
+                # including `schema_override`
+                'cause': cause,
+            }
+        )
+
+        try:
+            res.raise_for_status()
+        except HTTPError:
+            if res.json()["status"]["user_message"] == "Invalid token.":
+                raise UserException("""Invalid API key has been set, job could not be triggered. Make sure your API
+                key is valid and re-enter it into the component configuration.""")
+            raise UserException(f"Encountered Error when triggering job: {res.text}")
+
+        response_payload = res.json()
+        return response_payload['data']
+
+    @backoff.on_exception(backoff.expo, HTTPError, max_tries=3, factor=2)
+    def get_job_run_status(self, job_run_id: int, get_steps=False) -> dict:
+        """
+        Fetches Dictionary with job status.
+        Args:
+            job_run_id: Job run ID
+            get_steps: if set to True, gets additional job run data
+        """
+        res = requests.get(
+            url=f"{self.base_url}/api/v2/accounts/{self.account_id}/runs/{job_run_id}/",
+            headers=self.auth_headers,
+            params='include_related=["run_steps", "job"]' if get_steps else ""
+        )
+
+        res.raise_for_status()
+
+        return res.json()
+
+    @backoff.on_exception(backoff.expo, HTTPError, max_tries=3, factor=2)
+    def list_available_artifacts(self, job_run_id: int) -> list:
+        res = requests.get(
+            url=f"{self.base_url}/api/v2/accounts/{self.account_id}/runs/{job_run_id}/artifacts/",
+            headers={'Authorization': f"Token {self.api_key}"},
+        )
+
+        res.raise_for_status()
+
+        return res.json().get("data")
 
 
 ================================================
-File: /docker-compose.yml
+File: /src/mapping.py
 ================================================
-version: "2"
-services:
-  # for development purposes
-  dev:
-    build: .
-    volumes:
-        - ./:/code
-        - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-  test:
-    # Use to run flake8 and unittests checks
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-    command:
-      - /bin/sh
-      - /code/scripts/build_n_test.sh
+def assign_status_data(job_run_data: dict):
+    data = job_run_data.get("data", {})
+    return {
+        "id": data.get("id"),
+        "trigger_id": data.get("trigger_id"),
+        "account_id": data.get("account_id"),
+        "project_id": data.get("project_id"),
+        "job_definition_id": data.get("job_definition_id"),
+        "status": data.get("status"),
+        "git_branch": data.get("git_branch"),
+        "git_sha": data.get("git_sha"),
+        "status_message": data.get("status_message"),
+        "created_at": data.get("created_at"),
+        "updated_at": data.get("updated_at"),
+        "dequeued_at": data.get("dequeued_at"),
+        "started_at": data.get("started_at"),
+        "finished_at": data.get("finished_at"),
+        "last_checked_at": data.get("last_checked_at"),
+        "last_heartbeat_at": data.get("last_heartbeat_at"),
+        "owner_thread_id": data.get("owner_thread_id"),
+        "executed_by_thread_id": data.get("executed_by_thread_id"),
+        "artifacts_saved": data.get("artifacts_saved"),
+        "artifact_s3_path": data.get("artifact_s3_path"),
+        "has_docs_generated": data.get("has_docs_generated"),
+        "trigger": data.get("trigger"),
+        "job": data.get("job"),
+        "duration": data.get("duration"),
+        "queued_duration": data.get("queued_duration"),
+        "run_duration": data.get("run_duration"),
+        "duration_humanized": data.get("duration_humanized"),
+        "queued_duration_humanized": data.get("queued_duration_humanized"),
+        "run_duration_humanized": data.get("run_duration_humanized"),
+        "finished_at_humanized": data.get("finished_at_humanized"),
+        "status_humanized": data.get("status_humanized"),
+        "created_at_humanized": data.get("created_at_humanized")
+    }
+
+
+def assign_trigger_data(data):
+    return {
+        "id": data.get("id"),
+        "trigger_id": data.get("trigger_id"),
+        "account_id": data.get("account_id"),
+        "environment_id": data.get("environment_id"),
+        "project_id": data.get("project_id"),
+        "job_definition_id": data.get("job_definition_id"),
+        "status": data.get("status"),
+        "dbt_version": data.get("dbt_version"),
+        "git_branch": data.get("git_branch"),
+        "git_sha": data.get("git_sha"),
+        "status_message": data.get("status_message"),
+        "owner_thread_id": data.get("owner_thread_id"),
+        "executed_by_thread_id": data.get("executed_by_thread_id"),
+        "deferring_run_id": data.get("deferring_run_id"),
+        "artifacts_saved": data.get("artifacts_saved"),
+        "artifact_s3_path": data.get("artifact_s3_path"),
+        "has_docs_generated": data.get("has_docs_generated"),
+        "has_sources_generated": data.get("has_sources_generated"),
+        "notifications_sent": data.get("notifications_sent"),
+        "blocked_by": data.get("blocked_by"),
+        "created_at": data.get("created_at"),
+        "updated_at": data.get("updated_at"),
+        "dequeued_at": data.get("dequeued_at"),
+        "started_at": data.get("started_at"),
+        "finished_at": data.get("finished_at"),
+        "last_checked_at": data.get("last_checked_at"),
+        "last_heartbeat_at": data.get("last_heartbeat_at"),
+        "should_start_at": data.get("should_start_at"),
+        "trigger": data.get("trigger", {}),
+        "job": data.get("job", {}),
+        "environment": data.get("environment"),
+        "run_steps": data.get("run_steps"),
+        "status_humanized": data.get("status_humanized"),
+        "in_progress": data.get("in_progress"),
+        "is_complete": data.get("is_complete"),
+        "is_success": data.get("is_success"),
+        "is_error": data.get("is_error"),
+        "is_cancelled": data.get("is_cancelled"),
+        "duration": data.get("duration"),
+        "queued_duration": data.get("queued_duration"),
+        "run_duration": data.get("run_duration"),
+        "duration_humanized": data.get("duration_humanized"),
+        "queued_duration_humanized": data.get("queued_duration_humanized"),
+        "run_duration_humanized": data.get("run_duration_humanized"),
+        "created_at_humanized": data.get("created_at_humanized"),
+        "finished_at_humanized": data.get("finished_at_humanized"),
+        "retrying_run_id": data.get("retrying_run_id"),
+        "can_retry": data.get("can_retry"),
+        "retry_not_supported_reason": data.get("retry_not_supported_reason"),
+        "job_id": data.get("job_id"),
+        "is_running": data.get("is_running"),
+        "href": data.get("href"),
+        "used_repo_cache": data.get("used_repo_cache"),
+        "scribe_enabled": data.get("scribe_enabled")
+    }
+
 
 ================================================
 File: /src/component.py
@@ -413,224 +604,38 @@ if __name__ == "__main__":
 
 
 ================================================
-File: /src/mapping.py
+File: /LICENSE.md
 ================================================
-def assign_status_data(job_run_data: dict):
-    data = job_run_data.get("data", {})
-    return {
-        "id": data.get("id"),
-        "trigger_id": data.get("trigger_id"),
-        "account_id": data.get("account_id"),
-        "project_id": data.get("project_id"),
-        "job_definition_id": data.get("job_definition_id"),
-        "status": data.get("status"),
-        "git_branch": data.get("git_branch"),
-        "git_sha": data.get("git_sha"),
-        "status_message": data.get("status_message"),
-        "created_at": data.get("created_at"),
-        "updated_at": data.get("updated_at"),
-        "dequeued_at": data.get("dequeued_at"),
-        "started_at": data.get("started_at"),
-        "finished_at": data.get("finished_at"),
-        "last_checked_at": data.get("last_checked_at"),
-        "last_heartbeat_at": data.get("last_heartbeat_at"),
-        "owner_thread_id": data.get("owner_thread_id"),
-        "executed_by_thread_id": data.get("executed_by_thread_id"),
-        "artifacts_saved": data.get("artifacts_saved"),
-        "artifact_s3_path": data.get("artifact_s3_path"),
-        "has_docs_generated": data.get("has_docs_generated"),
-        "trigger": data.get("trigger"),
-        "job": data.get("job"),
-        "duration": data.get("duration"),
-        "queued_duration": data.get("queued_duration"),
-        "run_duration": data.get("run_duration"),
-        "duration_humanized": data.get("duration_humanized"),
-        "queued_duration_humanized": data.get("queued_duration_humanized"),
-        "run_duration_humanized": data.get("run_duration_humanized"),
-        "finished_at_humanized": data.get("finished_at_humanized"),
-        "status_humanized": data.get("status_humanized"),
-        "created_at_humanized": data.get("created_at_humanized")
-    }
+The MIT License (MIT)
 
+Copyright (c) 2018 Keboola DS, http://keboola.com
 
-def assign_trigger_data(data):
-    return {
-        "id": data.get("id"),
-        "trigger_id": data.get("trigger_id"),
-        "account_id": data.get("account_id"),
-        "environment_id": data.get("environment_id"),
-        "project_id": data.get("project_id"),
-        "job_definition_id": data.get("job_definition_id"),
-        "status": data.get("status"),
-        "dbt_version": data.get("dbt_version"),
-        "git_branch": data.get("git_branch"),
-        "git_sha": data.get("git_sha"),
-        "status_message": data.get("status_message"),
-        "owner_thread_id": data.get("owner_thread_id"),
-        "executed_by_thread_id": data.get("executed_by_thread_id"),
-        "deferring_run_id": data.get("deferring_run_id"),
-        "artifacts_saved": data.get("artifacts_saved"),
-        "artifact_s3_path": data.get("artifact_s3_path"),
-        "has_docs_generated": data.get("has_docs_generated"),
-        "has_sources_generated": data.get("has_sources_generated"),
-        "notifications_sent": data.get("notifications_sent"),
-        "blocked_by": data.get("blocked_by"),
-        "created_at": data.get("created_at"),
-        "updated_at": data.get("updated_at"),
-        "dequeued_at": data.get("dequeued_at"),
-        "started_at": data.get("started_at"),
-        "finished_at": data.get("finished_at"),
-        "last_checked_at": data.get("last_checked_at"),
-        "last_heartbeat_at": data.get("last_heartbeat_at"),
-        "should_start_at": data.get("should_start_at"),
-        "trigger": data.get("trigger", {}),
-        "job": data.get("job", {}),
-        "environment": data.get("environment"),
-        "run_steps": data.get("run_steps"),
-        "status_humanized": data.get("status_humanized"),
-        "in_progress": data.get("in_progress"),
-        "is_complete": data.get("is_complete"),
-        "is_success": data.get("is_success"),
-        "is_error": data.get("is_error"),
-        "is_cancelled": data.get("is_cancelled"),
-        "duration": data.get("duration"),
-        "queued_duration": data.get("queued_duration"),
-        "run_duration": data.get("run_duration"),
-        "duration_humanized": data.get("duration_humanized"),
-        "queued_duration_humanized": data.get("queued_duration_humanized"),
-        "run_duration_humanized": data.get("run_duration_humanized"),
-        "created_at_humanized": data.get("created_at_humanized"),
-        "finished_at_humanized": data.get("finished_at_humanized"),
-        "retrying_run_id": data.get("retrying_run_id"),
-        "can_retry": data.get("can_retry"),
-        "retry_not_supported_reason": data.get("retry_not_supported_reason"),
-        "job_id": data.get("job_id"),
-        "is_running": data.get("is_running"),
-        "href": data.get("href"),
-        "used_repo_cache": data.get("used_repo_cache"),
-        "scribe_enabled": data.get("scribe_enabled")
-    }
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
 
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 ================================================
-File: /src/client.py
+File: /requirements.txt
 ================================================
-import backoff
-import requests
-import os
-from pathlib import Path
-import logging
-
-from requests.exceptions import HTTPError
-from keboola.component.exceptions import UserException
-
-
-class DbtClient:
-
-    def __init__(self, account_id, job_id, api_key, base_url):
-        self.account_id = account_id
-        self.job_id = job_id
-        self.api_key = api_key
-        self.base_url = base_url
-
-        self.auth_headers = {'Authorization': f"Token {api_key}"}
-
-    def fetch_artifact(self, job_run_id: int, artifact: str) -> None:
-        """
-        Gets available artifacts and stores them in temp folder.
-        Args:
-            artifact: Path to artifact
-            job_run_id: Job run ID
-        """
-        res = requests.get(
-            url=f"{self.base_url}/api/v2/accounts/{self.account_id}/runs/{job_run_id}/artifacts/{artifact}",
-            headers=self.auth_headers
-        )
-        if res.status_code == 200:
-            self.store_artifact(artifact, res.text)
-            logging.info(f"Stored artifact: {artifact}")
-        else:
-            logging.warning(f"Cannot save {artifact}: {res.text}")
-
-    @staticmethod
-    def store_artifact(artifact: str, file: str) -> None:
-        """
-        Stores file in data/temp folder
-        Args:
-            artifact: filename
-            file: string content to be stored
-        """
-        cwd = Path(os.getcwd())
-        root_dir = cwd.parent.absolute()
-        temp_dir = os.path.join(root_dir, "data", "artifacts", "out", "current")
-
-        full_path = Path(os.path.join(temp_dir, artifact))
-        parent_dir = full_path.parent.absolute()
-        if not os.path.exists(parent_dir):
-            os.makedirs(parent_dir)
-
-        with open(full_path, "w") as f:
-            f.write(file)
-
-    def trigger_job(self, cause: str) -> dict:
-        """
-        Triggers the dbt job.
-        Returns dictionary with data field from response.
-
-        Args:
-            cause: String identifier which will be sent along with job trigger request.
-        """
-        res = requests.post(
-            url=f"{self.base_url}/api/v2/accounts/{self.account_id}/jobs/{self.job_id}/run/",
-            headers=self.auth_headers,
-            json={
-                # Optionally pass a description that can be viewed within the dbt Cloud API.
-                # See the API docs for additional parameters that can be passed in,
-                # including `schema_override`
-                'cause': cause,
-            }
-        )
-
-        try:
-            res.raise_for_status()
-        except HTTPError:
-            if res.json()["status"]["user_message"] == "Invalid token.":
-                raise UserException("""Invalid API key has been set, job could not be triggered. Make sure your API
-                key is valid and re-enter it into the component configuration.""")
-            raise UserException(f"Encountered Error when triggering job: {res.text}")
-
-        response_payload = res.json()
-        return response_payload['data']
-
-    @backoff.on_exception(backoff.expo, HTTPError, max_tries=3, factor=2)
-    def get_job_run_status(self, job_run_id: int, get_steps=False) -> dict:
-        """
-        Fetches Dictionary with job status.
-        Args:
-            job_run_id: Job run ID
-            get_steps: if set to True, gets additional job run data
-        """
-        res = requests.get(
-            url=f"{self.base_url}/api/v2/accounts/{self.account_id}/runs/{job_run_id}/",
-            headers=self.auth_headers,
-            params='include_related=["run_steps", "job"]' if get_steps else ""
-        )
-
-        res.raise_for_status()
-
-        return res.json()
-
-    @backoff.on_exception(backoff.expo, HTTPError, max_tries=3, factor=2)
-    def list_available_artifacts(self, job_run_id: int) -> list:
-        res = requests.get(
-            url=f"{self.base_url}/api/v2/accounts/{self.account_id}/runs/{job_run_id}/artifacts/",
-            headers={'Authorization': f"Token {self.api_key}"},
-        )
-
-        res.raise_for_status()
-
-        return res.json().get("data")
-
+keboola.component==1.3.5
+mock
+freezegun
+requests
+backoff==2.2.1
 
 ================================================
 File: /bitbucket-pipelines.yml
@@ -705,105 +710,9 @@ pipelines:
             - ./deploy.sh
 
 ================================================
-File: /tests/test_component.py
-================================================
-'''
-Created on 12. 11. 2018
-
-@author: esner
-'''
-import unittest
-import mock
-import os
-from freezegun import freeze_time
-
-from component import Component
-
-
-class TestComponent(unittest.TestCase):
-
-    # set global time to 2010-10-10 - affects functions like datetime.now()
-    @freeze_time("2010-10-10")
-    # set KBC_DATADIR env to non-existing dir
-    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
-    def test_run_no_cfg_fails(self):
-        with self.assertRaises(ValueError):
-            comp = Component()
-            comp.run()
-
-
-if __name__ == "__main__":
-    # import sys;sys.argv = ['', 'Test.testName']
-    unittest.main()
-
-
-================================================
-File: /tests/__init__.py
-================================================
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
-
-================================================
-File: /component_config/logger
-================================================
-gelf
-
-================================================
-File: /component_config/component_long_description.md
-================================================
-Requirements:
-
- - API key
- - Account ID
- - Job ID
-
-Optional:
-
- - DBT Cloud URL
-
-#### Output
-
-Tables (data is going to be imported incrementally):  
- - in.c-dbt-cloud-job-trigger-{config_id}.dbt_cloud_trigger - response from [api-v2#tag/Jobs/operation/triggerRun](https://docs.getdbt.com/dbt-cloud/api-v2#tag/Jobs/operation/triggerRun)
- - in.c-dbt-cloud-job-trigger-{config_id}.dbt_cloud_run - response from [api-v2#tag/Runs/operation/getRunById](https://docs.getdbt.com/dbt-cloud/api-v2#tag/Runs/operation/getRunById)
-
-Artifacts:  
-
-Saves all artifacts from https://docs.getdbt.com/dbt-cloud/api-v2#tag/Runs/operation/getArtifactsByRunId into Keboola storage.
-
-
-================================================
-File: /component_config/configuration_description.md
-================================================
-Triggers dbt Cloud job. Optionally, saves job info at trigger time and after the job is done.  
-
-Next, saves response from https://docs.getdbt.com/dbt-cloud/api-v2#tag/Jobs/operation/triggerRun into table **dbt_cloud_trigger**.
-
-If the parameter "wait_for_result" is set to true, waits for the job to complete for the maximum time set via parameter "max_wait_time" then stores result of https://docs.getdbt.com/dbt-cloud/api-v2#tag/Runs/operation/getRunById into table **dbt_cloud_run** and stores all available artifacts.
-
-
-================================================
 File: /component_config/component_short_description.md
 ================================================
 dbt is a data transformation tool that enables data analysts and engineers to transform, test and document data in the cloud data warehouse.
-
-================================================
-File: /component_config/loggerConfiguration.json
-================================================
-{
-  "verbosity": {
-    "100": "normal",
-    "200": "normal",
-    "250": "normal",
-    "300": "verbose",
-    "400": "verbose",
-    "500": "camouflage",
-    "550": "camouflage",
-    "600": "camouflage"
-  },
-  "gelf_server_type": "tcp"
-}
 
 ================================================
 File: /component_config/configSchema.json
@@ -883,72 +792,43 @@ File: /component_config/configSchema.json
 }
 
 ================================================
+File: /component_config/configuration_description.md
+================================================
+Triggers dbt Cloud job. Optionally, saves job info at trigger time and after the job is done.  
+
+Next, saves response from https://docs.getdbt.com/dbt-cloud/api-v2#tag/Jobs/operation/triggerRun into table **dbt_cloud_trigger**.
+
+If the parameter "wait_for_result" is set to true, waits for the job to complete for the maximum time set via parameter "max_wait_time" then stores result of https://docs.getdbt.com/dbt-cloud/api-v2#tag/Runs/operation/getRunById into table **dbt_cloud_run** and stores all available artifacts.
+
+
+================================================
 File: /component_config/configRowSchema.json
 ================================================
 {}
 
 ================================================
-File: /component_config/sample-config/config.json
+File: /component_config/component_long_description.md
 ================================================
-{
-  "storage": {
-    "input": {
-      "files": [],
-      "tables": [
-        {
-          "source": "in.c-test.test",
-          "destination": "test.csv",
-          "limit": 50,
-          "columns": [],
-          "where_values": [],
-          "where_operator": "eq"
-        }
-      ]
-    },
-    "output": {
-      "files": [],
-      "tables": []
-    }
-  },
-  "parameters": {
-    "#api_token": "demo",
-    "period_from": "yesterday",
-    "endpoints": [
-      "deals",
-      "companies"
-    ],
-    "company_properties": "",
-    "deal_properties": "",
-    "debug": true
-  },
-  "image_parameters": {
-    "syrup_url": "https://syrup.keboola.com/"
-  },
-  "authorization": {
-    "oauth_api": {
-      "id": "OAUTH_API_ID",
-      "credentials": {
-        "id": "main",
-        "authorizedFor": "Myself",
-        "creator": {
-          "id": "1234",
-          "description": "me@keboola.com"
-        },
-        "created": "2016-01-31 00:13:30",
-        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
-        "oauthVersion": "2.0",
-        "appKey": "000000004C184A49",
-        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
-      }
-    }
-  }
-}
+Requirements:
 
+ - API key
+ - Account ID
+ - Job ID
 
-================================================
-File: /component_config/sample-config/in/state.json
-================================================
-{"data_delta": "10222018"}
+Optional:
+
+ - DBT Cloud URL
+
+#### Output
+
+Tables (data is going to be imported incrementally):  
+ - in.c-dbt-cloud-job-trigger-{config_id}.dbt_cloud_trigger - response from [api-v2#tag/Jobs/operation/triggerRun](https://docs.getdbt.com/dbt-cloud/api-v2#tag/Jobs/operation/triggerRun)
+ - in.c-dbt-cloud-job-trigger-{config_id}.dbt_cloud_run - response from [api-v2#tag/Runs/operation/getRunById](https://docs.getdbt.com/dbt-cloud/api-v2#tag/Runs/operation/getRunById)
+
+Artifacts:  
+
+Saves all artifacts from https://docs.getdbt.com/dbt-cloud/api-v2#tag/Runs/operation/getArtifactsByRunId into Keboola storage.
+
 
 ================================================
 File: /component_config/sample-config/in/tables/test.csv
@@ -1058,6 +938,11 @@ File: /component_config/sample-config/in/tables/test.csv.manifest
 }
 
 ================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
 File: /component_config/sample-config/in/files/order1.xml
 ================================================
 <?xml version='1.0' ?>
@@ -1127,6 +1012,190 @@ File: /component_config/sample-config/out/files/order1.xml
         </order>
     </orders>
 </root_el>
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: /component_config/logger
+================================================
+gelf
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
 
 ================================================
 File: /scripts/update_dev_portal_properties.sh
@@ -1244,6 +1313,46 @@ else
 fi
 
 ================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
 File: /scripts/run_kbc_tests.ps1
 ================================================
 echo "Preparing KBC test image"
@@ -1279,115 +1388,6 @@ docker push $REPOSITORY`:test
 echo 'running test config in KBC'
 docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
 
-
-================================================
-File: /scripts/run.bat
-================================================
-@echo off
-
-echo Running component...
-docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
-
-================================================
-File: /scripts/build_n_run.ps1
-================================================
-echo Building component...
-$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
-docker build -rm -t $COMP_TAG ../
-
-echo Running component...
-Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
-    $Readhost = Read-Host " ( y / n ) " 
-    Switch ($ReadHost) 
-     { 
-       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
-       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
-       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
-     } 
-
-Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
-    $Readhost = Read-Host " ( y / n ) " 
-    Switch ($ReadHost) 
-     { 
-       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
-       N {Write-Host "No, execute the app normally"; 
-		    echo $DATA_PATH
-			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
-	   } 
-       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
-     } 
-
-
-
-
-================================================
-File: /scripts/build_n_test.sh
-================================================
-#!/bin/sh
-set -e
-
-flake8 --config=flake8.cfg
-python -m unittest discover
-
-================================================
-File: /requirements.txt
-================================================
-keboola.component==1.3.5
-mock
-freezegun
-requests
-backoff==2.2.1
-
-================================================
-File: /Dockerfile
-================================================
-FROM python:3.8.6-slim
-ENV PYTHONIOENCODING utf-8
-
-COPY /src /code/src/
-COPY /tests /code/tests/
-COPY /scripts /code/scripts/
-COPY requirements.txt /code/requirements.txt
-COPY flake8.cfg /code/flake8.cfg
-COPY deploy.sh /code/deploy.sh
-
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
-
-RUN pip install flake8
-
-RUN pip install -r /code/requirements.txt
-
-WORKDIR /code/
-
-
-CMD ["python", "-u", "/code/src/component.py"]
-
-
-================================================
-File: /LICENSE.md
-================================================
-The MIT License (MIT)
-
-Copyright (c) 2018 Keboola DS, http://keboola.com
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files, to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished
-to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
 
 ================================================
 File: /README.md
