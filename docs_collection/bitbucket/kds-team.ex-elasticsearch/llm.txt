@@ -1,113 +1,46 @@
 Directory structure:
 └── kds_consulting_team-kds-team.ex-elasticsearch/
-    ├── tests/
-    │   ├── __init__.py
-    │   └── test_component.py
-    ├── Dockerfile
     ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
     ├── src/
-    │   ├── client/
-    │   │   ├── ssh_utils.py
-    │   │   └── es_client.py
+    │   ├── legacy_client/
+    │   │   ├── ssh_client.py
+    │   │   ├── legacy_es_client.py
+    │   │   └── result.py
     │   ├── component.py
-    │   └── legacy_client/
-    │       ├── legacy_es_client.py
-    │       ├── ssh_client.py
-    │       └── result.py
-    ├── LICENSE.md
-    ├── requirements.txt
+    │   └── client/
+    │       ├── es_client.py
+    │       └── ssh_utils.py
     ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
     ├── component_config/
-    │   ├── component_short_description.md
-    │   ├── configSchema.json
-    │   ├── stack_parameters.json
-    │   ├── configuration_description.md
-    │   ├── configRowSchema.json
     │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   ├── configRowSchema.json
     │   └── sample-config/
     │       ├── legacy_config.json
     │       ├── in/
+    │       │   ├── state.json
     │       │   ├── tables/
     │       │   │   ├── test.csv
     │       │   │   └── test.csv.manifest
-    │       │   ├── state.json
     │       │   └── files/
     │       │       └── order1.xml
     │       └── out/
     │           └── config.json
-    ├── deploy.sh
-    ├── docker-compose.yml
     ├── scripts/
-    │   ├── build_n_test.sh
-    │   └── update_dev_portal_properties.sh
+    │   ├── update_dev_portal_properties.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
     └── README.md
-
-================================================
-File: /tests/__init__.py
-================================================
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
-
-
-================================================
-File: /tests/test_component.py
-================================================
-"""
-Created on 12. 11. 2018
-
-@author: esner
-"""
-import unittest
-import mock
-import os
-from freezegun import freeze_time
-
-from component import Component
-
-
-class TestComponent(unittest.TestCase):
-
-    # set global time to 2010-10-10 - affects functions like datetime.now()
-    @freeze_time("2010-10-10")
-    # set KBC_DATADIR env to non-existing dir
-    @mock.patch.dict(os.environ, {"KBC_DATADIR": "./non-existing-dir"})
-    def test_run_no_cfg_fails(self):
-        with self.assertRaises(ValueError):
-            comp = Component()
-            comp.run()
-
-
-if __name__ == "__main__":
-    # import sys;sys.argv = ['', 'Test.testName']
-    unittest.main()
-
-
-================================================
-File: /Dockerfile
-================================================
-FROM python:3.11.7-slim
-ENV PYTHONIOENCODING utf-8
-
-COPY /src /code/src/
-COPY /tests /code/tests/
-COPY /scripts /code/scripts/
-COPY requirements.txt /code/requirements.txt
-COPY flake8.cfg /code/flake8.cfg
-COPY deploy.sh /code/deploy.sh
-
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential curl
-
-RUN pip install flake8
-
-RUN pip install -r /code/requirements.txt
-
-WORKDIR /code/
-
-
-CMD ["python", "-u", "/code/src/component.py"]
-
 
 ================================================
 File: /flake8.cfg
@@ -136,148 +69,564 @@ max-line-length = 120
 
 
 ================================================
-File: /src/client/ssh_utils.py
+File: /deploy.sh
 ================================================
-import base64
-import binascii
-import contextlib
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "3"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+
+================================================
+File: /src/legacy_client/ssh_client.py
+================================================
+import io
+import json
+import logging
+import socket
+import sys
+from typing import List, Tuple
+from retry import retry
 import paramiko
-from io import StringIO
-from typing import Tuple
+from furl import furl
+
+Headers = List[Tuple[str, str]]
+
+# Workaround for re-key timeout: https://github.com/paramiko/paramiko/issues/822
+paramiko.packet.Packetizer.REKEY_BYTES = 1e12
+
+SIZE_PARAM = 'size'
+SCROLL_PARAM = 'scroll'
+
+DEFAULT_SIZE = 2000
+DEFAULT_SCROLL = '15m'
+SSH_COMMAND_TIMEOUT = 60  # this is in seconds
 
 
-class SomeSSHException(Exception):
-    pass
+class SshClient:
 
+    def __init__(self, SshTunnel, Database):
 
-def get_private_key(input_key, private_key_password):
-    key = _get_decoded_key(input_key)
-    try:
-        if private_key_password:
-            return paramiko.RSAKey.from_private_key(StringIO(key), password=private_key_password)
+        self.SshTunnel = SshTunnel
+
+        pkey_file = io.StringIO(SshTunnel.key)
+        self.pkey = self._parse_private_key(pkey_file)
+
+        # Set up SSH paramiko client
+        self.ssh = paramiko.SSHClient()
+        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        self.connect_ssh()
+
+        self.db = Database
+        self._default_size = DEFAULT_SIZE
+
+    def connect_ssh(self):
+        try:
+            self.ssh.connect(hostname=self.SshTunnel.hostname, port=self.SshTunnel.port,
+                             username=self.SshTunnel.username, pkey=self.pkey)
+        except (socket.gaierror, paramiko.ssh_exception.AuthenticationException):
+            logging.exception("Could not establish SSH tunnel. Check that all SSH parameters are correct.")
+            sys.exit(1)
+
+    def _parse_private_key(self, keyfile):
+        # try all versions of encryption keys
+        pkey = None
+        failed = False
+        try:
+            pkey = paramiko.RSAKey.from_private_key(keyfile)
+        except paramiko.SSHException as e:
+            logging.debug(e)
+            logging.warning("RSS Private key invalid, trying DSS.")
+            failed = True
+        except IndexError:
+            logging.exception("Could not read RSS Private Key - have you provided it correctly?")
+            sys.exit(1)
+        # DSS
+        if failed:
+            try:
+                pkey = paramiko.DSSKey.from_private_key(keyfile)
+                failed = False
+            except paramiko.SSHException:
+                logging.warning("DSS Private key invalid, trying ECDSAKey.")
+                failed = True
+            except IndexError:
+                logging.exception("Could not read DSS Private Key - have you provided it correctly?")
+                sys.exit(1)
+        # ECDSAKey
+        if failed:
+            try:
+                pkey = paramiko.ECDSAKey.from_private_key(keyfile)
+                failed = False
+            except paramiko.SSHException:
+                logging.warning("ECDSAKey Private key invalid, trying Ed25519Key.")
+                failed = True
+            except IndexError:
+                logging.exception("Could not read ECDSAKey Private Key - have you provided it correctly?")
+                sys.exit(1)
+        # Ed25519Key
+        if failed:
+            try:
+                pkey = paramiko.Ed25519Key.from_private_key(keyfile)
+            except paramiko.SSHException as e:
+                logging.warning("Ed25519Key Private key invalid.")
+                raise e
+            except IndexError:
+                logging.exception("Could not read Ed25519Key Private Key - have you provided it correctly?")
+                sys.exit(1)
+
+        return pkey
+
+    def build_curl(self, url, request_type, headers=None, json_body=None):
+
+        # Start of curl string
+        curl = 'curl -i'
+        curl += f' --request {request_type}'
+
+        # Add headers
+        _header_string = ''
+        for header in headers:
+            _header_string += f' -H "{header[0]}: {header[1]}"'
+
+        curl += _header_string
+
+        # Add JSON body
+        if json_body is not None:
+            curl += f' --data \'{json.dumps(json_body)}\''
+
+        curl += f' {url}'
+
+        logging.debug(f"Constructed cURL: {curl}.")
+        return curl
+
+    @retry(paramiko.ssh_exception.SSHException, delay=3, tries=5, backoff=3)
+    def _execute_ssh_command(self, curl):
+        """
+        Wrapped func to execute ssh command with timeout defined in SSH_COMMAND_TIMEOUT
+        """
+        _, stdout, stderr = self.ssh.exec_command(command=curl, timeout=SSH_COMMAND_TIMEOUT)
+        return _, stdout, stderr
+
+    def execute_ssh_command(self, curl):
+        """
+        Executes ssh command with timeout defined in SSH_COMMAND_TIMEOUT
+        """
+        try:
+            _, stdout, stderr = self._execute_ssh_command(curl)
+        except paramiko.ssh_exception.SSHException:
+            try:
+                logging.info("Failed to execute SSH command, resetting connection and trying again...")
+                self.connect_ssh()
+                _, stdout, stderr = self._execute_ssh_command(curl)
+            except paramiko.ssh_exception.SSHException:
+                logging.exception(f"Maximum number of retries (3) reached when executing ssh_command {curl}")
+                sys.exit(1)
+            return _, stdout, stderr
+        return _, stdout, stderr
+
+    def get_first_page(self, index, body):
+
+        db_url = furl(f'{self.db.host}:{self.db.port}')
+        db_url /= f'{index}/_search'
+
+        self._default_scroll = body.pop(SCROLL_PARAM, DEFAULT_SCROLL)
+        db_url.args[SCROLL_PARAM] = self._default_scroll
+
+        if SIZE_PARAM in body:
+            self._default_size = body[SIZE_PARAM]
         else:
-            return paramiko.RSAKey.from_private_key(StringIO(key))
-    except paramiko.ssh_exception.SSHException as pkey_error:
-        raise SomeSSHException("Invalid private key") from pkey_error
+            body[SIZE_PARAM] = self._default_size
 
+        logging.info(f"Default size: {self._default_size}")
 
-def _get_decoded_key(input_key):
-    """
-        Have to satisfy both encoded and not encoded keys
-    """
-    b64_decoded_input_key = ""
-    with contextlib.suppress(binascii.Error):
-        b64_decoded_input_key = base64.b64decode(input_key, validate=True).decode('utf-8')
+        curl = self.build_curl(db_url, 'POST', [('Content-Type', 'application/json')], body)
 
-    is_valid_b64, message_b64 = validate_ssh_private_key(b64_decoded_input_key)
-    is_valid, message = validate_ssh_private_key(input_key)
-    if is_valid_b64:
-        final_key = b64_decoded_input_key
-    elif is_valid:
-        final_key = input_key
-    else:
-        raise SomeSSHException("\n".join([message, message_b64]))
-    return final_key
+        _, stdout, stderr = self.execute_ssh_command(curl)
+        out, err = stdout.read(), stderr.read()
 
+        return out.decode().strip(), err.decode().strip()
 
-def validate_ssh_private_key(ssh_private_key: str) -> Tuple[bool, str]:
-    if "\n" not in ssh_private_key:
-        return False, "SSH Private key is invalid, make sure it \\n characters as new lines"
-    return True, ""
+    def get_scroll(self, scroll_id):
+        db_url = furl(f'{self.db.host}:{self.db.port}')
+        db_url /= '_search/scroll'
+
+        data = {'scroll': self._default_scroll, 'scroll_id': scroll_id}
+
+        curl = self.build_curl(db_url, 'POST', [('Content-Type', 'application/json')], data)
+
+        _, stdout, stderr = self.execute_ssh_command(curl)
+        out, err = stdout.read(), stderr.read()
+
+        return out.decode().strip(), err.decode().strip()
 
 
 ================================================
-File: /src/client/es_client.py
+File: /src/legacy_client/legacy_es_client.py
 ================================================
 import json
-import typing as t
-from typing import Iterable
+import logging
+from dataclasses import dataclass
+from keboola.csvwriter import ElasticDictWriter
+import csv
 
-from elasticsearch import Elasticsearch
-from elasticsearch.exceptions import ApiError, TransportError
+import dateparser
+import pytz
+from keboola.component.base import ComponentBase
+from keboola.component.exceptions import UserException
 
-DEFAULT_SIZE = 10_000
-SCROLL_TIMEOUT = '15m'
+from legacy_client.ssh_client import SshClient
+from legacy_client.result import Fetcher
+
+KEY_INDEX_NAME = 'index_name'
+KEY_REQUEST_BODY = 'request_body'
+KEY_STORAGE_TABLE = 'storage_table'
+KEY_INCREMENTAL = 'incremental'
+KEY_PRIMARY_KEYS = 'primary_keys'
+
+KEY_DATE = 'date'
+KEY_DATE_APPEND = 'append_date'
+KEY_DATE_FORMAT = 'format'
+KEY_DATE_SHIFT = 'shift'
+KEY_DATE_TZ = 'time_zone'
+
+KEY_SSH = 'ssh'
+KEY_SSH_USE = 'use_ssh'
+KEY_SSH_HOST = 'hostname'
+KEY_SSH_PORT = 'port'
+KEY_SSH_USERNAME = 'username'
+KEY_SSH_PKEY = '#private_key'
+
+KEY_DB = 'db'
+KEY_DB_HOST = 'hostname'
+KEY_DB_PORT = 'port'
+
+KEY_DEBUG = 'debug'
+
+MANDATORY_PARAMS = [KEY_INDEX_NAME, KEY_DB, KEY_STORAGE_TABLE, KEY_SSH]
 
 
-class ElasticsearchClientException(Exception):
-    pass
+@dataclass
+class SshTunnel:
+    hostname: str
+    port: int
+    username: str
+    key: str
 
 
-class ElasticsearchClient(Elasticsearch):
+@dataclass
+class Database:
+    host: str
+    port: str
 
-    def __init__(self, hosts: list, scheme: str = None, http_auth: tuple = None, api_key: tuple = None):
-        options = {"hosts": hosts, "timeout": 30, "retry_on_timeout": True, "max_retries": 5}
 
-        if scheme == "https":
-            options.update({"verify_certs": False, "ssl_show_warn": False})
+class LegacyClient(ComponentBase):
+    BATCH_PROCESSING_SIZE = 100000
 
-        if http_auth:
-            options.update({"http_auth": http_auth})
-        elif api_key:
-            options.update({"api_key": api_key})
+    def __init__(self):
+        super().__init__()
 
-        super().__init__(**options)
+        logging.info("Running legacy ssh client.")
 
-    def extract_data(self, index_name: str, query: str) -> Iterable:
-        """
-        Extracts data from the specified Elasticsearch index based on the given query.
+        if self.configuration.parameters.get('debug', False) is True:
+            logger = logging.getLogger()
+            logger.setLevel(level='DEBUG')
 
-        Parameters:
-            index_name (str): Name of the Elasticsearch index.
-            query (dict): Elasticsearch DSL query.
-
-        Yields:
-            dict
-        """
-        response = self.search(index=index_name, size=DEFAULT_SIZE, scroll=SCROLL_TIMEOUT, body=query)
-        for r in self._process_response(response):
-            yield r
-
-        while len(response['hits']['hits']):
-            response = self.scroll(scroll_id=response["_scroll_id"], scroll=SCROLL_TIMEOUT)
-            for r in self._process_response(response):
-                yield r
-
-    def _process_response(self, response: dict) -> Iterable:
-        results = [hit["_source"] for hit in response['hits']['hits']]
-        for result in results:
-            yield self.flatten_json(result)
-
-    def ping(
-        self,
-        *,
-        error_trace: t.Optional[bool] = None,
-        filter_path: t.Optional[t.Union[t.List[str], str]] = None,
-        human: t.Optional[bool] = None,
-        pretty: t.Optional[bool] = None,
-    ) -> bool:
-        """
-        Returns True if a successful response returns from the info() API,
-        otherwise returns False. This API call can fail either at the transport
-        layer (due to connection errors or timeouts) or from a non-2XX HTTP response
-        (due to authentication or authorization issues).
-
-        If you want to discover why the request failed you should use the ``info()`` API.
-
-        `<https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html>`_
-        """
-        __path = "/"
-        __query: t.Dict[str, t.Any] = {}
-        if error_trace is not None:
-            __query["error_trace"] = error_trace
-        if filter_path is not None:
-            __query["filter_path"] = filter_path
-        if human is not None:
-            __query["human"] = human
-        if pretty is not None:
-            __query["pretty"] = pretty
-        __headers = {"accept": "application/json"}
         try:
-            self.perform_request("HEAD", __path, params=__query, headers=__headers)
-            return True
-        except (ApiError, TransportError) as e:
-            raise ElasticsearchClientException(e)
+            self.validate_configuration_parameters(MANDATORY_PARAMS)
+        except ValueError as e:
+            raise UserException(e)
+
+        _db_object = self._parse_db_parameters()
+        _ssh_object = self._parse_ssh_parameters()
+        self.index, self.index_params = self._parse_index_parameters()
+
+        self.client = SshClient(_ssh_object, _db_object)
+
+        self.fetcher = Fetcher(self.tables_out_path, self.configuration.parameters[KEY_STORAGE_TABLE],
+                               self.configuration.parameters.get(KEY_INCREMENTAL, True),
+                               self.configuration.parameters.get(KEY_PRIMARY_KEYS, []))
+
+    def _parse_ssh_parameters(self):
+
+        ssh_config = self.configuration.parameters.get(KEY_SSH, {})
+
+        if ssh_config == {}:  # or ssh_config.get(KEY_SSH_USE) is False:
+            raise UserException("SSH configuration not specified.")
+        else:
+            try:
+                ssh_object = SshTunnel(ssh_config[KEY_SSH_HOST], ssh_config[KEY_SSH_PORT],
+                                       ssh_config[KEY_SSH_USERNAME], ssh_config[KEY_SSH_PKEY])
+            except KeyError as e:
+                raise UserException(f"Missing mandatory field {e} in SSH configuration.")
+
+            return ssh_object
+
+    def _parse_db_parameters(self):
+        db_config = self.configuration.parameters[KEY_DB]
+        try:
+            db_object = Database(db_config[KEY_DB_HOST], db_config[KEY_DB_PORT])
+        except KeyError as e:
+            raise UserException(f"Missing mandatory field {e} in DB configuration.")
+        return db_object
+
+    def _parse_index_parameters(self):
+
+        index = self.configuration.parameters[KEY_INDEX_NAME]
+        date_config = self.configuration.parameters.get(KEY_DATE, {})
+
+        _req_body = self.configuration.parameters.get(KEY_REQUEST_BODY, '{}').strip()
+        request_body_string = _req_body if _req_body != '' else '{}'
+
+        if '{{date}}' in index:
+            _date = dateparser.parse(date_config.get(KEY_DATE_SHIFT, 'yesterday'))
+
+            if _date is None:
+                raise UserException(f"Could not parse value {date_config[KEY_DATE_SHIFT]} to date.")
+
+            _date = _date.replace(tzinfo=pytz.UTC)
+
+            _tz = date_config.get(KEY_DATE_TZ, 'UTC')
+
+            if _tz not in pytz.all_timezones:
+                raise UserException(f"Incorrect timezone {_tz} provided. Timezone must be a valid DB timezone name. "
+                                    "See https://en.wikipedia.org/wiki/List_of_tz_database_time_zones#List.")
+
+            _date_tz = pytz.timezone(_tz).normalize(_date)
+            _date_formatted = _date_tz.strftime(date_config.get(KEY_DATE_FORMAT, '%Y-%m-%d'))
+
+            index = index.replace('{{date}}', _date_formatted)
+            logging.info(f"Replaced date placeholder with value {_date_formatted}. " +
+                         f"Downloading data from index {index}.")
+
+        else:
+            logging.info(f"No date placeholder found in index name {index}.")
+
+        try:
+            request_body = json.loads(request_body_string)
+        except ValueError:
+            raise UserException("Could not parse request body string to JSON.")
+
+        return index, request_body
+
+    def parse_curl_stdout(self, stdout):
+        stdout_split = stdout.split('\r\n\r\n')
+        rsp_status = stdout_split[0].split(' ')[1]
+        rsp_body = stdout_split[1]
+        return rsp_status, rsp_body
+
+    def parse_scroll(self, scroll_response):
+
+        try:
+            scroll_json = json.loads(scroll_response)
+        except ValueError as e:
+            raise UserException(f"Could not parse JSON response - {e}.")
+
+        return scroll_json.get('_scroll_id'), scroll_json['hits']['total'], scroll_json['hits']['hits']
+
+    def run(self):
+
+        previous_state = self.get_state_file()
+        if previous_state:
+            columns = previous_state.get("columns", [])
+            logging.info(f"Using table columns from state file: {columns}")
+        else:
+            columns = []
+        is_complete = False
+
+        _fp_out, _fp_err = self.client.get_first_page(self.index, self.index_params)
+
+        if _fp_out == '' and _fp_err != '':
+            raise UserException(f"Could not download data. Error: {_fp_err}")
+
+        elif _fp_out == '' and _fp_err == '':
+            raise UserException("No data returned.")
+
+        else:
+            pass
+
+        logging.debug("Parsing first page.")
+        stdout_sc, stdout_body = self.parse_curl_stdout(_fp_out)
+
+        if stdout_sc != '200':
+            raise UserException(f"Could not download data. Error: {stdout_body}.")
+
+        else:
+            _scroll_id, _nr_results, _results = self.parse_scroll(stdout_body)
+
+        logging.info(f"{_nr_results} rows will be downloaded from index {self.index}.")
+        all_results = [self.fetcher.flatten_json(r) for r in _results]
+
+        already_written = 0
+        with ElasticDictWriter(self.fetcher.get_table_path(), fieldnames=columns, restval='',
+                               quoting=csv.QUOTE_ALL, quotechar='\"') as wr:
+            for row in self.fetcher.fetch_results(all_results):
+                wr.writerow(row)
+
+            already_written += len(_results)
+
+            if len(_results) < self.client._default_size:
+                is_complete = True
+
+            while not is_complete:
+
+                _scroll_out, _scroll_err = self.client.get_scroll(_scroll_id)
+
+                if _scroll_out == '':
+                    raise UserException(f"Could not download data for scroll {_scroll_id}.\n" +
+                                        f"STDERR: {_scroll_err}.")
+
+                else:
+                    pass
+
+                stdout_sc, stdout_body = self.parse_curl_stdout(_scroll_out)
+
+                if stdout_sc != '200':
+                    raise UserException(f"Could not download data. Error: {stdout_body}.")
+
+                else:
+                    _scroll_id, _, _results = self.parse_scroll(stdout_body)
+
+                all_results = [self.fetcher.flatten_json(r) for r in _results]
+
+                if len(_results) < self.client._default_size:
+                    is_complete = True
+
+                for row in self.fetcher.fetch_results(all_results):
+                    wr.writerow(row)
+                already_written += len(_results)
+
+                if already_written % self.BATCH_PROCESSING_SIZE == 0:
+                    logging.info(f"Parsed {already_written} results so far.")
+
+        logging.info(f"Downloaded all data for index {self.index}. Parsed {already_written} rows.")
+        if already_written > 0:
+            self.fetcher.create_manifest(wr.fieldnames, self.fetcher.incremental, self.fetcher.primary_keys)
+            self.write_state_file({"columns": wr.fieldnames})
+
+        logging.info("Component finished.")
+
+
+================================================
+File: /src/legacy_client/result.py
+================================================
+import json
+import logging
+import os
+import sys
+from typing import List
+
+
+class Fetcher:
+
+    def __init__(self, path: str, table_name: str, incremental: bool = False, primary_keys: List = []):
+
+        if (_tn := table_name.strip()) == '':
+            logging.error("No table name provided.")
+            sys.exit(1)
+        else:
+            self.table_name = _tn
+
+        self.incremental = bool(incremental)
+        self.table_path = path
+        self.result_schema = None
+
+        if isinstance(primary_keys, List) is False:
+            logging.error("Primary keys must be provided as an array.")
+            sys.exit(1)
+        else:
+            self.primary_keys = primary_keys
 
     def flatten_json(self, x, out=None, name=''):
         if out is None:
@@ -293,6 +642,25 @@ class ElasticsearchClient(Elasticsearch):
             out[name[:-1]] = x
 
         return out
+
+    def create_manifest(self, columns, incremental, primary_keys):
+
+        with open(os.path.join(self.table_path, self.table_name) + '.manifest', 'w') as man_file:
+            json.dump(
+                {
+                    'columns': columns,
+                    'incremental': incremental,
+                    'primary_key': primary_keys
+                }, man_file
+            )
+
+    @staticmethod
+    def fetch_results(results):
+        for row in results:
+            yield row
+
+    def get_table_path(self):
+        return os.path.join(self.table_path, self.table_name)
 
 
 ================================================
@@ -606,463 +974,97 @@ if __name__ == "__main__":
 
 
 ================================================
-File: /src/legacy_client/legacy_es_client.py
+File: /src/client/es_client.py
 ================================================
 import json
-import logging
-from dataclasses import dataclass
-from keboola.csvwriter import ElasticDictWriter
-import csv
+import typing as t
+from typing import Iterable
 
-import dateparser
-import pytz
-from keboola.component.base import ComponentBase
-from keboola.component.exceptions import UserException
+from elasticsearch import Elasticsearch
+from elasticsearch.exceptions import ApiError, TransportError
 
-from legacy_client.ssh_client import SshClient
-from legacy_client.result import Fetcher
+DEFAULT_SIZE = 10_000
+SCROLL_TIMEOUT = '15m'
 
-KEY_INDEX_NAME = 'index_name'
-KEY_REQUEST_BODY = 'request_body'
-KEY_STORAGE_TABLE = 'storage_table'
-KEY_INCREMENTAL = 'incremental'
-KEY_PRIMARY_KEYS = 'primary_keys'
 
-KEY_DATE = 'date'
-KEY_DATE_APPEND = 'append_date'
-KEY_DATE_FORMAT = 'format'
-KEY_DATE_SHIFT = 'shift'
-KEY_DATE_TZ = 'time_zone'
+class ElasticsearchClientException(Exception):
+    pass
 
-KEY_SSH = 'ssh'
-KEY_SSH_USE = 'use_ssh'
-KEY_SSH_HOST = 'hostname'
-KEY_SSH_PORT = 'port'
-KEY_SSH_USERNAME = 'username'
-KEY_SSH_PKEY = '#private_key'
 
-KEY_DB = 'db'
-KEY_DB_HOST = 'hostname'
-KEY_DB_PORT = 'port'
+class ElasticsearchClient(Elasticsearch):
 
-KEY_DEBUG = 'debug'
+    def __init__(self, hosts: list, scheme: str = None, http_auth: tuple = None, api_key: tuple = None):
+        options = {"hosts": hosts, "timeout": 30, "retry_on_timeout": True, "max_retries": 5}
 
-MANDATORY_PARAMS = [KEY_INDEX_NAME, KEY_DB, KEY_STORAGE_TABLE, KEY_SSH]
+        if scheme == "https":
+            options.update({"verify_certs": False, "ssl_show_warn": False})
 
+        if http_auth:
+            options.update({"http_auth": http_auth})
+        elif api_key:
+            options.update({"api_key": api_key})
 
-@dataclass
-class SshTunnel:
-    hostname: str
-    port: int
-    username: str
-    key: str
+        super().__init__(**options)
 
-
-@dataclass
-class Database:
-    host: str
-    port: str
-
-
-class LegacyClient(ComponentBase):
-    BATCH_PROCESSING_SIZE = 100000
-
-    def __init__(self):
-        super().__init__()
-
-        logging.info("Running legacy ssh client.")
-
-        if self.configuration.parameters.get('debug', False) is True:
-            logger = logging.getLogger()
-            logger.setLevel(level='DEBUG')
-
-        try:
-            self.validate_configuration_parameters(MANDATORY_PARAMS)
-        except ValueError as e:
-            raise UserException(e)
-
-        _db_object = self._parse_db_parameters()
-        _ssh_object = self._parse_ssh_parameters()
-        self.index, self.index_params = self._parse_index_parameters()
-
-        self.client = SshClient(_ssh_object, _db_object)
-
-        self.fetcher = Fetcher(self.tables_out_path, self.configuration.parameters[KEY_STORAGE_TABLE],
-                               self.configuration.parameters.get(KEY_INCREMENTAL, True),
-                               self.configuration.parameters.get(KEY_PRIMARY_KEYS, []))
-
-    def _parse_ssh_parameters(self):
-
-        ssh_config = self.configuration.parameters.get(KEY_SSH, {})
-
-        if ssh_config == {}:  # or ssh_config.get(KEY_SSH_USE) is False:
-            raise UserException("SSH configuration not specified.")
-        else:
-            try:
-                ssh_object = SshTunnel(ssh_config[KEY_SSH_HOST], ssh_config[KEY_SSH_PORT],
-                                       ssh_config[KEY_SSH_USERNAME], ssh_config[KEY_SSH_PKEY])
-            except KeyError as e:
-                raise UserException(f"Missing mandatory field {e} in SSH configuration.")
-
-            return ssh_object
-
-    def _parse_db_parameters(self):
-        db_config = self.configuration.parameters[KEY_DB]
-        try:
-            db_object = Database(db_config[KEY_DB_HOST], db_config[KEY_DB_PORT])
-        except KeyError as e:
-            raise UserException(f"Missing mandatory field {e} in DB configuration.")
-        return db_object
-
-    def _parse_index_parameters(self):
-
-        index = self.configuration.parameters[KEY_INDEX_NAME]
-        date_config = self.configuration.parameters.get(KEY_DATE, {})
-
-        _req_body = self.configuration.parameters.get(KEY_REQUEST_BODY, '{}').strip()
-        request_body_string = _req_body if _req_body != '' else '{}'
-
-        if '{{date}}' in index:
-            _date = dateparser.parse(date_config.get(KEY_DATE_SHIFT, 'yesterday'))
-
-            if _date is None:
-                raise UserException(f"Could not parse value {date_config[KEY_DATE_SHIFT]} to date.")
-
-            _date = _date.replace(tzinfo=pytz.UTC)
-
-            _tz = date_config.get(KEY_DATE_TZ, 'UTC')
-
-            if _tz not in pytz.all_timezones:
-                raise UserException(f"Incorrect timezone {_tz} provided. Timezone must be a valid DB timezone name. "
-                                    "See https://en.wikipedia.org/wiki/List_of_tz_database_time_zones#List.")
-
-            _date_tz = pytz.timezone(_tz).normalize(_date)
-            _date_formatted = _date_tz.strftime(date_config.get(KEY_DATE_FORMAT, '%Y-%m-%d'))
-
-            index = index.replace('{{date}}', _date_formatted)
-            logging.info(f"Replaced date placeholder with value {_date_formatted}. " +
-                         f"Downloading data from index {index}.")
-
-        else:
-            logging.info(f"No date placeholder found in index name {index}.")
-
-        try:
-            request_body = json.loads(request_body_string)
-        except ValueError:
-            raise UserException("Could not parse request body string to JSON.")
-
-        return index, request_body
-
-    def parse_curl_stdout(self, stdout):
-        stdout_split = stdout.split('\r\n\r\n')
-        rsp_status = stdout_split[0].split(' ')[1]
-        rsp_body = stdout_split[1]
-        return rsp_status, rsp_body
-
-    def parse_scroll(self, scroll_response):
-
-        try:
-            scroll_json = json.loads(scroll_response)
-        except ValueError as e:
-            raise UserException(f"Could not parse JSON response - {e}.")
-
-        return scroll_json.get('_scroll_id'), scroll_json['hits']['total'], scroll_json['hits']['hits']
-
-    def run(self):
-
-        previous_state = self.get_state_file()
-        if previous_state:
-            columns = previous_state.get("columns", [])
-            logging.info(f"Using table columns from state file: {columns}")
-        else:
-            columns = []
-        is_complete = False
-
-        _fp_out, _fp_err = self.client.get_first_page(self.index, self.index_params)
-
-        if _fp_out == '' and _fp_err != '':
-            raise UserException(f"Could not download data. Error: {_fp_err}")
-
-        elif _fp_out == '' and _fp_err == '':
-            raise UserException("No data returned.")
-
-        else:
-            pass
-
-        logging.debug("Parsing first page.")
-        stdout_sc, stdout_body = self.parse_curl_stdout(_fp_out)
-
-        if stdout_sc != '200':
-            raise UserException(f"Could not download data. Error: {stdout_body}.")
-
-        else:
-            _scroll_id, _nr_results, _results = self.parse_scroll(stdout_body)
-
-        logging.info(f"{_nr_results} rows will be downloaded from index {self.index}.")
-        all_results = [self.fetcher.flatten_json(r) for r in _results]
-
-        already_written = 0
-        with ElasticDictWriter(self.fetcher.get_table_path(), fieldnames=columns, restval='',
-                               quoting=csv.QUOTE_ALL, quotechar='\"') as wr:
-            for row in self.fetcher.fetch_results(all_results):
-                wr.writerow(row)
-
-            already_written += len(_results)
-
-            if len(_results) < self.client._default_size:
-                is_complete = True
-
-            while not is_complete:
-
-                _scroll_out, _scroll_err = self.client.get_scroll(_scroll_id)
-
-                if _scroll_out == '':
-                    raise UserException(f"Could not download data for scroll {_scroll_id}.\n" +
-                                        f"STDERR: {_scroll_err}.")
-
-                else:
-                    pass
-
-                stdout_sc, stdout_body = self.parse_curl_stdout(_scroll_out)
-
-                if stdout_sc != '200':
-                    raise UserException(f"Could not download data. Error: {stdout_body}.")
-
-                else:
-                    _scroll_id, _, _results = self.parse_scroll(stdout_body)
-
-                all_results = [self.fetcher.flatten_json(r) for r in _results]
-
-                if len(_results) < self.client._default_size:
-                    is_complete = True
-
-                for row in self.fetcher.fetch_results(all_results):
-                    wr.writerow(row)
-                already_written += len(_results)
-
-                if already_written % self.BATCH_PROCESSING_SIZE == 0:
-                    logging.info(f"Parsed {already_written} results so far.")
-
-        logging.info(f"Downloaded all data for index {self.index}. Parsed {already_written} rows.")
-        if already_written > 0:
-            self.fetcher.create_manifest(wr.fieldnames, self.fetcher.incremental, self.fetcher.primary_keys)
-            self.write_state_file({"columns": wr.fieldnames})
-
-        logging.info("Component finished.")
-
-
-================================================
-File: /src/legacy_client/ssh_client.py
-================================================
-import io
-import json
-import logging
-import socket
-import sys
-from typing import List, Tuple
-from retry import retry
-import paramiko
-from furl import furl
-
-Headers = List[Tuple[str, str]]
-
-# Workaround for re-key timeout: https://github.com/paramiko/paramiko/issues/822
-paramiko.packet.Packetizer.REKEY_BYTES = 1e12
-
-SIZE_PARAM = 'size'
-SCROLL_PARAM = 'scroll'
-
-DEFAULT_SIZE = 2000
-DEFAULT_SCROLL = '15m'
-SSH_COMMAND_TIMEOUT = 60  # this is in seconds
-
-
-class SshClient:
-
-    def __init__(self, SshTunnel, Database):
-
-        self.SshTunnel = SshTunnel
-
-        pkey_file = io.StringIO(SshTunnel.key)
-        self.pkey = self._parse_private_key(pkey_file)
-
-        # Set up SSH paramiko client
-        self.ssh = paramiko.SSHClient()
-        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        self.connect_ssh()
-
-        self.db = Database
-        self._default_size = DEFAULT_SIZE
-
-    def connect_ssh(self):
-        try:
-            self.ssh.connect(hostname=self.SshTunnel.hostname, port=self.SshTunnel.port,
-                             username=self.SshTunnel.username, pkey=self.pkey)
-        except (socket.gaierror, paramiko.ssh_exception.AuthenticationException):
-            logging.exception("Could not establish SSH tunnel. Check that all SSH parameters are correct.")
-            sys.exit(1)
-
-    def _parse_private_key(self, keyfile):
-        # try all versions of encryption keys
-        pkey = None
-        failed = False
-        try:
-            pkey = paramiko.RSAKey.from_private_key(keyfile)
-        except paramiko.SSHException as e:
-            logging.debug(e)
-            logging.warning("RSS Private key invalid, trying DSS.")
-            failed = True
-        except IndexError:
-            logging.exception("Could not read RSS Private Key - have you provided it correctly?")
-            sys.exit(1)
-        # DSS
-        if failed:
-            try:
-                pkey = paramiko.DSSKey.from_private_key(keyfile)
-                failed = False
-            except paramiko.SSHException:
-                logging.warning("DSS Private key invalid, trying ECDSAKey.")
-                failed = True
-            except IndexError:
-                logging.exception("Could not read DSS Private Key - have you provided it correctly?")
-                sys.exit(1)
-        # ECDSAKey
-        if failed:
-            try:
-                pkey = paramiko.ECDSAKey.from_private_key(keyfile)
-                failed = False
-            except paramiko.SSHException:
-                logging.warning("ECDSAKey Private key invalid, trying Ed25519Key.")
-                failed = True
-            except IndexError:
-                logging.exception("Could not read ECDSAKey Private Key - have you provided it correctly?")
-                sys.exit(1)
-        # Ed25519Key
-        if failed:
-            try:
-                pkey = paramiko.Ed25519Key.from_private_key(keyfile)
-            except paramiko.SSHException as e:
-                logging.warning("Ed25519Key Private key invalid.")
-                raise e
-            except IndexError:
-                logging.exception("Could not read Ed25519Key Private Key - have you provided it correctly?")
-                sys.exit(1)
-
-        return pkey
-
-    def build_curl(self, url, request_type, headers=None, json_body=None):
-
-        # Start of curl string
-        curl = 'curl -i'
-        curl += f' --request {request_type}'
-
-        # Add headers
-        _header_string = ''
-        for header in headers:
-            _header_string += f' -H "{header[0]}: {header[1]}"'
-
-        curl += _header_string
-
-        # Add JSON body
-        if json_body is not None:
-            curl += f' --data \'{json.dumps(json_body)}\''
-
-        curl += f' {url}'
-
-        logging.debug(f"Constructed cURL: {curl}.")
-        return curl
-
-    @retry(paramiko.ssh_exception.SSHException, delay=3, tries=5, backoff=3)
-    def _execute_ssh_command(self, curl):
+    def extract_data(self, index_name: str, query: str) -> Iterable:
         """
-        Wrapped func to execute ssh command with timeout defined in SSH_COMMAND_TIMEOUT
-        """
-        _, stdout, stderr = self.ssh.exec_command(command=curl, timeout=SSH_COMMAND_TIMEOUT)
-        return _, stdout, stderr
+        Extracts data from the specified Elasticsearch index based on the given query.
 
-    def execute_ssh_command(self, curl):
+        Parameters:
+            index_name (str): Name of the Elasticsearch index.
+            query (dict): Elasticsearch DSL query.
+
+        Yields:
+            dict
         """
-        Executes ssh command with timeout defined in SSH_COMMAND_TIMEOUT
+        response = self.search(index=index_name, size=DEFAULT_SIZE, scroll=SCROLL_TIMEOUT, body=query)
+        for r in self._process_response(response):
+            yield r
+
+        while len(response['hits']['hits']):
+            response = self.scroll(scroll_id=response["_scroll_id"], scroll=SCROLL_TIMEOUT)
+            for r in self._process_response(response):
+                yield r
+
+    def _process_response(self, response: dict) -> Iterable:
+        results = [hit["_source"] for hit in response['hits']['hits']]
+        for result in results:
+            yield self.flatten_json(result)
+
+    def ping(
+        self,
+        *,
+        error_trace: t.Optional[bool] = None,
+        filter_path: t.Optional[t.Union[t.List[str], str]] = None,
+        human: t.Optional[bool] = None,
+        pretty: t.Optional[bool] = None,
+    ) -> bool:
         """
+        Returns True if a successful response returns from the info() API,
+        otherwise returns False. This API call can fail either at the transport
+        layer (due to connection errors or timeouts) or from a non-2XX HTTP response
+        (due to authentication or authorization issues).
+
+        If you want to discover why the request failed you should use the ``info()`` API.
+
+        `<https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html>`_
+        """
+        __path = "/"
+        __query: t.Dict[str, t.Any] = {}
+        if error_trace is not None:
+            __query["error_trace"] = error_trace
+        if filter_path is not None:
+            __query["filter_path"] = filter_path
+        if human is not None:
+            __query["human"] = human
+        if pretty is not None:
+            __query["pretty"] = pretty
+        __headers = {"accept": "application/json"}
         try:
-            _, stdout, stderr = self._execute_ssh_command(curl)
-        except paramiko.ssh_exception.SSHException:
-            try:
-                logging.info("Failed to execute SSH command, resetting connection and trying again...")
-                self.connect_ssh()
-                _, stdout, stderr = self._execute_ssh_command(curl)
-            except paramiko.ssh_exception.SSHException:
-                logging.exception(f"Maximum number of retries (3) reached when executing ssh_command {curl}")
-                sys.exit(1)
-            return _, stdout, stderr
-        return _, stdout, stderr
-
-    def get_first_page(self, index, body):
-
-        db_url = furl(f'{self.db.host}:{self.db.port}')
-        db_url /= f'{index}/_search'
-
-        self._default_scroll = body.pop(SCROLL_PARAM, DEFAULT_SCROLL)
-        db_url.args[SCROLL_PARAM] = self._default_scroll
-
-        if SIZE_PARAM in body:
-            self._default_size = body[SIZE_PARAM]
-        else:
-            body[SIZE_PARAM] = self._default_size
-
-        logging.info(f"Default size: {self._default_size}")
-
-        curl = self.build_curl(db_url, 'POST', [('Content-Type', 'application/json')], body)
-
-        _, stdout, stderr = self.execute_ssh_command(curl)
-        out, err = stdout.read(), stderr.read()
-
-        return out.decode().strip(), err.decode().strip()
-
-    def get_scroll(self, scroll_id):
-        db_url = furl(f'{self.db.host}:{self.db.port}')
-        db_url /= '_search/scroll'
-
-        data = {'scroll': self._default_scroll, 'scroll_id': scroll_id}
-
-        curl = self.build_curl(db_url, 'POST', [('Content-Type', 'application/json')], data)
-
-        _, stdout, stderr = self.execute_ssh_command(curl)
-        out, err = stdout.read(), stderr.read()
-
-        return out.decode().strip(), err.decode().strip()
-
-
-================================================
-File: /src/legacy_client/result.py
-================================================
-import json
-import logging
-import os
-import sys
-from typing import List
-
-
-class Fetcher:
-
-    def __init__(self, path: str, table_name: str, incremental: bool = False, primary_keys: List = []):
-
-        if (_tn := table_name.strip()) == '':
-            logging.error("No table name provided.")
-            sys.exit(1)
-        else:
-            self.table_name = _tn
-
-        self.incremental = bool(incremental)
-        self.table_path = path
-        self.result_schema = None
-
-        if isinstance(primary_keys, List) is False:
-            logging.error("Primary keys must be provided as an array.")
-            sys.exit(1)
-        else:
-            self.primary_keys = primary_keys
+            self.perform_request("HEAD", __path, params=__query, headers=__headers)
+            return True
+        except (ApiError, TransportError) as e:
+            raise ElasticsearchClientException(e)
 
     def flatten_json(self, x, out=None, name=''):
         if out is None:
@@ -1079,69 +1081,57 @@ class Fetcher:
 
         return out
 
-    def create_manifest(self, columns, incremental, primary_keys):
-
-        with open(os.path.join(self.table_path, self.table_name) + '.manifest', 'w') as man_file:
-            json.dump(
-                {
-                    'columns': columns,
-                    'incremental': incremental,
-                    'primary_key': primary_keys
-                }, man_file
-            )
-
-    @staticmethod
-    def fetch_results(results):
-        for row in results:
-            yield row
-
-    def get_table_path(self):
-        return os.path.join(self.table_path, self.table_name)
-
 
 ================================================
-File: /LICENSE.md
+File: /src/client/ssh_utils.py
 ================================================
-The MIT License (MIT)
+import base64
+import binascii
+import contextlib
+import paramiko
+from io import StringIO
+from typing import Tuple
 
-Copyright (c) 2018 Keboola DS, http://keboola.com
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files, to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished
-to do so, subject to the following conditions:
+class SomeSSHException(Exception):
+    pass
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+def get_private_key(input_key, private_key_password):
+    key = _get_decoded_key(input_key)
+    try:
+        if private_key_password:
+            return paramiko.RSAKey.from_private_key(StringIO(key), password=private_key_password)
+        else:
+            return paramiko.RSAKey.from_private_key(StringIO(key))
+    except paramiko.ssh_exception.SSHException as pkey_error:
+        raise SomeSSHException("Invalid private key") from pkey_error
 
-================================================
-File: /requirements.txt
-================================================
-keboola.component==1.4.3
-keboola.csvwriter
-keboola.json-to-csv
-elasticsearch==8.10.1
-dateparser
-paramiko==3.4.0
-retry
-furl
-mock
-freezegun
-https://bitbucket.org/kds_consulting_team/datadirtest/get/1.5.1.zip#egg=datadirtest
-pytest
-faker
-cryptography==36.0.2 # to supress Blowfish warnings from Paramiko
-sshtunnel==0.4.0
+
+def _get_decoded_key(input_key):
+    """
+        Have to satisfy both encoded and not encoded keys
+    """
+    b64_decoded_input_key = ""
+    with contextlib.suppress(binascii.Error):
+        b64_decoded_input_key = base64.b64decode(input_key, validate=True).decode('utf-8')
+
+    is_valid_b64, message_b64 = validate_ssh_private_key(b64_decoded_input_key)
+    is_valid, message = validate_ssh_private_key(input_key)
+    if is_valid_b64:
+        final_key = b64_decoded_input_key
+    elif is_valid:
+        final_key = input_key
+    else:
+        raise SomeSSHException("\n".join([message, message_b64]))
+    return final_key
+
+
+def validate_ssh_private_key(ssh_private_key: str) -> Tuple[bool, str]:
+    if "\n" not in ssh_private_key:
+        return False, "SSH Private key is invalid, make sure it \\n characters as new lines"
+    return True, ""
+
 
 ================================================
 File: /bitbucket-pipelines.yml
@@ -1218,130 +1208,59 @@ pipelines:
             - ./deploy.sh
 
 ================================================
-File: /component_config/component_short_description.md
+File: /tests/test_component.py
 ================================================
+"""
+Created on 12. 11. 2018
+
+@author: esner
+"""
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {"KBC_DATADIR": "./non-existing-dir"})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# Elasticsearch Extractor
+
 Elasticsearch is a search engine based on the Lucene library. It provides a distributed, multitenant-capable full-text search engine with an HTTP web interface and schema-free JSON documents.
 
-================================================
-File: /component_config/configSchema.json
-================================================
-{
-  "title": "Authorization",
-  "type": "object",
-  "required": [
-    "db"
-  ],
-  "properties": {
-    "db": {
-      "title": "Database",
-      "type": "object",
-      "required": [
-        "hostname",
-        "port"
-      ],
-      "propertyOrder": 1,
-      "properties": {
-        "hostname": {
-          "title": "Hostname",
-          "type": "string",
-          "propertyOrder": 10
-        },
-        "port": {
-          "title": "Port",
-          "type": "integer",
-          "propertyOrder": 20,
-          "default": 9200
-        }
-      }
-    },
-    "authentication": {
-      "title": "Authentication",
-      "propertyOrder": 2,
-      "properties": {
-        "auth_type": {
-          "title": "Authentication Type",
-          "type": "string",
-          "enum": [
-            "basic",
-            "api_key",
-            "no_auth"
-          ],
-          "default": "no_auth",
-          "options": {
-            "enum_titles": [
-              "Basic",
-              "API key",
-              "No Authentication"
-            ]
-          },
-          "propertyOrder": 1
-        },
-        "username": {
-          "title": "Username",
-          "type": "string",
-          "options": {
-            "dependencies": {
-              "auth_type": "basic"
-            }
-          },
-          "propertyOrder": 2
-        },
-        "#password": {
-          "title": "Password",
-          "type": "string",
-          "format": "password",
-          "options": {
-            "dependencies": {
-              "auth_type": "basic"
-            }
-          },
-          "propertyOrder": 3
-        },
-        "api_key_id": {
-          "title": "API Key ID",
-          "type": "string",
-          "options": {
-            "dependencies": {
-              "auth_type": "api_key"
-            }
-          },
-          "propertyOrder": 4
-        },
-        "#api_key": {
-          "title": "API Key",
-          "type": "string",
-          "format": "password",
-          "options": {
-            "dependencies": {
-              "auth_type": "api_key"
-            }
-          },
-          "propertyOrder": 5
-        }
-      }
-    },
-    "scheme": {
-      "title": "Scheme",
-      "type": "string",
-      "enum": [
-        "http",
-        "https"
-      ],
-      "default": "http",
-      "propertyOrder": 4
-    },
-        "ssh_options": {
-          "type": "object",
-          "format": "ssh-editor",
-          "propertyOrder": 5
-        }
-  }
-}
+The component allows to download data from indexes in an Elasticseach engine directly to Keboola without complicated setup.
 
-================================================
-File: /component_config/stack_parameters.json
-================================================
-{}
+
+# Notes on functionality
+
+The extractor utilizes Elasticsearch [Search API](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-search.html) to download the data from an index. Users are able to define their own request by specifying a JSON request body, which will be appended to a request. For all allowed request body specifications, please refer to [Request Body in Search API](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-search.html#search-search-api-request-body) documentation.
 
 ================================================
 File: /component_config/configuration_description.md
@@ -1470,6 +1389,132 @@ An array of columns, specifying a primary key for the storage table inside Keboo
 Specifies, whether to use incremental load (`true`) or full load (`false`).
 
 ================================================
+File: /component_config/component_short_description.md
+================================================
+Elasticsearch is a search engine based on the Lucene library. It provides a distributed, multitenant-capable full-text search engine with an HTTP web interface and schema-free JSON documents.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{
+  "title": "Authorization",
+  "type": "object",
+  "required": [
+    "db"
+  ],
+  "properties": {
+    "db": {
+      "title": "Database",
+      "type": "object",
+      "required": [
+        "hostname",
+        "port"
+      ],
+      "propertyOrder": 1,
+      "properties": {
+        "hostname": {
+          "title": "Hostname",
+          "type": "string",
+          "propertyOrder": 10
+        },
+        "port": {
+          "title": "Port",
+          "type": "integer",
+          "propertyOrder": 20,
+          "default": 9200
+        }
+      }
+    },
+    "authentication": {
+      "title": "Authentication",
+      "propertyOrder": 2,
+      "properties": {
+        "auth_type": {
+          "title": "Authentication Type",
+          "type": "string",
+          "enum": [
+            "basic",
+            "api_key",
+            "no_auth"
+          ],
+          "default": "no_auth",
+          "options": {
+            "enum_titles": [
+              "Basic",
+              "API key",
+              "No Authentication"
+            ]
+          },
+          "propertyOrder": 1
+        },
+        "username": {
+          "title": "Username",
+          "type": "string",
+          "options": {
+            "dependencies": {
+              "auth_type": "basic"
+            }
+          },
+          "propertyOrder": 2
+        },
+        "#password": {
+          "title": "Password",
+          "type": "string",
+          "format": "password",
+          "options": {
+            "dependencies": {
+              "auth_type": "basic"
+            }
+          },
+          "propertyOrder": 3
+        },
+        "api_key_id": {
+          "title": "API Key ID",
+          "type": "string",
+          "options": {
+            "dependencies": {
+              "auth_type": "api_key"
+            }
+          },
+          "propertyOrder": 4
+        },
+        "#api_key": {
+          "title": "API Key",
+          "type": "string",
+          "format": "password",
+          "options": {
+            "dependencies": {
+              "auth_type": "api_key"
+            }
+          },
+          "propertyOrder": 5
+        }
+      }
+    },
+    "scheme": {
+      "title": "Scheme",
+      "type": "string",
+      "enum": [
+        "http",
+        "https"
+      ],
+      "default": "http",
+      "propertyOrder": 4
+    },
+        "ssh_options": {
+          "type": "object",
+          "format": "ssh-editor",
+          "propertyOrder": 5
+        }
+  }
+}
+
+================================================
 File: /component_config/configRowSchema.json
 ================================================
 {
@@ -1580,20 +1625,6 @@ File: /component_config/configRowSchema.json
 }
 
 ================================================
-File: /component_config/component_long_description.md
-================================================
-# Elasticsearch Extractor
-
-Elasticsearch is a search engine based on the Lucene library. It provides a distributed, multitenant-capable full-text search engine with an HTTP web interface and schema-free JSON documents.
-
-The component allows to download data from indexes in an Elasticseach engine directly to Keboola without complicated setup.
-
-
-# Notes on functionality
-
-The extractor utilizes Elasticsearch [Search API](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-search.html) to download the data from an index. Users are able to define their own request by specifying a JSON request body, which will be appended to a request. For all allowed request body specifications, please refer to [Request Body in Search API](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-search.html#search-search-api-request-body) documentation.
-
-================================================
 File: /component_config/sample-config/legacy_config.json
 ================================================
 {
@@ -1622,6 +1653,11 @@ File: /component_config/sample-config/legacy_config.json
   },
   "image_parameters": {}
 }
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
 
 ================================================
 File: /component_config/sample-config/in/tables/test.csv
@@ -1731,11 +1767,6 @@ File: /component_config/sample-config/in/tables/test.csv.manifest
 }
 
 ================================================
-File: /component_config/sample-config/in/state.json
-================================================
-{"data_delta": "10222018"}
-
-================================================
 File: /component_config/sample-config/in/files/order1.xml
 ================================================
 <?xml version='1.0' ?>
@@ -1785,116 +1816,6 @@ File: /component_config/sample-config/out/config.json
     "debug": false
   }
 }
-
-================================================
-File: /deploy.sh
-================================================
-#!/bin/sh
-set -e
-
-env
-
-# compatibility with travis and bitbucket
-if [ ! -z ${BITBUCKET_TAG} ]
-then
-	echo "assigning bitbucket tag"
-	export TAG="$BITBUCKET_TAG"
-elif [ ! -z ${TRAVIS_TAG} ]
-then
-	echo "assigning travis tag"
-	export TAG="$TRAVIS_TAG"
-elif [ ! -z ${GITHUB_TAG} ]
-then
-	echo "assigning github tag"
-	export TAG="$GITHUB_TAG"
-else
-	echo No Tag is set!
-	exit 1
-fi
-
-echo "Tag is '${TAG}'"
-
-#check if deployment is triggered only in master
-if [ ${BITBUCKET_BRANCH} != "master" ]; then
-               echo Deploy on tagged commit can be only executed in master!
-               exit 1
-fi
-
-# Obtain the component repository and log in
-echo "Obtain the component repository and log in"
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
-
-echo "Set credentials"
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
-
-# Push to the repository
-echo "Push to the repository"
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${TAG}
-docker push ${REPOSITORY}:latest
-
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
-fi
-
-
-================================================
-File: /docker-compose.yml
-================================================
-version: "3"
-services:
-  # for development purposes
-  dev:
-    build: .
-    volumes:
-        - ./:/code
-        - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-    deploy:
-      resources:
-        limits:
-          memory: 256m
-
-  test:
-    # Use to run flake8 and unittests checks
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-    command:
-      - /bin/sh
-      - /code/scripts/build_n_test.sh
-
-
-================================================
-File: /scripts/build_n_test.sh
-================================================
-#!/bin/sh
-set -e
-
-flake8 --config=flake8.cfg
-python -m unittest discover
 
 ================================================
 File: /scripts/update_dev_portal_properties.sh
@@ -1982,6 +1903,85 @@ else
     echo "shortDescription is empty!"
     exit 1
 fi
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+keboola.component==1.4.3
+keboola.csvwriter
+keboola.json-to-csv
+elasticsearch==8.10.1
+dateparser
+paramiko==3.4.0
+retry
+furl
+mock
+freezegun
+https://bitbucket.org/kds_consulting_team/datadirtest/get/1.5.1.zip#egg=datadirtest
+pytest
+faker
+cryptography==36.0.2 # to supress Blowfish warnings from Paramiko
+sshtunnel==0.4.0
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.11.7-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential curl
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 ================================================
 File: /README.md

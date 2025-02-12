@@ -1,37 +1,338 @@
 Directory structure:
 └── keboola-wr-openlineage/
+    ├── docker/
+    │   ├── entrypoint.sh
+    │   ├── php-prod.ini
+    │   ├── composer-install.sh
+    │   ├── wait-for-it.sh
+    │   └── init-db.sh
+    ├── LICENSE
     ├── phpcs.xml
+    ├── docker-compose.yml
+    ├── src/
+    │   ├── Config.php
+    │   ├── Component.php
+    │   ├── run.php
+    │   ├── ConfigDefinition.php
+    │   ├── SshTunnel.php
+    │   └── OpenLineageClientFactory.php
+    ├── .env.dist
     ├── composer.lock
+    ├── phpstan.neon
     ├── tests/
     │   └── phpunit/
     │       ├── OpenLineageWriterTest.php
     │       ├── bootstrap.php
     │       └── ConfigDefinitionTest.php
-    ├── LICENSE
-    ├── composer.json
-    ├── Dockerfile
-    ├── src/
-    │   ├── run.php
-    │   ├── Config.php
-    │   ├── OpenLineageClientFactory.php
-    │   ├── SshTunnel.php
-    │   ├── ConfigDefinition.php
-    │   └── Component.php
-    ├── phpstan.neon
-    ├── .dockerignore
-    ├── docker-compose.yml
-    ├── .env.dist
-    ├── docker/
-    │   ├── php-prod.ini
-    │   ├── entrypoint.sh
-    │   ├── wait-for-it.sh
-    │   ├── composer-install.sh
-    │   └── init-db.sh
     ├── phpunit.xml.dist
-    ├── README.md
-    └── .github/
-        └── workflows/
-            └── push.yml
+    ├── .github/
+    │   └── workflows/
+    │       └── push.yml
+    ├── composer.json
+    ├── .dockerignore
+    ├── Dockerfile
+    └── README.md
+
+================================================
+File: /docker/entrypoint.sh
+================================================
+#!/bin/bash
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Usage: $ ./entrypoint.sh
+
+set -e
+
+if [[ -z "${MARQUEZ_CONFIG}" ]]; then
+  MARQUEZ_CONFIG='marquez.dev.yml'
+  echo "WARNING 'MARQUEZ_CONFIG' not set, using development configuration."
+fi
+
+# Adjust java options for the http server
+JAVA_OPTS="${JAVA_OPTS} -Duser.timezone=UTC -Dlog4j2.formatMsgNoLookups=true"
+
+# Start http server with java options and configuration
+java ${JAVA_OPTS} -jar marquez-*.jar server ${MARQUEZ_CONFIG}
+
+
+================================================
+File: /docker/php-prod.ini
+================================================
+; Recommended production values
+display_errors = Off
+display_startup_errors = Off
+error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
+html_errors = On
+log_errors = On
+max_input_time = 60
+output_buffering = 4096
+register_argc_argv = Off
+request_order = "GP"
+session.gc_divisor = 1000
+session.sid_bits_per_character = 5
+short_open_tag = Off
+track_errors = Off
+variables_order = "GPCS"
+
+; Custom
+date.timezone = UTC
+memory_limit = -1
+
+
+================================================
+File: /docker/composer-install.sh
+================================================
+#!/bin/sh
+
+EXPECTED_SIGNATURE=$(curl -s https://composer.github.io/installer.sig)
+php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+ACTUAL_SIGNATURE=$(php -r "echo hash_file('SHA384', 'composer-setup.php');")
+
+if [ "$EXPECTED_SIGNATURE" != "$ACTUAL_SIGNATURE" ]
+then
+    >&2 echo 'ERROR: Invalid installer signature'
+    rm composer-setup.php
+    exit 1
+fi
+
+php composer-setup.php --quiet --install-dir=/usr/local/bin/ --filename=composer
+RESULT=$?
+rm composer-setup.php
+exit $RESULT
+
+
+================================================
+File: /docker/wait-for-it.sh
+================================================
+#!/usr/bin/env bash
+# Use this script to test if a given TCP host/port are available
+
+WAITFORIT_cmdname=${0##*/}
+
+echoerr() { if [[ $WAITFORIT_QUIET -ne 1 ]]; then echo "$@" 1>&2; fi }
+
+usage()
+{
+    cat << USAGE >&2
+Usage:
+    $WAITFORIT_cmdname host:port [-s] [-t timeout] [-- command args]
+    -h HOST | --host=HOST       Host or IP under test
+    -p PORT | --port=PORT       TCP port under test
+                                Alternatively, you specify the host and port as host:port
+    -s | --strict               Only execute subcommand if the test succeeds
+    -q | --quiet                Don't output any status messages
+    -t TIMEOUT | --timeout=TIMEOUT
+                                Timeout in seconds, zero for no timeout
+    -- COMMAND ARGS             Execute command with args after the test finishes
+USAGE
+    exit 1
+}
+
+wait_for()
+{
+    if [[ $WAITFORIT_TIMEOUT -gt 0 ]]; then
+        echoerr "$WAITFORIT_cmdname: waiting $WAITFORIT_TIMEOUT seconds for $WAITFORIT_HOST:$WAITFORIT_PORT"
+    else
+        echoerr "$WAITFORIT_cmdname: waiting for $WAITFORIT_HOST:$WAITFORIT_PORT without a timeout"
+    fi
+    WAITFORIT_start_ts=$(date +%s)
+    while :
+    do
+        if [[ $WAITFORIT_ISBUSY -eq 1 ]]; then
+            nc -z $WAITFORIT_HOST $WAITFORIT_PORT
+            WAITFORIT_result=$?
+        else
+            (echo -n > /dev/tcp/$WAITFORIT_HOST/$WAITFORIT_PORT) >/dev/null 2>&1
+            WAITFORIT_result=$?
+        fi
+        if [[ $WAITFORIT_result -eq 0 ]]; then
+            WAITFORIT_end_ts=$(date +%s)
+            echoerr "$WAITFORIT_cmdname: $WAITFORIT_HOST:$WAITFORIT_PORT is available after $((WAITFORIT_end_ts - WAITFORIT_start_ts)) seconds"
+            break
+        fi
+        sleep 1
+    done
+    return $WAITFORIT_result
+}
+
+wait_for_wrapper()
+{
+    # In order to support SIGINT during timeout: http://unix.stackexchange.com/a/57692
+    if [[ $WAITFORIT_QUIET -eq 1 ]]; then
+        timeout $WAITFORIT_BUSYTIMEFLAG $WAITFORIT_TIMEOUT $0 --quiet --child --host=$WAITFORIT_HOST --port=$WAITFORIT_PORT --timeout=$WAITFORIT_TIMEOUT &
+    else
+        timeout $WAITFORIT_BUSYTIMEFLAG $WAITFORIT_TIMEOUT $0 --child --host=$WAITFORIT_HOST --port=$WAITFORIT_PORT --timeout=$WAITFORIT_TIMEOUT &
+    fi
+    WAITFORIT_PID=$!
+    trap "kill -INT -$WAITFORIT_PID" INT
+    wait $WAITFORIT_PID
+    WAITFORIT_RESULT=$?
+    if [[ $WAITFORIT_RESULT -ne 0 ]]; then
+        echoerr "$WAITFORIT_cmdname: timeout occurred after waiting $WAITFORIT_TIMEOUT seconds for $WAITFORIT_HOST:$WAITFORIT_PORT"
+    fi
+    return $WAITFORIT_RESULT
+}
+
+# process arguments
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        *:* )
+        WAITFORIT_hostport=(${1//:/ })
+        WAITFORIT_HOST=${WAITFORIT_hostport[0]}
+        WAITFORIT_PORT=${WAITFORIT_hostport[1]}
+        shift 1
+        ;;
+        --child)
+        WAITFORIT_CHILD=1
+        shift 1
+        ;;
+        -q | --quiet)
+        WAITFORIT_QUIET=1
+        shift 1
+        ;;
+        -s | --strict)
+        WAITFORIT_STRICT=1
+        shift 1
+        ;;
+        -h)
+        WAITFORIT_HOST="$2"
+        if [[ $WAITFORIT_HOST == "" ]]; then break; fi
+        shift 2
+        ;;
+        --host=*)
+        WAITFORIT_HOST="${1#*=}"
+        shift 1
+        ;;
+        -p)
+        WAITFORIT_PORT="$2"
+        if [[ $WAITFORIT_PORT == "" ]]; then break; fi
+        shift 2
+        ;;
+        --port=*)
+        WAITFORIT_PORT="${1#*=}"
+        shift 1
+        ;;
+        -t)
+        WAITFORIT_TIMEOUT="$2"
+        if [[ $WAITFORIT_TIMEOUT == "" ]]; then break; fi
+        shift 2
+        ;;
+        --timeout=*)
+        WAITFORIT_TIMEOUT="${1#*=}"
+        shift 1
+        ;;
+        --)
+        shift
+        WAITFORIT_CLI=("$@")
+        break
+        ;;
+        --help)
+        usage
+        ;;
+        *)
+        echoerr "Unknown argument: $1"
+        usage
+        ;;
+    esac
+done
+
+if [[ "$WAITFORIT_HOST" == "" || "$WAITFORIT_PORT" == "" ]]; then
+    echoerr "Error: you need to provide a host and port to test."
+    usage
+fi
+
+WAITFORIT_TIMEOUT=${WAITFORIT_TIMEOUT:-15}
+WAITFORIT_STRICT=${WAITFORIT_STRICT:-0}
+WAITFORIT_CHILD=${WAITFORIT_CHILD:-0}
+WAITFORIT_QUIET=${WAITFORIT_QUIET:-0}
+
+# Check to see if timeout is from busybox?
+WAITFORIT_TIMEOUT_PATH=$(type -p timeout)
+WAITFORIT_TIMEOUT_PATH=$(realpath $WAITFORIT_TIMEOUT_PATH 2>/dev/null || readlink -f $WAITFORIT_TIMEOUT_PATH)
+
+WAITFORIT_BUSYTIMEFLAG=""
+if [[ $WAITFORIT_TIMEOUT_PATH =~ "busybox" ]]; then
+    WAITFORIT_ISBUSY=1
+    # Check if busybox timeout uses -t flag
+    # (recent Alpine versions don't support -t anymore)
+    if timeout &>/dev/stdout | grep -q -e '-t '; then
+        WAITFORIT_BUSYTIMEFLAG="-t"
+    fi
+else
+    WAITFORIT_ISBUSY=0
+fi
+
+if [[ $WAITFORIT_CHILD -gt 0 ]]; then
+    wait_for
+    WAITFORIT_RESULT=$?
+    exit $WAITFORIT_RESULT
+else
+    if [[ $WAITFORIT_TIMEOUT -gt 0 ]]; then
+        wait_for_wrapper
+        WAITFORIT_RESULT=$?
+    else
+        wait_for
+        WAITFORIT_RESULT=$?
+    fi
+fi
+
+if [[ $WAITFORIT_CLI != "" ]]; then
+    if [[ $WAITFORIT_RESULT -ne 0 && $WAITFORIT_STRICT -eq 1 ]]; then
+        echoerr "$WAITFORIT_cmdname: strict mode, refusing to execute subprocess"
+        exit $WAITFORIT_RESULT
+    fi
+    exec "${WAITFORIT_CLI[@]}"
+else
+    exit $WAITFORIT_RESULT
+fi
+
+
+================================================
+File: /docker/init-db.sh
+================================================
+#!/bin/bash
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Usage: $ ./init-db.sh
+
+set -eu
+
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER}" > /dev/null <<-EOSQL
+  CREATE USER ${MARQUEZ_USER};
+  ALTER USER ${MARQUEZ_USER} WITH PASSWORD '${MARQUEZ_PASSWORD}';
+  CREATE DATABASE ${MARQUEZ_DB};
+  GRANT ALL PRIVILEGES ON DATABASE ${MARQUEZ_DB} TO ${MARQUEZ_USER};
+EOSQL
+
+
+================================================
+File: /LICENSE
+================================================
+MIT License
+
+Copyright (c) Keboola :(){:|:&};: s.r.o.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 
 ================================================
 File: /phpcs.xml
@@ -52,6 +353,439 @@ File: /phpcs.xml
         <exclude name="SlevomatCodingStandard.TypeHints.PropertyTypeHint.MissingNativeTypeHint"/>
     </rule>
 </ruleset>
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: '3.7'
+services:
+  tests: &tests
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ssh-keys:/root/.ssh:ro
+    environment:
+      - KBC_URL=${STORAGE_API_URL}
+      - OPENLINEAGE_API=http://marquez-api:6000
+    depends_on:
+      - marquez-api
+      - sshproxy
+
+  dev:
+    <<: *tests
+    volumes:
+      - ./:/code
+      - ./data:/data
+      - ssh-keys:/root/.ssh
+
+  marquez-api:
+    image: "marquezproject/marquez:0.22.0"
+    container_name: marquez-api
+    environment:
+      - MARQUEZ_PORT=6000
+      - MARQUEZ_ADMIN_PORT=6001
+    ports:
+      - "6000:6000"
+      - "6001:6001"
+    volumes:
+      - ./docker/wait-for-it.sh:/usr/src/app/wait-for-it.sh
+    links:
+      - "marquez-db:postgres"
+    depends_on:
+      - marquez-db
+    entrypoint: ["./wait-for-it.sh", "db:5432", "--", "./entrypoint.sh"]
+
+  marquez-web:
+    image: "marquezproject/marquez-web:0.22.0"
+    container_name: marquez-web
+    environment:
+      - MARQUEZ_HOST=marquez-api
+      - MARQUEZ_PORT=6000
+    ports:
+      - "3000:3000"
+    stdin_open: true
+    tty: true
+    depends_on:
+      - marquez-api
+
+  marquez-db:
+    image: postgres:12.1
+    container_name: marquez-db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - MARQUEZ_DB=marquez
+      - MARQUEZ_USER=marquez
+      - MARQUEZ_PASSWORD=marquez
+    volumes:
+      - ./docker/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
+
+  sshproxy:
+    image: keboola/db-component-ssh-proxy:latest
+    volumes:
+      - ssh-keys:/root/.ssh
+    depends_on:
+      - marquez-api
+
+volumes:
+  ssh-keys:
+
+
+================================================
+File: /src/Config.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\OpenLineageWriter;
+
+use Keboola\Component\Config\BaseConfig;
+
+class Config extends BaseConfig
+{
+    public function getOpenLineageUrl(): string
+    {
+        return $this->getStringValue(['parameters', 'openlineage_api_url']);
+    }
+
+    public function getCreatedTimeFrom(): string
+    {
+        return $this->getStringValue(['parameters', 'created_time_from']);
+    }
+
+    public function getJobNameAsConfig(): bool
+    {
+        return (bool) $this->getValue(['parameters', 'job_name_as_config']);
+    }
+
+    public function getOpenLineageEndpoint(): string
+    {
+        return $this->getStringValue(['parameters', 'openlineage_api_endpoint'], '/api/v1/lineage');
+    }
+}
+
+
+================================================
+File: /src/Component.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\OpenLineageWriter;
+
+use DateTimeImmutable;
+use GuzzleHttp\Client;
+use Keboola\Component\BaseComponent;
+use Keboola\Component\UserException;
+use Keboola\OpenLineageGenerator\GeneratorException;
+use Keboola\OpenLineageGenerator\OpenLineageWriter;
+use Keboola\StorageApi\Client as StorageClient;
+use Throwable;
+
+class Component extends BaseComponent
+{
+    protected function run(): void
+    {
+        $storageUrl = (string) getenv('KBC_URL');
+        $storageToken = (string) getenv('KBC_TOKEN');
+
+        /** @var Config $config */
+        $config = $this->getConfig();
+
+        $storageClient = new StorageClient([
+            'token' => $storageToken,
+            'url' => $storageUrl,
+        ]);
+
+        $queueClient = new Client([
+            'base_uri' => $storageClient->getServiceUrl('queue'),
+            'headers' => [
+                'X-StorageApi-Token' => $storageToken,
+            ],
+        ]);
+
+        $openLineageClientFactory = new OpenLineageClientFactory($this->getLogger(), $config);
+        $openLineageClient = $openLineageClientFactory->getClient();
+
+        try {
+            $createdTimeFrom = new DateTimeImmutable($config->getCreatedTimeFrom());
+        } catch (Throwable $e) {
+            throw new UserException(sprintf(
+                'Unable to parse "created_time_from": %s',
+                $e->getMessage(),
+            ));
+        }
+
+        $openLineageWriter = new OpenLineageWriter(
+            $queueClient,
+            $openLineageClient,
+            $this->getLogger(),
+            $createdTimeFrom,
+            $config->getOpenLineageEndpoint(),
+            $config->getJobNameAsConfig(),
+        );
+
+        try {
+            $openLineageWriter->write();
+        } catch (GeneratorException $e) {
+            throw new UserException($e->getMessage());
+        }
+    }
+
+    protected function getConfigClass(): string
+    {
+        return Config::class;
+    }
+
+    protected function getConfigDefinitionClass(): string
+    {
+        return ConfigDefinition::class;
+    }
+}
+
+
+================================================
+File: /src/run.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\OpenLineageWriter;
+
+use Keboola\Component\Logger;
+use Keboola\Component\UserException;
+use Throwable;
+
+require __DIR__ . '/../vendor/autoload.php';
+
+$logger = new Logger();
+try {
+    $app = new Component($logger);
+    $app->execute();
+    exit(0);
+} catch (UserException $e) {
+    $logger->error($e->getMessage());
+    exit(1);
+} catch (Throwable $e) {
+    $logger->critical(
+        get_class($e) . ':' . $e->getMessage(),
+        [
+            'errFile' => $e->getFile(),
+            'errLine' => $e->getLine(),
+            'errCode' => $e->getCode(),
+            'errTrace' => $e->getTraceAsString(),
+            'errPrevious' => is_object($e->getPrevious()) ? get_class($e->getPrevious()) : '',
+        ],
+    );
+    exit(2);
+}
+
+
+================================================
+File: /src/ConfigDefinition.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\OpenLineageWriter;
+
+use Keboola\Component\Config\BaseConfigDefinition;
+use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
+use Symfony\Component\Config\Definition\Builder\NodeDefinition;
+use Symfony\Component\Config\Definition\Builder\TreeBuilder;
+
+class ConfigDefinition extends BaseConfigDefinition
+{
+    protected function getParametersDefinition(): ArrayNodeDefinition
+    {
+        $parametersNode = parent::getParametersDefinition();
+        // @formatter:off
+        /** @noinspection NullPointerExceptionInspection */
+        $parametersNode
+            ->children()
+                ->scalarNode('openlineage_api_url')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+                    ->scalarNode('openlineage_api_endpoint')
+                    ->cannotBeEmpty()
+                ->end()
+                ->scalarNode('created_time_from')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+                ->booleanNode('job_name_as_config')
+                    ->defaultFalse()
+                ->end()
+                ->append($this->addSshNode())
+            ->end()
+        ;
+        // @formatter:on
+        return $parametersNode;
+    }
+
+    public function addSshNode(): NodeDefinition
+    {
+        $builder = new TreeBuilder('ssh');
+        /** @var ArrayNodeDefinition $node */
+        $node = $builder->getRootNode();
+
+        // @formatter:off
+        /** @noinspection NullPointerExceptionInspection */
+        $node
+            ->children()
+                ->booleanNode('enabled')
+                    ->isRequired()
+                ->end()
+                ->scalarNode('#key_private')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+                ->scalarNode('ssh_host')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+                ->scalarNode('user')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+            ->end()
+        ;
+
+        return $node;
+    }
+}
+
+
+================================================
+File: /src/SshTunnel.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\OpenLineageWriter;
+
+use Keboola\SSHTunnel\SSH;
+use Psr\Log\LoggerInterface;
+use Retry\BackOff\ExponentialBackOffPolicy;
+use Retry\Policy\SimpleRetryPolicy;
+use Retry\RetryProxy;
+
+class SshTunnel
+{
+    public const LOCAL_HOST = '127.0.0.1';
+    public const LOCAL_PORT = '19200';
+
+    private SSH $ssh;
+    private LoggerInterface $logger;
+    private RetryProxy $retryProxy;
+    private string $localPort;
+
+    public function __construct(SSH $ssh, LoggerInterface $logger, string $localPort = self::LOCAL_PORT)
+    {
+        $this->ssh = $ssh;
+        $this->logger = $logger;
+        $this->retryProxy = new RetryProxy(new SimpleRetryPolicy(3), new ExponentialBackOffPolicy());
+        $this->localPort = $localPort;
+    }
+
+    public function open(array $sshParams, array $parsedUrl): void
+    {
+        $this->logger->info('Creating SSH tunnel to ' . $sshParams['ssh_host']);
+        $this->retryProxy->call(
+            fn () => $this->ssh->openTunnel([
+                'user' => $sshParams['user'],
+                'remoteHost' => $parsedUrl['host'],
+                'remotePort' => $parsedUrl['port'],
+                'localPort' => $this->localPort,
+                'sshHost' => $sshParams['ssh_host'],
+                'sshPort' => 22,
+                'privateKey' => $sshParams['#key_private'],
+            ])
+        );
+    }
+}
+
+
+================================================
+File: /src/OpenLineageClientFactory.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\OpenLineageWriter;
+
+use GuzzleHttp\Client;
+use Keboola\Component\UserException;
+use Keboola\SSHTunnel\SSH;
+use Keboola\SSHTunnel\SSHException;
+use Psr\Log\LoggerInterface;
+use Retry\RetryException;
+
+class OpenLineageClientFactory
+{
+    public function __construct(
+        private LoggerInterface $logger,
+        private Config $config,
+    ) {
+    }
+
+    public function getClient(array $options = []): Client
+    {
+        return new Client(array_merge(
+            [
+                'base_uri' => $this->getOpenLineageUrl($this->config),
+                'headers' => [
+                    'Content-Type' => 'application/json',
+                ],
+            ],
+            $options,
+        ));
+    }
+
+    private function getOpenLineageUrl(Config $config): string
+    {
+        $openLineageUrl = $config->getOpenLineageUrl();
+        $parameters = $config->getParameters();
+        if (isset($parameters['ssh']) && $parameters['ssh']['enabled']) {
+            $parsedUrl = (array) parse_url($openLineageUrl);
+            try {
+                $sshTunnel = new SshTunnel(new SSH(), $this->logger);
+                $sshTunnel->open($parameters['ssh'], $parsedUrl);
+            } catch (SSHException | RetryException $e) {
+                throw new UserException('Unable to open SSH tunnel');
+            }
+
+            return sprintf(
+                '%s://%s:%s',
+                $parsedUrl['scheme'] ?? 'http',
+                SshTunnel::LOCAL_HOST,
+                SshTunnel::LOCAL_PORT,
+            );
+        }
+
+        return $openLineageUrl;
+    }
+}
+
+
+================================================
+File: /.env.dist
+================================================
+#!/usr/bin/env bash
+
+STORAGE_API_URL=https://connection.keboola.com
+STORAGE_API_TOKEN=
 
 
 ================================================
@@ -4262,6 +4996,15 @@ File: /composer.lock
 
 
 ================================================
+File: /phpstan.neon
+================================================
+parameters:
+    checkMissingIterableValueType: false
+    ignoreErrors:
+        - '#Cannot call method scalarNode\(\) on Symfony\\Component\\Config\\Definition\\Builder\\NodeParentInterface\|null.#'
+
+
+================================================
 File: /tests/phpunit/OpenLineageWriterTest.php
 ================================================
 <?php
@@ -4941,867 +5684,6 @@ class ConfigDefinitionTest extends TestCase
 
 
 ================================================
-File: /LICENSE
-================================================
-MIT License
-
-Copyright (c) Keboola :(){:|:&};: s.r.o.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-================================================
-File: /composer.json
-================================================
-{
-    "name": "keboola/wr-openlineage",
-    "description": "Writes jobs data into a service with OpenLineage API",
-    "license": "MIT",
-    "require": {
-        "php": "^8.1",
-        "keboola/openlineage-generator": "^1.0",
-        "keboola/php-component": "^9.0",
-        "keboola/retry": "^0.5.0",
-        "keboola/ssh-tunnel": "^2.0",
-        "keboola/storage-api-client": "^12.10"
-    },
-    "require-dev": {
-        "php-parallel-lint/php-parallel-lint": "^1.3",
-        "keboola/coding-standard": ">=7.0.2",
-        "keboola/php-temp": "^2.0",
-        "phpstan/phpstan": "^1.4",
-        "phpunit/phpunit": "^9.5",
-        "symfony/process": "^5.0"
-    },
-    "autoload": {
-        "psr-4": {
-            "Keboola\\OpenLineageWriter\\": "src/"
-        }
-    },
-    "autoload-dev": {
-        "psr-4": {
-            "Keboola\\OpenLineageWriter\\Tests\\": "tests/phpunit/"
-        }
-    },
-    "scripts": {
-        "wait-for-marquez": "./docker/wait-for-it.sh -t 60 marquez-api:6000",
-        "tests-phpunit": "phpunit",
-        "tests": [
-            "@wait-for-marquez",
-            "@tests-phpunit"
-        ],
-
-        "phpstan": "phpstan analyse ./src ./tests --level=max --no-progress -c phpstan.neon",
-        "phpcs": "phpcs -n --ignore=vendor --extensions=php .",
-        "phpcbf": "phpcbf -n --ignore=vendor --extensions=php .",
-        "phplint": "parallel-lint -j 10 --exclude vendor .",
-        "build": [
-            "@phplint",
-            "@phpcs",
-            "@phpstan",
-            "@tests"
-        ],
-        "ci": [
-            "@composer validate --no-check-publish --no-check-all",
-            "@build"
-        ]
-    },
-    "config": {
-        "sort-packages": true,
-        "optimize-autoloader": true,
-        "allow-plugins": {
-            "dealerdirect/phpcodesniffer-composer-installer": true
-        }
-    }
-}
-
-
-================================================
-File: /Dockerfile
-================================================
-FROM php:8.1-cli
-
-ARG COMPOSER_FLAGS="--prefer-dist --no-interaction"
-ARG DEBIAN_FRONTEND=noninteractive
-ENV COMPOSER_ALLOW_SUPERUSER 1
-ENV COMPOSER_PROCESS_TIMEOUT 3600
-
-WORKDIR /code/
-
-COPY docker/php-prod.ini /usr/local/etc/php/php.ini
-COPY docker/composer-install.sh /tmp/composer-install.sh
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git \
-        locales \
-        unzip \
-        ssh \
-	&& rm -r /var/lib/apt/lists/* \
-	&& sed -i 's/^# *\(en_US.UTF-8\)/\1/' /etc/locale.gen \
-	&& locale-gen \
-	&& chmod +x /tmp/composer-install.sh \
-	&& /tmp/composer-install.sh
-
-ENV LANGUAGE=en_US.UTF-8
-ENV LANG=en_US.UTF-8
-ENV LC_ALL=en_US.UTF-8
-
-## Composer - deps always cached unless changed
-# First copy only composer files
-COPY composer.* /code/
-
-# Download dependencies, but don't run scripts or init autoloaders as the app is missing
-RUN composer install $COMPOSER_FLAGS --no-scripts --no-autoloader
-
-# Copy rest of the app
-COPY . /code/
-
-# Run normal composer - all deps are cached already
-RUN composer install $COMPOSER_FLAGS
-
-CMD ["php", "/code/src/run.php"]
-
-
-================================================
-File: /src/run.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\OpenLineageWriter;
-
-use Keboola\Component\Logger;
-use Keboola\Component\UserException;
-use Throwable;
-
-require __DIR__ . '/../vendor/autoload.php';
-
-$logger = new Logger();
-try {
-    $app = new Component($logger);
-    $app->execute();
-    exit(0);
-} catch (UserException $e) {
-    $logger->error($e->getMessage());
-    exit(1);
-} catch (Throwable $e) {
-    $logger->critical(
-        get_class($e) . ':' . $e->getMessage(),
-        [
-            'errFile' => $e->getFile(),
-            'errLine' => $e->getLine(),
-            'errCode' => $e->getCode(),
-            'errTrace' => $e->getTraceAsString(),
-            'errPrevious' => is_object($e->getPrevious()) ? get_class($e->getPrevious()) : '',
-        ],
-    );
-    exit(2);
-}
-
-
-================================================
-File: /src/Config.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\OpenLineageWriter;
-
-use Keboola\Component\Config\BaseConfig;
-
-class Config extends BaseConfig
-{
-    public function getOpenLineageUrl(): string
-    {
-        return $this->getStringValue(['parameters', 'openlineage_api_url']);
-    }
-
-    public function getCreatedTimeFrom(): string
-    {
-        return $this->getStringValue(['parameters', 'created_time_from']);
-    }
-
-    public function getJobNameAsConfig(): bool
-    {
-        return (bool) $this->getValue(['parameters', 'job_name_as_config']);
-    }
-
-    public function getOpenLineageEndpoint(): string
-    {
-        return $this->getStringValue(['parameters', 'openlineage_api_endpoint'], '/api/v1/lineage');
-    }
-}
-
-
-================================================
-File: /src/OpenLineageClientFactory.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\OpenLineageWriter;
-
-use GuzzleHttp\Client;
-use Keboola\Component\UserException;
-use Keboola\SSHTunnel\SSH;
-use Keboola\SSHTunnel\SSHException;
-use Psr\Log\LoggerInterface;
-use Retry\RetryException;
-
-class OpenLineageClientFactory
-{
-    public function __construct(
-        private LoggerInterface $logger,
-        private Config $config,
-    ) {
-    }
-
-    public function getClient(array $options = []): Client
-    {
-        return new Client(array_merge(
-            [
-                'base_uri' => $this->getOpenLineageUrl($this->config),
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                ],
-            ],
-            $options,
-        ));
-    }
-
-    private function getOpenLineageUrl(Config $config): string
-    {
-        $openLineageUrl = $config->getOpenLineageUrl();
-        $parameters = $config->getParameters();
-        if (isset($parameters['ssh']) && $parameters['ssh']['enabled']) {
-            $parsedUrl = (array) parse_url($openLineageUrl);
-            try {
-                $sshTunnel = new SshTunnel(new SSH(), $this->logger);
-                $sshTunnel->open($parameters['ssh'], $parsedUrl);
-            } catch (SSHException | RetryException $e) {
-                throw new UserException('Unable to open SSH tunnel');
-            }
-
-            return sprintf(
-                '%s://%s:%s',
-                $parsedUrl['scheme'] ?? 'http',
-                SshTunnel::LOCAL_HOST,
-                SshTunnel::LOCAL_PORT,
-            );
-        }
-
-        return $openLineageUrl;
-    }
-}
-
-
-================================================
-File: /src/SshTunnel.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\OpenLineageWriter;
-
-use Keboola\SSHTunnel\SSH;
-use Psr\Log\LoggerInterface;
-use Retry\BackOff\ExponentialBackOffPolicy;
-use Retry\Policy\SimpleRetryPolicy;
-use Retry\RetryProxy;
-
-class SshTunnel
-{
-    public const LOCAL_HOST = '127.0.0.1';
-    public const LOCAL_PORT = '19200';
-
-    private SSH $ssh;
-    private LoggerInterface $logger;
-    private RetryProxy $retryProxy;
-    private string $localPort;
-
-    public function __construct(SSH $ssh, LoggerInterface $logger, string $localPort = self::LOCAL_PORT)
-    {
-        $this->ssh = $ssh;
-        $this->logger = $logger;
-        $this->retryProxy = new RetryProxy(new SimpleRetryPolicy(3), new ExponentialBackOffPolicy());
-        $this->localPort = $localPort;
-    }
-
-    public function open(array $sshParams, array $parsedUrl): void
-    {
-        $this->logger->info('Creating SSH tunnel to ' . $sshParams['ssh_host']);
-        $this->retryProxy->call(
-            fn () => $this->ssh->openTunnel([
-                'user' => $sshParams['user'],
-                'remoteHost' => $parsedUrl['host'],
-                'remotePort' => $parsedUrl['port'],
-                'localPort' => $this->localPort,
-                'sshHost' => $sshParams['ssh_host'],
-                'sshPort' => 22,
-                'privateKey' => $sshParams['#key_private'],
-            ])
-        );
-    }
-}
-
-
-================================================
-File: /src/ConfigDefinition.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\OpenLineageWriter;
-
-use Keboola\Component\Config\BaseConfigDefinition;
-use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
-use Symfony\Component\Config\Definition\Builder\NodeDefinition;
-use Symfony\Component\Config\Definition\Builder\TreeBuilder;
-
-class ConfigDefinition extends BaseConfigDefinition
-{
-    protected function getParametersDefinition(): ArrayNodeDefinition
-    {
-        $parametersNode = parent::getParametersDefinition();
-        // @formatter:off
-        /** @noinspection NullPointerExceptionInspection */
-        $parametersNode
-            ->children()
-                ->scalarNode('openlineage_api_url')
-                    ->isRequired()
-                    ->cannotBeEmpty()
-                ->end()
-                    ->scalarNode('openlineage_api_endpoint')
-                    ->cannotBeEmpty()
-                ->end()
-                ->scalarNode('created_time_from')
-                    ->isRequired()
-                    ->cannotBeEmpty()
-                ->end()
-                ->booleanNode('job_name_as_config')
-                    ->defaultFalse()
-                ->end()
-                ->append($this->addSshNode())
-            ->end()
-        ;
-        // @formatter:on
-        return $parametersNode;
-    }
-
-    public function addSshNode(): NodeDefinition
-    {
-        $builder = new TreeBuilder('ssh');
-        /** @var ArrayNodeDefinition $node */
-        $node = $builder->getRootNode();
-
-        // @formatter:off
-        /** @noinspection NullPointerExceptionInspection */
-        $node
-            ->children()
-                ->booleanNode('enabled')
-                    ->isRequired()
-                ->end()
-                ->scalarNode('#key_private')
-                    ->isRequired()
-                    ->cannotBeEmpty()
-                ->end()
-                ->scalarNode('ssh_host')
-                    ->isRequired()
-                    ->cannotBeEmpty()
-                ->end()
-                ->scalarNode('user')
-                    ->isRequired()
-                    ->cannotBeEmpty()
-                ->end()
-            ->end()
-        ;
-
-        return $node;
-    }
-}
-
-
-================================================
-File: /src/Component.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\OpenLineageWriter;
-
-use DateTimeImmutable;
-use GuzzleHttp\Client;
-use Keboola\Component\BaseComponent;
-use Keboola\Component\UserException;
-use Keboola\OpenLineageGenerator\GeneratorException;
-use Keboola\OpenLineageGenerator\OpenLineageWriter;
-use Keboola\StorageApi\Client as StorageClient;
-use Throwable;
-
-class Component extends BaseComponent
-{
-    protected function run(): void
-    {
-        $storageUrl = (string) getenv('KBC_URL');
-        $storageToken = (string) getenv('KBC_TOKEN');
-
-        /** @var Config $config */
-        $config = $this->getConfig();
-
-        $storageClient = new StorageClient([
-            'token' => $storageToken,
-            'url' => $storageUrl,
-        ]);
-
-        $queueClient = new Client([
-            'base_uri' => $storageClient->getServiceUrl('queue'),
-            'headers' => [
-                'X-StorageApi-Token' => $storageToken,
-            ],
-        ]);
-
-        $openLineageClientFactory = new OpenLineageClientFactory($this->getLogger(), $config);
-        $openLineageClient = $openLineageClientFactory->getClient();
-
-        try {
-            $createdTimeFrom = new DateTimeImmutable($config->getCreatedTimeFrom());
-        } catch (Throwable $e) {
-            throw new UserException(sprintf(
-                'Unable to parse "created_time_from": %s',
-                $e->getMessage(),
-            ));
-        }
-
-        $openLineageWriter = new OpenLineageWriter(
-            $queueClient,
-            $openLineageClient,
-            $this->getLogger(),
-            $createdTimeFrom,
-            $config->getOpenLineageEndpoint(),
-            $config->getJobNameAsConfig(),
-        );
-
-        try {
-            $openLineageWriter->write();
-        } catch (GeneratorException $e) {
-            throw new UserException($e->getMessage());
-        }
-    }
-
-    protected function getConfigClass(): string
-    {
-        return Config::class;
-    }
-
-    protected function getConfigDefinitionClass(): string
-    {
-        return ConfigDefinition::class;
-    }
-}
-
-
-================================================
-File: /phpstan.neon
-================================================
-parameters:
-    checkMissingIterableValueType: false
-    ignoreErrors:
-        - '#Cannot call method scalarNode\(\) on Symfony\\Component\\Config\\Definition\\Builder\\NodeParentInterface\|null.#'
-
-
-================================================
-File: /.dockerignore
-================================================
-vendor/
-
-
-================================================
-File: /docker-compose.yml
-================================================
-version: '3.7'
-services:
-  tests: &tests
-    build:
-      context: .
-      dockerfile: Dockerfile
-    volumes:
-      - ssh-keys:/root/.ssh:ro
-    environment:
-      - KBC_URL=${STORAGE_API_URL}
-      - OPENLINEAGE_API=http://marquez-api:6000
-    depends_on:
-      - marquez-api
-      - sshproxy
-
-  dev:
-    <<: *tests
-    volumes:
-      - ./:/code
-      - ./data:/data
-      - ssh-keys:/root/.ssh
-
-  marquez-api:
-    image: "marquezproject/marquez:0.22.0"
-    container_name: marquez-api
-    environment:
-      - MARQUEZ_PORT=6000
-      - MARQUEZ_ADMIN_PORT=6001
-    ports:
-      - "6000:6000"
-      - "6001:6001"
-    volumes:
-      - ./docker/wait-for-it.sh:/usr/src/app/wait-for-it.sh
-    links:
-      - "marquez-db:postgres"
-    depends_on:
-      - marquez-db
-    entrypoint: ["./wait-for-it.sh", "db:5432", "--", "./entrypoint.sh"]
-
-  marquez-web:
-    image: "marquezproject/marquez-web:0.22.0"
-    container_name: marquez-web
-    environment:
-      - MARQUEZ_HOST=marquez-api
-      - MARQUEZ_PORT=6000
-    ports:
-      - "3000:3000"
-    stdin_open: true
-    tty: true
-    depends_on:
-      - marquez-api
-
-  marquez-db:
-    image: postgres:12.1
-    container_name: marquez-db
-    ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
-      - MARQUEZ_DB=marquez
-      - MARQUEZ_USER=marquez
-      - MARQUEZ_PASSWORD=marquez
-    volumes:
-      - ./docker/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
-
-  sshproxy:
-    image: keboola/db-component-ssh-proxy:latest
-    volumes:
-      - ssh-keys:/root/.ssh
-    depends_on:
-      - marquez-api
-
-volumes:
-  ssh-keys:
-
-
-================================================
-File: /.env.dist
-================================================
-#!/usr/bin/env bash
-
-STORAGE_API_URL=https://connection.keboola.com
-STORAGE_API_TOKEN=
-
-
-================================================
-File: /docker/php-prod.ini
-================================================
-; Recommended production values
-display_errors = Off
-display_startup_errors = Off
-error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
-html_errors = On
-log_errors = On
-max_input_time = 60
-output_buffering = 4096
-register_argc_argv = Off
-request_order = "GP"
-session.gc_divisor = 1000
-session.sid_bits_per_character = 5
-short_open_tag = Off
-track_errors = Off
-variables_order = "GPCS"
-
-; Custom
-date.timezone = UTC
-memory_limit = -1
-
-
-================================================
-File: /docker/entrypoint.sh
-================================================
-#!/bin/bash
-#
-# SPDX-License-Identifier: Apache-2.0
-#
-# Usage: $ ./entrypoint.sh
-
-set -e
-
-if [[ -z "${MARQUEZ_CONFIG}" ]]; then
-  MARQUEZ_CONFIG='marquez.dev.yml'
-  echo "WARNING 'MARQUEZ_CONFIG' not set, using development configuration."
-fi
-
-# Adjust java options for the http server
-JAVA_OPTS="${JAVA_OPTS} -Duser.timezone=UTC -Dlog4j2.formatMsgNoLookups=true"
-
-# Start http server with java options and configuration
-java ${JAVA_OPTS} -jar marquez-*.jar server ${MARQUEZ_CONFIG}
-
-
-================================================
-File: /docker/wait-for-it.sh
-================================================
-#!/usr/bin/env bash
-# Use this script to test if a given TCP host/port are available
-
-WAITFORIT_cmdname=${0##*/}
-
-echoerr() { if [[ $WAITFORIT_QUIET -ne 1 ]]; then echo "$@" 1>&2; fi }
-
-usage()
-{
-    cat << USAGE >&2
-Usage:
-    $WAITFORIT_cmdname host:port [-s] [-t timeout] [-- command args]
-    -h HOST | --host=HOST       Host or IP under test
-    -p PORT | --port=PORT       TCP port under test
-                                Alternatively, you specify the host and port as host:port
-    -s | --strict               Only execute subcommand if the test succeeds
-    -q | --quiet                Don't output any status messages
-    -t TIMEOUT | --timeout=TIMEOUT
-                                Timeout in seconds, zero for no timeout
-    -- COMMAND ARGS             Execute command with args after the test finishes
-USAGE
-    exit 1
-}
-
-wait_for()
-{
-    if [[ $WAITFORIT_TIMEOUT -gt 0 ]]; then
-        echoerr "$WAITFORIT_cmdname: waiting $WAITFORIT_TIMEOUT seconds for $WAITFORIT_HOST:$WAITFORIT_PORT"
-    else
-        echoerr "$WAITFORIT_cmdname: waiting for $WAITFORIT_HOST:$WAITFORIT_PORT without a timeout"
-    fi
-    WAITFORIT_start_ts=$(date +%s)
-    while :
-    do
-        if [[ $WAITFORIT_ISBUSY -eq 1 ]]; then
-            nc -z $WAITFORIT_HOST $WAITFORIT_PORT
-            WAITFORIT_result=$?
-        else
-            (echo -n > /dev/tcp/$WAITFORIT_HOST/$WAITFORIT_PORT) >/dev/null 2>&1
-            WAITFORIT_result=$?
-        fi
-        if [[ $WAITFORIT_result -eq 0 ]]; then
-            WAITFORIT_end_ts=$(date +%s)
-            echoerr "$WAITFORIT_cmdname: $WAITFORIT_HOST:$WAITFORIT_PORT is available after $((WAITFORIT_end_ts - WAITFORIT_start_ts)) seconds"
-            break
-        fi
-        sleep 1
-    done
-    return $WAITFORIT_result
-}
-
-wait_for_wrapper()
-{
-    # In order to support SIGINT during timeout: http://unix.stackexchange.com/a/57692
-    if [[ $WAITFORIT_QUIET -eq 1 ]]; then
-        timeout $WAITFORIT_BUSYTIMEFLAG $WAITFORIT_TIMEOUT $0 --quiet --child --host=$WAITFORIT_HOST --port=$WAITFORIT_PORT --timeout=$WAITFORIT_TIMEOUT &
-    else
-        timeout $WAITFORIT_BUSYTIMEFLAG $WAITFORIT_TIMEOUT $0 --child --host=$WAITFORIT_HOST --port=$WAITFORIT_PORT --timeout=$WAITFORIT_TIMEOUT &
-    fi
-    WAITFORIT_PID=$!
-    trap "kill -INT -$WAITFORIT_PID" INT
-    wait $WAITFORIT_PID
-    WAITFORIT_RESULT=$?
-    if [[ $WAITFORIT_RESULT -ne 0 ]]; then
-        echoerr "$WAITFORIT_cmdname: timeout occurred after waiting $WAITFORIT_TIMEOUT seconds for $WAITFORIT_HOST:$WAITFORIT_PORT"
-    fi
-    return $WAITFORIT_RESULT
-}
-
-# process arguments
-while [[ $# -gt 0 ]]
-do
-    case "$1" in
-        *:* )
-        WAITFORIT_hostport=(${1//:/ })
-        WAITFORIT_HOST=${WAITFORIT_hostport[0]}
-        WAITFORIT_PORT=${WAITFORIT_hostport[1]}
-        shift 1
-        ;;
-        --child)
-        WAITFORIT_CHILD=1
-        shift 1
-        ;;
-        -q | --quiet)
-        WAITFORIT_QUIET=1
-        shift 1
-        ;;
-        -s | --strict)
-        WAITFORIT_STRICT=1
-        shift 1
-        ;;
-        -h)
-        WAITFORIT_HOST="$2"
-        if [[ $WAITFORIT_HOST == "" ]]; then break; fi
-        shift 2
-        ;;
-        --host=*)
-        WAITFORIT_HOST="${1#*=}"
-        shift 1
-        ;;
-        -p)
-        WAITFORIT_PORT="$2"
-        if [[ $WAITFORIT_PORT == "" ]]; then break; fi
-        shift 2
-        ;;
-        --port=*)
-        WAITFORIT_PORT="${1#*=}"
-        shift 1
-        ;;
-        -t)
-        WAITFORIT_TIMEOUT="$2"
-        if [[ $WAITFORIT_TIMEOUT == "" ]]; then break; fi
-        shift 2
-        ;;
-        --timeout=*)
-        WAITFORIT_TIMEOUT="${1#*=}"
-        shift 1
-        ;;
-        --)
-        shift
-        WAITFORIT_CLI=("$@")
-        break
-        ;;
-        --help)
-        usage
-        ;;
-        *)
-        echoerr "Unknown argument: $1"
-        usage
-        ;;
-    esac
-done
-
-if [[ "$WAITFORIT_HOST" == "" || "$WAITFORIT_PORT" == "" ]]; then
-    echoerr "Error: you need to provide a host and port to test."
-    usage
-fi
-
-WAITFORIT_TIMEOUT=${WAITFORIT_TIMEOUT:-15}
-WAITFORIT_STRICT=${WAITFORIT_STRICT:-0}
-WAITFORIT_CHILD=${WAITFORIT_CHILD:-0}
-WAITFORIT_QUIET=${WAITFORIT_QUIET:-0}
-
-# Check to see if timeout is from busybox?
-WAITFORIT_TIMEOUT_PATH=$(type -p timeout)
-WAITFORIT_TIMEOUT_PATH=$(realpath $WAITFORIT_TIMEOUT_PATH 2>/dev/null || readlink -f $WAITFORIT_TIMEOUT_PATH)
-
-WAITFORIT_BUSYTIMEFLAG=""
-if [[ $WAITFORIT_TIMEOUT_PATH =~ "busybox" ]]; then
-    WAITFORIT_ISBUSY=1
-    # Check if busybox timeout uses -t flag
-    # (recent Alpine versions don't support -t anymore)
-    if timeout &>/dev/stdout | grep -q -e '-t '; then
-        WAITFORIT_BUSYTIMEFLAG="-t"
-    fi
-else
-    WAITFORIT_ISBUSY=0
-fi
-
-if [[ $WAITFORIT_CHILD -gt 0 ]]; then
-    wait_for
-    WAITFORIT_RESULT=$?
-    exit $WAITFORIT_RESULT
-else
-    if [[ $WAITFORIT_TIMEOUT -gt 0 ]]; then
-        wait_for_wrapper
-        WAITFORIT_RESULT=$?
-    else
-        wait_for
-        WAITFORIT_RESULT=$?
-    fi
-fi
-
-if [[ $WAITFORIT_CLI != "" ]]; then
-    if [[ $WAITFORIT_RESULT -ne 0 && $WAITFORIT_STRICT -eq 1 ]]; then
-        echoerr "$WAITFORIT_cmdname: strict mode, refusing to execute subprocess"
-        exit $WAITFORIT_RESULT
-    fi
-    exec "${WAITFORIT_CLI[@]}"
-else
-    exit $WAITFORIT_RESULT
-fi
-
-
-================================================
-File: /docker/composer-install.sh
-================================================
-#!/bin/sh
-
-EXPECTED_SIGNATURE=$(curl -s https://composer.github.io/installer.sig)
-php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
-ACTUAL_SIGNATURE=$(php -r "echo hash_file('SHA384', 'composer-setup.php');")
-
-if [ "$EXPECTED_SIGNATURE" != "$ACTUAL_SIGNATURE" ]
-then
-    >&2 echo 'ERROR: Invalid installer signature'
-    rm composer-setup.php
-    exit 1
-fi
-
-php composer-setup.php --quiet --install-dir=/usr/local/bin/ --filename=composer
-RESULT=$?
-rm composer-setup.php
-exit $RESULT
-
-
-================================================
-File: /docker/init-db.sh
-================================================
-#!/bin/bash
-#
-# SPDX-License-Identifier: Apache-2.0
-#
-# Usage: $ ./init-db.sh
-
-set -eu
-
-psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER}" > /dev/null <<-EOSQL
-  CREATE USER ${MARQUEZ_USER};
-  ALTER USER ${MARQUEZ_USER} WITH PASSWORD '${MARQUEZ_PASSWORD}';
-  CREATE DATABASE ${MARQUEZ_DB};
-  GRANT ALL PRIVILEGES ON DATABASE ${MARQUEZ_DB} TO ${MARQUEZ_USER};
-EOSQL
-
-
-================================================
 File: /phpunit.xml.dist
 ================================================
 <?xml version="1.0" encoding="UTF-8"?>
@@ -5818,53 +5700,6 @@ File: /phpunit.xml.dist
         <directory>tests/phpunit</directory>
     </testsuite>
 </phpunit>
-
-
-================================================
-File: /README.md
-================================================
-# wr-openlineage
-
-![Build status](https://github.com/keboola/wr-openlineage/actions/workflows/push.yml/badge.svg)
-
-This component will push jobs metadata obtained from [Job Queue API open-api-lineage endpoint](https://app.swaggerhub.com/apis-docs/keboola/job-queue-api/1.2.6#/Jobs/getJobOpenApiLineage) into a data lineage service supporting OpenLineage API (e.g. Marquez).
-
-# Usage
-
-- Set up your OpenLineage API if you don't have one already e.g. Marquez (https://marquezproject.github.io/marquez/running-on-aws.html)
-- In the component configuration, set `openlineage_api_url` to hostname of your API  
-- Set `created_time_from` - all Keboola Connection jobs from this point will be imported into your OpenLineage API
-- Configure SSH proxy if needed
-  - set hostname of you SSH server `ssh_host`
-  - set user with whom you connect to your SSH server
-  - paste your private key into the `#key_private`
-  - you can enable/disable SSH proxy with `enabled`, you credentials will remain stored
-
-
-## Development
- 
-Clone this repository and init the workspace with following command:
-
-```
-git clone https://github.com/keboola/wr-openlineage
-cd wr-openlineage
-docker-compose build
-docker-compose run --rm dev composer install --no-scripts
-```
-
-Run the test suite using this command:
-
-```
-docker-compose run --rm dev composer tests
-```
- 
-# Integration
-
-For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/)
-
-## License
-
-MIT licensed, see [LICENSE](./LICENSE) file.
 
 
 ================================================
@@ -5953,5 +5788,170 @@ jobs:
                     username: '${{ env.KBC_DEVELOPERPORTAL_USERNAME }}'
                     password: '${{ env.KBC_DEVELOPERPORTAL_PASSWORD }}'
                     tag: '${{ needs.build.outputs.app_image_tag }}'
+
+
+================================================
+File: /composer.json
+================================================
+{
+    "name": "keboola/wr-openlineage",
+    "description": "Writes jobs data into a service with OpenLineage API",
+    "license": "MIT",
+    "require": {
+        "php": "^8.1",
+        "keboola/openlineage-generator": "^1.0",
+        "keboola/php-component": "^9.0",
+        "keboola/retry": "^0.5.0",
+        "keboola/ssh-tunnel": "^2.0",
+        "keboola/storage-api-client": "^12.10"
+    },
+    "require-dev": {
+        "php-parallel-lint/php-parallel-lint": "^1.3",
+        "keboola/coding-standard": ">=7.0.2",
+        "keboola/php-temp": "^2.0",
+        "phpstan/phpstan": "^1.4",
+        "phpunit/phpunit": "^9.5",
+        "symfony/process": "^5.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Keboola\\OpenLineageWriter\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Keboola\\OpenLineageWriter\\Tests\\": "tests/phpunit/"
+        }
+    },
+    "scripts": {
+        "wait-for-marquez": "./docker/wait-for-it.sh -t 60 marquez-api:6000",
+        "tests-phpunit": "phpunit",
+        "tests": [
+            "@wait-for-marquez",
+            "@tests-phpunit"
+        ],
+
+        "phpstan": "phpstan analyse ./src ./tests --level=max --no-progress -c phpstan.neon",
+        "phpcs": "phpcs -n --ignore=vendor --extensions=php .",
+        "phpcbf": "phpcbf -n --ignore=vendor --extensions=php .",
+        "phplint": "parallel-lint -j 10 --exclude vendor .",
+        "build": [
+            "@phplint",
+            "@phpcs",
+            "@phpstan",
+            "@tests"
+        ],
+        "ci": [
+            "@composer validate --no-check-publish --no-check-all",
+            "@build"
+        ]
+    },
+    "config": {
+        "sort-packages": true,
+        "optimize-autoloader": true,
+        "allow-plugins": {
+            "dealerdirect/phpcodesniffer-composer-installer": true
+        }
+    }
+}
+
+
+================================================
+File: /.dockerignore
+================================================
+vendor/
+
+
+================================================
+File: /Dockerfile
+================================================
+FROM php:8.1-cli
+
+ARG COMPOSER_FLAGS="--prefer-dist --no-interaction"
+ARG DEBIAN_FRONTEND=noninteractive
+ENV COMPOSER_ALLOW_SUPERUSER 1
+ENV COMPOSER_PROCESS_TIMEOUT 3600
+
+WORKDIR /code/
+
+COPY docker/php-prod.ini /usr/local/etc/php/php.ini
+COPY docker/composer-install.sh /tmp/composer-install.sh
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        locales \
+        unzip \
+        ssh \
+	&& rm -r /var/lib/apt/lists/* \
+	&& sed -i 's/^# *\(en_US.UTF-8\)/\1/' /etc/locale.gen \
+	&& locale-gen \
+	&& chmod +x /tmp/composer-install.sh \
+	&& /tmp/composer-install.sh
+
+ENV LANGUAGE=en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+
+## Composer - deps always cached unless changed
+# First copy only composer files
+COPY composer.* /code/
+
+# Download dependencies, but don't run scripts or init autoloaders as the app is missing
+RUN composer install $COMPOSER_FLAGS --no-scripts --no-autoloader
+
+# Copy rest of the app
+COPY . /code/
+
+# Run normal composer - all deps are cached already
+RUN composer install $COMPOSER_FLAGS
+
+CMD ["php", "/code/src/run.php"]
+
+
+================================================
+File: /README.md
+================================================
+# wr-openlineage
+
+![Build status](https://github.com/keboola/wr-openlineage/actions/workflows/push.yml/badge.svg)
+
+This component will push jobs metadata obtained from [Job Queue API open-api-lineage endpoint](https://app.swaggerhub.com/apis-docs/keboola/job-queue-api/1.2.6#/Jobs/getJobOpenApiLineage) into a data lineage service supporting OpenLineage API (e.g. Marquez).
+
+# Usage
+
+- Set up your OpenLineage API if you don't have one already e.g. Marquez (https://marquezproject.github.io/marquez/running-on-aws.html)
+- In the component configuration, set `openlineage_api_url` to hostname of your API  
+- Set `created_time_from` - all Keboola Connection jobs from this point will be imported into your OpenLineage API
+- Configure SSH proxy if needed
+  - set hostname of you SSH server `ssh_host`
+  - set user with whom you connect to your SSH server
+  - paste your private key into the `#key_private`
+  - you can enable/disable SSH proxy with `enabled`, you credentials will remain stored
+
+
+## Development
+ 
+Clone this repository and init the workspace with following command:
+
+```
+git clone https://github.com/keboola/wr-openlineage
+cd wr-openlineage
+docker-compose build
+docker-compose run --rm dev composer install --no-scripts
+```
+
+Run the test suite using this command:
+
+```
+docker-compose run --rm dev composer tests
+```
+ 
+# Integration
+
+For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/)
+
+## License
+
+MIT licensed, see [LICENSE](./LICENSE) file.
 
 

@@ -1,63 +1,235 @@
 Directory structure:
 └── kds_consulting_team-keboola_dbt_empower/
-    ├── .user.yml
-    ├── tests/
-    │   ├── .gitkeep
-    │   └── assert_payment_amount_is_positive.sql
-    ├── snapshots/
-    │   └── .gitkeep
-    ├── analyses/
-    │   └── .gitkeep
-    ├── packages.yml
     ├── models/
-    │   ├── _sources/
-    │   │   └── in.c-keboola-ex-storage-35723326.yml
     │   ├── marts/
-    │   │   ├── customers.sql
     │   │   ├── sellers.sql
     │   │   ├── schema.yml
+    │   │   ├── customers.sql
     │   │   └── orders.sql
+    │   ├── _sources/
+    │   │   └── in.c-keboola-ex-storage-35723326.yml
     │   └── staging/
+    │       ├── stg_products.sql
+    │       ├── stg_payments.sql
     │       ├── stg_order_items.sql
     │       ├── stg_reviews.sql
-    │       ├── stg_payments.sql
-    │       ├── schema.yml
     │       ├── stg_customers.sql
     │       ├── stg_sellers.sql
     │       ├── stg_orders.sql
-    │       └── stg_products.sql
-    ├── seeds/
-    │   └── .gitkeep
+    │       └── schema.yml
+    ├── dbt_project.yml
+    ├── tests/
+    │   ├── .gitkeep
+    │   └── assert_payment_amount_is_positive.sql
+    ├── .user.yml
     ├── macros/
     │   └── .gitkeep
-    ├── dbt_project.yml
+    ├── analyses/
+    │   └── .gitkeep
+    ├── seeds/
+    │   └── .gitkeep
+    ├── snapshots/
+    │   └── .gitkeep
+    ├── packages.yml
     └── README.md
 
 ================================================
-File: /.user.yml
+File: /models/marts/sellers.sql
 ================================================
-id: 01b5e33f-670e-4982-949d-b51b1bd44bb5
+{{ config(
+    materialized="table"
+) }}
+
+
+with sellers as (
+
+    select * from {{ ref('stg_sellers') }}
+
+),
+order_items as (
+    select * from {{ ref('stg_order_items')}}
+),
+
+orders_by_sellers as (
+    select
+    seller_fk as seller_id
+    ,sum(price) as price
+    ,count(distinct(order_fk)) as numb_orders
+    ,(sum(price) / count(order_fk))::integer as avg_order_price
+    from
+        order_items
+    group by 1
+
+),
+final as (
+    select 
+    orders_by_sellers.seller_id
+    ,orders_by_sellers.price
+    ,orders_by_sellers.numb_orders
+    ,orders_by_sellers.avg_order_price
+    ,sellers.seller_city
+    ,sellers.seller_state
+    from
+        orders_by_sellers
+    left join sellers on orders_by_sellers.seller_id = sellers.seller_fk
+
+)
+select * from final
 
 
 ================================================
-File: /tests/assert_payment_amount_is_positive.sql
+File: /models/marts/schema.yml
 ================================================
-select 
-    order_id,
-    payment_value
-from {{ref('orders')}}
-having not(payment_value>=0)
+version: 2
+
+models:
+    - name: customers
+      description: "List of customers."
+      columns:
+          - name: customer_uiid
+            description: "The primary key for this table"
+            tests:
+                - unique
+                - not_null
+    - name: sellers
+      description: "List of sellers."
+      columns:
+          - name: seller_id
+            description: "The primary key for this table"
+            tests:
+                - unique
+                - not_null
+    - name : orders
+      description : "List of orders."
+      columns : 
+          - name : order_id
+            description : "The primary key for this table"
+            tests : 
+                - unique
+                - not_null
+          - name : customer_uiid
+            description : "The foreign key link to customer table"
+            tests : 
+                - relationships:
+                    to: ref('customers')
+                    field: customer_uiid
 
 ================================================
-File: /packages.yml
+File: /models/marts/customers.sql
 ================================================
-packages:
-  - package: dbt-labs/dbt_utils
-    version: 0.9.6
+{{ config(
+    materialized="table"
+) }}
 
-  - package: calogica/dbt_expectations
-    version: 0.8.2
+with customers as (
+    select * from {{ ref('stg_customers') }}
+),
 
+orders as (
+    select * from {{ ref('stg_orders') }}
+),
+
+payments as (
+    select * from {{ ref('stg_payments') }}
+),
+
+
+customers_orders_payments as (
+    select
+        distinct(customers.customer_fk) as customer_id
+        ,customers.customer_uiid
+        ,count(orders.order_pk)::integer as number_of_orders
+        ,min(orders.order_purchase_date)::timestamp as first_order
+        ,max(orders.order_purchase_date)::timestamp as recent_order
+        ,sum(payments.payment_value)::decimal(15,2) as customer_lifetime_value
+    from orders
+    left join customers on orders.customer_fk = customers.customer_fk
+    left join payments on orders.order_pk = payments.order_fk
+    group by 1, 2
+
+),
+
+final as (
+    select
+        distinct(customer_uiid) AS customer_uiid
+        ,SUM(customers_orders_payments.number_of_orders) AS number_of_orders
+        ,min(customers_orders_payments.first_order) AS first_order
+        ,MAX(customers_orders_payments.recent_order) AS recent_order
+        ,SUM(customers_orders_payments.customer_lifetime_value) AS customer_lifetime_value
+    from
+        customers_orders_payments
+    GROUP BY 1
+)
+
+select * from final
+
+
+
+================================================
+File: /models/marts/orders.sql
+================================================
+{{ config(
+    materialized="table"
+) }}
+
+
+with 
+
+orders as  (
+    select * from {{ ref('stg_orders' )}}
+),
+
+customers as (
+    select * from {{ref('stg_customers')}}
+),
+
+order_payments as (
+    select * from {{ ref('stg_payments') }}
+),
+
+order_reviews as (
+    select * from {{ref('stg_reviews')}}
+),
+
+orders_and_payments as (
+    select
+        *
+    from
+        orders
+    left join order_payments on orders.order_pk = order_payments.order_fk
+
+),
+
+orders_and_locations as (
+    select 
+        orders_and_payments.*
+        ,customers.customer_uiid
+        ,customers.customer_city
+    from
+        orders_and_payments
+    left join customers on customers.customer_fk = orders_and_payments.customer_fk
+),
+final as (
+
+    select 
+         order_pk as order_id
+        ,customer_uiid
+        ,order_status
+        ,order_purchase_date
+        ,order_approved_date
+        ,order_delivered_carrier_date
+        ,order_delivered_customer_date
+        ,order_estimated_delivery_date
+        ,est_delivery_delay
+        ,numb_payment_methods
+        ,payment_type
+        ,payment_installments
+        ,payment_value
+        ,customer_city as delivery_city
+    from
+        orders_and_locations
+)
+select * from final
 
 ================================================
 File: /models/_sources/in.c-keboola-ex-storage-35723326.yml
@@ -194,202 +366,46 @@ sources:
 
 
 ================================================
-File: /models/marts/customers.sql
+File: /models/staging/stg_products.sql
 ================================================
-{{ config(
-    materialized="table"
-) }}
-
-with customers as (
-    select * from {{ ref('stg_customers') }}
+with source as (
+    select *
+    from {{ source('in.c-keboola-ex-storage-35723326', 'olist_products_dataset') }}
 ),
-
-orders as (
-    select * from {{ ref('stg_orders') }}
-),
-
-payments as (
-    select * from {{ ref('stg_payments') }}
-),
-
-
-customers_orders_payments as (
+renamed as (
     select
-        distinct(customers.customer_fk) as customer_id
-        ,customers.customer_uiid
-        ,count(orders.order_pk)::integer as number_of_orders
-        ,min(orders.order_purchase_date)::timestamp as first_order
-        ,max(orders.order_purchase_date)::timestamp as recent_order
-        ,sum(payments.payment_value)::decimal(15,2) as customer_lifetime_value
-    from orders
-    left join customers on orders.customer_fk = customers.customer_fk
-    left join payments on orders.order_pk = payments.order_fk
-    group by 1, 2
-
-),
-
-final as (
-    select
-        distinct(customer_uiid) AS customer_uiid
-        ,SUM(customers_orders_payments.number_of_orders) AS number_of_orders
-        ,min(customers_orders_payments.first_order) AS first_order
-        ,MAX(customers_orders_payments.recent_order) AS recent_order
-        ,SUM(customers_orders_payments.customer_lifetime_value) AS customer_lifetime_value
-    from
-        customers_orders_payments
-    GROUP BY 1
+        "product_id" as product_pk
+        ,"product_category_name" as product_category_name
+        ,"product_name_lenght"::integer as product_name_lenght
+        ,"product_description_lenght"::integer as product_description_lenght
+        ,"product_photos_qty"::integer as product_photos_qty
+        ,"product_weight_g"::integer as product_weight_g
+        ,"product_length_cm"::integer as product_length_cm
+        ,"product_height_cm"::integer as product_height_cm
+        ,"product_width_cm"::integer as product_width_cm
+    from source
 )
-
-select * from final
-
-
+select *
+from renamed
 
 ================================================
-File: /models/marts/sellers.sql
+File: /models/staging/stg_payments.sql
 ================================================
-{{ config(
-    materialized="table"
-) }}
-
-
-with sellers as (
-
-    select * from {{ ref('stg_sellers') }}
-
+with source as (
+    select *
+    from {{ source('in.c-keboola-ex-storage-35723326','olist_order_payments_dataset' ) }}
 ),
-order_items as (
-    select * from {{ ref('stg_order_items')}}
-),
-
-orders_by_sellers as (
+renamed as (
     select
-    seller_fk as seller_id
-    ,sum(price) as price
-    ,count(distinct(order_fk)) as numb_orders
-    ,(sum(price) / count(order_fk))::integer as avg_order_price
-    from
-        order_items
-    group by 1
-
-),
-final as (
-    select 
-    orders_by_sellers.seller_id
-    ,orders_by_sellers.price
-    ,orders_by_sellers.numb_orders
-    ,orders_by_sellers.avg_order_price
-    ,sellers.seller_city
-    ,sellers.seller_state
-    from
-        orders_by_sellers
-    left join sellers on orders_by_sellers.seller_id = sellers.seller_fk
-
+        "order_id"::varchar as order_fk
+        ,"payment_sequential"::integer as numb_payment_methods
+        ,"payment_type" as payment_type
+        ,"payment_installments"::integer as payment_installments
+        ,"payment_value"::decimal(15,2) as payment_value
+    from source
 )
-select * from final
-
-
-================================================
-File: /models/marts/schema.yml
-================================================
-version: 2
-
-models:
-    - name: customers
-      description: "List of customers."
-      columns:
-          - name: customer_uiid
-            description: "The primary key for this table"
-            tests:
-                - unique
-                - not_null
-    - name: sellers
-      description: "List of sellers."
-      columns:
-          - name: seller_id
-            description: "The primary key for this table"
-            tests:
-                - unique
-                - not_null
-    - name : orders
-      description : "List of orders."
-      columns : 
-          - name : order_id
-            description : "The primary key for this table"
-            tests : 
-                - unique
-                - not_null
-          - name : customer_uiid
-            description : "The foreign key link to customer table"
-            tests : 
-                - relationships:
-                    to: ref('customers')
-                    field: customer_uiid
-
-================================================
-File: /models/marts/orders.sql
-================================================
-{{ config(
-    materialized="table"
-) }}
-
-
-with 
-
-orders as  (
-    select * from {{ ref('stg_orders' )}}
-),
-
-customers as (
-    select * from {{ref('stg_customers')}}
-),
-
-order_payments as (
-    select * from {{ ref('stg_payments') }}
-),
-
-order_reviews as (
-    select * from {{ref('stg_reviews')}}
-),
-
-orders_and_payments as (
-    select
-        *
-    from
-        orders
-    left join order_payments on orders.order_pk = order_payments.order_fk
-
-),
-
-orders_and_locations as (
-    select 
-        orders_and_payments.*
-        ,customers.customer_uiid
-        ,customers.customer_city
-    from
-        orders_and_payments
-    left join customers on customers.customer_fk = orders_and_payments.customer_fk
-),
-final as (
-
-    select 
-         order_pk as order_id
-        ,customer_uiid
-        ,order_status
-        ,order_purchase_date
-        ,order_approved_date
-        ,order_delivered_carrier_date
-        ,order_delivered_customer_date
-        ,order_estimated_delivery_date
-        ,est_delivery_delay
-        ,numb_payment_methods
-        ,payment_type
-        ,payment_installments
-        ,payment_value
-        ,customer_city as delivery_city
-    from
-        orders_and_locations
-)
-select * from final
+select *
+from renamed
 
 ================================================
 File: /models/staging/stg_order_items.sql
@@ -431,19 +447,66 @@ select *
 from renamed
 
 ================================================
-File: /models/staging/stg_payments.sql
+File: /models/staging/stg_customers.sql
 ================================================
 with source as (
     select *
-    from {{ source('in.c-keboola-ex-storage-35723326','olist_order_payments_dataset' ) }}
+    from {{ source('in.c-keboola-ex-storage-35723326', 'olist_customers_dataset') }}
+) ,
+renamed as (
+    select
+        "customer_id"::varchar as customer_fk
+        ,"customer_unique_id"::varchar as customer_uiid
+        ,"customer_city"::varchar as customer_city
+        ,"customer_state"::varchar as customer_state
+    from source
+)
+select *
+from renamed
+
+================================================
+File: /models/staging/stg_sellers.sql
+================================================
+with source as (
+    select *
+    from {{ source('in.c-keboola-ex-storage-35723326', 'olist_sellers_dataset') }}
 ),
 renamed as (
     select
-        "order_id"::varchar as order_fk
-        ,"payment_sequential"::integer as numb_payment_methods
-        ,"payment_type" as payment_type
-        ,"payment_installments"::integer as payment_installments
-        ,"payment_value"::decimal(15,2) as payment_value
+        "seller_id" as seller_fk
+        ,"seller_city" as seller_city
+        ,"seller_state" as seller_state
+    from source
+)
+select *
+from renamed
+
+================================================
+File: /models/staging/stg_orders.sql
+================================================
+with source as (
+    select *
+    from {{ source('in.c-keboola-ex-storage-35723326', 'olist_orders_dataset') }}
+),
+renamed as (
+    select
+        "order_id"::varchar as order_pk
+        ,"customer_id"::varchar as customer_fk
+        ,CASE 
+            WHEN "order_status"='delivered' THEN 'completed'
+            WHEN "order_status"='canceled' THEN 'cancelled'
+            ELSE 'in_progress'
+        END AS order_status
+        ,try_to_timestamp("order_purchase_timestamp") as order_purchase_date
+        ,try_to_timestamp("order_approved_at") as order_approved_date
+        ,try_to_timestamp("order_delivered_carrier_date") as order_delivered_carrier_date
+        ,try_to_timestamp("order_delivered_customer_date") as order_delivered_customer_date
+        ,try_to_timestamp("order_estimated_delivery_date") as order_estimated_delivery_date
+        ,datediff(
+            day
+            ,try_to_timestamp("order_delivered_customer_date")
+            ,try_to_timestamp("order_estimated_delivery_date")
+        )::integer as est_delivery_delay
     from source
 )
 select *
@@ -587,95 +650,6 @@ models:
 
 
 ================================================
-File: /models/staging/stg_customers.sql
-================================================
-with source as (
-    select *
-    from {{ source('in.c-keboola-ex-storage-35723326', 'olist_customers_dataset') }}
-) ,
-renamed as (
-    select
-        "customer_id"::varchar as customer_fk
-        ,"customer_unique_id"::varchar as customer_uiid
-        ,"customer_city"::varchar as customer_city
-        ,"customer_state"::varchar as customer_state
-    from source
-)
-select *
-from renamed
-
-================================================
-File: /models/staging/stg_sellers.sql
-================================================
-with source as (
-    select *
-    from {{ source('in.c-keboola-ex-storage-35723326', 'olist_sellers_dataset') }}
-),
-renamed as (
-    select
-        "seller_id" as seller_fk
-        ,"seller_city" as seller_city
-        ,"seller_state" as seller_state
-    from source
-)
-select *
-from renamed
-
-================================================
-File: /models/staging/stg_orders.sql
-================================================
-with source as (
-    select *
-    from {{ source('in.c-keboola-ex-storage-35723326', 'olist_orders_dataset') }}
-),
-renamed as (
-    select
-        "order_id"::varchar as order_pk
-        ,"customer_id"::varchar as customer_fk
-        ,CASE 
-            WHEN "order_status"='delivered' THEN 'completed'
-            WHEN "order_status"='canceled' THEN 'cancelled'
-            ELSE 'in_progress'
-        END AS order_status
-        ,try_to_timestamp("order_purchase_timestamp") as order_purchase_date
-        ,try_to_timestamp("order_approved_at") as order_approved_date
-        ,try_to_timestamp("order_delivered_carrier_date") as order_delivered_carrier_date
-        ,try_to_timestamp("order_delivered_customer_date") as order_delivered_customer_date
-        ,try_to_timestamp("order_estimated_delivery_date") as order_estimated_delivery_date
-        ,datediff(
-            day
-            ,try_to_timestamp("order_delivered_customer_date")
-            ,try_to_timestamp("order_estimated_delivery_date")
-        )::integer as est_delivery_delay
-    from source
-)
-select *
-from renamed
-
-================================================
-File: /models/staging/stg_products.sql
-================================================
-with source as (
-    select *
-    from {{ source('in.c-keboola-ex-storage-35723326', 'olist_products_dataset') }}
-),
-renamed as (
-    select
-        "product_id" as product_pk
-        ,"product_category_name" as product_category_name
-        ,"product_name_lenght"::integer as product_name_lenght
-        ,"product_description_lenght"::integer as product_description_lenght
-        ,"product_photos_qty"::integer as product_photos_qty
-        ,"product_weight_g"::integer as product_weight_g
-        ,"product_length_cm"::integer as product_length_cm
-        ,"product_height_cm"::integer as product_height_cm
-        ,"product_width_cm"::integer as product_width_cm
-    from source
-)
-select *
-from renamed
-
-================================================
 File: /dbt_project.yml
 ================================================
 
@@ -715,6 +689,32 @@ models:
   keboola_dbt_olist:
     staging:
       +materialized: view
+
+================================================
+File: /tests/assert_payment_amount_is_positive.sql
+================================================
+select 
+    order_id,
+    payment_value
+from {{ref('orders')}}
+having not(payment_value>=0)
+
+================================================
+File: /.user.yml
+================================================
+id: 01b5e33f-670e-4982-949d-b51b1bd44bb5
+
+
+================================================
+File: /packages.yml
+================================================
+packages:
+  - package: dbt-labs/dbt_utils
+    version: 0.9.6
+
+  - package: calogica/dbt_expectations
+    version: 0.8.2
+
 
 ================================================
 File: /README.md

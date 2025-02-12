@@ -1,27 +1,11 @@
 Directory structure:
 └── kds_consulting_team-kds-team.ex-as400-custom/
-    ├── phpunit.sh
-    ├── driver/
-    │   ├── odbcinst.ini
-    │   └── ibm-iaccess-1.1.0.5-1.0.amd64.deb
-    ├── composer.lock
-    ├── tests/
-    │   ├── data/
-    │   │   ├── projact.csv
-    │   │   ├── escaping.csv
-    │   │   ├── db2/
-    │   │   │   └── config.yml
-    │   │   ├── out/
-    │   │   │   └── tables/
-    │   │   │       └── in.c-main.db2projact.csv
-    │   │   └── loadData.php
-    │   └── Keboola/
-    │       └── Extractor/
-    │           └── DB2Test.php
     ├── .travis.yml
-    ├── composer.json
-    ├── run.php
-    ├── Dockerfile
+    ├── driver/
+    │   ├── ibm-iaccess-1.1.0.5-1.0.amd64.deb
+    │   └── odbcinst.ini
+    ├── deploy.sh
+    ├── docker-compose.yml
     ├── src/
     │   └── Keboola/
     │       └── DbExtractor/
@@ -29,25 +13,54 @@ Directory structure:
     │           │   └── DB2ConfigDefinition.php
     │           └── Extractor/
     │               └── DB2.php
+    ├── composer.lock
     ├── bitbucket-pipelines.yml
-    ├── deploy.sh
-    ├── docker-compose.yml
+    ├── tests/
+    │   ├── Keboola/
+    │   │   └── Extractor/
+    │   │       └── DB2Test.php
+    │   └── data/
+    │       ├── loadData.php
+    │       ├── db2/
+    │       │   └── config.yml
+    │       ├── projact.csv
+    │       ├── escaping.csv
+    │       └── out/
+    │           └── tables/
+    │               └── in.c-main.db2projact.csv
     ├── phpunit.xml.dist
+    ├── phpunit.sh
+    ├── run.php
+    ├── composer.json
+    ├── Dockerfile
     └── README.md
 
 ================================================
-File: /phpunit.sh
+File: /.travis.yml
 ================================================
-#!/usr/bin/env bash
+sudo: false
 
-# install dependencies
-curl -sS https://getcomposer.org/installer | php
-echo "memory_limit = -1" >> /etc/php.ini
-php composer.phar install -n;
+services:
+  - docker
 
-# run test suite
-export ROOT_PATH="/code";
-./vendor/bin/phpunit;
+script:
+  - docker-compose build app
+
+after_success:
+  - docker images
+
+after_error:
+  - docker-compose logs
+
+after_failure:
+  - docker-compose logs
+
+deploy:
+  provider: script
+  skip_cleanup: true
+  script: ./deploy.sh
+  on:
+    tags: true
 
 
 ================================================
@@ -64,6 +77,298 @@ Setup64         = /usr/lib/libcwbodbcs.so
 Threading       = 2
 DontDLClose     = 1
 UsageCount      = 1
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/bash
+set -e
+
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Deploy to KBC -> update the tag in Keboola Developer Portal (needs $KBC_DEVELOPERPORTAL_VENDOR & $KBC_DEVELOPERPORTAL_APP)
+docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  app:
+    build: .
+    image: keboola/db-extractor-db2-bata
+    volumes:
+      - .:/code
+    working_dir: /code
+    command: "./phpunit.sh"
+    tty: true
+    stdin_open: true
+
+#  environment:
+#    - DB2_DB_HOST=db2
+#    - DB2_DB_PORT=50000
+#    - DB2_DB_DATABASE=SAMPLE
+#    - DB2_DB_USER=db2inst1
+#    - DB2_DB_PASSWORD=db2inst1
+#  links:
+#    - db2
+
+#db2:
+#  image: quay.io/keboola/db2express-c-docker
+#  privileged: true
+#  expose:
+#    - "50000"
+
+
+================================================
+File: /src/Keboola/DbExtractor/Configuration/DB2ConfigDefinition.php
+================================================
+<?php
+/**
+ * Author: miro@keboola.com
+ * Date: 14/06/2017
+ */
+namespace Keboola\DbExtractor\Configuration;
+
+use Symfony\Component\Config\Definition\Builder\TreeBuilder;
+
+class DB2ConfigDefinition extends ConfigDefinition
+{
+    /**
+     * Generates the configuration tree builder.
+     *
+     * @return \Symfony\Component\Config\Definition\Builder\TreeBuilder The tree builder
+     */
+    public function getConfigTreeBuilder()
+    {
+        $treeBuilder = new TreeBuilder();
+        $rootNode = $treeBuilder->root('parameters');
+
+        $rootNode
+            ->children()
+                ->scalarNode('data_dir')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+                ->scalarNode('extractor_class')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+                ->arrayNode('db')
+                    ->children()
+                        ->scalarNode('driver')->end()
+                        ->scalarNode('host')->end()
+                        ->scalarNode('port')->end()
+                        ->scalarNode('database')
+                            ->isRequired()
+                            ->cannotBeEmpty()
+                        ->end()
+                        ->scalarNode('user')
+                            ->isRequired()
+                        ->end()
+                        ->scalarNode('password')->end()
+                        ->scalarNode('#password')->end()
+                        ->append($this->addSshNode())
+                    ->end()
+                ->end()
+                ->arrayNode('tables')
+                    ->prototype('array')
+                        ->children()
+                            ->integerNode('id')
+                                ->isRequired()
+                                ->min(0)
+                            ->end()
+                            ->scalarNode('name')
+                                ->isRequired()
+                                ->cannotBeEmpty()
+                            ->end()
+                            ->scalarNode('query')
+                                ->isRequired()
+                                ->cannotBeEmpty()
+                            ->end()
+                            ->scalarNode('outputTable')
+                                ->isRequired()
+                                ->cannotBeEmpty()
+                            ->end()
+                            ->booleanNode('incremental')
+                                ->defaultValue(false)
+                            ->end()
+                            ->booleanNode('enabled')
+                                ->defaultValue(true)
+                            ->end()
+                            ->arrayNode('primaryKey')
+                                ->prototype('scalar')
+                                ->end()
+                            ->end()
+                            ->integerNode('retries')
+                                ->min(1)
+                            ->end()
+                            ->arrayNode('encoding')
+                                ->addDefaultsIfNotSet()
+                                ->children()
+                                    ->scalarNode('from')
+                                        ->defaultValue('ISO-8859-1')
+                                    ->end()
+                                    ->scalarNode('to')
+                                        ->defaultValue('UTF-8')
+                                    ->end()
+                                ->end()
+                            ->end()
+                        ->end()
+                    ->end()
+                ->end()
+            ->end()
+        ;
+
+        return $treeBuilder;
+    }
+}
+
+================================================
+File: /src/Keboola/DbExtractor/Extractor/DB2.php
+================================================
+<?php
+/**
+ * Created by PhpStorm.
+ * User: miroslavcillik
+ * Date: 10/02/16
+ * Time: 17:49
+ */
+
+namespace Keboola\DbExtractor\Extractor;
+
+use Keboola\DbExtractor\Exception\ApplicationException;
+use Keboola\DbExtractor\Exception\UserException;
+
+class DB2 extends Extractor
+{
+    private $dbConfig;
+
+    public function createConnection($dbParams)
+    {
+        $this->dbConfig = $dbParams;
+
+        // check params
+        foreach (['host', 'database', 'user', 'password'] as $r) {
+            if (!isset($dbParams[$r])) {
+                throw new UserException(sprintf("Parameter %s is missing.", $r));
+            }
+        }
+
+        // convert errors to PDOExceptions
+        $options = [
+            \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION
+        ];
+
+        $dsn = sprintf(
+            "odbc:DRIVER={IBM i Access ODBC Driver};SYSTEM=%s;DATABASE=%s;PROTOCOL=TCPIP;CCSID=870",
+            $dbParams['host'],
+            $dbParams['database']
+        );
+
+        $pdo = new \PDO($dsn, $dbParams['user'], $dbParams['password'], $options);
+
+        return $pdo;
+    }
+
+    /**
+     * @param array $table
+     * @return $outputTable output table name
+     * @throws ApplicationException
+     * @throws UserException
+     * @throws \Keboola\Csv\Exception
+     */
+    public function export(array $table)
+    {
+        if (empty($table['outputTable'])) {
+            throw new UserException("Missing attribute 'outputTable'");
+        }
+        $outputTable = $table['outputTable'];
+        if (empty($table['query'])) {
+            throw new UserException("Missing attribute 'query'");
+        }
+        $query = $table['query'];
+        $encoding = isset($table['encoding']) ? $table['encoding'] : null;
+
+        $this->logger->info("Exporting to " . $outputTable);
+        $csv = $this->createOutputCsv($outputTable);
+
+        // write header and first line
+        try {
+            $stmt = $this->db->prepare($query);
+            $stmt->execute();
+            $resultRow = $stmt->fetch(\PDO::FETCH_ASSOC);
+
+            if (is_array($resultRow) && !empty($resultRow)) {
+                $csv->writeRow($this->encode(array_keys($resultRow), $encoding));
+                $csv->writeRow($this->encode($resultRow, $encoding));
+
+                // write the rest
+                while ($resultRow = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+                    if ($encoding !== null) {
+                        $resultRow = $this->encode($resultRow, $encoding);
+                    }
+                    $csv->writeRow($resultRow);
+                }
+
+                if ($this->createManifest($table) === false) {
+                    throw new ApplicationException("Unable to create manifest", 0, null, [
+                        'table' => $table
+                    ]);
+                }
+            } else {
+                $this->logger->warning("Query returned empty result. Nothing was imported.");
+            }
+        } catch (\PDOException $e) {
+            throw new UserException("DB query failed: " . $e->getMessage(), 0, $e);
+        }
+
+        return $outputTable;
+    }
+
+    private function encode($row, $encoding)
+    {
+        return array_map(function ($item) use ($encoding) {
+            if (is_numeric($item)) {
+                return $item;
+            }
+            return ($encoding === null) ? $item : mb_convert_encoding($item, $encoding['to'], $encoding['from']);
+        }, $row);
+    }
+
+    private function replaceNull($row, $value)
+    {
+        foreach ($row as $k => $v) {
+            if ($v === null) {
+                $row[$k] = $value;
+            }
+        }
+
+        return $row;
+    }
+
+    public function testConnection()
+    {
+        $this->db->query('SELECT 1 FROM sysibm.sysdummy1');
+    }
+}
 
 
 ================================================
@@ -1648,211 +1953,37 @@ File: /composer.lock
 
 
 ================================================
-File: /tests/data/projact.csv
+File: /bitbucket-pipelines.yml
 ================================================
-"PROJNO","ACTNO","ACSTAFF","ACSTDATE","ACENDATE"
-"AD3100","10","","2002-01-01",""
-"AD3110","10","","2002-01-01",""
-"AD3111","60","","2002-01-01",""
-"AD3111","60","","2002-03-15",""
-"AD3111","70","","2002-03-15",""
-"AD3111","80","","2002-04-15",""
-"AD3111","180","","2002-10-15",""
-"AD3111","70","","2002-02-15",""
-"AD3111","80","","2002-09-15",""
-"AD3112","60","","2002-01-01",""
-"AD3112","60","","2002-02-01",""
-"AD3112","60","","2003-01-01",""
-"AD3112","70","","2002-02-01",""
-"AD3112","70","","2002-03-15",""
-"AD3112","70","","2002-08-15",""
-"AD3112","80","","2002-08-15",""
-"AD3112","80","","2002-10-15",""
-"AD3112","180","","2002-08-15",""
-"AD3113","70","","2002-06-15",""
-"AD3113","70","","2002-07-01",""
-"AD3113","80","","2002-01-01",""
-"AD3113","80","","2002-03-01",""
-"AD3113","180","","2002-03-01",""
-"AD3113","180","","2002-04-15",""
-"AD3113","180","","2002-06-01",""
-"AD3113","60","","2002-03-01",""
-"AD3113","60","","2002-04-01",""
-"AD3113","60","","2002-09-01",""
-"AD3113","70","","2002-09-01",""
-"AD3113","70","","2002-10-15",""
-"IF1000","10","","2002-06-01",""
-"IF1000","90","","2002-10-01",""
-"IF1000","100","","2002-10-01",""
-"IF2000","10","","2002-01-01",""
-"IF2000","100","","2002-01-01",""
-"IF2000","100","","2002-03-01",""
-"IF2000","110","","2002-03-01",""
-"IF2000","110","","2002-10-01",""
-"MA2100","10","","2002-01-01",""
-"MA2100","20","","2002-01-01",""
-"MA2110","10","","2002-01-01",""
-"MA2111","50","","2002-01-01",""
-"MA2111","60","","2002-06-15",""
-"MA2111","40","","2002-01-01",""
-"MA2112","60","","2002-01-01",""
-"MA2112","180","","2002-07-15",""
-"MA2112","70","","2002-06-01",""
-"MA2112","70","","2002-01-01",""
-"MA2112","80","","2002-10-01",""
-"MA2113","60","","2002-07-15",""
-"MA2113","80","","2002-01-01",""
-"MA2113","70","","2002-04-01",""
-"MA2113","80","","2002-10-01",""
-"MA2113","180","","2002-10-01",""
-"OP1000","10","","2002-01-01",""
-"OP1010","10","","2002-01-01",""
-"OP1010","130","","2002-01-01",""
-"OP2010","10","","2002-01-01",""
-"OP2011","140","","2002-01-01",""
-"OP2011","150","","2002-01-01",""
-"OP2012","140","","2002-01-01",""
-"OP2012","160","","2002-01-01",""
-"OP2013","140","","2002-01-01",""
-"OP2013","170","","2002-01-01",""
-"PL2100","30","","2002-01-01",""
+options:
+  docker: true
 
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker -v
+          - docker build -t $APP_IMAGE .
+          - docker run $APP_IMAGE php /code/phpunit.sh
 
-================================================
-File: /tests/data/escaping.csv
-================================================
-"COL1","COL2"
-"line with enclosure","second column"
-"column with enclosure "", and comma inside text","second column enclosure in text """
-"columns with
-new line","columns with 	tab"
-"unicode characters","ľščťžýáíéúäôň"
-"first","something with
-
-double new line"
-
-
-================================================
-File: /tests/data/db2/config.yml
-================================================
-parameters:
-    db:
-        driver: db2
-        host: db2
-        port: 50000
-        database: SAMPLE
-        user: db2inst1
-        password: db2inst1
-
-    tables:
-        -
-            name: projact
-            query: "SELECT * FROM DB2INST1.PROJACT"
-            outputTable: in.c-main.db2projact
-            incremental: false
-            primaryKey: ~
-            enabled: true
-
-
-================================================
-File: /tests/data/out/tables/in.c-main.db2projact.csv
-================================================
-"PROJNO","ACTNO","ACSTAFF","ACSTDATE","ACENDATE"
-"AD3100","10","","2002-01-01",""
-"AD3110","10","","2002-01-01",""
-"AD3111","60","","2002-01-01",""
-"AD3111","60","","2002-03-15",""
-"AD3111","70","","2002-03-15",""
-"AD3111","80","","2002-04-15",""
-"AD3111","180","","2002-10-15",""
-"AD3111","70","","2002-02-15",""
-"AD3111","80","","2002-09-15",""
-"AD3112","60","","2002-01-01",""
-"AD3112","60","","2002-02-01",""
-"AD3112","60","","2003-01-01",""
-"AD3112","70","","2002-02-01",""
-"AD3112","70","","2002-03-15",""
-"AD3112","70","","2002-08-15",""
-"AD3112","80","","2002-08-15",""
-"AD3112","80","","2002-10-15",""
-"AD3112","180","","2002-08-15",""
-"AD3113","70","","2002-06-15",""
-"AD3113","70","","2002-07-01",""
-"AD3113","80","","2002-01-01",""
-"AD3113","80","","2002-03-01",""
-"AD3113","180","","2002-03-01",""
-"AD3113","180","","2002-04-15",""
-"AD3113","180","","2002-06-01",""
-"AD3113","60","","2002-03-01",""
-"AD3113","60","","2002-04-01",""
-"AD3113","60","","2002-09-01",""
-"AD3113","70","","2002-09-01",""
-"AD3113","70","","2002-10-15",""
-"IF1000","10","","2002-06-01",""
-"IF1000","90","","2002-10-01",""
-"IF1000","100","","2002-10-01",""
-"IF2000","10","","2002-01-01",""
-"IF2000","100","","2002-01-01",""
-"IF2000","100","","2002-03-01",""
-"IF2000","110","","2002-03-01",""
-"IF2000","110","","2002-10-01",""
-"MA2100","10","","2002-01-01",""
-"MA2100","20","","2002-01-01",""
-"MA2110","10","","2002-01-01",""
-"MA2111","50","","2002-01-01",""
-"MA2111","60","","2002-06-15",""
-"MA2111","40","","2002-01-01",""
-"MA2112","60","","2002-01-01",""
-"MA2112","180","","2002-07-15",""
-"MA2112","70","","2002-06-01",""
-"MA2112","70","","2002-01-01",""
-"MA2112","80","","2002-10-01",""
-"MA2113","60","","2002-07-15",""
-"MA2113","80","","2002-01-01",""
-"MA2113","70","","2002-04-01",""
-"MA2113","80","","2002-10-01",""
-"MA2113","180","","2002-10-01",""
-"OP1000","10","","2002-01-01",""
-"OP1010","10","","2002-01-01",""
-"OP1010","130","","2002-01-01",""
-"OP2010","10","","2002-01-01",""
-"OP2011","140","","2002-01-01",""
-"OP2011","150","","2002-01-01",""
-"OP2012","140","","2002-01-01",""
-"OP2012","160","","2002-01-01",""
-"OP2013","140","","2002-01-01",""
-"OP2013","170","","2002-01-01",""
-"PL2100","30","","2002-01-01",""
-
-
-================================================
-File: /tests/data/loadData.php
-================================================
-<?php
-/**
- * Created by PhpStorm.
- * User: miroslavcillik
- * Date: 15/02/16
- * Time: 16:44
- */
-
-$pdo = new \PDO(
-    "odbc:DRIVER={IBM DB2 ODBC DRIVER};DATABASE=SAMPLE;HOSTNAME=db2;PORT=50000;PROTOCOL=TCPIP;",
-    'db2inst1',
-    'db2inst1'
-);
-
-$result = $pdo->exec("
-    import from 'escaping.csv' of csv replace into escaping
-");
-
-var_dump($result);
-
-var_dump($pdo->errorCode());
-
-var_dump($pdo->errorInfo());
-
-
+  tags:
+    '*':
+      - step:
+          script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker -v
+          - docker build -t $APP_IMAGE .
+          - docker run $APP_IMAGE php /code/phpunit.sh
+          # push test image to ECR - uncomment when initialised
+          # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          # - docker push $REPOSITORY:test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+          # Deploy is only triggered on tagged commit
+          - ./deploy.sh
 
 ================================================
 File: /tests/Keboola/Extractor/DB2Test.php
@@ -1992,56 +2123,252 @@ class DB2Test extends ExtractorTest
 
 
 ================================================
-File: /.travis.yml
+File: /tests/data/loadData.php
 ================================================
-sudo: false
+<?php
+/**
+ * Created by PhpStorm.
+ * User: miroslavcillik
+ * Date: 15/02/16
+ * Time: 16:44
+ */
 
-services:
-  - docker
+$pdo = new \PDO(
+    "odbc:DRIVER={IBM DB2 ODBC DRIVER};DATABASE=SAMPLE;HOSTNAME=db2;PORT=50000;PROTOCOL=TCPIP;",
+    'db2inst1',
+    'db2inst1'
+);
 
-script:
-  - docker-compose build app
+$result = $pdo->exec("
+    import from 'escaping.csv' of csv replace into escaping
+");
 
-after_success:
-  - docker images
+var_dump($result);
 
-after_error:
-  - docker-compose logs
+var_dump($pdo->errorCode());
 
-after_failure:
-  - docker-compose logs
+var_dump($pdo->errorInfo());
 
-deploy:
-  provider: script
-  skip_cleanup: true
-  script: ./deploy.sh
-  on:
-    tags: true
 
 
 ================================================
-File: /composer.json
+File: /tests/data/db2/config.yml
 ================================================
-{
-    "name": "keboola/db-extractor-db2",
-    "require": {
-        "keboola/db-extractor-common": "^4.0"
-    },
-    "require-dev": {
-        "phpunit/phpunit": "4.6.*"
-    },
-    "authors": [
-        {
-            "name": "Miroslav Cillik",
-            "email": "miro@keboola.com"
-        }
-    ],
-    "autoload": {
-        "psr-4": {
-            "Keboola\\": "src/Keboola/"
-        }
-    }
-}
+parameters:
+    db:
+        driver: db2
+        host: db2
+        port: 50000
+        database: SAMPLE
+        user: db2inst1
+        password: db2inst1
+
+    tables:
+        -
+            name: projact
+            query: "SELECT * FROM DB2INST1.PROJACT"
+            outputTable: in.c-main.db2projact
+            incremental: false
+            primaryKey: ~
+            enabled: true
+
+
+================================================
+File: /tests/data/projact.csv
+================================================
+"PROJNO","ACTNO","ACSTAFF","ACSTDATE","ACENDATE"
+"AD3100","10","","2002-01-01",""
+"AD3110","10","","2002-01-01",""
+"AD3111","60","","2002-01-01",""
+"AD3111","60","","2002-03-15",""
+"AD3111","70","","2002-03-15",""
+"AD3111","80","","2002-04-15",""
+"AD3111","180","","2002-10-15",""
+"AD3111","70","","2002-02-15",""
+"AD3111","80","","2002-09-15",""
+"AD3112","60","","2002-01-01",""
+"AD3112","60","","2002-02-01",""
+"AD3112","60","","2003-01-01",""
+"AD3112","70","","2002-02-01",""
+"AD3112","70","","2002-03-15",""
+"AD3112","70","","2002-08-15",""
+"AD3112","80","","2002-08-15",""
+"AD3112","80","","2002-10-15",""
+"AD3112","180","","2002-08-15",""
+"AD3113","70","","2002-06-15",""
+"AD3113","70","","2002-07-01",""
+"AD3113","80","","2002-01-01",""
+"AD3113","80","","2002-03-01",""
+"AD3113","180","","2002-03-01",""
+"AD3113","180","","2002-04-15",""
+"AD3113","180","","2002-06-01",""
+"AD3113","60","","2002-03-01",""
+"AD3113","60","","2002-04-01",""
+"AD3113","60","","2002-09-01",""
+"AD3113","70","","2002-09-01",""
+"AD3113","70","","2002-10-15",""
+"IF1000","10","","2002-06-01",""
+"IF1000","90","","2002-10-01",""
+"IF1000","100","","2002-10-01",""
+"IF2000","10","","2002-01-01",""
+"IF2000","100","","2002-01-01",""
+"IF2000","100","","2002-03-01",""
+"IF2000","110","","2002-03-01",""
+"IF2000","110","","2002-10-01",""
+"MA2100","10","","2002-01-01",""
+"MA2100","20","","2002-01-01",""
+"MA2110","10","","2002-01-01",""
+"MA2111","50","","2002-01-01",""
+"MA2111","60","","2002-06-15",""
+"MA2111","40","","2002-01-01",""
+"MA2112","60","","2002-01-01",""
+"MA2112","180","","2002-07-15",""
+"MA2112","70","","2002-06-01",""
+"MA2112","70","","2002-01-01",""
+"MA2112","80","","2002-10-01",""
+"MA2113","60","","2002-07-15",""
+"MA2113","80","","2002-01-01",""
+"MA2113","70","","2002-04-01",""
+"MA2113","80","","2002-10-01",""
+"MA2113","180","","2002-10-01",""
+"OP1000","10","","2002-01-01",""
+"OP1010","10","","2002-01-01",""
+"OP1010","130","","2002-01-01",""
+"OP2010","10","","2002-01-01",""
+"OP2011","140","","2002-01-01",""
+"OP2011","150","","2002-01-01",""
+"OP2012","140","","2002-01-01",""
+"OP2012","160","","2002-01-01",""
+"OP2013","140","","2002-01-01",""
+"OP2013","170","","2002-01-01",""
+"PL2100","30","","2002-01-01",""
+
+
+================================================
+File: /tests/data/escaping.csv
+================================================
+"COL1","COL2"
+"line with enclosure","second column"
+"column with enclosure "", and comma inside text","second column enclosure in text """
+"columns with
+new line","columns with 	tab"
+"unicode characters","ľščťžýáíéúäôň"
+"first","something with
+
+double new line"
+
+
+================================================
+File: /tests/data/out/tables/in.c-main.db2projact.csv
+================================================
+"PROJNO","ACTNO","ACSTAFF","ACSTDATE","ACENDATE"
+"AD3100","10","","2002-01-01",""
+"AD3110","10","","2002-01-01",""
+"AD3111","60","","2002-01-01",""
+"AD3111","60","","2002-03-15",""
+"AD3111","70","","2002-03-15",""
+"AD3111","80","","2002-04-15",""
+"AD3111","180","","2002-10-15",""
+"AD3111","70","","2002-02-15",""
+"AD3111","80","","2002-09-15",""
+"AD3112","60","","2002-01-01",""
+"AD3112","60","","2002-02-01",""
+"AD3112","60","","2003-01-01",""
+"AD3112","70","","2002-02-01",""
+"AD3112","70","","2002-03-15",""
+"AD3112","70","","2002-08-15",""
+"AD3112","80","","2002-08-15",""
+"AD3112","80","","2002-10-15",""
+"AD3112","180","","2002-08-15",""
+"AD3113","70","","2002-06-15",""
+"AD3113","70","","2002-07-01",""
+"AD3113","80","","2002-01-01",""
+"AD3113","80","","2002-03-01",""
+"AD3113","180","","2002-03-01",""
+"AD3113","180","","2002-04-15",""
+"AD3113","180","","2002-06-01",""
+"AD3113","60","","2002-03-01",""
+"AD3113","60","","2002-04-01",""
+"AD3113","60","","2002-09-01",""
+"AD3113","70","","2002-09-01",""
+"AD3113","70","","2002-10-15",""
+"IF1000","10","","2002-06-01",""
+"IF1000","90","","2002-10-01",""
+"IF1000","100","","2002-10-01",""
+"IF2000","10","","2002-01-01",""
+"IF2000","100","","2002-01-01",""
+"IF2000","100","","2002-03-01",""
+"IF2000","110","","2002-03-01",""
+"IF2000","110","","2002-10-01",""
+"MA2100","10","","2002-01-01",""
+"MA2100","20","","2002-01-01",""
+"MA2110","10","","2002-01-01",""
+"MA2111","50","","2002-01-01",""
+"MA2111","60","","2002-06-15",""
+"MA2111","40","","2002-01-01",""
+"MA2112","60","","2002-01-01",""
+"MA2112","180","","2002-07-15",""
+"MA2112","70","","2002-06-01",""
+"MA2112","70","","2002-01-01",""
+"MA2112","80","","2002-10-01",""
+"MA2113","60","","2002-07-15",""
+"MA2113","80","","2002-01-01",""
+"MA2113","70","","2002-04-01",""
+"MA2113","80","","2002-10-01",""
+"MA2113","180","","2002-10-01",""
+"OP1000","10","","2002-01-01",""
+"OP1010","10","","2002-01-01",""
+"OP1010","130","","2002-01-01",""
+"OP2010","10","","2002-01-01",""
+"OP2011","140","","2002-01-01",""
+"OP2011","150","","2002-01-01",""
+"OP2012","140","","2002-01-01",""
+"OP2012","160","","2002-01-01",""
+"OP2013","140","","2002-01-01",""
+"OP2013","170","","2002-01-01",""
+"PL2100","30","","2002-01-01",""
+
+
+================================================
+File: /phpunit.xml.dist
+================================================
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit backupGlobals="false"
+         backupStaticAttributes="false"
+         colors="true"
+         convertErrorsToExceptions="true"
+         convertNoticesToExceptions="true"
+         convertWarningsToExceptions="true"
+         processIsolation="false"
+         stopOnFailure="true"
+         syntaxCheck="false"
+         bootstrap="vendor/keboola/db-extractor-common/bootstrap.php">
+
+    <php>
+        <const name="ROOT_PATH" value="./"/>
+        <const name="APP_NAME" value="ex-db-db2"/>
+    </php>
+
+    <testsuite name="DB Extractor DB2 Test Suite">
+        <directory>tests/Keboola/Extractor</directory>
+    </testsuite>
+
+</phpunit>
+
+
+================================================
+File: /phpunit.sh
+================================================
+#!/usr/bin/env bash
+
+# install dependencies
+curl -sS https://getcomposer.org/installer | php
+echo "memory_limit = -1" >> /etc/php.ini
+php composer.phar install -n;
+
+# run test suite
+export ROOT_PATH="/code";
+./vendor/bin/phpunit;
 
 
 ================================================
@@ -2089,6 +2416,31 @@ try {
 }
 
 exit(0);
+
+
+================================================
+File: /composer.json
+================================================
+{
+    "name": "keboola/db-extractor-db2",
+    "require": {
+        "keboola/db-extractor-common": "^4.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "4.6.*"
+    },
+    "authors": [
+        {
+            "name": "Miroslav Cillik",
+            "email": "miro@keboola.com"
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "Keboola\\": "src/Keboola/"
+        }
+    }
+}
 
 
 ================================================
@@ -2153,358 +2505,6 @@ RUN php composer.phar install --no-interaction
 
 # Run app
 CMD php ./run.php --data=/data
-
-
-================================================
-File: /src/Keboola/DbExtractor/Configuration/DB2ConfigDefinition.php
-================================================
-<?php
-/**
- * Author: miro@keboola.com
- * Date: 14/06/2017
- */
-namespace Keboola\DbExtractor\Configuration;
-
-use Symfony\Component\Config\Definition\Builder\TreeBuilder;
-
-class DB2ConfigDefinition extends ConfigDefinition
-{
-    /**
-     * Generates the configuration tree builder.
-     *
-     * @return \Symfony\Component\Config\Definition\Builder\TreeBuilder The tree builder
-     */
-    public function getConfigTreeBuilder()
-    {
-        $treeBuilder = new TreeBuilder();
-        $rootNode = $treeBuilder->root('parameters');
-
-        $rootNode
-            ->children()
-                ->scalarNode('data_dir')
-                    ->isRequired()
-                    ->cannotBeEmpty()
-                ->end()
-                ->scalarNode('extractor_class')
-                    ->isRequired()
-                    ->cannotBeEmpty()
-                ->end()
-                ->arrayNode('db')
-                    ->children()
-                        ->scalarNode('driver')->end()
-                        ->scalarNode('host')->end()
-                        ->scalarNode('port')->end()
-                        ->scalarNode('database')
-                            ->isRequired()
-                            ->cannotBeEmpty()
-                        ->end()
-                        ->scalarNode('user')
-                            ->isRequired()
-                        ->end()
-                        ->scalarNode('password')->end()
-                        ->scalarNode('#password')->end()
-                        ->append($this->addSshNode())
-                    ->end()
-                ->end()
-                ->arrayNode('tables')
-                    ->prototype('array')
-                        ->children()
-                            ->integerNode('id')
-                                ->isRequired()
-                                ->min(0)
-                            ->end()
-                            ->scalarNode('name')
-                                ->isRequired()
-                                ->cannotBeEmpty()
-                            ->end()
-                            ->scalarNode('query')
-                                ->isRequired()
-                                ->cannotBeEmpty()
-                            ->end()
-                            ->scalarNode('outputTable')
-                                ->isRequired()
-                                ->cannotBeEmpty()
-                            ->end()
-                            ->booleanNode('incremental')
-                                ->defaultValue(false)
-                            ->end()
-                            ->booleanNode('enabled')
-                                ->defaultValue(true)
-                            ->end()
-                            ->arrayNode('primaryKey')
-                                ->prototype('scalar')
-                                ->end()
-                            ->end()
-                            ->integerNode('retries')
-                                ->min(1)
-                            ->end()
-                            ->arrayNode('encoding')
-                                ->addDefaultsIfNotSet()
-                                ->children()
-                                    ->scalarNode('from')
-                                        ->defaultValue('ISO-8859-1')
-                                    ->end()
-                                    ->scalarNode('to')
-                                        ->defaultValue('UTF-8')
-                                    ->end()
-                                ->end()
-                            ->end()
-                        ->end()
-                    ->end()
-                ->end()
-            ->end()
-        ;
-
-        return $treeBuilder;
-    }
-}
-
-================================================
-File: /src/Keboola/DbExtractor/Extractor/DB2.php
-================================================
-<?php
-/**
- * Created by PhpStorm.
- * User: miroslavcillik
- * Date: 10/02/16
- * Time: 17:49
- */
-
-namespace Keboola\DbExtractor\Extractor;
-
-use Keboola\DbExtractor\Exception\ApplicationException;
-use Keboola\DbExtractor\Exception\UserException;
-
-class DB2 extends Extractor
-{
-    private $dbConfig;
-
-    public function createConnection($dbParams)
-    {
-        $this->dbConfig = $dbParams;
-
-        // check params
-        foreach (['host', 'database', 'user', 'password'] as $r) {
-            if (!isset($dbParams[$r])) {
-                throw new UserException(sprintf("Parameter %s is missing.", $r));
-            }
-        }
-
-        // convert errors to PDOExceptions
-        $options = [
-            \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION
-        ];
-
-        $dsn = sprintf(
-            "odbc:DRIVER={IBM i Access ODBC Driver};SYSTEM=%s;DATABASE=%s;PROTOCOL=TCPIP;CCSID=870",
-            $dbParams['host'],
-            $dbParams['database']
-        );
-
-        $pdo = new \PDO($dsn, $dbParams['user'], $dbParams['password'], $options);
-
-        return $pdo;
-    }
-
-    /**
-     * @param array $table
-     * @return $outputTable output table name
-     * @throws ApplicationException
-     * @throws UserException
-     * @throws \Keboola\Csv\Exception
-     */
-    public function export(array $table)
-    {
-        if (empty($table['outputTable'])) {
-            throw new UserException("Missing attribute 'outputTable'");
-        }
-        $outputTable = $table['outputTable'];
-        if (empty($table['query'])) {
-            throw new UserException("Missing attribute 'query'");
-        }
-        $query = $table['query'];
-        $encoding = isset($table['encoding']) ? $table['encoding'] : null;
-
-        $this->logger->info("Exporting to " . $outputTable);
-        $csv = $this->createOutputCsv($outputTable);
-
-        // write header and first line
-        try {
-            $stmt = $this->db->prepare($query);
-            $stmt->execute();
-            $resultRow = $stmt->fetch(\PDO::FETCH_ASSOC);
-
-            if (is_array($resultRow) && !empty($resultRow)) {
-                $csv->writeRow($this->encode(array_keys($resultRow), $encoding));
-                $csv->writeRow($this->encode($resultRow, $encoding));
-
-                // write the rest
-                while ($resultRow = $stmt->fetch(\PDO::FETCH_ASSOC)) {
-                    if ($encoding !== null) {
-                        $resultRow = $this->encode($resultRow, $encoding);
-                    }
-                    $csv->writeRow($resultRow);
-                }
-
-                if ($this->createManifest($table) === false) {
-                    throw new ApplicationException("Unable to create manifest", 0, null, [
-                        'table' => $table
-                    ]);
-                }
-            } else {
-                $this->logger->warning("Query returned empty result. Nothing was imported.");
-            }
-        } catch (\PDOException $e) {
-            throw new UserException("DB query failed: " . $e->getMessage(), 0, $e);
-        }
-
-        return $outputTable;
-    }
-
-    private function encode($row, $encoding)
-    {
-        return array_map(function ($item) use ($encoding) {
-            if (is_numeric($item)) {
-                return $item;
-            }
-            return ($encoding === null) ? $item : mb_convert_encoding($item, $encoding['to'], $encoding['from']);
-        }, $row);
-    }
-
-    private function replaceNull($row, $value)
-    {
-        foreach ($row as $k => $v) {
-            if ($v === null) {
-                $row[$k] = $value;
-            }
-        }
-
-        return $row;
-    }
-
-    public function testConnection()
-    {
-        $this->db->query('SELECT 1 FROM sysibm.sysdummy1');
-    }
-}
-
-
-================================================
-File: /bitbucket-pipelines.yml
-================================================
-options:
-  docker: true
-
-pipelines:
-  default:
-    - step:
-        script:
-          - export APP_IMAGE=$APP_IMAGE
-          - docker -v
-          - docker build -t $APP_IMAGE .
-          - docker run $APP_IMAGE php /code/phpunit.sh
-
-  tags:
-    '*':
-      - step:
-          script:
-          - export APP_IMAGE=$APP_IMAGE
-          - docker -v
-          - docker build -t $APP_IMAGE .
-          - docker run $APP_IMAGE php /code/phpunit.sh
-          # push test image to ECR - uncomment when initialised
-          # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
-          # - docker tag $APP_IMAGE:latest $REPOSITORY:test
-          # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-          # - docker push $REPOSITORY:test
-          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
-          # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
-          # Deploy is only triggered on tagged commit
-          - ./deploy.sh
-
-================================================
-File: /deploy.sh
-================================================
-#!/bin/bash
-set -e
-
-if [ $BITBUCKET_BRANCH != "master" ]; then
-               echo Deploy on tagged commit can be only executed in master!
-               exit 1
-fi
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
-docker push ${REPOSITORY}:${BITBUCKET_TAG}
-docker push ${REPOSITORY}:latest
-
-# Deploy to KBC -> update the tag in Keboola Developer Portal (needs $KBC_DEVELOPERPORTAL_VENDOR & $KBC_DEVELOPERPORTAL_APP)
-docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
-
-
-================================================
-File: /docker-compose.yml
-================================================
-version: "2"
-services:
-  app:
-    build: .
-    image: keboola/db-extractor-db2-bata
-    volumes:
-      - .:/code
-    working_dir: /code
-    command: "./phpunit.sh"
-    tty: true
-    stdin_open: true
-
-#  environment:
-#    - DB2_DB_HOST=db2
-#    - DB2_DB_PORT=50000
-#    - DB2_DB_DATABASE=SAMPLE
-#    - DB2_DB_USER=db2inst1
-#    - DB2_DB_PASSWORD=db2inst1
-#  links:
-#    - db2
-
-#db2:
-#  image: quay.io/keboola/db2express-c-docker
-#  privileged: true
-#  expose:
-#    - "50000"
-
-
-================================================
-File: /phpunit.xml.dist
-================================================
-<?xml version="1.0" encoding="UTF-8"?>
-<phpunit backupGlobals="false"
-         backupStaticAttributes="false"
-         colors="true"
-         convertErrorsToExceptions="true"
-         convertNoticesToExceptions="true"
-         convertWarningsToExceptions="true"
-         processIsolation="false"
-         stopOnFailure="true"
-         syntaxCheck="false"
-         bootstrap="vendor/keboola/db-extractor-common/bootstrap.php">
-
-    <php>
-        <const name="ROOT_PATH" value="./"/>
-        <const name="APP_NAME" value="ex-db-db2"/>
-    </php>
-
-    <testsuite name="DB Extractor DB2 Test Suite">
-        <directory>tests/Keboola/Extractor</directory>
-    </testsuite>
-
-</phpunit>
 
 
 ================================================

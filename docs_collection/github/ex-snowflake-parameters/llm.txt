@@ -1,33 +1,218 @@
 Directory structure:
 └── keboola-ex-snowflake-parameters/
+    ├── docker/
+    │   ├── php-prod.ini
+    │   ├── composer-install.sh
+    │   └── simba.snowflake.ini
+    ├── .travis.yml
+    ├── configuration-schema.json
+    ├── deploy.sh
     ├── phpcs.xml
+    ├── docker-compose.yml
+    ├── src/
+    │   ├── Config.php
+    │   ├── Component.php
+    │   ├── run.php
+    │   ├── ParametersFetcher.php
+    │   └── ConfigDefinition.php
     ├── composer.lock
+    ├── phpstan.neon
     ├── tests/
     │   └── phpunit/
     │       ├── FunctionalTest.php
+    │       ├── ParametersFetcherTest.php
     │       ├── bootstrap.php
-    │       ├── ConfigDefinitionTest.php
-    │       └── ParametersFetcherTest.php
-    ├── .travis.yml
-    ├── composer.json
-    ├── Dockerfile
-    ├── src/
-    │   ├── ParametersFetcher.php
-    │   ├── run.php
-    │   ├── Config.php
-    │   ├── ConfigDefinition.php
-    │   └── Component.php
-    ├── phpstan.neon
-    ├── .dockerignore
-    ├── deploy.sh
-    ├── docker-compose.yml
-    ├── docker/
-    │   ├── simba.snowflake.ini
-    │   ├── php-prod.ini
-    │   └── composer-install.sh
+    │       └── ConfigDefinitionTest.php
     ├── phpunit.xml.dist
-    ├── README.md
-    └── configuration-schema.json
+    ├── composer.json
+    ├── .dockerignore
+    ├── Dockerfile
+    └── README.md
+
+================================================
+File: /docker/php-prod.ini
+================================================
+; Recommended production values
+display_errors = Off
+display_startup_errors = Off
+error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
+html_errors = On
+log_errors = On
+max_input_time = 60
+output_buffering = 4096
+register_argc_argv = Off
+request_order = "GP"
+session.gc_divisor = 1000
+session.sid_bits_per_character = 5
+short_open_tag = Off
+track_errors = Off
+variables_order = "GPCS"
+
+; Custom
+date.timezone = UTC
+
+================================================
+File: /docker/composer-install.sh
+================================================
+#!/bin/sh
+
+EXPECTED_SIGNATURE=$(curl -s https://composer.github.io/installer.sig)
+php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+ACTUAL_SIGNATURE=$(php -r "echo hash_file('SHA384', 'composer-setup.php');")
+
+if [ "$EXPECTED_SIGNATURE" != "$ACTUAL_SIGNATURE" ]
+then
+    >&2 echo 'ERROR: Invalid installer signature'
+    rm composer-setup.php
+    exit 1
+fi
+
+php composer-setup.php --quiet --install-dir=/usr/local/bin/ --filename=composer
+RESULT=$?
+rm composer-setup.php
+exit $RESULT
+
+
+================================================
+File: /docker/simba.snowflake.ini
+================================================
+[Driver]
+DriverManagerEncoding=UTF-16
+DriverLocale=en-US
+ErrorMessagesPath=/usr/lib/snowflake/odbc/ErrorMessages/
+LogNamespace=
+LogPath=/tmp
+ODBCInstLib=libodbcinst.so
+#LogLevel=6
+CABundleFile=/usr/lib/snowflake/odbc/lib/cacert.pem
+
+
+================================================
+File: /.travis.yml
+================================================
+sudo: required
+
+language: bash
+
+services:
+  - docker
+
+before_script:
+  - export APP_IMAGE=keboola-component
+  - docker -v
+  # download Snowflake drivers
+  - >-
+    docker
+    run
+    -e AWS_ACCESS_KEY_ID
+    -e AWS_SECRET_ACCESS_KEY
+    -v `pwd`:/code
+    quay.io/keboola/aws-cli
+    s3 cp s3://keboola-configs/drivers/snowflake/snowflake-odbc-2.14.0.x86_64.deb /code/docker/snowflake-odbc.deb
+  - docker build -t $APP_IMAGE .
+  - >-
+    docker
+    run
+    -e SNOWFLAKE_HOST
+    -e SNOWFLAKE_USER
+    -e SNOWFLAKE_PASSWORD
+    $APP_IMAGE
+    composer ci
+
+  # push test image to ECR
+  - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+  - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+  - docker tag $APP_IMAGE:latest $REPOSITORY:test
+  - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+  - docker push $REPOSITORY:test
+  - docker pull quay.io/keboola/syrup-cli:latest
+
+
+script:
+  # run test job inside KBC
+  - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_APP_TEST_CONFIG_ID test
+
+deploy:
+  provider: script
+  skip_cleanup: true
+  script: ./deploy.sh
+  on:
+    tags: true
+
+
+================================================
+File: /configuration-schema.json
+================================================
+{
+  "title": "Snowflake Credentials",
+  "type": "object",
+  "required": [
+    "host",
+    "username",
+    "#password"
+  ],
+  "properties": {
+    "host": {
+      "type": "string",
+      "title": "Hostname",
+      "default": "",
+      "minLength": 1
+    },
+    "username": {
+      "type": "string",
+      "title": "Username",
+      "default": "",
+      "minLength": 1
+    },
+    "#password": {
+      "type": "string",
+      "title": "Password",
+      "format": "password",
+      "default": "",
+      "minLength": 1
+    }
+  }
+}
+
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/bash
+set -e
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TRAVIS_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TRAVIS_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TRAVIS_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TRAVIS_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TRAVIS_TAG} is not allowed."
+fi
+
 
 ================================================
 File: /phpcs.xml
@@ -36,6 +221,242 @@ File: /phpcs.xml
 <ruleset name="Project">
     <rule ref="vendor/keboola/coding-standard/src/ruleset.xml"/>
 </ruleset>
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: '2'
+services:
+  dev:
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - SNOWFLAKE_HOST
+      - SNOWFLAKE_USER
+      - SNOWFLAKE_PASSWORD
+
+
+================================================
+File: /src/Config.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\SnowflakeParametersExtractor;
+
+use Keboola\Component\Config\BaseConfig;
+
+class Config extends BaseConfig
+{
+    public function getHost(): string
+    {
+        return $this->getValue(['parameters', 'host']);
+    }
+
+    public function getUsername(): string
+    {
+        return $this->getValue(['parameters', 'username']);
+    }
+
+    public function getPassword(): string
+    {
+        return $this->getValue(['parameters', '#password']);
+    }
+}
+
+
+================================================
+File: /src/Component.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\SnowflakeParametersExtractor;
+
+use Keboola\Component\BaseComponent;
+use Keboola\Component\UserException;
+use Keboola\Csv\CsvFile;
+use Keboola\Db\Import\Exception as SnowflakeException;
+use Keboola\Db\Import\Snowflake\Connection;
+
+class Component extends BaseComponent
+{
+    public function run(): void
+    {
+        $parametersFetcher = new ParametersFetcher($this->createSnowflakeConnection());
+        $parameters = $this->addHostToParameters(
+            $parametersFetcher->fetchAccountParameters()
+        );
+
+        $csvFile = new CsvFile($this->getAccountParametersTableDestination());
+        foreach ($parameters as $parameter) {
+            $csvFile->writeRow($parameter);
+        }
+
+        $this->getManifestManager()->writeTableManifestFromArray(
+            $this->getAccountParametersTableDestination(),
+            [
+                'primary_key' => [
+                    'host',
+                    'key',
+                ],
+                'columns' => array_keys($parameters[0]),
+            ]
+        );
+    }
+
+    private function addHostToParameters(array $parameters): array
+    {
+        /** @var Config $config */
+        $config = $this->getConfig();
+        return array_map(
+            function (array $parameter) use ($config) {
+                return array_merge(
+                    [
+                        'host' => $config->getHost(),
+                    ],
+                    $parameter
+                );
+            },
+            $parameters
+        );
+    }
+
+    private function createSnowflakeConnection(): Connection
+    {
+        /** @var Config $config */
+        $config = $this->getConfig();
+        try {
+            return new Connection([
+                'host' => $config->getHost(),
+                'user' => $config->getUsername(),
+                'password' => $config->getPassword(),
+            ]);
+        } catch (SnowflakeException $e) {
+            throw new UserException($e->getMessage(), $e->getCode(), $e);
+        }
+    }
+
+    private function getAccountParametersTableDestination(): string
+    {
+        return $this->getDataDir()  . '/out/tables/account-parameters.csv';
+    }
+
+    protected function getConfigClass(): string
+    {
+        return Config::class;
+    }
+
+    protected function getConfigDefinitionClass(): string
+    {
+        return ConfigDefinition::class;
+    }
+}
+
+
+================================================
+File: /src/run.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+use Keboola\Component\UserException;
+use Keboola\SnowflakeParametersExtractor\Component;
+
+require __DIR__ . '/../vendor/autoload.php';
+
+try {
+    $app = new Component();
+    $app->run();
+    exit(0);
+} catch (UserException $e) {
+    echo $e->getMessage();
+    exit(1);
+} catch (Throwable $e) {
+    echo get_class($e) . ':' . $e->getMessage();
+    echo "\nFile: " . $e->getFile();
+    echo "\nLine: " . $e->getLine();
+    echo "\nCode: " . $e->getCode();
+    echo "\nTrace: " . $e->getTraceAsString() . "\n";
+    exit(2);
+}
+
+
+================================================
+File: /src/ParametersFetcher.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\SnowflakeParametersExtractor;
+
+use Keboola\Db\Import\Snowflake\Connection;
+
+class ParametersFetcher
+{
+    /**
+     * @var Connection
+     */
+    private $connection;
+
+    public function __construct(Connection $connection)
+    {
+        $this->connection = $connection;
+    }
+
+    public function fetchAccountParameters(): array
+    {
+        return $this->connection->fetchAll("SHOW PARAMETERS IN ACCOUNT");
+    }
+}
+
+
+================================================
+File: /src/ConfigDefinition.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\SnowflakeParametersExtractor;
+
+use Keboola\Component\Config\BaseConfigDefinition;
+use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
+
+class ConfigDefinition extends BaseConfigDefinition
+{
+    protected function getParametersDefinition(): ArrayNodeDefinition
+    {
+        $parametersNode = parent::getParametersDefinition();
+        // @formatter:off
+        /** @noinspection NullPointerExceptionInspection */
+        $parametersNode
+            ->children()
+                ->scalarNode('host')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+                ->scalarNode('username')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+                ->scalarNode('#password')
+                    ->isRequired()
+                    ->cannotBeEmpty()
+                ->end()
+            ->end()
+        ;
+        // @formatter:on
+        return $parametersNode;
+    }
+}
 
 
 ================================================
@@ -2611,6 +3032,15 @@ File: /composer.lock
 
 
 ================================================
+File: /phpstan.neon
+================================================
+parameters:
+    ignoreErrors:
+        - '#Call to an undefined method Symfony\\Component\\Config\\Definition\\Builder\\NodeParentInterface::scalarNode()#'
+        - '#Calling method scalarNode\(\) on possibly null value of type Symfony\\Component\\Config\\Definition\\Builder\\NodeParentInterface#'
+
+
+================================================
 File: /tests/phpunit/FunctionalTest.php
 ================================================
 <?php
@@ -2689,6 +3119,44 @@ class FunctionalTest extends TestCase
             "column_metadata" => [],
         ];
         $this->assertEquals($expectedManifest, (new JsonDecode(true))->decode(file_get_contents($outputManifestFilePath), JsonEncoder::FORMAT));
+    }
+}
+
+
+================================================
+File: /tests/phpunit/ParametersFetcherTest.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\SnowflakeParametersExtractor\Tests;
+
+use Keboola\Db\Import\Snowflake\Connection;
+use Keboola\SnowflakeParametersExtractor\ParametersFetcher;
+use PHPUnit\Framework\TestCase;
+
+class ParametersFetcherTest extends TestCase
+{
+
+    public function testFetchParameters(): void
+    {
+        $connection = new Connection([
+            'host' => getenv('SNOWFLAKE_HOST'),
+            'user' => getenv('SNOWFLAKE_USER'),
+            'password' => getenv('SNOWFLAKE_PASSWORD'),
+        ]);
+
+        $accountParameters = (new ParametersFetcher($connection))->fetchAccountParameters();
+        $firstParameter = reset($accountParameters);
+
+        $this->assertNotEmpty($accountParameters);
+
+        $this->assertArrayHasKey('key', $firstParameter);
+        $this->assertArrayHasKey('value', $firstParameter);
+        $this->assertArrayHasKey('default', $firstParameter);
+        $this->assertArrayHasKey('level', $firstParameter);
+        $this->assertArrayHasKey('description', $firstParameter);
     }
 }
 
@@ -2817,94 +3285,23 @@ class ConfigDefinitionTest extends TestCase
 
 
 ================================================
-File: /tests/phpunit/ParametersFetcherTest.php
+File: /phpunit.xml.dist
 ================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\SnowflakeParametersExtractor\Tests;
-
-use Keboola\Db\Import\Snowflake\Connection;
-use Keboola\SnowflakeParametersExtractor\ParametersFetcher;
-use PHPUnit\Framework\TestCase;
-
-class ParametersFetcherTest extends TestCase
-{
-
-    public function testFetchParameters(): void
-    {
-        $connection = new Connection([
-            'host' => getenv('SNOWFLAKE_HOST'),
-            'user' => getenv('SNOWFLAKE_USER'),
-            'password' => getenv('SNOWFLAKE_PASSWORD'),
-        ]);
-
-        $accountParameters = (new ParametersFetcher($connection))->fetchAccountParameters();
-        $firstParameter = reset($accountParameters);
-
-        $this->assertNotEmpty($accountParameters);
-
-        $this->assertArrayHasKey('key', $firstParameter);
-        $this->assertArrayHasKey('value', $firstParameter);
-        $this->assertArrayHasKey('default', $firstParameter);
-        $this->assertArrayHasKey('level', $firstParameter);
-        $this->assertArrayHasKey('description', $firstParameter);
-    }
-}
-
-
-================================================
-File: /.travis.yml
-================================================
-sudo: required
-
-language: bash
-
-services:
-  - docker
-
-before_script:
-  - export APP_IMAGE=keboola-component
-  - docker -v
-  # download Snowflake drivers
-  - >-
-    docker
-    run
-    -e AWS_ACCESS_KEY_ID
-    -e AWS_SECRET_ACCESS_KEY
-    -v `pwd`:/code
-    quay.io/keboola/aws-cli
-    s3 cp s3://keboola-configs/drivers/snowflake/snowflake-odbc-2.14.0.x86_64.deb /code/docker/snowflake-odbc.deb
-  - docker build -t $APP_IMAGE .
-  - >-
-    docker
-    run
-    -e SNOWFLAKE_HOST
-    -e SNOWFLAKE_USER
-    -e SNOWFLAKE_PASSWORD
-    $APP_IMAGE
-    composer ci
-
-  # push test image to ECR
-  - docker pull quay.io/keboola/developer-portal-cli-v2:latest
-  - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
-  - docker tag $APP_IMAGE:latest $REPOSITORY:test
-  - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-  - docker push $REPOSITORY:test
-  - docker pull quay.io/keboola/syrup-cli:latest
-
-
-script:
-  # run test job inside KBC
-  - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_APP_TEST_CONFIG_ID test
-
-deploy:
-  provider: script
-  skip_cleanup: true
-  script: ./deploy.sh
-  on:
-    tags: true
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit backupGlobals="false"
+         backupStaticAttributes="false"
+         colors="true"
+         convertErrorsToExceptions="true"
+         convertNoticesToExceptions="true"
+         convertWarningsToExceptions="true"
+         processIsolation="false"
+         stopOnFailure="false"
+         syntaxCheck="false"
+         bootstrap="tests/phpunit/bootstrap.php">
+    <testsuite name="Main Test Suite">
+        <directory>tests/phpunit</directory>
+    </testsuite>
+</phpunit>
 
 
 ================================================
@@ -2968,6 +3365,12 @@ File: /composer.json
 
 
 ================================================
+File: /.dockerignore
+================================================
+vendor/
+
+
+================================================
 File: /Dockerfile
 ================================================
 FROM php:7-cli
@@ -3024,374 +3427,6 @@ CMD ["php", "/code/src/run.php"]
 
 
 ================================================
-File: /src/ParametersFetcher.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\SnowflakeParametersExtractor;
-
-use Keboola\Db\Import\Snowflake\Connection;
-
-class ParametersFetcher
-{
-    /**
-     * @var Connection
-     */
-    private $connection;
-
-    public function __construct(Connection $connection)
-    {
-        $this->connection = $connection;
-    }
-
-    public function fetchAccountParameters(): array
-    {
-        return $this->connection->fetchAll("SHOW PARAMETERS IN ACCOUNT");
-    }
-}
-
-
-================================================
-File: /src/run.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-use Keboola\Component\UserException;
-use Keboola\SnowflakeParametersExtractor\Component;
-
-require __DIR__ . '/../vendor/autoload.php';
-
-try {
-    $app = new Component();
-    $app->run();
-    exit(0);
-} catch (UserException $e) {
-    echo $e->getMessage();
-    exit(1);
-} catch (Throwable $e) {
-    echo get_class($e) . ':' . $e->getMessage();
-    echo "\nFile: " . $e->getFile();
-    echo "\nLine: " . $e->getLine();
-    echo "\nCode: " . $e->getCode();
-    echo "\nTrace: " . $e->getTraceAsString() . "\n";
-    exit(2);
-}
-
-
-================================================
-File: /src/Config.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\SnowflakeParametersExtractor;
-
-use Keboola\Component\Config\BaseConfig;
-
-class Config extends BaseConfig
-{
-    public function getHost(): string
-    {
-        return $this->getValue(['parameters', 'host']);
-    }
-
-    public function getUsername(): string
-    {
-        return $this->getValue(['parameters', 'username']);
-    }
-
-    public function getPassword(): string
-    {
-        return $this->getValue(['parameters', '#password']);
-    }
-}
-
-
-================================================
-File: /src/ConfigDefinition.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\SnowflakeParametersExtractor;
-
-use Keboola\Component\Config\BaseConfigDefinition;
-use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
-
-class ConfigDefinition extends BaseConfigDefinition
-{
-    protected function getParametersDefinition(): ArrayNodeDefinition
-    {
-        $parametersNode = parent::getParametersDefinition();
-        // @formatter:off
-        /** @noinspection NullPointerExceptionInspection */
-        $parametersNode
-            ->children()
-                ->scalarNode('host')
-                    ->isRequired()
-                    ->cannotBeEmpty()
-                ->end()
-                ->scalarNode('username')
-                    ->isRequired()
-                    ->cannotBeEmpty()
-                ->end()
-                ->scalarNode('#password')
-                    ->isRequired()
-                    ->cannotBeEmpty()
-                ->end()
-            ->end()
-        ;
-        // @formatter:on
-        return $parametersNode;
-    }
-}
-
-
-================================================
-File: /src/Component.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\SnowflakeParametersExtractor;
-
-use Keboola\Component\BaseComponent;
-use Keboola\Component\UserException;
-use Keboola\Csv\CsvFile;
-use Keboola\Db\Import\Exception as SnowflakeException;
-use Keboola\Db\Import\Snowflake\Connection;
-
-class Component extends BaseComponent
-{
-    public function run(): void
-    {
-        $parametersFetcher = new ParametersFetcher($this->createSnowflakeConnection());
-        $parameters = $this->addHostToParameters(
-            $parametersFetcher->fetchAccountParameters()
-        );
-
-        $csvFile = new CsvFile($this->getAccountParametersTableDestination());
-        foreach ($parameters as $parameter) {
-            $csvFile->writeRow($parameter);
-        }
-
-        $this->getManifestManager()->writeTableManifestFromArray(
-            $this->getAccountParametersTableDestination(),
-            [
-                'primary_key' => [
-                    'host',
-                    'key',
-                ],
-                'columns' => array_keys($parameters[0]),
-            ]
-        );
-    }
-
-    private function addHostToParameters(array $parameters): array
-    {
-        /** @var Config $config */
-        $config = $this->getConfig();
-        return array_map(
-            function (array $parameter) use ($config) {
-                return array_merge(
-                    [
-                        'host' => $config->getHost(),
-                    ],
-                    $parameter
-                );
-            },
-            $parameters
-        );
-    }
-
-    private function createSnowflakeConnection(): Connection
-    {
-        /** @var Config $config */
-        $config = $this->getConfig();
-        try {
-            return new Connection([
-                'host' => $config->getHost(),
-                'user' => $config->getUsername(),
-                'password' => $config->getPassword(),
-            ]);
-        } catch (SnowflakeException $e) {
-            throw new UserException($e->getMessage(), $e->getCode(), $e);
-        }
-    }
-
-    private function getAccountParametersTableDestination(): string
-    {
-        return $this->getDataDir()  . '/out/tables/account-parameters.csv';
-    }
-
-    protected function getConfigClass(): string
-    {
-        return Config::class;
-    }
-
-    protected function getConfigDefinitionClass(): string
-    {
-        return ConfigDefinition::class;
-    }
-}
-
-
-================================================
-File: /phpstan.neon
-================================================
-parameters:
-    ignoreErrors:
-        - '#Call to an undefined method Symfony\\Component\\Config\\Definition\\Builder\\NodeParentInterface::scalarNode()#'
-        - '#Calling method scalarNode\(\) on possibly null value of type Symfony\\Component\\Config\\Definition\\Builder\\NodeParentInterface#'
-
-
-================================================
-File: /.dockerignore
-================================================
-vendor/
-
-
-================================================
-File: /deploy.sh
-================================================
-#!/bin/bash
-set -e
-
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
-
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
-
-# Push to the repository
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TRAVIS_TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${TRAVIS_TAG}
-docker push ${REPOSITORY}:latest
-
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${TRAVIS_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TRAVIS_TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${TRAVIS_TAG} is not allowed."
-fi
-
-
-================================================
-File: /docker-compose.yml
-================================================
-version: '2'
-services:
-  dev:
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-    environment:
-      - SNOWFLAKE_HOST
-      - SNOWFLAKE_USER
-      - SNOWFLAKE_PASSWORD
-
-
-================================================
-File: /docker/simba.snowflake.ini
-================================================
-[Driver]
-DriverManagerEncoding=UTF-16
-DriverLocale=en-US
-ErrorMessagesPath=/usr/lib/snowflake/odbc/ErrorMessages/
-LogNamespace=
-LogPath=/tmp
-ODBCInstLib=libodbcinst.so
-#LogLevel=6
-CABundleFile=/usr/lib/snowflake/odbc/lib/cacert.pem
-
-
-================================================
-File: /docker/php-prod.ini
-================================================
-; Recommended production values
-display_errors = Off
-display_startup_errors = Off
-error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
-html_errors = On
-log_errors = On
-max_input_time = 60
-output_buffering = 4096
-register_argc_argv = Off
-request_order = "GP"
-session.gc_divisor = 1000
-session.sid_bits_per_character = 5
-short_open_tag = Off
-track_errors = Off
-variables_order = "GPCS"
-
-; Custom
-date.timezone = UTC
-
-================================================
-File: /docker/composer-install.sh
-================================================
-#!/bin/sh
-
-EXPECTED_SIGNATURE=$(curl -s https://composer.github.io/installer.sig)
-php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
-ACTUAL_SIGNATURE=$(php -r "echo hash_file('SHA384', 'composer-setup.php');")
-
-if [ "$EXPECTED_SIGNATURE" != "$ACTUAL_SIGNATURE" ]
-then
-    >&2 echo 'ERROR: Invalid installer signature'
-    rm composer-setup.php
-    exit 1
-fi
-
-php composer-setup.php --quiet --install-dir=/usr/local/bin/ --filename=composer
-RESULT=$?
-rm composer-setup.php
-exit $RESULT
-
-
-================================================
-File: /phpunit.xml.dist
-================================================
-<?xml version="1.0" encoding="UTF-8"?>
-<phpunit backupGlobals="false"
-         backupStaticAttributes="false"
-         colors="true"
-         convertErrorsToExceptions="true"
-         convertNoticesToExceptions="true"
-         convertWarningsToExceptions="true"
-         processIsolation="false"
-         stopOnFailure="false"
-         syntaxCheck="false"
-         bootstrap="tests/phpunit/bootstrap.php">
-    <testsuite name="Main Test Suite">
-        <directory>tests/phpunit</directory>
-    </testsuite>
-</phpunit>
-
-
-================================================
 File: /README.md
 ================================================
 # Snowflake Parameters Extractors
@@ -3445,40 +3480,5 @@ docker-compose run --rm dev composer tests
 # Integration
 
 For information about deployment and integration with KBC, please refer to the [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/) 
-
-
-================================================
-File: /configuration-schema.json
-================================================
-{
-  "title": "Snowflake Credentials",
-  "type": "object",
-  "required": [
-    "host",
-    "username",
-    "#password"
-  ],
-  "properties": {
-    "host": {
-      "type": "string",
-      "title": "Hostname",
-      "default": "",
-      "minLength": 1
-    },
-    "username": {
-      "type": "string",
-      "title": "Username",
-      "default": "",
-      "minLength": 1
-    },
-    "#password": {
-      "type": "string",
-      "title": "Password",
-      "format": "password",
-      "default": "",
-      "minLength": 1
-    }
-  }
-}
 
 

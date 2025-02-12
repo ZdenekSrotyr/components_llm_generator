@@ -1,69 +1,46 @@
 Directory structure:
 └── kds_consulting_team-kds-team.ex-gooddata-project/
-    ├── tests/
-    │   ├── __init__.py
-    │   └── test_component.py
-    ├── change_log.md
-    ├── Dockerfile
     ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── change_log.md
     ├── src/
-    │   ├── main.py
-    │   └── gooddata/
-    │       ├── client.py
-    │       ├── component.py
-    │       └── result.py
-    ├── LICENSE.md
-    ├── requirements.txt
+    │   ├── gooddata/
+    │   │   ├── component.py
+    │   │   ├── client.py
+    │   │   └── result.py
+    │   └── main.py
     ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
     ├── component_config/
-    │   ├── component_short_description.md
-    │   ├── configSchema.json
-    │   ├── stack_parameters.json
-    │   ├── configuration_description.md
     │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
     │   └── sample-config/
+    │       ├── config.json
     │       ├── in/
+    │       │   ├── state.json
     │       │   ├── tables/
     │       │   │   ├── test.csv
     │       │   │   └── test.csv.manifest
-    │       │   ├── state.json
     │       │   └── files/
     │       │       └── order1.xml
-    │       ├── out/
-    │       │   ├── tables/
-    │       │   │   └── test.csv
-    │       │   └── files/
-    │       │       └── order1.xml
-    │       └── config.json
-    ├── deploy.sh
-    ├── docker-compose.yml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
     ├── scripts/
-    │   ├── build_n_test.sh
-    │   └── update_dev_portal_properties.sh
+    │   ├── update_dev_portal_properties.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
     └── README.md
-
-================================================
-File: /change_log.md
-================================================
-**0.0.1**
-Added users endpoint
-
-================================================
-File: /Dockerfile
-================================================
-FROM python:3.8.5-slim
-ENV PYTHONIOENCODING utf-8
-
-COPY . /code/
-
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
-RUN pip install flake8
-RUN pip install -r /code/requirements.txt
-WORKDIR /code/
-
-CMD ["python3", "-u", "/code/src/main.py"]
-
 
 ================================================
 File: /flake8.cfg
@@ -89,18 +66,239 @@ max-line-length = 120
 
 
 ================================================
-File: /src/main.py
+File: /deploy.sh
 ================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /change_log.md
+================================================
+**0.0.1**
+Added users endpoint
+
+================================================
+File: /src/gooddata/component.py
+================================================
+# import csv
+# import json
+import logging
+# import os
+import re
 import sys
-from gooddata.component import GoodDataProjectComponent
+from gooddata.client import GoodDataProjectClient
+from gooddata.result import GoodDataWriter
+from kbc.env_handler import KBCEnvHandler
 
-# Environment setup
-sys.tracebacklimit = 3
 
-if __name__ == '__main__':
+KEY_USERNAME = 'username'
+KEY_PASSWORD = '#password'
+KEY_PROJECTID = 'projectId'
+KEY_CUSTOMDOMAIN = 'customDomain'
+KEY_OBJECTS = 'objects'
+KEY_OBJECTS_DETAILS = 'objects_details'
+KEY_GDURL = 'gooddataUrl'
+KEY_DEBUG = 'debug'
 
-    c = GoodDataProjectComponent()
-    c.run()
+MANDATORY_PARAMETERS = [KEY_USERNAME, KEY_PASSWORD, KEY_PROJECTID, KEY_OBJECTS]
+QUERY_OBJECTS = ["attributes", "datasets", "facts", "folders", "metrics", "projectdashboards", "tables", "reports"]
+
+APP_VERSION = '0.2.0'
+
+
+class Writers:
+    pass
+
+
+class GoodDataProjectComponent(KBCEnvHandler):
+
+    def __init__(self):
+
+        logging.info("Running component version %s..." % APP_VERSION)
+
+        KBCEnvHandler.__init__(self, MANDATORY_PARAMETERS)
+        self.validate_config(MANDATORY_PARAMETERS)
+
+        self.param_username = self.cfg_params[KEY_USERNAME]
+        self.param_password = self.cfg_params[KEY_PASSWORD]
+        self.param_project_id = self.cfg_params[KEY_PROJECTID]
+        self.param_objects = self.cfg_params[KEY_OBJECTS]
+        self.param_objects_details = self.cfg_params.get(KEY_OBJECTS_DETAILS, {})
+        self.param_custom_domain = self.cfg_params.get(KEY_CUSTOMDOMAIN, '')
+        self.param_gooddata_url = self.image_params.get(KEY_GDURL, '')
+
+        if self.cfg_params.get('debug', False) is True:
+            logger = logging.getLogger()
+            logger.setLevel(level='DEBUG')
+
+        self._processAndValidateParameters()
+
+        self.client = GoodDataProjectClient(username=self.param_username,
+                                            password=self.param_password,
+                                            project_id=self.param_project_id,
+                                            gooddata_url=self.param_gooddata_url)
+
+    def _processAndValidateParameters(self):
+
+        custDomain = re.sub(r'\s', '', self.param_custom_domain)
+
+        if custDomain != '':
+
+            rxgString = r'https://.*\.gooddata\.com/*'
+            rgxCheck = re.fullmatch(rxgString, custDomain)
+
+            if rgxCheck is None:
+                logging.error(f"{custDomain} is not a valid GoodData domain.")
+                sys.exit(1)
+
+            else:
+                self.param_gooddata_url = custDomain
+
+        elif custDomain == '' and self.param_gooddata_url == '':
+            logging.error("Custom domain must be provided.")
+            sys.exit(1)
+
+        logging.info(f"Using domain {self.param_gooddata_url}.")
+
+    def downloadAllData(self):
+
+        for obj, value in self.param_objects.items():
+
+            if value is False:
+                continue
+
+            logging.info(f"Downloading metadata for object type {obj}.")
+
+            if obj == 'users':
+
+                _wrt = GoodDataWriter(self.tables_out_path, 'users', False)
+                _all_users = [x['user'] for x in self.client.getAllUsers()]
+                _wrt.writerows(_all_users)
+
+            elif obj == 'usergroups':
+
+                _wrt = GoodDataWriter(self.tables_out_path, 'usergroups', False)
+                _all_usergroups = self.client.getUserGroups(self.param_project_id)
+
+                ug_prep = [ug['userGroup'] for ug in _all_usergroups]
+
+                for ug in ug_prep:
+                    ug['project_id'] = ug['content']['project'].split('/')[-1]
+                _wrt.writerows(ug_prep)
+
+                _ug_ids = [ug['userGroup']['content']['id'] for ug in _all_usergroups]
+                _wrt_members = GoodDataWriter(self.tables_out_path, 'usergroups-members', False)
+
+                for ug in _ug_ids:
+                    _ug_members = self.client.getUserGroupMembers(ug)
+                    mem_prep = [u['user'] for u in _ug_members]
+
+                    for mem in mem_prep:
+                        mem['user_id'] = mem['links']['self'].split('/')[-1]
+                        mem['usergroup_id'] = ug
+
+                    _wrt_members.writerows(mem_prep)
+
+            elif obj in QUERY_OBJECTS:
+
+                _wrt = GoodDataWriter(self.tables_out_path, obj, False, result_type='md')
+                _all_objects = self.client.queryObjects(obj)
+                _wrt.writerows(_all_objects)
+
+                if self.param_objects_details.get(obj, False) is True:
+                    logging.info(f"Downloading details for all objects of type {obj}.")
+
+                    _wrt_detail = GoodDataWriter(self.tables_out_path, str(obj) + '_details', False, 'detail')
+                    details = []
+
+                    for md in _all_objects:
+                        link = md['link']
+                        idf = md['identifier']
+
+                        if obj == 'reports':
+                            _definitions = self.client.getObjectDetail(link)
+                            try:
+                                _latest_definition = _definitions['report']['content']['definitions'][-1]
+                            except IndexError:
+                                continue
+
+                            _detail = self.client.getObjectDetail(_latest_definition)
+                        else:
+                            _detail = self.client.getObjectDetail(link)
+                        details += [{'link': link, 'identifier': idf, 'type': obj, 'detail': _detail}]
+
+                    _wrt_detail.writerows(details)
+
+            else:
+                pass
+
+    def run(self):
+
+        self.downloadAllData()
 
 
 ================================================
@@ -309,166 +507,6 @@ class GoodDataProjectClient(HttpClientBase):
 
 
 ================================================
-File: /src/gooddata/component.py
-================================================
-# import csv
-# import json
-import logging
-# import os
-import re
-import sys
-from gooddata.client import GoodDataProjectClient
-from gooddata.result import GoodDataWriter
-from kbc.env_handler import KBCEnvHandler
-
-
-KEY_USERNAME = 'username'
-KEY_PASSWORD = '#password'
-KEY_PROJECTID = 'projectId'
-KEY_CUSTOMDOMAIN = 'customDomain'
-KEY_OBJECTS = 'objects'
-KEY_OBJECTS_DETAILS = 'objects_details'
-KEY_GDURL = 'gooddataUrl'
-KEY_DEBUG = 'debug'
-
-MANDATORY_PARAMETERS = [KEY_USERNAME, KEY_PASSWORD, KEY_PROJECTID, KEY_OBJECTS]
-QUERY_OBJECTS = ["attributes", "datasets", "facts", "folders", "metrics", "projectdashboards", "tables", "reports"]
-
-APP_VERSION = '0.2.0'
-
-
-class Writers:
-    pass
-
-
-class GoodDataProjectComponent(KBCEnvHandler):
-
-    def __init__(self):
-
-        logging.info("Running component version %s..." % APP_VERSION)
-
-        KBCEnvHandler.__init__(self, MANDATORY_PARAMETERS)
-        self.validate_config(MANDATORY_PARAMETERS)
-
-        self.param_username = self.cfg_params[KEY_USERNAME]
-        self.param_password = self.cfg_params[KEY_PASSWORD]
-        self.param_project_id = self.cfg_params[KEY_PROJECTID]
-        self.param_objects = self.cfg_params[KEY_OBJECTS]
-        self.param_objects_details = self.cfg_params.get(KEY_OBJECTS_DETAILS, {})
-        self.param_custom_domain = self.cfg_params.get(KEY_CUSTOMDOMAIN, '')
-        self.param_gooddata_url = self.image_params.get(KEY_GDURL, '')
-
-        if self.cfg_params.get('debug', False) is True:
-            logger = logging.getLogger()
-            logger.setLevel(level='DEBUG')
-
-        self._processAndValidateParameters()
-
-        self.client = GoodDataProjectClient(username=self.param_username,
-                                            password=self.param_password,
-                                            project_id=self.param_project_id,
-                                            gooddata_url=self.param_gooddata_url)
-
-    def _processAndValidateParameters(self):
-
-        custDomain = re.sub(r'\s', '', self.param_custom_domain)
-
-        if custDomain != '':
-
-            rxgString = r'https://.*\.gooddata\.com/*'
-            rgxCheck = re.fullmatch(rxgString, custDomain)
-
-            if rgxCheck is None:
-                logging.error(f"{custDomain} is not a valid GoodData domain.")
-                sys.exit(1)
-
-            else:
-                self.param_gooddata_url = custDomain
-
-        elif custDomain == '' and self.param_gooddata_url == '':
-            logging.error("Custom domain must be provided.")
-            sys.exit(1)
-
-        logging.info(f"Using domain {self.param_gooddata_url}.")
-
-    def downloadAllData(self):
-
-        for obj, value in self.param_objects.items():
-
-            if value is False:
-                continue
-
-            logging.info(f"Downloading metadata for object type {obj}.")
-
-            if obj == 'users':
-
-                _wrt = GoodDataWriter(self.tables_out_path, 'users', False)
-                _all_users = [x['user'] for x in self.client.getAllUsers()]
-                _wrt.writerows(_all_users)
-
-            elif obj == 'usergroups':
-
-                _wrt = GoodDataWriter(self.tables_out_path, 'usergroups', False)
-                _all_usergroups = self.client.getUserGroups(self.param_project_id)
-
-                ug_prep = [ug['userGroup'] for ug in _all_usergroups]
-
-                for ug in ug_prep:
-                    ug['project_id'] = ug['content']['project'].split('/')[-1]
-                _wrt.writerows(ug_prep)
-
-                _ug_ids = [ug['userGroup']['content']['id'] for ug in _all_usergroups]
-                _wrt_members = GoodDataWriter(self.tables_out_path, 'usergroups-members', False)
-
-                for ug in _ug_ids:
-                    _ug_members = self.client.getUserGroupMembers(ug)
-                    mem_prep = [u['user'] for u in _ug_members]
-
-                    for mem in mem_prep:
-                        mem['user_id'] = mem['links']['self'].split('/')[-1]
-                        mem['usergroup_id'] = ug
-
-                    _wrt_members.writerows(mem_prep)
-
-            elif obj in QUERY_OBJECTS:
-
-                _wrt = GoodDataWriter(self.tables_out_path, obj, False, result_type='md')
-                _all_objects = self.client.queryObjects(obj)
-                _wrt.writerows(_all_objects)
-
-                if self.param_objects_details.get(obj, False) is True:
-                    logging.info(f"Downloading details for all objects of type {obj}.")
-
-                    _wrt_detail = GoodDataWriter(self.tables_out_path, str(obj) + '_details', False, 'detail')
-                    details = []
-
-                    for md in _all_objects:
-                        link = md['link']
-                        idf = md['identifier']
-
-                        if obj == 'reports':
-                            _definitions = self.client.getObjectDetail(link)
-                            try:
-                                _latest_definition = _definitions['report']['content']['definitions'][-1]
-                            except IndexError:
-                                continue
-
-                            _detail = self.client.getObjectDetail(_latest_definition)
-                        else:
-                            _detail = self.client.getObjectDetail(link)
-                        details += [{'link': link, 'identifier': idf, 'type': obj, 'detail': _detail}]
-
-                    _wrt_detail.writerows(details)
-
-            else:
-                pass
-
-    def run(self):
-
-        self.downloadAllData()
-
-
-================================================
 File: /src/gooddata/result.py
 ================================================
 import os
@@ -610,34 +648,19 @@ class GoodDataWriter:
 
 
 ================================================
-File: /LICENSE.md
+File: /src/main.py
 ================================================
-The MIT License (MIT)
+import sys
+from gooddata.component import GoodDataProjectComponent
 
-Copyright (c) 2018 Keboola DS, http://keboola.com
+# Environment setup
+sys.tracebacklimit = 3
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files, to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished
-to do so, subject to the following conditions:
+if __name__ == '__main__':
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+    c = GoodDataProjectComponent()
+    c.run()
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
-================================================
-File: /requirements.txt
-================================================
-https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.9.zip#egg=kbc
 
 ================================================
 File: /bitbucket-pipelines.yml
@@ -705,9 +728,41 @@ pipelines:
             - ./deploy.sh
 
 ================================================
+File: /component_config/component_long_description.md
+================================================
+# GoodData project Extractor
+
+The GD project extractor allows to extract project data from GD project. Currently, opnly users endpoint is supported.
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+The component accepts following parameters:
+
+- login - login to GoodData, must have admin privileges,
+- password - password associated with login,
+- project ID - GoodData project ID,
+- custom domain (opt.) - if whitelabelled domain is used, specify it.
+
+================================================
 File: /component_config/component_short_description.md
 ================================================
 GoodData project data extractor
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{
+    "connection.keboola.com": {
+      "gooddataUrl": "https://secure.gooddata.com"
+    },
+    "connection.eu-central-1.keboola.com": {
+      "gooddataUrl": "https://keboola.eu.gooddata.com"
+    },
+    "connection.ap-southeast-2.keboola.com": {
+      "gooddataUrl": "https://secure.gooddata.com"
+    }
+  }
 
 ================================================
 File: /component_config/configSchema.json
@@ -898,36 +953,66 @@ File: /component_config/configSchema.json
 }
 
 ================================================
-File: /component_config/stack_parameters.json
+File: /component_config/sample-config/config.json
 ================================================
 {
-    "connection.keboola.com": {
-      "gooddataUrl": "https://secure.gooddata.com"
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
     },
-    "connection.eu-central-1.keboola.com": {
-      "gooddataUrl": "https://keboola.eu.gooddata.com"
-    },
-    "connection.ap-southeast-2.keboola.com": {
-      "gooddataUrl": "https://secure.gooddata.com"
+    "output": {
+      "files": [],
+      "tables": []
     }
+  },
+  "parameters": {
+    "objects": {
+      "metrics": true,
+      "folders": false,
+      "tables": false,
+      "facts": false,
+      "users": false,
+      "attributes": false,
+      "projectdashboards": false,
+      "datasets": false,
+      "usergroups": false,
+      "reports": true
+    },
+    "username": "<email>",
+    "#password": "<password>",
+    "projectId": "<pid>",
+    "customDomain": "<custom_domain>",
+    "objects_details": {
+      "facts": false,
+      "tables": false,
+      "folders": false,
+      "metrics": true,
+      "datasets": false,
+      "attributes": false,
+      "projectdashboards": false,
+      "reports": true
+    }
+  },
+  "image_parameters": {
+    "gooddataUrl": "https://keboola.eu.gooddata.com"
   }
+}
+
 
 ================================================
-File: /component_config/configuration_description.md
+File: /component_config/sample-config/in/state.json
 ================================================
-The component accepts following parameters:
-
-- login - login to GoodData, must have admin privileges,
-- password - password associated with login,
-- project ID - GoodData project ID,
-- custom domain (opt.) - if whitelabelled domain is used, specify it.
-
-================================================
-File: /component_config/component_long_description.md
-================================================
-# GoodData project Extractor
-
-The GD project extractor allows to extract project data from GD project. Currently, opnly users endpoint is supported.
+{"data_delta": "10222018"}
 
 ================================================
 File: /component_config/sample-config/in/tables/test.csv
@@ -1037,11 +1122,6 @@ File: /component_config/sample-config/in/tables/test.csv.manifest
 }
 
 ================================================
-File: /component_config/sample-config/in/state.json
-================================================
-{"data_delta": "10222018"}
-
-================================================
 File: /component_config/sample-config/in/files/order1.xml
 ================================================
 <?xml version='1.0' ?>
@@ -1111,142 +1191,6 @@ File: /component_config/sample-config/out/files/order1.xml
         </order>
     </orders>
 </root_el>
-
-================================================
-File: /component_config/sample-config/config.json
-================================================
-{
-  "storage": {
-    "input": {
-      "files": [],
-      "tables": [
-        {
-          "source": "in.c-test.test",
-          "destination": "test.csv",
-          "limit": 50,
-          "columns": [],
-          "where_values": [],
-          "where_operator": "eq"
-        }
-      ]
-    },
-    "output": {
-      "files": [],
-      "tables": []
-    }
-  },
-  "parameters": {
-    "objects": {
-      "metrics": true,
-      "folders": false,
-      "tables": false,
-      "facts": false,
-      "users": false,
-      "attributes": false,
-      "projectdashboards": false,
-      "datasets": false,
-      "usergroups": false,
-      "reports": true
-    },
-    "username": "<email>",
-    "#password": "<password>",
-    "projectId": "<pid>",
-    "customDomain": "<custom_domain>",
-    "objects_details": {
-      "facts": false,
-      "tables": false,
-      "folders": false,
-      "metrics": true,
-      "datasets": false,
-      "attributes": false,
-      "projectdashboards": false,
-      "reports": true
-    }
-  },
-  "image_parameters": {
-    "gooddataUrl": "https://keboola.eu.gooddata.com"
-  }
-}
-
-
-================================================
-File: /deploy.sh
-================================================
-#!/bin/sh
-set -e
-
-#check if deployment is triggered only in master
-if [ $BITBUCKET_BRANCH != "master" ]; then
-               echo Deploy on tagged commit can be only executed in master!
-               exit 1
-fi
-
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
-
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
-
-# Push to the repository
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${BITBUCKET_TAG}
-docker push ${REPOSITORY}:latest
-
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
-fi
-
-
-================================================
-File: /docker-compose.yml
-================================================
-version: "2"
-services:
-  # for development purposes
-  dev:
-    build: .
-    volumes:
-        - ./:/code
-        - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-  test:
-    # Use to run flake8 and unittests checks
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-    command:
-      - /bin/sh
-      - /code/scripts/build_n_test.sh
-
-================================================
-File: /scripts/build_n_test.sh
-================================================
-#!/bin/sh
-set -e
-
-flake8 --config=flake8.cfg
-python -m unittest discover
 
 ================================================
 File: /scripts/update_dev_portal_properties.sh
@@ -1320,6 +1264,62 @@ else
     echo "shortDescription is empty!"
     exit 1
 fi
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.9.zip#egg=kbc
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.5-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+RUN pip install -r /code/requirements.txt
+WORKDIR /code/
+
+CMD ["python3", "-u", "/code/src/main.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 ================================================
 File: /README.md

@@ -1,46 +1,50 @@
 Directory structure:
-└── kds_consulting_team-kds-team.ex-ibm-watson-assistant/
+└── keboola-component-delta-lake/
     ├── flake8.cfg
     ├── deploy.sh
     ├── docker-compose.yml
     ├── src/
-    │   ├── ibm_watson_assistant/
-    │   │   ├── __init__.py
-    │   │   └── client.py
-    │   └── component.py
-    ├── bitbucket-pipelines.yml
+    │   ├── component.py
+    │   └── configuration.py
     ├── tests/
     │   ├── test_component.py
     │   └── __init__.py
     ├── component_config/
     │   ├── logger
     │   ├── component_long_description.md
+    │   ├── licenseUrl.md
+    │   ├── sourceCodeUrl.md
     │   ├── configuration_description.md
     │   ├── component_short_description.md
     │   ├── loggerConfiguration.json
     │   ├── configSchema.json
     │   ├── configRowSchema.json
-    │   └── sample-config/
-    │       ├── config.json
-    │       ├── in/
-    │       │   ├── state.json
-    │       │   ├── tables/
-    │       │   │   ├── test.csv
-    │       │   │   └── test.csv.manifest
-    │       │   └── files/
-    │       │       └── order1.xml
-    │       └── out/
-    │           ├── tables/
-    │           │   └── test.csv
-    │           └── files/
-    │               └── order1.xml
+    │   ├── sample-config/
+    │   │   ├── config.json
+    │   │   ├── in/
+    │   │   │   ├── state.json
+    │   │   │   ├── tables/
+    │   │   │   │   ├── test.csv
+    │   │   │   │   └── test.csv.manifest
+    │   │   │   └── files/
+    │   │   │       └── order1.xml
+    │   │   └── out/
+    │   │       ├── tables/
+    │   │       │   └── test.csv
+    │   │       └── files/
+    │   │           └── order1.xml
+    │   └── documentationUrl.md
     ├── scripts/
-    │   ├── update_dev_portal_properties.sh
     │   ├── run_kbc_tests.ps1
-    │   ├── run.bat
+    │   ├── developer_portal/
+    │   │   ├── update_properties.sh
+    │   │   └── fn_actions_md_update.sh
     │   ├── build_n_run.ps1
     │   └── build_n_test.sh
     ├── requirements.txt
+    ├── .github/
+    │   └── workflows/
+    │       └── push.yml
     ├── docs/
     │   └── imgs/
     ├── TEMPLATE_README.md
@@ -169,208 +173,109 @@ services:
       - /code/scripts/build_n_test.sh
 
 ================================================
-File: /src/ibm_watson_assistant/__init__.py
-================================================
-from .client import WatsonAssistantClient, ClientApiException  # noqa
-
-
-================================================
-File: /src/ibm_watson_assistant/client.py
-================================================
-from ibm_watson import AssistantV1
-from ibm_cloud_sdk_core.authenticators import IAMAuthenticator
-from ibm_cloud_sdk_core.api_exception import ApiException
-import logging
-import time
-import functools
-
-WATSON_ENDPOINT = 'https://api.eu-de.assistant.watson.cloud.ibm.com/'
-
-
-class ClientApiException(Exception):
-    pass
-
-
-def retry_on_rate_limit(func):
-    """Decorator to handle retry logic on rate limit."""
-
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        retries = 0
-        while retries < self.max_retries:
-            try:
-                return func(self, *args, **kwargs)
-            except ApiException as e:
-                retries += 1
-                retry_after = self.get_retry_after(e.http_response.headers._store)
-                logging.info(
-                    f"Rate limit reached. Attempt {retries} of {self.max_retries}. Sleeping for {retry_after} seconds")
-                time.sleep(retry_after)
-        raise ClientApiException(f"Failed to complete {func.__name__} after {self.max_retries} attempts.")
-
-    return wrapper
-
-
-class WatsonAssistantClient:
-    def __init__(self, api_key, watson_version, max_retries=3):
-        self.api_key = api_key
-        self.watson_version = watson_version
-        self.skill = None
-        self.client = None
-        self.retry_after = 60
-        self.max_retries = max_retries
-
-    def login(self):
-        """Authenticate and initialize the Watson Assistant client."""
-        authenticator = IAMAuthenticator(self.api_key)
-        self.client = AssistantV1(version=self.watson_version, authenticator=authenticator)
-        self.client.set_service_url(WATSON_ENDPOINT)
-
-    @retry_on_rate_limit
-    def get_workspace(self, workspace_id):
-        return self.client.get_workspace(workspace_id=workspace_id, export=True).get_result()
-
-    @retry_on_rate_limit
-    def get_all_logs(self, filters, cursor=None):
-        return self.client.list_all_logs(filter=filters, cursor=cursor)
-
-    def fetch_logs(self, filters, cursor) -> (dict, dict):
-        r = self.get_all_logs(filters, cursor=cursor)
-        headers = r.headers
-        return r.get_result(), headers
-
-    @staticmethod
-    def get_retry_after(headers: dict) -> float:
-        ratelimit_reset = headers.get("x-ratelimit-reset")[1]
-        if not ratelimit_reset:
-            ratelimit_reset = headers.get("X-RateLimit-Reset")
-
-        if not ratelimit_reset:
-            raise ClientApiException("Unretryable error: No rate limit reset header found")
-
-        sleep_for = float(ratelimit_reset) - time.time()
-        logging.info(f"Rate limit reached. Sleeping for {sleep_for} seconds")
-        return sleep_for
-
-
-================================================
 File: /src/component.py
 ================================================
-import logging
-import json
-from typing import Dict
-from ibm_watson_assistant import WatsonAssistantClient, ClientApiException
+"""
+Template Component main class.
 
+"""
+
+import logging
+import os
+
+import duckdb
+from deltalake import write_deltalake
+from duckdb.duckdb import DuckDBPyConnection
 from keboola.component.base import ComponentBase
 from keboola.component.exceptions import UserException
 
-KEY_WORKSPACE_ID = "workspace_id"
-KEY_API_KEY = "#api_key"
-KEY_MODE = "mode"
-KEY_LIST_LOGS_FILTER = "list_logs_filter"
-KEY_LOG_FILE_NAME = "list_logs_file_name"
-KEY_WATSON_VERSION = "version"
+from configuration import Configuration
 
-REQUIRED_PARAMETERS = [KEY_API_KEY, KEY_WATSON_VERSION]
-REQUIRED_IMAGE_PARS = []
+DUCK_DB_DIR = os.path.join(os.environ.get("TMPDIR", "/tmp"), "duckdb")
 
 
 class Component(ComponentBase):
     def __init__(self):
-        super().__init__(required_parameters=REQUIRED_PARAMETERS,
-                         required_image_parameters=REQUIRED_IMAGE_PARS)
-        params = self.configuration.parameters
-        watson_version = params.get(KEY_WATSON_VERSION)
-        api_key = params.get(KEY_API_KEY)
+        super().__init__()
+        self.params = Configuration(**self.configuration.parameters)
+        self._connection = self.init_connection()
 
-        self.watson_client = WatsonAssistantClient(api_key, watson_version)
-        self.watson_client.login()
+    def run(self):
+        """
+        Main execution code
+        """
 
-    def run(self) -> None:
-        params = self.configuration.parameters
-        mode = params.get(KEY_MODE, "workspace")
-        workspace_id = params.get(KEY_WORKSPACE_ID)
+        tables = self.get_input_tables_definitions()
+        files = self.get_input_files_definitions()
 
-        if mode == "workspace":
-            self.get_and_write_workspaces(workspace_id)
-        elif mode == "list_all_logs":
-            list_logs_filter = params.get(KEY_LIST_LOGS_FILTER, "")
-            list_logs_file_name = params.get(KEY_LOG_FILE_NAME, "logs.json")
-            self.get_and_save_all_logs(list_logs_filter, list_logs_file_name)
-        else:
-            raise UserException(f"Mode {mode} is not a valid mode. Use either 'workspace' or 'list_all_logs'")
+        if (tables and files) or (not tables and not files):
+            raise Exception("Each configuration row can be mapped to either a file or a table, but not both.")
 
-    def get_workspace_data(self, workspace_id: str):
-        try:
-            return self.watson_client.get_workspace(workspace_id)
-        except ClientApiException as client_exc:
-            raise UserException(client_exc) from client_exc
+        if len(tables) > 1:
+            raise UserException("Each configuration row can have only one input table")
 
-    def get_and_save_all_logs(self, list_logs_filter: str, list_logs_file_name: str) -> None:
-        out_file = self.create_out_file_definition(list_logs_file_name, tags=["ibm_watson_assistant", "logs"])
-        last_page = False
-        first_page = True
-        cursor = None
-        # each page is written individually so there is no memory leak,
-        # therefore the file needs to start with {"logs" :[
-        # then the logs are written in, then the file needs to be finished by adding ])
-        self.prep_json_file(out_file)
-        while not last_page:
-            logs_response = self.get_all_logs(list_logs_filter, cursor=cursor)
-            logs = logs_response.get("logs")
-            self.write_logs_to_file(out_file, logs, first_page)
-            cursor = logs_response.get("pagination", {}).get("next_cursor")
-            if not cursor:
-                last_page = True
-            first_page = False
+        relation = None
+        if tables:
+            table = tables[0]
+            if table.is_sliced:
+                path = f"{table.full_path}/*.csv"
+            else:
+                path = table.full_path
 
-        self.finish_json_file(out_file)
-        self.write_manifest(out_file)
+            dtypes = {key: value.data_types.get("base").dtype for key, value in table.schema.items()}
+            relation = self._connection.read_csv(path, dtype=dtypes)
 
-    @staticmethod
-    def prep_json_file(out_file):
-        with open(out_file.full_path, 'a') as fp:
-            fp.write('{"logs":[')
+        if files:
+            files_paths = [file.full_path for file in files]
+            relation = self._connection.read_parquet(files_paths)
 
-    @staticmethod
-    def finish_json_file(out_file):
-        with open(out_file.full_path, 'a') as fp:
-            fp.write(']}')
+        arrow_batches = relation.fetch_arrow_reader(batch_size=1000)
 
-    @staticmethod
-    def write_logs_to_file(out_file, logs, first_page):
-        with open(out_file.full_path, 'a') as fp:
-            for log in logs:
-                if not first_page:
-                    fp.write(",")
-                else:
-                    first_page = False
-                json.dump(log, fp)
+        storage_options = {
+            "azure_storage_account_name": self.params.account_name,
+            "azure_storage_sas_token": self.params.sas_token,
+        }
 
-    def get_all_logs(self, filters: str, cursor: str = None) -> Dict:
-        try:
-            result, headers = self.watson_client.fetch_logs(filters, cursor)
-            logging.info(f"Remaining rate-limit: {int(headers.get('X-RateLimit-Remaining'))}")
-            return result
-        except ClientApiException as client_exc:
-            raise UserException(f"{client_exc}. Check the validity of your API token, your version, and "
-                                f"make sure your filters are setup correctly") from client_exc
+        uri = f"az://{self.params.destination.container_name}/{self.params.destination.blob_name}"
 
-    def get_and_write_workspaces(self, workspace_id):
-        workspace_data = self.get_workspace_data(workspace_id)
+        write_deltalake(
+            table_or_uri=uri,
+            data=arrow_batches,
+            storage_options=storage_options,
+            partition_by=self.params.destination.partition_by,
+            mode=self.params.destination.mode.value,
+        )
 
-        file_name = f"{workspace_id}_workspace.json"
-        out_file = self.create_out_file_definition(file_name, tags=[workspace_id, "ibm_watson_assistant", "workspaces"])
+        self._connection.close()
 
-        with open(out_file.full_path, 'w') as fp:
-            json.dump(workspace_data, fp)
-        self.write_manifest(out_file)
+    def init_connection(self) -> DuckDBPyConnection:
+        """
+        Returns connection to temporary DuckDB database
+        """
+        os.makedirs(DUCK_DB_DIR, exist_ok=True)
+        # TODO: On GCP consider changin tmp to /opt/tmp
+        config = dict(
+            temp_directory=DUCK_DB_DIR,
+            extension_directory=os.path.join(DUCK_DB_DIR, "extensions"),
+            threads=self.params.threads,
+            max_memory=f"{self.params.max_memory}MB",
+        )
+        conn = duckdb.connect(config=config)
+
+        if not self.params.preserve_insertion_order:
+            conn.execute("SET preserve_insertion_order = false;").fetchall()
+
+        return conn
 
 
+"""
+        Main entrypoint
+"""
 if __name__ == "__main__":
     try:
         comp = Component()
-        comp.run()
+        # this triggers the run method by default and is controlled by the configuration.action parameter
+        comp.execute_action()
     except UserException as exc:
         logging.exception(exc)
         exit(1)
@@ -380,75 +285,48 @@ if __name__ == "__main__":
 
 
 ================================================
-File: /bitbucket-pipelines.yml
+File: /src/configuration.py
 ================================================
-options:
-  docker: true
-
-pipelines:
-  default:
-    - step:
-        caches:
-          - docker
-        script:
-          - export APP_IMAGE=keboola-component
-          - docker build . --tag=$APP_IMAGE
-          - docker images
-          - docker -v
-          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
-          - echo "Running unit-tests..."
-          - docker run $APP_IMAGE python -m unittest discover
-          - echo 'Pushing test image to repo. [tag=test]'
-          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
-          - docker tag $APP_IMAGE:latest $REPOSITORY:test
-          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-          - docker push $REPOSITORY:test
+import logging
+from enum import Enum
+from pydantic import BaseModel, Field, ValidationError
+from keboola.component.exceptions import UserException
 
 
-  branches:
-    master:
-      - step:
-          caches:
-            - docker
-          script:
-            - export APP_IMAGE=keboola-component
-            - docker build . --tag=$APP_IMAGE
-            - docker images
-            - docker -v
-            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
-            - echo "Running unit-tests..."
-            - docker run $APP_IMAGE python -m unittest discover
-            - echo 'Pushing test image to repo. [tag=test]'
-            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
-            - docker tag $APP_IMAGE:latest $REPOSITORY:test
-            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-            - docker push $REPOSITORY:test
-            - chmod +x ./scripts/update_dev_portal_properties.sh
-            - ./scripts/update_dev_portal_properties.sh
-  tags:
-    '*':
-      - step:
-          deployment: production
-          script:
-            - export APP_IMAGE=keboola-component
-            - docker build . --tag=$APP_IMAGE
-            - docker images
-            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
-            - echo "Running unit-tests..."
-            - docker run $APP_IMAGE python -m unittest discover
-            - echo "Preparing KBC test image"
-            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
-            # push test image to ECR - uncomment when initialised
-            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
-            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
-            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-            # - docker push $REPOSITORY:test
-            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
-            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
-            - chmod +x ./scripts/update_dev_portal_properties.sh
-            - chmod +x ./deploy.sh
-            - ./scripts/update_dev_portal_properties.sh
-            - ./deploy.sh
+class LoadType(str, Enum):
+    error = "error"
+    append = "append"
+    overwrite = "overwrite"
+    ignore = "ignore"
+
+
+class Destination(BaseModel):
+    container_name: str = Field()
+    blob_name: str = Field()
+    mode: LoadType = Field(default=LoadType.append)
+    partition_by: list[str] = Field(default_factory=list)
+
+
+class Configuration(BaseModel):
+    account_name: str
+    sas_token: str = Field(alias="#sas_token")
+    destination: Destination
+    batch_size: int = 10_000
+    preserve_insertion_order: bool = True
+    debug: bool = False
+    threads: int = 1
+    max_memory: int = 256
+
+    def __init__(self, **data):
+        try:
+            super().__init__(**data)
+        except ValidationError as e:
+            error_messages = [f"{err['loc'][0]}: {err['msg']}" for err in e.errors()]
+            raise UserException(f"Validation Error: {', '.join(error_messages)}")
+
+        if self.debug:
+            logging.debug("Component will run in Debug mode")
+
 
 ================================================
 File: /tests/test_component.py
@@ -498,52 +376,27 @@ gelf
 ================================================
 File: /component_config/component_long_description.md
 ================================================
-This extractor enables users extract the settings of specified skills. The setting data of a skill contain intents,
-entities, and dialogs.
+Delta Lake long description
+
+================================================
+File: /component_config/licenseUrl.md
+================================================
+https://github.com/keboola/component-delta-lake.git/blob/master/LICENSE.md
+
+================================================
+File: /component_config/sourceCodeUrl.md
+================================================
+https://github.com/keboola/component-delta-lake.git
 
 ================================================
 File: /component_config/configuration_description.md
 ================================================
-## Configuration parameters
-This extractor refers to **Skills** as **Workspaces** as this is how they are referred to in the documentation of the API.
-  
-- **#api_key**:
-    Your IBM Watson Assistant api key
-- **mode** :
-  either 'list_all_logs' or 'workspace'. If 'list_all_logs' is set then the parameter list_logs_filter must be set. If 'workspace' is set then workspace_id must be set
-
-- **list_logs_filter**:
-        Filter for list all logs, docs of filter can be found [here](https://cloud.ibm.com/docs/assistant?topic=assistant-filter-reference#filter-reference). You must specify a filter query that includes a value for language, as well as a value for request.context.system.assistant_id, workspace_id, or request.context.metadata.deployment.
-- **workspace_id**:
-    Id of the skill/workspace that you wish to write data to 
-  
-- **version**:
-    version of the API you wish to use e.g. 2019-02-28
-  
-
-## Sample Configuration
-```json
-{
-    "workspace_id": "ID_OF_WORKSPACE_HERE",
-    "#api_key": "API_KEY_HERE",
-    "version": "2019-02-28"
-}
-```
-Or
-```json
-{
-    "#api_key": "API_KEY_HERE",
-    "version": "2019-02-28",
-    "mode" : "list_all_logs",
-    "list_logs_filter" : "language::en,workspace_id::ID_OF_WORKSPACE_HERE"
-}
-```
+Configuration description.
 
 ================================================
 File: /component_config/component_short_description.md
 ================================================
-IBM Watson Assistant is a cloud service that allows developers to embed an artificial intelligence virtual assistant in
-the software they are developing and brand the assistant as their own.
+Delta Lake short description
 
 ================================================
 File: /component_config/loggerConfiguration.json
@@ -565,24 +418,176 @@ File: /component_config/loggerConfiguration.json
 ================================================
 File: /component_config/configSchema.json
 ================================================
-{}
-
+{
+  "type": "object",
+  "title": "Authorization",
+  "required": [
+    "account_name",
+    "#sas_token"
+  ],
+  "properties": {
+    "account_name": {
+      "type": "string",
+      "title": "Storage Account Name",
+      "propertyOrder": 1
+    },
+    "#sas_token": {
+      "type": "string",
+      "title": "SAS token",
+      "format": "password",
+      "propertyOrder": 2
+    }
+  }
+}
 
 ================================================
 File: /component_config/configRowSchema.json
 ================================================
-{}
+{
+  "type": "object",
+  "title": "Component configuration",
+  "required": [
+    "destination",
+    "preserve_insertion_order",
+    "debug"
+  ],
+  "properties": {
+    "destination": {
+      "type": "object",
+      "title": "Data Destination",
+      "required": [
+        "container_name",
+        "blob_name"
+      ],
+      "properties": {
+        "container_name": {
+          "type": "string",
+          "title": "Container name",
+          "propertyOrder": 1
+        },
+        "blob_name": {
+          "type": "string",
+          "title": "Blob name",
+          "propertyOrder": 2
+        },
+        "mode": {
+          "enum": [
+            "error",
+            "append",
+            "overwrite",
+            "ignore"
+          ],
+          "type": "string",
+          "title": "Load Type",
+          "default": "append",
+          "options": {
+            "enum_titles": [
+              "Raise error if existing",
+              "Append",
+              "Overwrite",
+              "Ignore"
+            ]
+          },
+          "propertyOrder": 3
+        },
+        "partition_by": {
+          "type": "array",
+          "items": {
+            "enum": [],
+            "type": "string"
+          },
+          "title": "Partition table by",
+          "format": "select",
+          "options": {
+            "tags": true
+          },
+          "uniqueItems": true,
+          "propertyOrder": 4
+        }
+      },
+      "propertyOrder": 1
+    },
+    "batch_size": {
+      "type": "integer",
+      "title": "Batch size",
+      "default": 10000,
+      "propertyOrder": 2,
+      "description": "By default, the extractor will load data in batches of 10000 rows. You can adjust this value to optimize the performance (or solve OOM) of the writer."
+    },
+    "preserve_insertion_order": {
+      "type": "boolean",
+      "title": "Preserve insertion order",
+      "format": "checkbox",
+      "default": true,
+      "description": "If enabled, the writer will preserve the order of the rows in the destination table, when encountering OOM error, disabling this option may help",
+      "propertyOrder": 3
+    },
+    "debug": {
+      "type": "boolean",
+      "title": "Debug mode",
+      "format": "checkbox",
+      "default": false,
+      "description": "If enabled, the component will produce detailed logs",
+      "propertyOrder": 4
+    }
+  }
+}
 
 ================================================
 File: /component_config/sample-config/config.json
 ================================================
 {
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
   "parameters": {
-    "s3_bucket": "S3_BUCKET_NAME_HERE",
-    "#cloud_storage_api_key": "IBM_CLOUD_STORAGE_API_TOKEN_HERE",
-    "#assistant_api_key": "IBM_WATSON_ASSISTANT_API_TOKEN_HERE",
-    "version": "2019-02-28",
-    "s3_skill_object" : "skill_object.xlsx"
+    "#api_token": "DEMO",
+    "print_hello": true,
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
   }
 }
 
@@ -771,119 +776,9 @@ File: /component_config/sample-config/out/files/order1.xml
 </root_el>
 
 ================================================
-File: /scripts/update_dev_portal_properties.sh
+File: /component_config/documentationUrl.md
 ================================================
-#!/usr/bin/env bash
-
-set -e
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-
-
-# Update properties in Keboola Developer Portal
-echo "Updating long description"
-value=`cat component_config/component_long_description.md`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
-else
-    echo "longDescription is empty!"
-    exit 1
-fi
-
-echo "Updating config schema"
-value=`cat component_config/configSchema.json`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
-else
-    echo "configurationSchema is empty!"
-fi
-
-echo "Updating row config schema"
-value=`cat component_config/configRowSchema.json`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
-else
-    echo "configurationRowSchema is empty!"
-fi
-
-
-echo "Updating config description"
-
-value=`cat component_config/configuration_description.md`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
-else
-    echo "configurationDescription is empty!"
-fi
-
-
-echo "Updating short description"
-
-value=`cat component_config/component_short_description.md`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
-else
-    echo "shortDescription is empty!"
-fi
-
-echo "Updating logger settings"
-
-value=`cat component_config/logger`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} logger --value="$value"
-else
-    echo "logger type is empty!"
-fi
-
-echo "Updating logger configuration"
-value=`cat component_config/loggerConfiguration.json`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} loggerConfiguration --value="$value"
-else
-    echo "loggerConfiguration is empty!"
-fi
+https://github.com/keboola/component-delta-lake.git/blob/master/README.md
 
 ================================================
 File: /scripts/run_kbc_tests.ps1
@@ -923,12 +818,107 @@ docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cl
 
 
 ================================================
-File: /scripts/run.bat
+File: /scripts/developer_portal/update_properties.sh
 ================================================
-@echo off
+#!/usr/bin/env bash
 
-echo Running component...
-docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+set -e
+
+# Check if the KBC_DEVELOPERPORTAL_APP environment variable is set
+if [ -z "$KBC_DEVELOPERPORTAL_APP" ]; then
+    echo "Error: KBC_DEVELOPERPORTAL_APP environment variable is not set."
+    exit 1
+fi
+
+# Pull the latest version of the developer portal CLI Docker image
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+# Function to update a property for the given app ID
+update_property() {
+    local app_id="$1"
+    local prop_name="$2"
+    local file_path="$3"
+
+    if [ ! -f "$file_path" ]; then
+        echo "File '$file_path' not found. Skipping update for property '$prop_name' of application '$app_id'."
+        return
+    fi
+
+    # shellcheck disable=SC2155
+    local value=$(<"$file_path")
+
+    echo "Updating $prop_name for $app_id"
+    echo "$value"
+
+    if [ -n "$value" ]; then
+        docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property "$KBC_DEVELOPERPORTAL_VENDOR" "$app_id" "$prop_name" --value="$value"
+        echo "Property $prop_name updated successfully for $app_id"
+    else
+        echo "$prop_name is empty for $app_id, skipping..."
+    fi
+}
+
+app_id="$KBC_DEVELOPERPORTAL_APP"
+
+update_property "$app_id" "isDeployReady" "component_config/isDeployReady.md"
+update_property "$app_id" "longDescription" "component_config/component_long_description.md"
+update_property "$app_id" "configurationSchema" "component_config/configSchema.json"
+update_property "$app_id" "configurationRowSchema" "component_config/configRowSchema.json"
+update_property "$app_id" "configurationDescription" "component_config/configuration_description.md"
+update_property "$app_id" "shortDescription" "component_config/component_short_description.md"
+update_property "$app_id" "logger" "component_config/logger"
+update_property "$app_id" "loggerConfiguration" "component_config/loggerConfiguration.json"
+update_property "$app_id" "licenseUrl" "component_config/licenseUrl.md"
+update_property "$app_id" "documentationUrl" "component_config/documentationUrl.md"
+update_property "$app_id" "sourceCodeUrl" "component_config/sourceCodeUrl.md"
+update_property "$app_id" "uiOptions" "component_config/uiOptions.md"
+
+# Update the actions.md file
+source "$(dirname "$0")/fn_actions_md_update.sh"
+# update_property actions
+update_property "$app_id" "actions" "component_config/actions.md"
+
+================================================
+File: /scripts/developer_portal/fn_actions_md_update.sh
+================================================
+#!/bin/bash
+
+# Set the path to the Python script file
+PYTHON_FILE="src/component.py"
+# Set the path to the Markdown file containing actions
+MD_FILE="component_config/actions.md"
+
+# Check if the file exists before creating it
+if [ ! -e "$MD_FILE" ]; then
+    touch "$MD_FILE"
+else
+    echo "File already exists: $MD_FILE"
+    exit 1
+fi
+
+# Get all occurrences of lines containing @sync_action('XXX') from the .py file
+SYNC_ACTIONS=$(grep -o -E "@sync_action\(['\"][^'\"]*['\"]\)" "$PYTHON_FILE" | sed "s/@sync_action(\(['\"]\)\([^'\"]*\)\(['\"]\))/\2/" | sort | uniq)
+
+# Check if any sync actions were found
+if [ -n "$SYNC_ACTIONS" ]; then
+    # Iterate over each occurrence of @sync_action('XXX')
+    for sync_action in $SYNC_ACTIONS; do
+        EXISTING_ACTIONS+=("$sync_action")
+    done
+
+    # Convert the array to JSON format
+    JSON_ACTIONS=$(printf '"%s",' "${EXISTING_ACTIONS[@]}")
+    JSON_ACTIONS="[${JSON_ACTIONS%,}]"
+
+    # Update the content of the actions.md file
+    echo "$JSON_ACTIONS" > "$MD_FILE"
+else
+    echo "No sync actions found. Not creating the file."
+fi
 
 ================================================
 File: /scripts/build_n_run.ps1
@@ -974,14 +964,245 @@ python -m unittest discover
 ================================================
 File: /requirements.txt
 ================================================
-keboola.component==1.3.5
+keboola.component
 keboola.utils
 keboola.http-client
-https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.5.0.zip#egg=kbc
-mock
 freezegun
-retry
-ibm-watson==8.1.0
+mock
+pydantic
+duckdb==1.2.0
+deltalake==0.24.0
+
+
+================================================
+File: /.github/workflows/push.yml
+================================================
+name: Keboola Component Build & Deploy Pipeline
+on: [ push ]
+concurrency: ci-${{ github.ref }} # to avoid tag collisions in the ECR
+env:
+  # repository variables:
+  KBC_DEVELOPERPORTAL_APP: "keboola.wr-delta-lake" # replace with your component id
+  KBC_DEVELOPERPORTAL_VENDOR: "keboola" # replace with your vendor
+  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+  KBC_DEVELOPERPORTAL_USERNAME: ${{ vars.KBC_DEVELOPERPORTAL_USERNAME }}
+
+  # repository secrets:
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }} # recommended for pushing to ECR
+  KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+
+  # (Optional) Test KBC project: https://connection.keboola.com/admin/projects/0000
+  KBC_TEST_PROJECT_CONFIGS: "" # space separated list of config ids
+  KBC_STORAGE_TOKEN: ${{ secrets.KBC_STORAGE_TOKEN }} # required for running KBC tests
+
+jobs:
+  push_event_info:
+    name: Push Event Info
+    runs-on: ubuntu-latest
+    outputs:
+      app_image_tag: ${{ steps.tag.outputs.app_image_tag }}
+      is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
+      is_default_branch: ${{ steps.default_branch.outputs.is_default_branch }}
+      is_deploy_ready: ${{ steps.deploy_ready.outputs.is_deploy_ready }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Fetch all branches from remote repository
+        run: git fetch --prune --unshallow --tags -f
+
+      - name: Get current branch name
+        id: current_branch
+        run: |
+          if [[ ${{ github.ref }} != "refs/tags/"* ]]; then
+            branch_name=${{ github.ref_name }}
+            echo "branch_name=$branch_name" | tee -a $GITHUB_OUTPUT
+          else
+            raw=$(git branch -r --contains ${{ github.ref }})
+            branch="$(echo $raw | sed "s/.*origin\///" | tr -d '\n')"
+            echo "branch_name=$branch" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Is current branch the default branch
+        id: default_branch
+        run: |
+          echo "default_branch='${{ github.event.repository.default_branch }}'"
+          if [ "${{ github.event.repository.default_branch }}" = "${{ steps.current_branch.outputs.branch_name }}" ]; then
+             echo "is_default_branch=true" | tee -a $GITHUB_OUTPUT
+          else
+             echo "is_default_branch=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Set image tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
+          echo "is_semantic_tag=$IS_SEMANTIC_TAG" | tee -a $GITHUB_OUTPUT
+          echo "app_image_tag=$TAG" | tee -a $GITHUB_OUTPUT
+
+      - name: Deploy-Ready check
+        id: deploy_ready
+        run: |
+          if [[ "${{ steps.default_branch.outputs.is_default_branch }}" == "true" \
+            && "${{ github.ref }}" == refs/tags/* \
+            && "${{ steps.tag.outputs.is_semantic_tag }}" == "true" ]]; then
+              echo "is_deploy_ready=true" | tee -a $GITHUB_OUTPUT
+          else
+              echo "is_deploy_ready=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Docker Image Build
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest
+          outputs: type=docker,dest=/tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - build
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Tests
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest flake8 . --config=flake8.cfg
+          echo "Running unit-tests..."
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest python -m unittest discover
+
+  tests-kbc:
+    name: Run KBC Tests
+    needs:
+      - push_event_info
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up environment variables
+        run: |
+          echo "KBC_TEST_PROJECT_CONFIGS=${KBC_TEST_PROJECT_CONFIGS}" >> $GITHUB_ENV
+          echo "KBC_STORAGE_TOKEN=${{ secrets.KBC_STORAGE_TOKEN }}" >> $GITHUB_ENV
+
+      - name: Run KBC test jobs
+        if: env.KBC_TEST_PROJECT_CONFIGS != '' && env.KBC_STORAGE_TOKEN != ''
+        uses: keboola/action-run-configs-parallel@master
+        with:
+          token: ${{ secrets.KBC_STORAGE_TOKEN }}
+          componentId: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          configs: ${{ env.KBC_TEST_PROJECT_CONFIGS }}
+
+  push:
+    name: Docker Image Push
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - tests
+      - tests-kbc
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Tests
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+
+      - name: Docker login
+        if: env.DOCKERHUB_TOKEN
+        run: docker login --username "${{ env.DOCKERHUB_USER }}" --password "${{ env.DOCKERHUB_TOKEN }}"
+
+      - name: Push image to ECR
+        uses: keboola/action-push-to-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          push_latest: ${{ needs.push_event_info.outputs.is_deploy_ready }}
+          source_image: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+
+  deploy:
+    name: Deploy to KBC
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Developer Portal Tag
+        uses: keboola/action-set-tag-developer-portal@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+
+  update_developer_portal_properties:
+    name: Developer Portal Properties Update
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    runs-on: ubuntu-latest
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Update developer portal properties
+        run: |
+          chmod +x scripts/developer_portal/*.sh
+          scripts/developer_portal/update_properties.sh
+
 
 ================================================
 File: /TEMPLATE_README.md
@@ -1213,25 +1434,23 @@ For information about deployment and integration with KBC, please refer to the [
 ================================================
 File: /Dockerfile
 ================================================
-FROM python:3.8.6-slim
+FROM python:3.11-slim
 ENV PYTHONIOENCODING utf-8
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+
+COPY requirements.txt /code/requirements.txt
+RUN pip install -r /code/requirements.txt
 
 COPY /src /code/src/
 COPY /tests /code/tests/
 COPY /scripts /code/scripts/
-COPY requirements.txt /code/requirements.txt
 COPY flake8.cfg /code/flake8.cfg
 COPY deploy.sh /code/deploy.sh
 
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
-
-RUN pip install flake8
-
-RUN pip install -r /code/requirements.txt
-
 WORKDIR /code/
-
 
 CMD ["python", "-u", "/code/src/component.py"]
 
@@ -1264,228 +1483,61 @@ THE SOFTWARE.
 ================================================
 File: /README.md
 ================================================
-IBM Watson Assistant Extracor
+Delta Lake
 =============
 
-IBM Watson Assistant is a cloud service that allows developers to embed an artificial intelligence virtual assistant in
-the software they are developing and brand the assistant as their own.
+Description
 
-This extractor enables users extract the settings of specified skills. The setting data of a skill contain intents,
-entities, and dialogs.
-
-For more information on skills, entities, intents, and dialogs see the IBM watson documentation.
-
-**Table of contents:**
+**Table of Contents:**
 
 [TOC]
 
-Functionality notes
+Functionality Notes
 ===================
-This extractor refers to **Skills** as **Workspaces** as this is how they are referred to in the documentation of the API.
-
-The extractor uses the ibm_watson python sdk utilizing the get_workspace() to download the whole workspace settings.
 
 Prerequisites
 =============
 
-Get the API token of IBM Watson assistant
+Ensure you have the necessary API token, register the application, etc.
+
+Features
+========
+
+| **Feature**             | **Description**                               |
+|-------------------------|-----------------------------------------------|
+| Generic UI Form         | Dynamic UI form for easy configuration.       |
+| Row-Based Configuration | Allows structuring the configuration in rows. |
+| OAuth                   | OAuth authentication enabled.                 |
+| Incremental Loading     | Fetch data in new increments.                 |
+| Backfill Mode           | Supports seamless backfill setup.             |
+| Date Range Filter       | Specify the date range for data retrieval.    |
+
+Supported Endpoints
+===================
+
+If you need additional endpoints, please submit your request to
+[ideas.keboola.com](https://ideas.keboola.com/).
 
 Configuration
 =============
 
-mode
+Param 1
 -------
-either 'list_all_logs' or 'workspace'. If 'list_all_logs' is set then the parameter list_logs_filter must be set. If 'workspace' is set then workspace_id must be set
+Details about parameter 1.
 
-list_logs_filter
+Param 2
 -------
-Filter for list all logs, docs of filter can be found [here](https://cloud.ibm.com/docs/assistant?topic=assistant-filter-reference#filter-reference). You must specify a filter query that includes a value for language, as well as a value for request.context.system.assistant_id, workspace_id, or request.context.metadata.deployment.
+Details about parameter 2.
 
-workspace_id
--------
-Id of the skill/workspace that you wish to write data to 
-
-#api_key
--------
-You IBM Watson Assistant api key
-
-version
--------
-version of the API you wish to use
-
-Sample Configuration
-=============
-```json
-{
-  "parameters": {
-    "workspace_id": "ID_OF_WORKSPACE_HERE",
-    "#api_key": "API_KEY_HERE",
-    "version": "2019-02-28"
-  }
-}
-```
-```json
-{
-  "parameters": {
-    "#api_key": "API_KEY_HERE",
-    "version": "2019-02-28",
-    "mode" : "list_all_logs",
-    "list_logs_filter" : "language::en,workspace_id::ID_OF_WORKSPACE_HERE"
-  }
-}
-```
 Output
 ======
 
-JSON file containing the settings of the workspace.
-
-Example of output:
-
-```json
-{
-  "status": "Available",
-  "name": "Test_Keboola",
-  "intents": [
-    {
-      "intent": "test_intent",
-      "examples": [
-        {
-          "text": "test"
-        }
-      ]
-    }
-  ],
-  "entities": [
-    {
-      "entity": "test",
-      "values": [
-        {
-          "type": "synonyms",
-          "value": "val",
-          "synonyms": [
-            "syn"
-          ]
-        },
-        {
-          "type": "synonyms",
-          "value": "test",
-          "synonyms": [
-            "syns"
-          ]
-        }
-      ],
-      "fuzzy_match": false
-    }
-  ],
-  "language": "cs",
-  "metadata": {
-    "skill": {
-      "counts": {
-        "intents": 1,
-        "entities": 1,
-        "dialog_nodes": 1
-      }
-    },
-    "api_version": {
-      "major_version": "v1",
-      "minor_version": "2019-02-28"
-    }
-  },
-  "webhooks": [
-    {
-      "url": "",
-      "name": "main_webhook",
-      "headers": []
-    }
-  ],
-  "description": "Test Keboola",
-  "dialog_nodes": [
-    {
-      "type": "standard",
-      "title": "test",
-      "output": {
-        "generic": [
-          {
-            "values": [
-              {
-                "text": "test text"
-              }
-            ],
-            "response_type": "text",
-            "selection_policy": "random"
-          }
-        ]
-      },
-      "parent": "node_id",
-      "next_step": {
-        "behavior": "jump_to",
-        "selector": "body",
-        "dialog_node": "node_id"
-      },
-      "conditions": "#test",
-      "dialog_node": "node_id",
-      "previous_sibling": "node_id",
-      "disambiguation_opt_out": true
-    }
-  ],
-  "workspace_id": "workspace id",
-  "counterexamples": [
-    {
-      "text": "counter"
-    }
-  ],
-  "system_settings": {
-    "tooling": {
-      "store_generic_responses": true
-    },
-    "disambiguation": {
-      "prompt": "promot test",
-      "enabled": false,
-      "randomize": true,
-      "max_suggestions": 3,
-      "suggestion_text_policy": "user_label",
-      "none_of_the_above_prompt": ""
-    },
-    "system_entities": {
-      "enabled": true
-    }
-  },
-  "learning_opt_out": false
-}
-```
-
-Use Case 
-=============
-This extractor is set to be used with the writer component.
-
-You can set up an orchestration of extract > transform > write. 
-Add the output json as input of the transformation, and the input of the writer as the output of the transformation.
-
-A sample transformation:
-
-```
-import json
-from keboola.component.interface import CommonInterface
-
-ci = CommonInterface()
-
-input_file = ci.get_input_files_definitions(only_latest_files=True)[0]
-
-with open(input_file.full_path, "r") as input_file:
-	workspace_data = json.load(input_file)
-  
-for i,intent in enumerate(workspace_data["intents"]):
-  workspace_data["intents"][i]["intent"] = f"{intent['intent']}_UPDATED"
-  
-with open("out/files/updated_WORKSPACE_ID_workspace.json", "w") as output_file:
-	workspace_data = json.dump(workspace_data, output_file)
-```
+Provides a list of tables, foreign keys, and schema.
 
 Development
 -----------
 
-If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to
-your custom path in the `docker-compose.yml` file:
+To customize the local data folder path, replace the `CUSTOM_FOLDER` placeholder with your desired path in the `docker-compose.yml` file:
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     volumes:
@@ -1493,17 +1545,17 @@ your custom path in the `docker-compose.yml` file:
       - ./CUSTOM_FOLDER:/data
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Clone this repository, init the workspace and run the component with following
-command:
+Clone this repository, initialize the workspace, and run the component using the following
+commands:
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-git clone https://bitbucket.org/kds_consulting_team/kds-team.ex-ibm-watson-assistant/src/master/ kds-team.ex-ibm-watson-assistant
-cd kds-team.ex-ibm-watson-assistant
+git clone https://github.com/keboola/component-delta-lake.git delta_lake
+cd delta_lake
 docker-compose build
 docker-compose run --rm dev
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Run the test suite and lint check using this command:
+Run the test suite and perform lint checks using this command:
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 docker-compose run --rm test
@@ -1512,8 +1564,8 @@ docker-compose run --rm test
 Integration
 ===========
 
-For information about deployment and integration with KBC, please refer to the
-[deployment section of developers
-documentation](https://developers.keboola.com/extend/component/deployment/)
+For details about deployment and integration with Keboola, refer to the
+[deployment section of the developer
+documentation](https://developers.keboola.com/extend/component/deployment/).
 
 

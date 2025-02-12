@@ -237,6 +237,11 @@
 - Repository: https://github.com/keboola/component-embeddings-v2
 - Description: None
 
+### component-delta-lake
+- [Documentation](github/component-delta-lake/llm.txt)
+- Repository: https://github.com/keboola/component-delta-lake
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors

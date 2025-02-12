@@ -1,22 +1,1262 @@
 Directory structure:
 └── kds_consulting_team-esnerda.ex-gusto-export/
-    ├── generic-mapping/
-    │   └── mappings.json
-    ├── configSchema.json
-    ├── Dockerfile
-    ├── gusto/
-    │   ├── __init__.py
-    │   ├── client.py
-    │   └── client_service.py
-    ├── bitbucket-pipelines.yml
+    ├── deploy.sh
     ├── component.py
+    ├── bitbucket-pipelines.yml
     ├── kbc/
+    │   ├── mapping.py
     │   ├── client_base.py
     │   ├── __init__.py
-    │   ├── env_handler.py
-    │   └── mapping.py
-    ├── deploy.sh
+    │   └── env_handler.py
+    ├── configSchema.json
+    ├── generic-mapping/
+    │   └── mappings.json
+    ├── Dockerfile
+    ├── gusto/
+    │   ├── client_service.py
+    │   ├── __init__.py
+    │   └── client.py
     └── README.md
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+================================================
+File: /component.py
+================================================
+'''
+
+@author: esner
+'''
+from kbc.env_handler import KBCEnvHandler
+from gusto.client_service import GustoService
+import logging
+import math
+import pytz
+
+from datetime import datetime
+from datetime import timedelta
+
+KEY_USER = 'user'
+KEY_PASS = '#pass'
+KEY_CUSTOMER_ID = 'customer_id'
+KEY_MASTER_LOCATION_ID = 'master_location_id'
+KEY_VENDOR_ID = '#vendor_id'
+
+
+KEY_PERIOD_FROM = 'period_from'
+KEY_PERIOD_TO = 'period_to'
+KEY_RELATIVE_PERIOD = 'relative_period'
+KEY_BACKFILL_MODE = 'backfill_mode'
+KEY_MAND_PERIOD_GROUP = [KEY_PERIOD_FROM, KEY_PERIOD_TO]
+KEY_MAND_DATE_GROUP = [KEY_RELATIVE_PERIOD, KEY_MAND_PERIOD_GROUP]
+
+MAX_PERIOD_SIZE = 10
+
+MANDATORY_PARS = [KEY_USER, KEY_PASS, KEY_CUSTOMER_ID,
+                  KEY_MASTER_LOCATION_ID, KEY_VENDOR_ID, KEY_MAND_DATE_GROUP]
+
+APP_VERSION = '0.1.6'
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, data_path = None):
+        KBCEnvHandler.__init__(self, MANDATORY_PARS, data_path = data_path)
+
+    def run(self, debug=False):
+        '''
+        Main execution code
+        '''
+        # setup
+        self.set_default_logger('DEBUG' if debug else 'INFO')
+        logging.info('Running version %s', APP_VERSION)
+        logging.info('Loading configuration...')
+        self.validateConfig()
+        params = self.cfg_params
+        backfill_mode = params.get(KEY_BACKFILL_MODE)
+        if backfill_mode and not (params.get(KEY_PERIOD_FROM) and params.get(KEY_PERIOD_TO)):
+            logging.error(
+                'Period from and Period To paremeters must be defined when backfill mode is on!')
+            exit(1)
+
+        gservice = GustoService(params[KEY_CUSTOMER_ID], params[KEY_MASTER_LOCATION_ID],
+                                params[KEY_VENDOR_ID], params[KEY_USER], params[KEY_PASS])
+
+        extract_time = datetime.utcnow()
+        start_date, end_date, periods = self._get_date_periods()
+
+        last_delta = None
+        last_state = self.get_state_file()
+        if last_state and params['since_last'] and last_state['data_delta'] and last_state['data_delta'] != 'None':
+            start_date = datetime.strptime(last_state['data_delta'], '%m%d%Y')
+            end_date = datetime.utcnow()            
+            last_delta = last_state['data_delta']
+        elif self.cfg_params.get(KEY_RELATIVE_PERIOD):
+            from_date = super().get_past_date(self.cfg_params.get(KEY_RELATIVE_PERIOD))
+            last_delta = from_date.strftime("%m%d%Y")
+
+        # get locations
+        logging.info('Getting locations..')
+        res_files, loc_ids = gservice.get_n_save_location(
+            self.tables_out_path, None, extract_time)
+        # create manifests
+        self._create_manifests(res_files)
+
+        
+        # get locations
+        logging.info('Getting categories..')
+        res_files = gservice.get_n_save_category(
+            self.tables_out_path, None, extract_time)
+        # create manifests
+        self._create_manifests(res_files)
+
+        
+        # get locations
+        logging.info('Getting order types..')
+        res_files = gservice.get_n_save_order_type(
+            self.tables_out_path, None, extract_time)
+        # create manifests
+        self._create_manifests(res_files)
+
+        logging.info('Fetching checks data for period %s - %s', start_date.date(), end_date.date())
+        index = 0
+        res_files = []
+        for loc_id in loc_ids['location']['id']:
+            # skip master locations
+            if str(loc_id) == params[KEY_MASTER_LOCATION_ID]:
+                continue
+
+            logging.info('Downloading checks for location id:%s', loc_id)
+
+            index += 1
+            if last_delta and (params['since_last'] or params[KEY_RELATIVE_PERIOD]):
+                res_files_local, cl, delta = gservice.get_n_save_checks(self.tables_out_path, loc_id, loc_id,
+                                                                        None, None, time_delta=last_delta, store_as_sliced=True)
+            else:
+                res_files_local, delta = self._get_checks_in_periods(
+                    loc_id, periods, gservice)
+
+            res_files += res_files_local
+
+        # create manifests
+        logging.info('Preparing checks sliced tables')
+        self._create_manifests_sliced(res_files)
+        # write statefile
+        self.write_state_file({'data_delta': str(delta),
+                               'last_period': {'start_date': str(start_date.date()),
+                                                   'end_date': str(end_date.date())}})
+
+        
+        logging.info('Extraction finshed sucessfully')
+
+    def _get_checks_in_periods(self, loc_id, periods, gservice):
+        res_in_period = []
+        last_delta = ''
+        res_files = []
+        for period in periods:
+            uid = str(loc_id) + '_' + \
+                period['start_date'] + '_' + period['end_date']
+            res_files, cols, delta = gservice.get_n_save_checks(self.tables_out_path, uid, loc_id,
+                                                                period['start_date'], period['end_date'], store_as_sliced=True)
+            last_delta = delta
+            res_in_period += res_files
+        return res_in_period, last_delta
+
+    def _get_date_periods(self):
+        periods = []
+        if self.cfg_params.get(KEY_BACKFILL_MODE):
+            start_date, end_date = self._get_backfill_period()
+            periods = list(self._split_dates_to_chunks(
+                start_date, end_date, MAX_PERIOD_SIZE))
+
+        elif self.cfg_params.get(KEY_RELATIVE_PERIOD):
+            start_date = super().get_past_date(self.cfg_params.get(KEY_RELATIVE_PERIOD))
+            end_date = datetime.now()
+            periods = list(self._split_dates_to_chunks(
+                start_date.date(), end_date.date(), MAX_PERIOD_SIZE))
+
+        elif self.cfg_params.get(KEY_PERIOD_FROM) and self.cfg_params.get(KEY_PERIOD_TO):
+            start_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
+            end_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
+            periods = list(self._split_dates_to_chunks(
+                start_date, end_date, MAX_PERIOD_SIZE))
+            
+
+        elif self.cfg_params.get(KEY_PERIOD_FROM) and self.cfg_params.get(KEY_PERIOD_TO):
+            start_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
+            end_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
+            periods = list(self._split_dates_to_chunks(
+                start_date, end_date, MAX_PERIOD_SIZE))
+
+        else:
+            end_date = datetime.utcnow()
+            start_date = self.get_past_date(
+                '14 days ago', end_date)
+            periods = [{'start_date': start_date.strftime("%m%d%Y"),
+                        'end_date': end_date.strftime("%m%d%Y")}]
+        return start_date, end_date, periods
+
+    def _split_dates_to_chunks(self, start_date, end_date, intv, strformat="%m%d%Y"):
+        nr_days = (end_date - start_date).days
+        if nr_days < intv:
+            yield {'start_date': start_date.strftime(strformat),
+                   'end_date': end_date.strftime(strformat)}
+        else:            
+            diff = (end_date - start_date) / (math.ceil(nr_days/intv))
+            for i in range(math.ceil(nr_days/intv)):
+                yield {'start_date': (start_date + diff * i).strftime(strformat),
+                       'end_date': (start_date + diff * (i + 1)).strftime(strformat)}
+
+    def _create_manifests(self, res_files):
+        for file in res_files:
+            self.configuration.write_table_manifest(
+                file_name=file['file_path'],
+                destination=file['prefix'],
+                primary_key=file['ids'])
+
+    def _create_manifests_sliced(self, res_files):
+
+        res_sliced_folders = {}
+        for file in res_files:
+            res_sliced_folders.update({file['prefix']: (file['ids'])})
+
+        for folder in res_sliced_folders:
+            self.create_sliced_tables(folder, res_sliced_folders[folder], True)
+    
+    def _get_backfill_period(self):
+        state = self.get_state_file()
+        
+        if state and state.get('last_period'):
+            last_start_date = datetime.strptime(
+                state['last_period']['start_date'], '%Y-%m-%d')
+            last_end_date = datetime.strptime(
+                state['last_period']['end_date'], '%Y-%m-%d')
+            
+            diff = last_end_date - last_start_date
+            # if period is a single day
+            if diff.days == 0:
+                diff = timedelta(days=1)
+
+            start_date = last_end_date
+            if (last_end_date.date() + diff) >= datetime.now(pytz.utc).date() + timedelta(days=1):
+                end_date = datetime.now(pytz.utc) + timedelta(days=1)
+            else:
+                end_date = last_end_date + diff
+        else:
+            start_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
+            end_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
+        return start_date, end_date
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    comp = Component()
+    comp.run()
+
+
+================================================
+File: /bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+
+  tags:
+    '*':
+      - step:
+          script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - ./deploy.sh
+
+================================================
+File: /kbc/mapping.py
+================================================
+"__author__ = 'Leo Chan'"
+from _collections import OrderedDict
+"__credits__ = 'Keboola 2017'"
+
+"""
+Python 3 environment 
+"""
+
+import os
+import logging
+import json
+import pandas as pd
+import uuid
+
+
+
+# used for parent-child key mapping
+KEY_PARENT_TABLE = 'parent_table' 
+KEY_UUID = 'uuid'
+KEY_ROW_NUMBER = 'row_number'
+
+### destination to fetch and output files
+DEFAULT_FILE_INPUT = "/data/in/tables/"
+DEFAULT_FILE_DESTINATION = "/data/out/tables/"#
+DEFAULT_MAPPING_PATH = '/code/generic-mapping/mappings.json'
+#DEFAULT_MAPPING_PATH = 'generic-mapping/mappings.json'
+
+class GenericMapping():
+    """
+    Handling Generic Ex Mapping
+    """
+
+    def __init__(self, endpoint, output_destination, user_values = {}, return_col = {}, mapping_file_path = DEFAULT_MAPPING_PATH):
+
+        ### Parameters
+        self._mapping_file_path = mapping_file_path
+        self.output_destination = output_destination
+        self.endpoint = endpoint
+        self.mapping = self.mapping_check(self.endpoint)
+        self._user_values = user_values
+        self._return_col = return_col
+        #self.data = data
+        self.out_file = {}
+        self.out_file[self.endpoint]=[]
+        self.out_file_pk = {} ### destination name from mapping
+        self.out_file_pk[self.endpoint]=[]
+        self.out_file_pk_raw = {} ### raw destination name from API output
+        self.get_primary_key(endpoint, self.mapping)
+        logging.debug(self.out_file_pk)
+        logging.debug(self.out_file_pk_raw)
+
+
+    def parse_n_save(self, data, file_uid, store_as_sliced = False):
+        ### Runs
+        self.root_parse(data)
+        return self.output(file_uid, store_as_sliced)
+
+    
+    def mapping_check(self, endpoint):
+        """
+        Selecting the Right Mapping for the specified endpoint
+        """
+
+        with open(self._mapping_file_path, 'r') as f:
+            out = json.load(f)
+        f.close()
+        return out[endpoint]
+
+    def root_parse(self, data):
+        """
+        Parsing the Root property of the return data
+        """
+
+        #data = self.data
+        mapping = self.mapping
+
+        for index, row in enumerate(data):
+            ### Looping row by row 
+            self.parsing(self.endpoint, mapping, row, index)      
+
+    def parsing(self, table_name, mapping, data, row_number):
+        """
+        Outputing data results based on configured mapping
+        """
+        
+        ### If new table property is found, 
+        ### create a new array to store values
+        if table_name not in self.out_file:
+            self.out_file[table_name] = []
+        
+
+        row_out = {} ### Storing row output
+
+        ### Looping thru the keys of the mapping
+        for column in mapping:
+            if not mapping[column].get("type") or mapping[column].get("type")=="column":
+                ### Delimit mapping variables
+                if "." in column:
+                    temp_value = column.split(".")
+
+                    try:
+                        ### Looping thru the array
+                        #value = data[temp_value[0]][temp_value[1]]
+                        value = data
+                        for word in temp_value:
+                            value = value[word]
+                    except Exception:
+                        value = ""
+                else:
+                    try:
+                        value = data[column]
+                    except Exception:
+                        value = ""
+                header = mapping[column]["mapping"]["destination"]
+            
+            elif mapping[column]["type"]=="table": 
+                ### Setting up table parameters, 
+                ### mappings and values for parsing the nested table
+                mapping_name = column
+                mapping_in = mapping[column]["tableMapping"] ### Mapping for the table
+                sub_table_name = mapping[column]["destination"] ### New table output name
+                sub_table_exist = True ### Determine if the table column exist as a property in source file
+                sub_table_row_exist = True ### Determine if there are any rows within the sub table
+                
+                ### Passing the function if the JSON property is not found
+                try:
+                    if "." in mapping_name:
+                        temp_value = mapping_name.split(".")
+                        data_in = data
+                        for word in temp_value:
+                            data_in = data_in[word]
+                    else:
+                        data_in = data[mapping_name]
+
+                    if not data_in or len(data_in)==0:
+                        sub_table_row_exist = False
+                except KeyError:
+                    sub_table_exist = False
+
+                ### Verify if the sub-table exist in the root table
+                if sub_table_exist and sub_table_row_exist:
+                    ### Setting up nested table primary key
+                    ### Using current table id to create unique pk with md5
+                    string_of_pk = "" ### Concat all the PK as a string
+                    ### Iterate through all the pk
+                    """for pk in self.out_file_pk_raw[table_name]:
+                        if "." in pk:
+                            temp_value = column.split(".")
+                            pk_value = data
+                            for each_temp in temp_value:
+                                pk_value = pk_value[each_temp]
+                            print("PK_VALUE - {0}".format(pk_value))
+                            print("STRING_OF_PK - {0}".format(string_of_pk))
+                            string_of_pk += pk_value
+                        else:
+                            string_of_pk += data[pk]"""
+                    #genrate random uuid if no primary key for parent table is defined, otherwise use pk
+                    if self.out_file_pk.get(table_name):
+                        
+                        pk_values = []
+                        for field in self.out_file_pk.get(table_name):
+                            # user defined PK
+                            if mapping[field].get('type') == 'user_index':
+                                value = str(self._validate_user_index_mapping(mapping, data, field, table_name, row_number))
+                            # user defined static value
+                            elif mapping[field].get('type') == 'user': 
+                                value = str(self._user_values.get(column))
+                            else:
+                                value = str(data[field])
+                            pk_values.append(value)
+                        
+                        sub_table_pk = mapping[column]["destination"] + "-"+ '|'.join(pk_values)
+                    else:
+                        sub_table_pk = mapping[column]["destination"] + "-"+str(uuid.uuid4().hex)
+
+                    mapping_in[KEY_PARENT_TABLE] = {
+                        "type": "pk",
+                        "value": sub_table_pk
+                    }
+
+                    ### Loop nested table
+                    self._parse_table(sub_table_name, mapping_in, data_in)
+                    
+                    ### Returning sub table PK
+                    value = sub_table_pk
+                
+                else:
+                    value = ""
+
+                ### Primary key return to the root table
+                header = column
+                
+            ### Sub table's Primary Key
+            ### Source: injected new property when new table is found in the mapping
+            elif mapping[column]["type"]=="pk":
+                # look if destination is overriden in mapping
+                if mapping.get('parentKey',{}).get('destination'):
+                    header = mapping.get('parentKey').get('destination')
+                else:
+                    header = column
+                value = mapping[column]["value"]
+            
+            elif mapping[column]["type"]=="user":
+                header = column
+                value = self._user_values.get(column)
+            elif mapping[column]["type"]=="user_index":
+                header = column
+                ## validate
+                value = self._validate_user_index_mapping(mapping, data, column, table_name, row_number)
+                
+            else:
+                print('Unsupported type ' + mapping[column]["type"])
+
+            ### Injecting new table elements for the row
+            row_out[header] = value
+
+        ### Storing JSON tables
+        out_file = self.out_file
+        out_file[table_name].append(row_out)
+        self.out_file = out_file
+
+        return
+
+    def _validate_user_index_mapping(self, mapping, data, column, table_name, index):
+
+        index_keys = self._user_values.get("user_index")
+        if not index_keys:
+            raise ValueError(
+                    'No index fields specified for "user_index mapping" name:' + column)
+        missing_keys = [index for index in index_keys if not data.get(index) and index not in [KEY_PARENT_TABLE, KEY_UUID, KEY_ROW_NUMBER]]
+        if missing_keys:
+            raise ValueError('Some keys specified in "user_index" mapping are missing in data: [{}]'.format(
+                    ','.join(missing_keys)))
+        if KEY_PARENT_TABLE in index_keys and not mapping.get(KEY_PARENT_TABLE):
+            raise ValueError(
+                    '"parent_key" is missing in (sub)table mapping but is specified, table [{}]'.format(table_name))
+
+        value = '|'.join([str(data[col])
+                          for col in index_keys if col not in [KEY_PARENT_TABLE, KEY_UUID, KEY_ROW_NUMBER]])
+        if KEY_PARENT_TABLE in index_keys:
+            value += '|' + mapping[KEY_PARENT_TABLE]['value']
+        # uuid if present
+        if KEY_UUID in index_keys:
+            value += "-"+str(uuid.uuid4().hex)
+        # row_number if present
+        if KEY_ROW_NUMBER in index_keys:
+            value += "-" + str(index)
+            
+        # return hash
+        return value
+
+
+    def _parse_table(self, table_name, mapping, data):
+        """
+        Parsing table data
+        Determining the type of the sub-table
+        *** Subfunction of parse() ***
+        """
+
+        if type(data) == dict:
+            self.parsing(table_name, mapping, data, None)
+
+        elif type(data) == list:
+            for index, row in enumerate(data):
+                self.parsing(table_name, mapping, row, index)
+
+        return
+
+    def get_primary_key(self, table_name, mapping):
+        """
+        Filtering out all the primary keys within the mapping table
+        """
+
+        ### If table_name does not exist in the PK list
+        if table_name not in self.out_file_pk_raw:
+            self.out_file_pk_raw[table_name] = []
+            self.out_file_pk[table_name] = []
+
+        for column in mapping:
+            ### Column type is "column"
+            if not mapping[column].get("type") or mapping[column].get("type") in ["column", 'user_index']:
+                ### Search if the priamryKey property is within the mapping configuration
+                if "primaryKey" in mapping[column]["mapping"].keys():
+                    ### Confirm if the primary key tab is true
+                    if mapping[column]["mapping"]["primaryKey"]:
+                        self.out_file_pk_raw[table_name].append(column)
+                        self.out_file_pk[table_name].append(mapping[column]["mapping"]["destination"])
+            ### Column type is "table"
+            elif mapping[column]["type"]=="table":
+                ## add parentKey if primary
+                if mapping[column].get('parentKey',{}).get('primaryKey', False):
+                    self.out_file_pk_raw[mapping[column]["destination"]]=[column]
+                    self.out_file_pk[mapping[column]["destination"]] = [mapping[column]["parentKey"]['destination']]
+                ### Recursively run the tableMapping
+                self.get_primary_key(table_name=mapping[column]["destination"], mapping=mapping[column]["tableMapping"])
+
+        return
+
+    def produce_manifest(self, file_name, primary_key):
+        """
+        Dummy function to return header per file type.
+        """
+
+        file = "/data/out/tables/"+str(file_name)+".manifest"
+        logging.debug("Manifest output: {0}".format(file))
+        #destination_part = file_name.split(".csv")[0]
+
+        manifest_template = {
+                            #"source": "myfile.csv"
+                            #,"destination": "in.c-mybucket.table"
+                            #"incremental": bool(incremental)
+                            #,"primary_key": ["VisitID","Value","MenuItem","Section"]
+                            #,"columns": [""]
+                            #,"delimiter": "|"
+                            #,"enclosure": ""
+                            }
+
+        column_header = []
+
+        manifest = manifest_template
+        #manifest["primary_key"] = primary_key
+
+        try:
+            with open(file, 'w') as file_out:
+                json.dump(manifest, file_out)
+                #logging.info("Output manifest file ({0}) produced.".format(file_name))
+        except Exception as e:
+            logging.error("Could not produce output file manifest.")
+            logging.error(e)
+        
+        return
+
+    def output(self, file_uid, store_as_sliced):
+        """
+        Output Data with its desired file name
+        Return:
+        result_files -- Array of dictionary 
+            e.g. {'file_path':'data/out/file_1.csv',
+                   'name' : file_1.csv,
+                    'prefix' : file,
+                    'ids' : ['id','parent_id']
+                 }
+        return_res_cols -- dict of return columns if specified, e.g. {'id':[1,2,3,4]}   
+        """
+        
+        ### Outputting files
+        result_files = []
+        return_res_cols = OrderedDict()
+        out_file = self.out_file
+        for file in out_file:
+            out_df = pd.DataFrame(out_file[file], dtype=str)
+            if file == 'check-payment_refund':
+                logging.debug('processing modifier')
+            # skip if result empty
+            if (out_df.empty):
+                logging.info('%s is empty, skipping.',out_file[file])
+                return [], []
+            # get return values if any
+            if isinstance(self._return_col, dict) and self._return_col.get(file):
+                return_res_cols.update({file: 
+                                        {self._return_col.get(file) : out_df[self._return_col.get(file)].tolist()}
+                                        })
+            suffix = ''
+            if file_uid:
+                suffix = '_' + str(file_uid)
+            file_name = file + suffix + ".csv"
+            if store_as_sliced:
+                dest_dir = os.path.join(self.output_destination, file)
+                if not os.path.exists(dest_dir):
+                    os.makedirs(dest_dir)
+                file_dest = os.path.join(dest_dir, file_name)
+            else:
+                file_dest = os.path.join(self.output_destination, file_name)
+
+            out_df.to_csv(file_dest, index=False)
+            logging.debug("Table output: {0}...".format(file_dest))
+            result_files.append({'file_path' : file_dest,
+                                 'name' : file_name,
+                                 'prefix' : file,
+                                 'ids' : self.out_file_pk[file]
+                                 })
+
+
+
+        return result_files, return_res_cols
+
+
+================================================
+File: /kbc/client_base.py
+================================================
+'''
+Created on 5. 10. 2018
+
+@author: esner
+'''
+import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+import json
+
+
+class HttpClientBase:
+    """
+    Base class for implementing a single endpoint related to a single entities
+
+    Attributes:
+        base_url (str): The base URL for this endpoint.
+    """
+
+    def __init__(self, base_url, max_retries = 10, backoff_factor = 0.3, status_forcelist = (500, 502, 504), default_http_header=[], auth = None, default_params = None):
+        """
+        Create an endpoint.
+
+        Args
+            root_url (str): Root url of API.
+
+        """
+        if not base_url:
+            raise ValueError("Base URL is required.")
+        self.base_url = base_url
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        self.status_forcelist = status_forcelist
+        self._auth = auth
+        self._auth_header = default_http_header
+        self._default_params = default_params
+
+    def requests_retry_session(self, session=None):
+        session = session or requests.Session()
+        retry = Retry(
+            total=self.max_retries,
+            read=self.max_retries,
+            connect=self.max_retries,
+            backoff_factor=self.backoff_factor,
+            status_forcelist=self.status_forcelist
+            )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        return session
+
+
+    def _get_raw(self, url, params=None, **kwargs):
+        """
+        Construct a requests GET call with args and kwargs and process the
+        results.
+
+
+        Args:
+            url (str): requested url
+            params (dict): additional url params to be passed to the underlying
+                requests.get
+            **kwargs: Key word arguments to pass to the get requests.get
+
+        Returns:
+            r (requests.Response): object
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        s.auth = self._auth
+        
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        s.headers.update(headers)
+        #set default params
+        if self._default_params:
+            params = self._default_params.update(params)
+        
+        r = self.requests_retry_session(session=s).request('GET', url = url, params = params, auth = self._auth, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            # Handle different error codes
+            raise Exception('Request failed with code: {}, message: {}'.format(r.status_code, r.text))
+        else:
+            return r
+    
+    def get(self, url, params =None, **kwargs):
+        r = self._get_raw(url, params, **kwargs)
+        return r.json()
+
+    def _post_raw(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+            **kwargs: Key word arguments to pass to the post request.
+
+        Returns:
+            body: 
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        s.headers.update(headers)
+        s.auth = self._auth
+        
+        params = kwargs.pop('params')
+        #set default params
+        if self._default_params:
+            kwargs.update({'params' :self._default_params.update(params)})
+        
+        r = self.requests_retry_session(session=s).request('POST', *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            # Handle different error codes
+            raise
+        else:
+            return r
+
+    def post(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+            **kwargs: Key word arguments to pass to the post request.
+
+        Returns:
+            body: json reposonse
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        s = requests.Session()
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        
+        params = kwargs.pop('params')
+        #set default params
+        if self._default_params:
+            kwargs.update({'params' :self._default_params.update(params)})
+        r = self.requests_retry_session(session=s).request('POST', headers=headers, *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            # Handle different error codes
+            raise
+        else:
+            return r.json()
+
+    def _patch(self, *args, **kwargs):
+        """
+        Construct a requests POST call with args and kwargs and process the
+        results.
+
+        Args:
+            *args: Positional arguments to pass to the post request.
+            **kwargs: Key word arguments to pass to the post request.
+
+        Returns:
+            body: Response body parsed from json.
+
+        Raises:
+            requests.HTTPError: If the API request fails.
+        """
+        headers = kwargs.pop('headers', {})
+        headers.update(self._auth_header)
+        r = requests.patch(headers=headers, *args, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            # Handle different error codes
+            raise
+        else:
+            return r
+
+
+================================================
+File: /kbc/env_handler.py
+================================================
+#==============================================================================
+# KBC Env handler
+#==============================================================================
+
+
+#============================ Import libraries ================================
+import logging
+import json
+import os
+import csv
+import pytz
+import sys
+from collections import Counter
+from keboola import docker
+import datetime
+from dateutil.relativedelta import relativedelta
+
+DEFAULT_DEL = ','
+DEFAULT_ENCLOSURE = '"'
+
+
+class KBCEnvHandler:
+    def __init__(self, mandatory_params, data_path=None):
+        # fetch data folder from ENV by default
+        if not data_path:
+            data_path = os.environ.get('KBC_DATADIR')
+
+        self.kbc_config_id = os.environ.get('KBC_CONFIGID')
+        
+        self.data_path = data_path
+        self.configuration = docker.Config(data_path)
+        self.cfg_params = self.configuration.get_parameters()
+        self.tables_out_path = os.path.join(data_path, 'out', 'tables')
+        self.tables_in_path = os.path.join(data_path, 'in', 'tables')
+
+        self._mandatory_params = mandatory_params
+
+#==============================================================================
+
+    def validateConfig(self):
+        '''
+        Validates config based on provided mandatory params.
+        Parameters can be grouped as arrays [Par1,Par2] => at least one of the pars has to be present
+        [par1,[par2,par3]] => either par1 OR both par2 and par3 needs to be present
+        '''
+        parameters = self.cfg_params
+        missing_fields = []
+        for field in self._mandatory_params:
+            if isinstance(field, list):
+                missing_fields.extend(self._validate_par_group(field))            
+            elif not parameters.get(field):
+                missing_fields.append(field)
+
+        if missing_fields:
+            raise ValueError(
+                'Missing mandatory configuration fields: [{}] '.format(', '.join(missing_fields)))
+
+    def _validate_par_group(self, par_group):
+        missing_fields = []
+        is_present = False
+        for par in par_group:
+            if isinstance(par,list):
+                missing_subset = self._get_par_missing_fields(par)
+                missing_fields.extend(missing_subset)
+                if not missing_subset:
+                    is_present = True
+                    
+            elif self.cfg_params.get(par):                
+                is_present = True
+            else:
+                missing_fields.append(par)
+        if not is_present:
+            return missing_fields
+        else:
+            return []
+    
+    def _get_par_missing_fields(self, mand_params):
+        parameters = self.cfg_params
+        missing_fields = []
+        for field in mand_params:
+           if not parameters.get(field):
+                missing_fields.append(field)
+        return missing_fields
+    
+    
+    
+    
+    def get_input_table_by_name(self, table_name):
+        tables = self.configuration.get_input_tables()
+        table = [t for t in tables if t.get('destination') == table_name]
+        if not table:
+            raise ValueError('Specified input mapping [{}] does not exist'.format(table_name))
+        return table[0]
+
+
+#================================= Logging ====================================
+
+    def set_default_logger(self, log_level = 'INFO'):
+        root = logging.getLogger()
+
+
+        hdl = logging.StreamHandler(sys.stdout)
+        logging.basicConfig(
+            level=log_level,
+            format='%(levelname)s - %(message)s',
+            handlers = [hdl])
+
+        logger = logging.getLogger()
+        return logger
+
+    def get_state_file(self):
+        logging.getLogger().info('Loading state file..')
+        state_file_path = os.path.join(self.data_path, 'in', 'state.json')
+        if not os.path.isfile(state_file_path):
+            logging.getLogger().info('State file not found. First run?')
+            return
+        try:
+            with open(state_file_path, 'r') \
+                    as state_file:
+                return json.load(state_file)
+        except (OSError, IOError):
+            raise ValueError(
+                "State file state.json unable to read "
+            )
+    def write_state_file(self, state_dict):
+        if not isinstance(state_dict, dict):
+            raise TypeError('Dictionary expected as a state file datatype!')
+
+        with open(os.path.join(self.configuration.data_dir,'out','state.json'), 'w+') as state_file:
+            json.dump(state_dict, state_file)
+
+    def create_sliced_tables(self, folder_name, pkey=None, incremental=False, src_delimiter=DEFAULT_DEL, src_enclosure=DEFAULT_ENCLOSURE, dest_bucket=None):
+        """
+        Creates prepares sliced tables from all files in DATA_PATH/out/tables/{folder_name} - i.e. removes all headers
+        and creates single manifest file based on provided parameters.
+
+        folder_name -- folder name in DATA_PATH directory that contains files for slices, the same name will be used as table name
+        src_enclosure -- enclosure of the source file ["]
+        src_delimiter -- delimiter of the source file [,]
+        dest_bucket -- name of the destination bucket (optional)
+
+
+        """
+        log = logging
+        log.info('Creating sliced tables for [{}]..'.format(folder_name))
+
+        folder_path = os.path.join(self.tables_out_path, folder_name)
+
+        if not os.path.isdir(folder_path):
+            raise ValueError("Specified folder ({}) does not exist in the data folder ({})".format(
+                folder_name, self.data_path))
+
+        # get files
+        files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if os.path.isfile(
+            os.path.join(folder_path, f))]
+
+        header = self.get_and_remove_headers_in_all(
+            files, src_delimiter, src_enclosure)
+        if dest_bucket:
+            destination = dest_bucket + '.' + folder_name
+        else:
+            destination = folder_name
+        
+
+        log.info('Creating manifest file..')
+        self.configuration.write_table_manifest(
+            file_name=folder_path, destination=destination, primary_key=pkey, incremental=incremental, columns=header)
+
+    def get_and_remove_headers_in_all(self, files, delimiter, enclosure):
+        """
+        Removes header from all specified files and return it as a list of strings
+
+        Throws error if there is some file with different header.
+
+        """
+        first_run = True
+        for file in files:
+            curr_header = self._get_and_remove_headers(
+                file, delimiter, enclosure)
+            if first_run:
+                header = curr_header
+                first_file = file
+                first_run = False
+            # check whether header matches
+            if Counter(header) != Counter(curr_header):
+                raise Exception('Header in file {}:[{}] is different than header in file {}:[{}]'.format(
+                    first_file, header, file, curr_header))
+        return header
+
+    def _get_and_remove_headers(self, file, delimiter, enclosure):
+        """
+        Removes header from specified file and return it as a list of strings.
+        Creates new updated file 'upd_'+origFileName and deletes the original
+        """
+        head, tail = os.path.split(file)
+        with open(file, "r") as input_file:
+            with open(os.path.join(head, 'upd_' + tail), 'w+',  newline='') as updated:
+                reader = csv.DictReader(
+                    input_file, delimiter=delimiter, quotechar=enclosure)
+                header = reader.fieldnames
+                writer = csv.DictWriter(
+                    updated, fieldnames=header, delimiter=DEFAULT_DEL, quotechar=DEFAULT_ENCLOSURE)
+                for row in reader:
+                    # write row
+                    writer.writerow(row)
+        os.remove(file)
+        return header
+#==============================================================================
+#== UTIL functions
+
+    def get_past_date(self, str_days_ago, to_date = None, tz = pytz.utc):
+        '''
+        Returns date in specified timezone relative to today.
+        
+        e.g.
+        '5 hours ago',
+        'yesterday',
+        '3 days ago',
+        '4 months ago',
+        '2 years ago',
+        'today'
+        '''
+        if to_date:
+            TODAY = to_date
+        else:
+            TODAY = datetime.datetime.now(tz)
+        splitted = str_days_ago.split()
+        if len(splitted) == 1 and splitted[0].lower() == 'today':
+            return TODAY
+        elif len(splitted) == 1 and splitted[0].lower() == 'yesterday':
+            date = TODAY - relativedelta(days=1)
+            return date
+        elif splitted[1].lower() in ['hour', 'hours', 'hr', 'hrs', 'h']:
+            date = datetime.datetime.now() - relativedelta(hours=int(splitted[0]))
+            return date.date()
+        elif splitted[1].lower() in ['day', 'days', 'd']:
+            date = TODAY - relativedelta(days=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['wk', 'wks', 'week', 'weeks', 'w']:
+            date = TODAY - relativedelta(weeks=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['mon', 'mons', 'month', 'months', 'm']:
+            date = TODAY - relativedelta(months=int(splitted[0]))
+            return date
+        elif splitted[1].lower() in ['yrs', 'yr', 'years', 'year', 'y']:
+            date = TODAY - relativedelta(years=int(splitted[0]))
+            return date
+        else:
+            raise ValueError('Invalid relative period!')
+
+
+
+
+================================================
+File: /configSchema.json
+================================================
+{
+	"type": "object",
+	"title": "Gusto Export API extractor configuration",
+	"required": [
+		"user",
+		"#pass",
+		"customer_id",
+		"master_location_id",
+		"#vendor_id",
+		"period_from",
+		"period_to",
+		"since_last",
+		"relative_period"
+	],
+	"properties": {
+		"user": {
+			"type": "string",
+			"title": "Gusto user name",
+			"propertyOrder": 100
+		},
+		"#pass": {
+			"type": "string",
+			"title": "Gusto password",
+			"format": "password",
+			"propertyOrder": 200
+		},
+		"customer_id": {
+			"type": "string",
+			"title": "Gusto customer id",
+			"propertyOrder": 300
+		},
+		"master_location_id": {
+			"type": "string",
+			"title": "Master location id",
+			"propertyOrder": 400
+		},
+		"#vendor_id": {
+			"type": "string",
+			"format": "password",
+			"title": "Gusto vendor id",
+			"propertyOrder": 500
+		},
+		"period_from": {
+			"type": "string",
+			"format": "date",
+			"title": "Period from date",
+			"propertyOrder": 600
+		},
+		"period_to": {
+			"type": "string",
+			"format": "date",
+			"title": "Period to date",
+			"propertyOrder": 700
+		},
+		"relative_period": {
+			"type": "string",
+			"title": "Relative period from now (utc)",
+			"description": "Relative period in format: '5 hours ago', 'yesterday','3 days ago', '4 months ago', '2 years ago', 'today'. Overrides `from` and `to` parameters.",
+			"propertyOrder": 710
+		},
+		"backfill_mode": {
+			"type": "number",
+			"title": "Backfill mode",
+			"description": "If backfill mode is enabled, each consecutive run of the component will continue from the end of the last run period, until current date is reached. The From and To date parameters are used to define Start date of the back-fill and also relative window of each run.",
+			"propertyOrder": 720,
+			"enum": [
+				0,
+				1
+			],
+			"default": 0,
+			"options": {
+				"enum_titles": [
+					"No",
+					"Yes"
+				]
+			}
+		},
+		"since_last": {
+			"type": "number",
+			"title": "Continue since last start",
+			"description": "Flag whether to continue since last extraction date (must be within 14 days)",
+			"propertyOrder": 800,
+			"enum": [
+				0,
+				1
+			],
+			"default": 0,
+			"options": {
+				"enum_titles": [
+					"No",
+					"Yes"
+				]
+			}
+		}
+	}
+}
+
 
 ================================================
 File: /generic-mapping/mappings.json
@@ -768,107 +2008,6 @@ File: /generic-mapping/mappings.json
 
 
 ================================================
-File: /configSchema.json
-================================================
-{
-	"type": "object",
-	"title": "Gusto Export API extractor configuration",
-	"required": [
-		"user",
-		"#pass",
-		"customer_id",
-		"master_location_id",
-		"#vendor_id",
-		"period_from",
-		"period_to",
-		"since_last",
-		"relative_period"
-	],
-	"properties": {
-		"user": {
-			"type": "string",
-			"title": "Gusto user name",
-			"propertyOrder": 100
-		},
-		"#pass": {
-			"type": "string",
-			"title": "Gusto password",
-			"format": "password",
-			"propertyOrder": 200
-		},
-		"customer_id": {
-			"type": "string",
-			"title": "Gusto customer id",
-			"propertyOrder": 300
-		},
-		"master_location_id": {
-			"type": "string",
-			"title": "Master location id",
-			"propertyOrder": 400
-		},
-		"#vendor_id": {
-			"type": "string",
-			"format": "password",
-			"title": "Gusto vendor id",
-			"propertyOrder": 500
-		},
-		"period_from": {
-			"type": "string",
-			"format": "date",
-			"title": "Period from date",
-			"propertyOrder": 600
-		},
-		"period_to": {
-			"type": "string",
-			"format": "date",
-			"title": "Period to date",
-			"propertyOrder": 700
-		},
-		"relative_period": {
-			"type": "string",
-			"title": "Relative period from now (utc)",
-			"description": "Relative period in format: '5 hours ago', 'yesterday','3 days ago', '4 months ago', '2 years ago', 'today'. Overrides `from` and `to` parameters.",
-			"propertyOrder": 710
-		},
-		"backfill_mode": {
-			"type": "number",
-			"title": "Backfill mode",
-			"description": "If backfill mode is enabled, each consecutive run of the component will continue from the end of the last run period, until current date is reached. The From and To date parameters are used to define Start date of the back-fill and also relative window of each run.",
-			"propertyOrder": 720,
-			"enum": [
-				0,
-				1
-			],
-			"default": 0,
-			"options": {
-				"enum_titles": [
-					"No",
-					"Yes"
-				]
-			}
-		},
-		"since_last": {
-			"type": "number",
-			"title": "Continue since last start",
-			"description": "Flag whether to continue since last extraction date (must be within 14 days)",
-			"propertyOrder": 800,
-			"enum": [
-				0,
-				1
-			],
-			"default": 0,
-			"options": {
-				"enum_titles": [
-					"No",
-					"Yes"
-				]
-			}
-		}
-	}
-}
-
-
-================================================
 File: /Dockerfile
 ================================================
 FROM quay.io/keboola/docker-custom-python:latest
@@ -879,98 +2018,6 @@ WORKDIR /data/
 
 
 CMD ["python", "-u", "/code/component.py"]
-
-
-================================================
-File: /gusto/client.py
-================================================
-'''
-Created on 15. 10. 2018
-
-@author: esner
-'''
-from kbc.client_base import HttpClientBase
-
-DEAFULT_BASE_V1 = 'https://gustoexportprod.azurewebsites.net/'
-BASE_ENDPOINT_MASK = 'export/v1/{}/{}'
-
-BASE_ENDPOINT_URL_MASK = DEAFULT_BASE_V1 + BASE_ENDPOINT_MASK
-
-KEY_VENDOR_ID = 'vendor_id'
-KEY_DATATYPE = 'data_type'
-KEY_SUBTYPE = 'sub_data_type'
-KEY_DATA_DELTA = 'delta_from'
-
-KEY_LOCATION = 'location'
-KEY_CHECKS = 'checks'
-KEY_ORDER_TYPE = 'order_type'
-KEY_CATEGORY = 'category'
-
-CONFIG_DATA_TYPE = 'config'
-
-MAX_RETIRES = 10
-STATUS_FORCE_LIST = (500, 502, 504)
-
-
-class Client(HttpClientBase):
-
-    def __init__(self, customer_id, master_location_id, vendor_id, user, password, base_url=DEAFULT_BASE_V1):
-
-        HttpClientBase.__init__(
-            self, base_url, max_retries=MAX_RETIRES, status_forcelist=STATUS_FORCE_LIST, auth = (user, password))
-        self._customer_id = customer_id
-        self._master_location_id = master_location_id
-        self._vendor_id = vendor_id
-
-    def get_location(self, customer_id = None, master_location_id = None, 
-                   vendor_id = None, data_delta = None):
-
-        return self._get_request(customer_id, master_location_id,
-                          vendor_id, CONFIG_DATA_TYPE, KEY_LOCATION, data_delta)
-    
-    def get_category(self, customer_id = None, master_location_id = None, 
-                   vendor_id = None, data_delta = None):
-
-        return self._get_request(customer_id, master_location_id,
-                          vendor_id, CONFIG_DATA_TYPE, KEY_CATEGORY, data_delta)
-
-    def get_order_type(self, customer_id = None, master_location_id = None, 
-                   vendor_id = None, data_delta = None):
-
-        return self._get_request(customer_id, master_location_id,
-                          vendor_id, CONFIG_DATA_TYPE, KEY_ORDER_TYPE, data_delta)
-        
-    def get_checks(self, location_id = None, customer_id = None, 
-                   vendor_id = None, data_delta = None, start_date = None, end_date = None):
-        
-        add_params = {'start_date' : start_date,
-                      'end_date' : end_date}
-        
-        
-        return self._get_request(customer_id, location_id,
-                          vendor_id, KEY_CHECKS, None, data_delta, **add_params)
-        
-    
-
-    def _get_request(self, customer_id, master_location_id, vendor_id, req_data_type, req_sub_data_type, data_delta, **additional_params):
-
-        # default vaules if empty
-        if not customer_id:
-            customer_id = self._customer_id
-        if not master_location_id:
-            master_location_id = self._master_location_id
-        if not vendor_id:
-            vendor_id = self._vendor_id
-            
-        url = BASE_ENDPOINT_URL_MASK.format(customer_id, master_location_id)
-
-        params = {KEY_VENDOR_ID: vendor_id,
-                  KEY_DATATYPE: req_data_type,
-                  KEY_SUBTYPE: req_sub_data_type,
-                  KEY_DATA_DELTA: data_delta}
-        params.update(additional_params)
-
-        return self.get(url, params)
 
 
 ================================================
@@ -1111,1143 +2158,96 @@ class GustoService:
         
 
 ================================================
-File: /bitbucket-pipelines.yml
-================================================
-options:
-  docker: true
-
-pipelines:
-  default:
-    - step:
-        script:
-          - export APP_IMAGE=keboola-component
-          - docker build . --tag=$APP_IMAGE
-          - docker images
-
-  tags:
-    '*':
-      - step:
-          script:
-          - export APP_IMAGE=keboola-component
-          - docker build . --tag=$APP_IMAGE
-          - docker images
-          - ./deploy.sh
-
-================================================
-File: /component.py
+File: /gusto/client.py
 ================================================
 '''
+Created on 15. 10. 2018
 
 @author: esner
 '''
-from kbc.env_handler import KBCEnvHandler
-from gusto.client_service import GustoService
-import logging
-import math
-import pytz
+from kbc.client_base import HttpClientBase
 
-from datetime import datetime
-from datetime import timedelta
+DEAFULT_BASE_V1 = 'https://gustoexportprod.azurewebsites.net/'
+BASE_ENDPOINT_MASK = 'export/v1/{}/{}'
 
-KEY_USER = 'user'
-KEY_PASS = '#pass'
-KEY_CUSTOMER_ID = 'customer_id'
-KEY_MASTER_LOCATION_ID = 'master_location_id'
-KEY_VENDOR_ID = '#vendor_id'
+BASE_ENDPOINT_URL_MASK = DEAFULT_BASE_V1 + BASE_ENDPOINT_MASK
 
+KEY_VENDOR_ID = 'vendor_id'
+KEY_DATATYPE = 'data_type'
+KEY_SUBTYPE = 'sub_data_type'
+KEY_DATA_DELTA = 'delta_from'
 
-KEY_PERIOD_FROM = 'period_from'
-KEY_PERIOD_TO = 'period_to'
-KEY_RELATIVE_PERIOD = 'relative_period'
-KEY_BACKFILL_MODE = 'backfill_mode'
-KEY_MAND_PERIOD_GROUP = [KEY_PERIOD_FROM, KEY_PERIOD_TO]
-KEY_MAND_DATE_GROUP = [KEY_RELATIVE_PERIOD, KEY_MAND_PERIOD_GROUP]
+KEY_LOCATION = 'location'
+KEY_CHECKS = 'checks'
+KEY_ORDER_TYPE = 'order_type'
+KEY_CATEGORY = 'category'
 
-MAX_PERIOD_SIZE = 10
+CONFIG_DATA_TYPE = 'config'
 
-MANDATORY_PARS = [KEY_USER, KEY_PASS, KEY_CUSTOMER_ID,
-                  KEY_MASTER_LOCATION_ID, KEY_VENDOR_ID, KEY_MAND_DATE_GROUP]
-
-APP_VERSION = '0.1.6'
+MAX_RETIRES = 10
+STATUS_FORCE_LIST = (500, 502, 504)
 
 
-class Component(KBCEnvHandler):
+class Client(HttpClientBase):
 
-    def __init__(self, data_path = None):
-        KBCEnvHandler.__init__(self, MANDATORY_PARS, data_path = data_path)
+    def __init__(self, customer_id, master_location_id, vendor_id, user, password, base_url=DEAFULT_BASE_V1):
 
-    def run(self, debug=False):
-        '''
-        Main execution code
-        '''
-        # setup
-        self.set_default_logger('DEBUG' if debug else 'INFO')
-        logging.info('Running version %s', APP_VERSION)
-        logging.info('Loading configuration...')
-        self.validateConfig()
-        params = self.cfg_params
-        backfill_mode = params.get(KEY_BACKFILL_MODE)
-        if backfill_mode and not (params.get(KEY_PERIOD_FROM) and params.get(KEY_PERIOD_TO)):
-            logging.error(
-                'Period from and Period To paremeters must be defined when backfill mode is on!')
-            exit(1)
+        HttpClientBase.__init__(
+            self, base_url, max_retries=MAX_RETIRES, status_forcelist=STATUS_FORCE_LIST, auth = (user, password))
+        self._customer_id = customer_id
+        self._master_location_id = master_location_id
+        self._vendor_id = vendor_id
 
-        gservice = GustoService(params[KEY_CUSTOMER_ID], params[KEY_MASTER_LOCATION_ID],
-                                params[KEY_VENDOR_ID], params[KEY_USER], params[KEY_PASS])
+    def get_location(self, customer_id = None, master_location_id = None, 
+                   vendor_id = None, data_delta = None):
 
-        extract_time = datetime.utcnow()
-        start_date, end_date, periods = self._get_date_periods()
+        return self._get_request(customer_id, master_location_id,
+                          vendor_id, CONFIG_DATA_TYPE, KEY_LOCATION, data_delta)
+    
+    def get_category(self, customer_id = None, master_location_id = None, 
+                   vendor_id = None, data_delta = None):
 
-        last_delta = None
-        last_state = self.get_state_file()
-        if last_state and params['since_last'] and last_state['data_delta'] and last_state['data_delta'] != 'None':
-            start_date = datetime.strptime(last_state['data_delta'], '%m%d%Y')
-            end_date = datetime.utcnow()            
-            last_delta = last_state['data_delta']
-        elif self.cfg_params.get(KEY_RELATIVE_PERIOD):
-            from_date = super().get_past_date(self.cfg_params.get(KEY_RELATIVE_PERIOD))
-            last_delta = from_date.strftime("%m%d%Y")
+        return self._get_request(customer_id, master_location_id,
+                          vendor_id, CONFIG_DATA_TYPE, KEY_CATEGORY, data_delta)
 
-        # get locations
-        logging.info('Getting locations..')
-        res_files, loc_ids = gservice.get_n_save_location(
-            self.tables_out_path, None, extract_time)
-        # create manifests
-        self._create_manifests(res_files)
+    def get_order_type(self, customer_id = None, master_location_id = None, 
+                   vendor_id = None, data_delta = None):
 
+        return self._get_request(customer_id, master_location_id,
+                          vendor_id, CONFIG_DATA_TYPE, KEY_ORDER_TYPE, data_delta)
         
-        # get locations
-        logging.info('Getting categories..')
-        res_files = gservice.get_n_save_category(
-            self.tables_out_path, None, extract_time)
-        # create manifests
-        self._create_manifests(res_files)
-
+    def get_checks(self, location_id = None, customer_id = None, 
+                   vendor_id = None, data_delta = None, start_date = None, end_date = None):
         
-        # get locations
-        logging.info('Getting order types..')
-        res_files = gservice.get_n_save_order_type(
-            self.tables_out_path, None, extract_time)
-        # create manifests
-        self._create_manifests(res_files)
-
-        logging.info('Fetching checks data for period %s - %s', start_date.date(), end_date.date())
-        index = 0
-        res_files = []
-        for loc_id in loc_ids['location']['id']:
-            # skip master locations
-            if str(loc_id) == params[KEY_MASTER_LOCATION_ID]:
-                continue
-
-            logging.info('Downloading checks for location id:%s', loc_id)
-
-            index += 1
-            if last_delta and (params['since_last'] or params[KEY_RELATIVE_PERIOD]):
-                res_files_local, cl, delta = gservice.get_n_save_checks(self.tables_out_path, loc_id, loc_id,
-                                                                        None, None, time_delta=last_delta, store_as_sliced=True)
-            else:
-                res_files_local, delta = self._get_checks_in_periods(
-                    loc_id, periods, gservice)
-
-            res_files += res_files_local
-
-        # create manifests
-        logging.info('Preparing checks sliced tables')
-        self._create_manifests_sliced(res_files)
-        # write statefile
-        self.write_state_file({'data_delta': str(delta),
-                               'last_period': {'start_date': str(start_date.date()),
-                                                   'end_date': str(end_date.date())}})
-
+        add_params = {'start_date' : start_date,
+                      'end_date' : end_date}
         
-        logging.info('Extraction finshed sucessfully')
+        
+        return self._get_request(customer_id, location_id,
+                          vendor_id, KEY_CHECKS, None, data_delta, **add_params)
+        
+    
 
-    def _get_checks_in_periods(self, loc_id, periods, gservice):
-        res_in_period = []
-        last_delta = ''
-        res_files = []
-        for period in periods:
-            uid = str(loc_id) + '_' + \
-                period['start_date'] + '_' + period['end_date']
-            res_files, cols, delta = gservice.get_n_save_checks(self.tables_out_path, uid, loc_id,
-                                                                period['start_date'], period['end_date'], store_as_sliced=True)
-            last_delta = delta
-            res_in_period += res_files
-        return res_in_period, last_delta
+    def _get_request(self, customer_id, master_location_id, vendor_id, req_data_type, req_sub_data_type, data_delta, **additional_params):
 
-    def _get_date_periods(self):
-        periods = []
-        if self.cfg_params.get(KEY_BACKFILL_MODE):
-            start_date, end_date = self._get_backfill_period()
-            periods = list(self._split_dates_to_chunks(
-                start_date, end_date, MAX_PERIOD_SIZE))
-
-        elif self.cfg_params.get(KEY_RELATIVE_PERIOD):
-            start_date = super().get_past_date(self.cfg_params.get(KEY_RELATIVE_PERIOD))
-            end_date = datetime.now()
-            periods = list(self._split_dates_to_chunks(
-                start_date.date(), end_date.date(), MAX_PERIOD_SIZE))
-
-        elif self.cfg_params.get(KEY_PERIOD_FROM) and self.cfg_params.get(KEY_PERIOD_TO):
-            start_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
-            end_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
-            periods = list(self._split_dates_to_chunks(
-                start_date, end_date, MAX_PERIOD_SIZE))
+        # default vaules if empty
+        if not customer_id:
+            customer_id = self._customer_id
+        if not master_location_id:
+            master_location_id = self._master_location_id
+        if not vendor_id:
+            vendor_id = self._vendor_id
             
+        url = BASE_ENDPOINT_URL_MASK.format(customer_id, master_location_id)
 
-        elif self.cfg_params.get(KEY_PERIOD_FROM) and self.cfg_params.get(KEY_PERIOD_TO):
-            start_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
-            end_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
-            periods = list(self._split_dates_to_chunks(
-                start_date, end_date, MAX_PERIOD_SIZE))
+        params = {KEY_VENDOR_ID: vendor_id,
+                  KEY_DATATYPE: req_data_type,
+                  KEY_SUBTYPE: req_sub_data_type,
+                  KEY_DATA_DELTA: data_delta}
+        params.update(additional_params)
 
-        else:
-            end_date = datetime.utcnow()
-            start_date = self.get_past_date(
-                '14 days ago', end_date)
-            periods = [{'start_date': start_date.strftime("%m%d%Y"),
-                        'end_date': end_date.strftime("%m%d%Y")}]
-        return start_date, end_date, periods
+        return self.get(url, params)
 
-    def _split_dates_to_chunks(self, start_date, end_date, intv, strformat="%m%d%Y"):
-        nr_days = (end_date - start_date).days
-        if nr_days < intv:
-            yield {'start_date': start_date.strftime(strformat),
-                   'end_date': end_date.strftime(strformat)}
-        else:            
-            diff = (end_date - start_date) / (math.ceil(nr_days/intv))
-            for i in range(math.ceil(nr_days/intv)):
-                yield {'start_date': (start_date + diff * i).strftime(strformat),
-                       'end_date': (start_date + diff * (i + 1)).strftime(strformat)}
-
-    def _create_manifests(self, res_files):
-        for file in res_files:
-            self.configuration.write_table_manifest(
-                file_name=file['file_path'],
-                destination=file['prefix'],
-                primary_key=file['ids'])
-
-    def _create_manifests_sliced(self, res_files):
-
-        res_sliced_folders = {}
-        for file in res_files:
-            res_sliced_folders.update({file['prefix']: (file['ids'])})
-
-        for folder in res_sliced_folders:
-            self.create_sliced_tables(folder, res_sliced_folders[folder], True)
-    
-    def _get_backfill_period(self):
-        state = self.get_state_file()
-        
-        if state and state.get('last_period'):
-            last_start_date = datetime.strptime(
-                state['last_period']['start_date'], '%Y-%m-%d')
-            last_end_date = datetime.strptime(
-                state['last_period']['end_date'], '%Y-%m-%d')
-            
-            diff = last_end_date - last_start_date
-            # if period is a single day
-            if diff.days == 0:
-                diff = timedelta(days=1)
-
-            start_date = last_end_date
-            if (last_end_date.date() + diff) >= datetime.now(pytz.utc).date() + timedelta(days=1):
-                end_date = datetime.now(pytz.utc) + timedelta(days=1)
-            else:
-                end_date = last_end_date + diff
-        else:
-            start_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
-            end_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
-        return start_date, end_date
-
-
-"""
-        Main entrypoint
-"""
-if __name__ == "__main__":
-    comp = Component()
-    comp.run()
-
-
-================================================
-File: /kbc/client_base.py
-================================================
-'''
-Created on 5. 10. 2018
-
-@author: esner
-'''
-import requests
-from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
-import json
-
-
-class HttpClientBase:
-    """
-    Base class for implementing a single endpoint related to a single entities
-
-    Attributes:
-        base_url (str): The base URL for this endpoint.
-    """
-
-    def __init__(self, base_url, max_retries = 10, backoff_factor = 0.3, status_forcelist = (500, 502, 504), default_http_header=[], auth = None, default_params = None):
-        """
-        Create an endpoint.
-
-        Args
-            root_url (str): Root url of API.
-
-        """
-        if not base_url:
-            raise ValueError("Base URL is required.")
-        self.base_url = base_url
-        self.max_retries = max_retries
-        self.backoff_factor = backoff_factor
-        self.status_forcelist = status_forcelist
-        self._auth = auth
-        self._auth_header = default_http_header
-        self._default_params = default_params
-
-    def requests_retry_session(self, session=None):
-        session = session or requests.Session()
-        retry = Retry(
-            total=self.max_retries,
-            read=self.max_retries,
-            connect=self.max_retries,
-            backoff_factor=self.backoff_factor,
-            status_forcelist=self.status_forcelist
-            )
-        adapter = HTTPAdapter(max_retries=retry)
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-        return session
-
-
-    def _get_raw(self, url, params=None, **kwargs):
-        """
-        Construct a requests GET call with args and kwargs and process the
-        results.
-
-
-        Args:
-            url (str): requested url
-            params (dict): additional url params to be passed to the underlying
-                requests.get
-            **kwargs: Key word arguments to pass to the get requests.get
-
-        Returns:
-            r (requests.Response): object
-
-        Raises:
-            requests.HTTPError: If the API request fails.
-        """
-        s = requests.Session()
-        s.auth = self._auth
-        
-        headers = kwargs.pop('headers', {})
-        headers.update(self._auth_header)
-        s.headers.update(headers)
-        #set default params
-        if self._default_params:
-            params = self._default_params.update(params)
-        
-        r = self.requests_retry_session(session=s).request('GET', url = url, params = params, auth = self._auth, **kwargs)
-        try:
-            r.raise_for_status()
-        except requests.HTTPError:
-            # Handle different error codes
-            raise Exception('Request failed with code: {}, message: {}'.format(r.status_code, r.text))
-        else:
-            return r
-    
-    def get(self, url, params =None, **kwargs):
-        r = self._get_raw(url, params, **kwargs)
-        return r.json()
-
-    def _post_raw(self, *args, **kwargs):
-        """
-        Construct a requests POST call with args and kwargs and process the
-        results.
-
-        Args:
-            *args: Positional arguments to pass to the post request.
-            **kwargs: Key word arguments to pass to the post request.
-
-        Returns:
-            body: 
-
-        Raises:
-            requests.HTTPError: If the API request fails.
-        """
-        s = requests.Session()
-        headers = kwargs.pop('headers', {})
-        headers.update(self._auth_header)
-        s.headers.update(headers)
-        s.auth = self._auth
-        
-        params = kwargs.pop('params')
-        #set default params
-        if self._default_params:
-            kwargs.update({'params' :self._default_params.update(params)})
-        
-        r = self.requests_retry_session(session=s).request('POST', *args, **kwargs)
-        try:
-            r.raise_for_status()
-        except requests.HTTPError:
-            # Handle different error codes
-            raise
-        else:
-            return r
-
-    def post(self, *args, **kwargs):
-        """
-        Construct a requests POST call with args and kwargs and process the
-        results.
-
-        Args:
-            *args: Positional arguments to pass to the post request.
-            **kwargs: Key word arguments to pass to the post request.
-
-        Returns:
-            body: json reposonse
-
-        Raises:
-            requests.HTTPError: If the API request fails.
-        """
-        s = requests.Session()
-        headers = kwargs.pop('headers', {})
-        headers.update(self._auth_header)
-        
-        params = kwargs.pop('params')
-        #set default params
-        if self._default_params:
-            kwargs.update({'params' :self._default_params.update(params)})
-        r = self.requests_retry_session(session=s).request('POST', headers=headers, *args, **kwargs)
-        try:
-            r.raise_for_status()
-        except requests.HTTPError:
-            # Handle different error codes
-            raise
-        else:
-            return r.json()
-
-    def _patch(self, *args, **kwargs):
-        """
-        Construct a requests POST call with args and kwargs and process the
-        results.
-
-        Args:
-            *args: Positional arguments to pass to the post request.
-            **kwargs: Key word arguments to pass to the post request.
-
-        Returns:
-            body: Response body parsed from json.
-
-        Raises:
-            requests.HTTPError: If the API request fails.
-        """
-        headers = kwargs.pop('headers', {})
-        headers.update(self._auth_header)
-        r = requests.patch(headers=headers, *args, **kwargs)
-        try:
-            r.raise_for_status()
-        except requests.HTTPError:
-            # Handle different error codes
-            raise
-        else:
-            return r
-
-
-================================================
-File: /kbc/env_handler.py
-================================================
-#==============================================================================
-# KBC Env handler
-#==============================================================================
-
-
-#============================ Import libraries ================================
-import logging
-import json
-import os
-import csv
-import pytz
-import sys
-from collections import Counter
-from keboola import docker
-import datetime
-from dateutil.relativedelta import relativedelta
-
-DEFAULT_DEL = ','
-DEFAULT_ENCLOSURE = '"'
-
-
-class KBCEnvHandler:
-    def __init__(self, mandatory_params, data_path=None):
-        # fetch data folder from ENV by default
-        if not data_path:
-            data_path = os.environ.get('KBC_DATADIR')
-
-        self.kbc_config_id = os.environ.get('KBC_CONFIGID')
-        
-        self.data_path = data_path
-        self.configuration = docker.Config(data_path)
-        self.cfg_params = self.configuration.get_parameters()
-        self.tables_out_path = os.path.join(data_path, 'out', 'tables')
-        self.tables_in_path = os.path.join(data_path, 'in', 'tables')
-
-        self._mandatory_params = mandatory_params
-
-#==============================================================================
-
-    def validateConfig(self):
-        '''
-        Validates config based on provided mandatory params.
-        Parameters can be grouped as arrays [Par1,Par2] => at least one of the pars has to be present
-        [par1,[par2,par3]] => either par1 OR both par2 and par3 needs to be present
-        '''
-        parameters = self.cfg_params
-        missing_fields = []
-        for field in self._mandatory_params:
-            if isinstance(field, list):
-                missing_fields.extend(self._validate_par_group(field))            
-            elif not parameters.get(field):
-                missing_fields.append(field)
-
-        if missing_fields:
-            raise ValueError(
-                'Missing mandatory configuration fields: [{}] '.format(', '.join(missing_fields)))
-
-    def _validate_par_group(self, par_group):
-        missing_fields = []
-        is_present = False
-        for par in par_group:
-            if isinstance(par,list):
-                missing_subset = self._get_par_missing_fields(par)
-                missing_fields.extend(missing_subset)
-                if not missing_subset:
-                    is_present = True
-                    
-            elif self.cfg_params.get(par):                
-                is_present = True
-            else:
-                missing_fields.append(par)
-        if not is_present:
-            return missing_fields
-        else:
-            return []
-    
-    def _get_par_missing_fields(self, mand_params):
-        parameters = self.cfg_params
-        missing_fields = []
-        for field in mand_params:
-           if not parameters.get(field):
-                missing_fields.append(field)
-        return missing_fields
-    
-    
-    
-    
-    def get_input_table_by_name(self, table_name):
-        tables = self.configuration.get_input_tables()
-        table = [t for t in tables if t.get('destination') == table_name]
-        if not table:
-            raise ValueError('Specified input mapping [{}] does not exist'.format(table_name))
-        return table[0]
-
-
-#================================= Logging ====================================
-
-    def set_default_logger(self, log_level = 'INFO'):
-        root = logging.getLogger()
-
-
-        hdl = logging.StreamHandler(sys.stdout)
-        logging.basicConfig(
-            level=log_level,
-            format='%(levelname)s - %(message)s',
-            handlers = [hdl])
-
-        logger = logging.getLogger()
-        return logger
-
-    def get_state_file(self):
-        logging.getLogger().info('Loading state file..')
-        state_file_path = os.path.join(self.data_path, 'in', 'state.json')
-        if not os.path.isfile(state_file_path):
-            logging.getLogger().info('State file not found. First run?')
-            return
-        try:
-            with open(state_file_path, 'r') \
-                    as state_file:
-                return json.load(state_file)
-        except (OSError, IOError):
-            raise ValueError(
-                "State file state.json unable to read "
-            )
-    def write_state_file(self, state_dict):
-        if not isinstance(state_dict, dict):
-            raise TypeError('Dictionary expected as a state file datatype!')
-
-        with open(os.path.join(self.configuration.data_dir,'out','state.json'), 'w+') as state_file:
-            json.dump(state_dict, state_file)
-
-    def create_sliced_tables(self, folder_name, pkey=None, incremental=False, src_delimiter=DEFAULT_DEL, src_enclosure=DEFAULT_ENCLOSURE, dest_bucket=None):
-        """
-        Creates prepares sliced tables from all files in DATA_PATH/out/tables/{folder_name} - i.e. removes all headers
-        and creates single manifest file based on provided parameters.
-
-        folder_name -- folder name in DATA_PATH directory that contains files for slices, the same name will be used as table name
-        src_enclosure -- enclosure of the source file ["]
-        src_delimiter -- delimiter of the source file [,]
-        dest_bucket -- name of the destination bucket (optional)
-
-
-        """
-        log = logging
-        log.info('Creating sliced tables for [{}]..'.format(folder_name))
-
-        folder_path = os.path.join(self.tables_out_path, folder_name)
-
-        if not os.path.isdir(folder_path):
-            raise ValueError("Specified folder ({}) does not exist in the data folder ({})".format(
-                folder_name, self.data_path))
-
-        # get files
-        files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if os.path.isfile(
-            os.path.join(folder_path, f))]
-
-        header = self.get_and_remove_headers_in_all(
-            files, src_delimiter, src_enclosure)
-        if dest_bucket:
-            destination = dest_bucket + '.' + folder_name
-        else:
-            destination = folder_name
-        
-
-        log.info('Creating manifest file..')
-        self.configuration.write_table_manifest(
-            file_name=folder_path, destination=destination, primary_key=pkey, incremental=incremental, columns=header)
-
-    def get_and_remove_headers_in_all(self, files, delimiter, enclosure):
-        """
-        Removes header from all specified files and return it as a list of strings
-
-        Throws error if there is some file with different header.
-
-        """
-        first_run = True
-        for file in files:
-            curr_header = self._get_and_remove_headers(
-                file, delimiter, enclosure)
-            if first_run:
-                header = curr_header
-                first_file = file
-                first_run = False
-            # check whether header matches
-            if Counter(header) != Counter(curr_header):
-                raise Exception('Header in file {}:[{}] is different than header in file {}:[{}]'.format(
-                    first_file, header, file, curr_header))
-        return header
-
-    def _get_and_remove_headers(self, file, delimiter, enclosure):
-        """
-        Removes header from specified file and return it as a list of strings.
-        Creates new updated file 'upd_'+origFileName and deletes the original
-        """
-        head, tail = os.path.split(file)
-        with open(file, "r") as input_file:
-            with open(os.path.join(head, 'upd_' + tail), 'w+',  newline='') as updated:
-                reader = csv.DictReader(
-                    input_file, delimiter=delimiter, quotechar=enclosure)
-                header = reader.fieldnames
-                writer = csv.DictWriter(
-                    updated, fieldnames=header, delimiter=DEFAULT_DEL, quotechar=DEFAULT_ENCLOSURE)
-                for row in reader:
-                    # write row
-                    writer.writerow(row)
-        os.remove(file)
-        return header
-#==============================================================================
-#== UTIL functions
-
-    def get_past_date(self, str_days_ago, to_date = None, tz = pytz.utc):
-        '''
-        Returns date in specified timezone relative to today.
-        
-        e.g.
-        '5 hours ago',
-        'yesterday',
-        '3 days ago',
-        '4 months ago',
-        '2 years ago',
-        'today'
-        '''
-        if to_date:
-            TODAY = to_date
-        else:
-            TODAY = datetime.datetime.now(tz)
-        splitted = str_days_ago.split()
-        if len(splitted) == 1 and splitted[0].lower() == 'today':
-            return TODAY
-        elif len(splitted) == 1 and splitted[0].lower() == 'yesterday':
-            date = TODAY - relativedelta(days=1)
-            return date
-        elif splitted[1].lower() in ['hour', 'hours', 'hr', 'hrs', 'h']:
-            date = datetime.datetime.now() - relativedelta(hours=int(splitted[0]))
-            return date.date()
-        elif splitted[1].lower() in ['day', 'days', 'd']:
-            date = TODAY - relativedelta(days=int(splitted[0]))
-            return date
-        elif splitted[1].lower() in ['wk', 'wks', 'week', 'weeks', 'w']:
-            date = TODAY - relativedelta(weeks=int(splitted[0]))
-            return date
-        elif splitted[1].lower() in ['mon', 'mons', 'month', 'months', 'm']:
-            date = TODAY - relativedelta(months=int(splitted[0]))
-            return date
-        elif splitted[1].lower() in ['yrs', 'yr', 'years', 'year', 'y']:
-            date = TODAY - relativedelta(years=int(splitted[0]))
-            return date
-        else:
-            raise ValueError('Invalid relative period!')
-
-
-
-
-================================================
-File: /kbc/mapping.py
-================================================
-"__author__ = 'Leo Chan'"
-from _collections import OrderedDict
-"__credits__ = 'Keboola 2017'"
-
-"""
-Python 3 environment 
-"""
-
-import os
-import logging
-import json
-import pandas as pd
-import uuid
-
-
-
-# used for parent-child key mapping
-KEY_PARENT_TABLE = 'parent_table' 
-KEY_UUID = 'uuid'
-KEY_ROW_NUMBER = 'row_number'
-
-### destination to fetch and output files
-DEFAULT_FILE_INPUT = "/data/in/tables/"
-DEFAULT_FILE_DESTINATION = "/data/out/tables/"#
-DEFAULT_MAPPING_PATH = '/code/generic-mapping/mappings.json'
-#DEFAULT_MAPPING_PATH = 'generic-mapping/mappings.json'
-
-class GenericMapping():
-    """
-    Handling Generic Ex Mapping
-    """
-
-    def __init__(self, endpoint, output_destination, user_values = {}, return_col = {}, mapping_file_path = DEFAULT_MAPPING_PATH):
-
-        ### Parameters
-        self._mapping_file_path = mapping_file_path
-        self.output_destination = output_destination
-        self.endpoint = endpoint
-        self.mapping = self.mapping_check(self.endpoint)
-        self._user_values = user_values
-        self._return_col = return_col
-        #self.data = data
-        self.out_file = {}
-        self.out_file[self.endpoint]=[]
-        self.out_file_pk = {} ### destination name from mapping
-        self.out_file_pk[self.endpoint]=[]
-        self.out_file_pk_raw = {} ### raw destination name from API output
-        self.get_primary_key(endpoint, self.mapping)
-        logging.debug(self.out_file_pk)
-        logging.debug(self.out_file_pk_raw)
-
-
-    def parse_n_save(self, data, file_uid, store_as_sliced = False):
-        ### Runs
-        self.root_parse(data)
-        return self.output(file_uid, store_as_sliced)
-
-    
-    def mapping_check(self, endpoint):
-        """
-        Selecting the Right Mapping for the specified endpoint
-        """
-
-        with open(self._mapping_file_path, 'r') as f:
-            out = json.load(f)
-        f.close()
-        return out[endpoint]
-
-    def root_parse(self, data):
-        """
-        Parsing the Root property of the return data
-        """
-
-        #data = self.data
-        mapping = self.mapping
-
-        for index, row in enumerate(data):
-            ### Looping row by row 
-            self.parsing(self.endpoint, mapping, row, index)      
-
-    def parsing(self, table_name, mapping, data, row_number):
-        """
-        Outputing data results based on configured mapping
-        """
-        
-        ### If new table property is found, 
-        ### create a new array to store values
-        if table_name not in self.out_file:
-            self.out_file[table_name] = []
-        
-
-        row_out = {} ### Storing row output
-
-        ### Looping thru the keys of the mapping
-        for column in mapping:
-            if not mapping[column].get("type") or mapping[column].get("type")=="column":
-                ### Delimit mapping variables
-                if "." in column:
-                    temp_value = column.split(".")
-
-                    try:
-                        ### Looping thru the array
-                        #value = data[temp_value[0]][temp_value[1]]
-                        value = data
-                        for word in temp_value:
-                            value = value[word]
-                    except Exception:
-                        value = ""
-                else:
-                    try:
-                        value = data[column]
-                    except Exception:
-                        value = ""
-                header = mapping[column]["mapping"]["destination"]
-            
-            elif mapping[column]["type"]=="table": 
-                ### Setting up table parameters, 
-                ### mappings and values for parsing the nested table
-                mapping_name = column
-                mapping_in = mapping[column]["tableMapping"] ### Mapping for the table
-                sub_table_name = mapping[column]["destination"] ### New table output name
-                sub_table_exist = True ### Determine if the table column exist as a property in source file
-                sub_table_row_exist = True ### Determine if there are any rows within the sub table
-                
-                ### Passing the function if the JSON property is not found
-                try:
-                    if "." in mapping_name:
-                        temp_value = mapping_name.split(".")
-                        data_in = data
-                        for word in temp_value:
-                            data_in = data_in[word]
-                    else:
-                        data_in = data[mapping_name]
-
-                    if not data_in or len(data_in)==0:
-                        sub_table_row_exist = False
-                except KeyError:
-                    sub_table_exist = False
-
-                ### Verify if the sub-table exist in the root table
-                if sub_table_exist and sub_table_row_exist:
-                    ### Setting up nested table primary key
-                    ### Using current table id to create unique pk with md5
-                    string_of_pk = "" ### Concat all the PK as a string
-                    ### Iterate through all the pk
-                    """for pk in self.out_file_pk_raw[table_name]:
-                        if "." in pk:
-                            temp_value = column.split(".")
-                            pk_value = data
-                            for each_temp in temp_value:
-                                pk_value = pk_value[each_temp]
-                            print("PK_VALUE - {0}".format(pk_value))
-                            print("STRING_OF_PK - {0}".format(string_of_pk))
-                            string_of_pk += pk_value
-                        else:
-                            string_of_pk += data[pk]"""
-                    #genrate random uuid if no primary key for parent table is defined, otherwise use pk
-                    if self.out_file_pk.get(table_name):
-                        
-                        pk_values = []
-                        for field in self.out_file_pk.get(table_name):
-                            # user defined PK
-                            if mapping[field].get('type') == 'user_index':
-                                value = str(self._validate_user_index_mapping(mapping, data, field, table_name, row_number))
-                            # user defined static value
-                            elif mapping[field].get('type') == 'user': 
-                                value = str(self._user_values.get(column))
-                            else:
-                                value = str(data[field])
-                            pk_values.append(value)
-                        
-                        sub_table_pk = mapping[column]["destination"] + "-"+ '|'.join(pk_values)
-                    else:
-                        sub_table_pk = mapping[column]["destination"] + "-"+str(uuid.uuid4().hex)
-
-                    mapping_in[KEY_PARENT_TABLE] = {
-                        "type": "pk",
-                        "value": sub_table_pk
-                    }
-
-                    ### Loop nested table
-                    self._parse_table(sub_table_name, mapping_in, data_in)
-                    
-                    ### Returning sub table PK
-                    value = sub_table_pk
-                
-                else:
-                    value = ""
-
-                ### Primary key return to the root table
-                header = column
-                
-            ### Sub table's Primary Key
-            ### Source: injected new property when new table is found in the mapping
-            elif mapping[column]["type"]=="pk":
-                # look if destination is overriden in mapping
-                if mapping.get('parentKey',{}).get('destination'):
-                    header = mapping.get('parentKey').get('destination')
-                else:
-                    header = column
-                value = mapping[column]["value"]
-            
-            elif mapping[column]["type"]=="user":
-                header = column
-                value = self._user_values.get(column)
-            elif mapping[column]["type"]=="user_index":
-                header = column
-                ## validate
-                value = self._validate_user_index_mapping(mapping, data, column, table_name, row_number)
-                
-            else:
-                print('Unsupported type ' + mapping[column]["type"])
-
-            ### Injecting new table elements for the row
-            row_out[header] = value
-
-        ### Storing JSON tables
-        out_file = self.out_file
-        out_file[table_name].append(row_out)
-        self.out_file = out_file
-
-        return
-
-    def _validate_user_index_mapping(self, mapping, data, column, table_name, index):
-
-        index_keys = self._user_values.get("user_index")
-        if not index_keys:
-            raise ValueError(
-                    'No index fields specified for "user_index mapping" name:' + column)
-        missing_keys = [index for index in index_keys if not data.get(index) and index not in [KEY_PARENT_TABLE, KEY_UUID, KEY_ROW_NUMBER]]
-        if missing_keys:
-            raise ValueError('Some keys specified in "user_index" mapping are missing in data: [{}]'.format(
-                    ','.join(missing_keys)))
-        if KEY_PARENT_TABLE in index_keys and not mapping.get(KEY_PARENT_TABLE):
-            raise ValueError(
-                    '"parent_key" is missing in (sub)table mapping but is specified, table [{}]'.format(table_name))
-
-        value = '|'.join([str(data[col])
-                          for col in index_keys if col not in [KEY_PARENT_TABLE, KEY_UUID, KEY_ROW_NUMBER]])
-        if KEY_PARENT_TABLE in index_keys:
-            value += '|' + mapping[KEY_PARENT_TABLE]['value']
-        # uuid if present
-        if KEY_UUID in index_keys:
-            value += "-"+str(uuid.uuid4().hex)
-        # row_number if present
-        if KEY_ROW_NUMBER in index_keys:
-            value += "-" + str(index)
-            
-        # return hash
-        return value
-
-
-    def _parse_table(self, table_name, mapping, data):
-        """
-        Parsing table data
-        Determining the type of the sub-table
-        *** Subfunction of parse() ***
-        """
-
-        if type(data) == dict:
-            self.parsing(table_name, mapping, data, None)
-
-        elif type(data) == list:
-            for index, row in enumerate(data):
-                self.parsing(table_name, mapping, row, index)
-
-        return
-
-    def get_primary_key(self, table_name, mapping):
-        """
-        Filtering out all the primary keys within the mapping table
-        """
-
-        ### If table_name does not exist in the PK list
-        if table_name not in self.out_file_pk_raw:
-            self.out_file_pk_raw[table_name] = []
-            self.out_file_pk[table_name] = []
-
-        for column in mapping:
-            ### Column type is "column"
-            if not mapping[column].get("type") or mapping[column].get("type") in ["column", 'user_index']:
-                ### Search if the priamryKey property is within the mapping configuration
-                if "primaryKey" in mapping[column]["mapping"].keys():
-                    ### Confirm if the primary key tab is true
-                    if mapping[column]["mapping"]["primaryKey"]:
-                        self.out_file_pk_raw[table_name].append(column)
-                        self.out_file_pk[table_name].append(mapping[column]["mapping"]["destination"])
-            ### Column type is "table"
-            elif mapping[column]["type"]=="table":
-                ## add parentKey if primary
-                if mapping[column].get('parentKey',{}).get('primaryKey', False):
-                    self.out_file_pk_raw[mapping[column]["destination"]]=[column]
-                    self.out_file_pk[mapping[column]["destination"]] = [mapping[column]["parentKey"]['destination']]
-                ### Recursively run the tableMapping
-                self.get_primary_key(table_name=mapping[column]["destination"], mapping=mapping[column]["tableMapping"])
-
-        return
-
-    def produce_manifest(self, file_name, primary_key):
-        """
-        Dummy function to return header per file type.
-        """
-
-        file = "/data/out/tables/"+str(file_name)+".manifest"
-        logging.debug("Manifest output: {0}".format(file))
-        #destination_part = file_name.split(".csv")[0]
-
-        manifest_template = {
-                            #"source": "myfile.csv"
-                            #,"destination": "in.c-mybucket.table"
-                            #"incremental": bool(incremental)
-                            #,"primary_key": ["VisitID","Value","MenuItem","Section"]
-                            #,"columns": [""]
-                            #,"delimiter": "|"
-                            #,"enclosure": ""
-                            }
-
-        column_header = []
-
-        manifest = manifest_template
-        #manifest["primary_key"] = primary_key
-
-        try:
-            with open(file, 'w') as file_out:
-                json.dump(manifest, file_out)
-                #logging.info("Output manifest file ({0}) produced.".format(file_name))
-        except Exception as e:
-            logging.error("Could not produce output file manifest.")
-            logging.error(e)
-        
-        return
-
-    def output(self, file_uid, store_as_sliced):
-        """
-        Output Data with its desired file name
-        Return:
-        result_files -- Array of dictionary 
-            e.g. {'file_path':'data/out/file_1.csv',
-                   'name' : file_1.csv,
-                    'prefix' : file,
-                    'ids' : ['id','parent_id']
-                 }
-        return_res_cols -- dict of return columns if specified, e.g. {'id':[1,2,3,4]}   
-        """
-        
-        ### Outputting files
-        result_files = []
-        return_res_cols = OrderedDict()
-        out_file = self.out_file
-        for file in out_file:
-            out_df = pd.DataFrame(out_file[file], dtype=str)
-            if file == 'check-payment_refund':
-                logging.debug('processing modifier')
-            # skip if result empty
-            if (out_df.empty):
-                logging.info('%s is empty, skipping.',out_file[file])
-                return [], []
-            # get return values if any
-            if isinstance(self._return_col, dict) and self._return_col.get(file):
-                return_res_cols.update({file: 
-                                        {self._return_col.get(file) : out_df[self._return_col.get(file)].tolist()}
-                                        })
-            suffix = ''
-            if file_uid:
-                suffix = '_' + str(file_uid)
-            file_name = file + suffix + ".csv"
-            if store_as_sliced:
-                dest_dir = os.path.join(self.output_destination, file)
-                if not os.path.exists(dest_dir):
-                    os.makedirs(dest_dir)
-                file_dest = os.path.join(dest_dir, file_name)
-            else:
-                file_dest = os.path.join(self.output_destination, file_name)
-
-            out_df.to_csv(file_dest, index=False)
-            logging.debug("Table output: {0}...".format(file_dest))
-            result_files.append({'file_path' : file_dest,
-                                 'name' : file_name,
-                                 'prefix' : file,
-                                 'ids' : self.out_file_pk[file]
-                                 })
-
-
-
-        return result_files, return_res_cols
-
-
-================================================
-File: /deploy.sh
-================================================
-#!/bin/sh
-set -e
-
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
-
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
-
-# Push to the repository
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${BITBUCKET_TAG}
-docker push ${REPOSITORY}:latest
-
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
-fi
 
 ================================================
 File: /README.md

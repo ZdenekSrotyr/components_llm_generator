@@ -1,37 +1,37 @@
 Directory structure:
 └── kds_consulting_team-kds-team.ex-liveagent/
-    ├── tests/
-    │   ├── __init__.py
-    │   └── test_component.py
     ├── .travis.yml
-    ├── change_log.md
-    ├── Dockerfile
     ├── flake8.cfg
-    ├── src/
-    │   ├── main.py
-    │   └── liveagent/
-    │       ├── client.py
-    │       ├── component.py
-    │       ├── result.py
-    │       └── utils.py
-    ├── LICENSE.md
-    ├── requirements.txt
-    ├── bitbucket-pipelines.yml
-    ├── component_config/
-    │   ├── component_short_description.md
-    │   ├── configSchema.json
-    │   ├── stack_parameters.json
-    │   ├── configuration_description.md
-    │   ├── component_long_description.md
-    │   └── sample-config/
-    │       ├── in/
-    │       │   └── state.json
-    │       └── config.json
     ├── deploy.sh
     ├── docker-compose.yml
+    ├── change_log.md
+    ├── src/
+    │   ├── liveagent/
+    │   │   ├── component.py
+    │   │   ├── utils.py
+    │   │   ├── client.py
+    │   │   └── result.py
+    │   └── main.py
+    ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       └── in/
+    │           └── state.json
     ├── scripts/
-    │   ├── build_n_test.sh
-    │   └── update_dev_portal_properties.sh
+    │   ├── update_dev_portal_properties.sh
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── Dockerfile
+    ├── LICENSE.md
     └── README.md
 
 ================================================
@@ -74,27 +74,6 @@ after_success:
 
 
 ================================================
-File: /Dockerfile
-================================================
-FROM python:3.8.6-slim
-ENV PYTHONIOENCODING utf-8
-
-COPY . /code/
-
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
-
-RUN pip install flake8
-
-RUN pip install -r /code/requirements.txt
-
-WORKDIR /code/
-
-
-CMD ["python", "-u", "/code/src/main.py"]
-
-
-================================================
 File: /flake8.cfg
 ================================================
 [flake8]
@@ -119,21 +98,329 @@ max-line-length = 120
 
 
 ================================================
-File: /src/main.py
+File: /deploy.sh
 ================================================
-from liveagent.component import Component, UserException
-import logging
+#!/bin/sh
+set -e
 
-if __name__ == "__main__":
-    try:
-        comp = Component()
-        comp.run()
-    except UserException as exc:
-        logging.exception(exc)
-        exit(1)
-    except Exception as exc:
-        logging.exception(exc)
-        exit(2)
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /src/liveagent/component.py
+================================================
+import dateparser
+import logging
+from kbc.env_handler import KBCEnvHandler
+from liveagent.utils import Parameters
+from liveagent.client import LiveAgentClient, ClientException
+from liveagent.result import LiveAgentWriter
+
+# configuration variables
+KEY_API_TOKEN = '#token'
+KEY_API_TOKEN_V1 = '#token_v1'
+KEY_ORGANIZATION = 'organization'
+KEY_OBJECTS = 'objects'
+KEY_DATE = 'date'
+KEY_DATE_FROM = 'from'
+KEY_DATE_UNTIL = 'until'
+KEY_INCREMENTAL = 'incremental_load'
+KEY_DEBUG = 'debug'
+KEY_FAIL_ON_ERROR = 'fail_on_error'
+
+MANDATORY_PARS = [KEY_API_TOKEN, KEY_ORGANIZATION, KEY_OBJECTS]
+MANDATORY_IMAGE_PARS = []
+
+APP_VERSION = '0.2.1'
+SUPPORTED_ENDPOINTS = ["agents", "calls", "companies", "contacts", "departments", "tags", "tickets", "tickets_messages",
+                       "tickets_history"]
+SUPPORTED_ENDPOINTS_V1 = ["agent_report", "agent_availability", "conversations", "agent_availability_chats",
+                          "calls_availability", "ranking_agents_report"]
+
+
+class UserException(Exception):
+    pass
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self):
+
+        super().__init__(mandatory_params=MANDATORY_PARS, log_level='INFO')
+        logging.info(f'Running version {APP_VERSION}.')
+
+        if self.cfg_params.get(KEY_DEBUG) is True:
+            logger = logging.getLogger()
+            logger.setLevel(logging.DEBUG)
+
+        try:
+            self.validate_config(MANDATORY_PARS)
+            self.validate_image_parameters(MANDATORY_IMAGE_PARS)
+        except ValueError as e:
+            raise UserException(e)
+
+        self.parameters = Parameters()
+        self.parameters.token = self.cfg_params[KEY_API_TOKEN]
+        self.parameters.token_v1 = self.cfg_params.get(KEY_API_TOKEN_V1, None)
+        self.parameters.objects = self.cfg_params[KEY_OBJECTS]
+        self.parameters.organization = self.cfg_params[KEY_ORGANIZATION]
+        self.parameters.date_object = self.cfg_params.get(KEY_DATE, {})
+        self.parameters.incremental = self.cfg_params.get(bool(KEY_INCREMENTAL), True)
+        self.parameters.fail_on_error = self.cfg_params.get(KEY_FAIL_ON_ERROR, False)
+
+        self.check_objects()
+        self.parse_dates()
+
+        self.client = LiveAgentClient(self.parameters.token, self.parameters.token_v1, self.parameters.organization,
+                                      self.parameters.date_from, self.parameters.date_until,
+                                      self.parameters.fail_on_error)
+
+    def parse_dates(self):
+
+        date_from = self.parameters.date_object.get(KEY_DATE_FROM, '30 days ago')
+        date_until = self.parameters.date_object.get(KEY_DATE_UNTIL, 'now')
+
+        date_from_parsed = dateparser.parse(date_from)
+        date_until_parsed = dateparser.parse(date_until)
+
+        if any([date_from_parsed is None, date_until_parsed is None]):
+            raise UserException(
+                "Date values could not be parsed. Please, refer to documentation for correct specification.")
+
+        else:
+            self.parameters.date_from = date_from_parsed.strftime('%Y-%m-%d %H:%M:%S')
+            self.parameters.date_until = date_until_parsed.strftime('%Y-%m-%d %H:%M:%S')
+
+            # self.parameters.date_from_iso = date_from_parsed.strftime('%Y-%m-%d')
+            # self.parameters.date_to_iso = date_until_parsed.strftime('%Y-%m-%d')
+
+            self.parameters.date_chunks = self.split_dates_to_chunks(
+                date_from_parsed, date_until_parsed, 0, '%Y-%m-%d')
+
+            logging.debug(f"Date from: {self.parameters.date_from}.")
+            logging.debug(f"Date until: {self.parameters.date_until}.")
+
+    def check_objects(self):
+
+        if not self.parameters.objects:
+            raise UserException("No objects to download were specified.")
+
+        _unsupported = []
+        for obj in self.parameters.objects:
+
+            if obj not in SUPPORTED_ENDPOINTS and obj not in SUPPORTED_ENDPOINTS_V1:
+                _unsupported += [obj]
+
+            if obj in SUPPORTED_ENDPOINTS_V1:
+                if self.parameters.token_v1 is None or self.parameters.token_v1 == '':
+                    raise UserException(f"Missing API V1 token for API V1 endpoint {obj}.")
+
+        if len(_unsupported) > 0:
+            raise UserException(
+                f"Unsupported endpoints specified: {_unsupported}. Must be one of {SUPPORTED_ENDPOINTS}.")
+
+    def run(self):
+
+        _objects = self.parameters.objects
+        _incremental = self.parameters.incremental
+
+        logging.info(f"Downloading data from {self.parameters.date_from} to {self.parameters.date_until}.")
+
+        for obj in _objects:
+
+            logging.info(f"Downloading {obj} data.")
+
+            _writer = LiveAgentWriter(self.tables_out_path, obj, _incremental)
+
+            if obj not in ['tickets_messages', 'tickets', *SUPPORTED_ENDPOINTS_V1]:
+
+                try:
+                    _api_results = eval(f'self.client.get_{obj}()')
+                except ClientException as c_ex:
+                    raise UserException(c_ex) from c_ex
+                _writer.writerows(_api_results)
+
+            elif obj == 'agent_availability':
+
+                try:
+                    _api_results = self.client.get_agent_availability_tickets(self.parameters.date_from,
+                                                                              self.parameters.date_until)
+                except ClientException as c_ex:
+                    raise UserException(c_ex) from c_ex
+
+                _writer.writerows(_api_results)
+
+            elif obj == 'agent_availability_chats':
+
+                try:
+                    _api_results = self.client.get_agent_availability_chats(self.parameters.date_from,
+                                                                            self.parameters.date_until)
+                except ClientException as c_ex:
+                    raise UserException(c_ex) from c_ex
+
+                _writer.writerows(_api_results)
+
+            elif obj == 'calls_availability':
+
+                try:
+                    _api_results = self.client.get_calls_availability(self.parameters.date_from,
+                                                                      self.parameters.date_until)
+                except ClientException as c_ex:
+                    raise UserException(c_ex) from c_ex
+
+                _writer.writerows(_api_results)
+
+            elif obj == 'conversations':
+
+                try:
+                    _api_results = self.client.get_conversations(self.parameters.date_from)
+                except ClientException as c_ex:
+                    raise UserException(c_ex) from c_ex
+                _writer.writerows(_api_results)
+
+            elif obj == 'agent_report':
+                for dt in self.parameters.date_chunks:
+                    date = dt['start_date']
+                    start = date + ' 00:00:00'
+                    end = date + ' 23:59:59'
+                    try:
+                        _api_results = self.client.get_agent_report(date_from=start, date_to=end)
+                    except ClientException as c_ex:
+                        raise UserException(c_ex) from c_ex
+                    _writer.writerows(_api_results, parentDict={'date': date})
+
+            elif obj == 'ranking_agents_report':
+                for dt in self.parameters.date_chunks:
+                    date = dt['start_date']
+                    start = date + ' 00:00:00'
+                    end = date + ' 23:59:59'
+                    try:
+                        _api_results = self.client.get_ranking_agents_report(date_from=start, date_to=end)
+                    except ClientException as c_ex:
+                        raise UserException(c_ex) from c_ex
+                    _writer.writerows(_api_results, parentDict={'date': date})
+
+            elif obj in ['tickets_messages', 'tickets']:
+                pass
+
+            else:
+                raise UserException(f"Unknown object {obj}.")
+
+        if 'tickets' in _objects or 'tickets_messages' in _objects:
+
+            logging.info("Downloading ticket data.")
+
+            _writer_tickets = LiveAgentWriter(self.tables_out_path, 'tickets', _incremental)
+            try:
+                _api_results = self.client.get_tickets()
+            except ClientException as c_ex:
+                raise UserException(c_ex) from c_ex
+            _writer_tickets.writerows(_api_results)
+
+            if 'tickets_messages' in _objects:
+
+                ticket_ids = [t['id'] for t in _api_results]
+
+                logging.info(f"The component will process messages for {len(ticket_ids)} tickets.")
+
+                _writer_messages = LiveAgentWriter(self.tables_out_path, 'tickets_messages', _incremental)
+                _writer_content = LiveAgentWriter(self.tables_out_path, 'tickets_messages_content',
+                                                  _incremental)
+
+                _out_messages = []
+                _out_contents = []
+
+                for tid in ticket_ids:
+                    try:
+                        _messages = self.client.get_ticket_messages(tid)
+
+                    except ClientException as c_ex:
+                        raise UserException(c_ex) from c_ex
+
+                    for msg in _messages:
+                        msg['ticket_id'] = tid
+                        msg_id = msg['id']
+
+                        _out_messages += [msg]
+
+                        for cont in msg['messages']:
+                            cont['message_id'] = msg_id
+                            _out_contents += [cont]
+
+                _writer_messages.writerows(_out_messages)
+                _writer_content.writerows(_out_contents)
+
+
+================================================
+File: /src/liveagent/utils.py
+================================================
+class Parameters:
+    pass
+
+
+class Writers:
+    pass
 
 
 ================================================
@@ -492,251 +779,6 @@ class LiveAgentClient(HttpClient):
 
 
 ================================================
-File: /src/liveagent/component.py
-================================================
-import dateparser
-import logging
-from kbc.env_handler import KBCEnvHandler
-from liveagent.utils import Parameters
-from liveagent.client import LiveAgentClient, ClientException
-from liveagent.result import LiveAgentWriter
-
-# configuration variables
-KEY_API_TOKEN = '#token'
-KEY_API_TOKEN_V1 = '#token_v1'
-KEY_ORGANIZATION = 'organization'
-KEY_OBJECTS = 'objects'
-KEY_DATE = 'date'
-KEY_DATE_FROM = 'from'
-KEY_DATE_UNTIL = 'until'
-KEY_INCREMENTAL = 'incremental_load'
-KEY_DEBUG = 'debug'
-KEY_FAIL_ON_ERROR = 'fail_on_error'
-
-MANDATORY_PARS = [KEY_API_TOKEN, KEY_ORGANIZATION, KEY_OBJECTS]
-MANDATORY_IMAGE_PARS = []
-
-APP_VERSION = '0.2.1'
-SUPPORTED_ENDPOINTS = ["agents", "calls", "companies", "contacts", "departments", "tags", "tickets", "tickets_messages",
-                       "tickets_history"]
-SUPPORTED_ENDPOINTS_V1 = ["agent_report", "agent_availability", "conversations", "agent_availability_chats",
-                          "calls_availability", "ranking_agents_report"]
-
-
-class UserException(Exception):
-    pass
-
-
-class Component(KBCEnvHandler):
-
-    def __init__(self):
-
-        super().__init__(mandatory_params=MANDATORY_PARS, log_level='INFO')
-        logging.info(f'Running version {APP_VERSION}.')
-
-        if self.cfg_params.get(KEY_DEBUG) is True:
-            logger = logging.getLogger()
-            logger.setLevel(logging.DEBUG)
-
-        try:
-            self.validate_config(MANDATORY_PARS)
-            self.validate_image_parameters(MANDATORY_IMAGE_PARS)
-        except ValueError as e:
-            raise UserException(e)
-
-        self.parameters = Parameters()
-        self.parameters.token = self.cfg_params[KEY_API_TOKEN]
-        self.parameters.token_v1 = self.cfg_params.get(KEY_API_TOKEN_V1, None)
-        self.parameters.objects = self.cfg_params[KEY_OBJECTS]
-        self.parameters.organization = self.cfg_params[KEY_ORGANIZATION]
-        self.parameters.date_object = self.cfg_params.get(KEY_DATE, {})
-        self.parameters.incremental = self.cfg_params.get(bool(KEY_INCREMENTAL), True)
-        self.parameters.fail_on_error = self.cfg_params.get(KEY_FAIL_ON_ERROR, False)
-
-        self.check_objects()
-        self.parse_dates()
-
-        self.client = LiveAgentClient(self.parameters.token, self.parameters.token_v1, self.parameters.organization,
-                                      self.parameters.date_from, self.parameters.date_until,
-                                      self.parameters.fail_on_error)
-
-    def parse_dates(self):
-
-        date_from = self.parameters.date_object.get(KEY_DATE_FROM, '30 days ago')
-        date_until = self.parameters.date_object.get(KEY_DATE_UNTIL, 'now')
-
-        date_from_parsed = dateparser.parse(date_from)
-        date_until_parsed = dateparser.parse(date_until)
-
-        if any([date_from_parsed is None, date_until_parsed is None]):
-            raise UserException(
-                "Date values could not be parsed. Please, refer to documentation for correct specification.")
-
-        else:
-            self.parameters.date_from = date_from_parsed.strftime('%Y-%m-%d %H:%M:%S')
-            self.parameters.date_until = date_until_parsed.strftime('%Y-%m-%d %H:%M:%S')
-
-            # self.parameters.date_from_iso = date_from_parsed.strftime('%Y-%m-%d')
-            # self.parameters.date_to_iso = date_until_parsed.strftime('%Y-%m-%d')
-
-            self.parameters.date_chunks = self.split_dates_to_chunks(
-                date_from_parsed, date_until_parsed, 0, '%Y-%m-%d')
-
-            logging.debug(f"Date from: {self.parameters.date_from}.")
-            logging.debug(f"Date until: {self.parameters.date_until}.")
-
-    def check_objects(self):
-
-        if not self.parameters.objects:
-            raise UserException("No objects to download were specified.")
-
-        _unsupported = []
-        for obj in self.parameters.objects:
-
-            if obj not in SUPPORTED_ENDPOINTS and obj not in SUPPORTED_ENDPOINTS_V1:
-                _unsupported += [obj]
-
-            if obj in SUPPORTED_ENDPOINTS_V1:
-                if self.parameters.token_v1 is None or self.parameters.token_v1 == '':
-                    raise UserException(f"Missing API V1 token for API V1 endpoint {obj}.")
-
-        if len(_unsupported) > 0:
-            raise UserException(
-                f"Unsupported endpoints specified: {_unsupported}. Must be one of {SUPPORTED_ENDPOINTS}.")
-
-    def run(self):
-
-        _objects = self.parameters.objects
-        _incremental = self.parameters.incremental
-
-        logging.info(f"Downloading data from {self.parameters.date_from} to {self.parameters.date_until}.")
-
-        for obj in _objects:
-
-            logging.info(f"Downloading {obj} data.")
-
-            _writer = LiveAgentWriter(self.tables_out_path, obj, _incremental)
-
-            if obj not in ['tickets_messages', 'tickets', *SUPPORTED_ENDPOINTS_V1]:
-
-                try:
-                    _api_results = eval(f'self.client.get_{obj}()')
-                except ClientException as c_ex:
-                    raise UserException(c_ex) from c_ex
-                _writer.writerows(_api_results)
-
-            elif obj == 'agent_availability':
-
-                try:
-                    _api_results = self.client.get_agent_availability_tickets(self.parameters.date_from,
-                                                                              self.parameters.date_until)
-                except ClientException as c_ex:
-                    raise UserException(c_ex) from c_ex
-
-                _writer.writerows(_api_results)
-
-            elif obj == 'agent_availability_chats':
-
-                try:
-                    _api_results = self.client.get_agent_availability_chats(self.parameters.date_from,
-                                                                            self.parameters.date_until)
-                except ClientException as c_ex:
-                    raise UserException(c_ex) from c_ex
-
-                _writer.writerows(_api_results)
-
-            elif obj == 'calls_availability':
-
-                try:
-                    _api_results = self.client.get_calls_availability(self.parameters.date_from,
-                                                                      self.parameters.date_until)
-                except ClientException as c_ex:
-                    raise UserException(c_ex) from c_ex
-
-                _writer.writerows(_api_results)
-
-            elif obj == 'conversations':
-
-                try:
-                    _api_results = self.client.get_conversations(self.parameters.date_from)
-                except ClientException as c_ex:
-                    raise UserException(c_ex) from c_ex
-                _writer.writerows(_api_results)
-
-            elif obj == 'agent_report':
-                for dt in self.parameters.date_chunks:
-                    date = dt['start_date']
-                    start = date + ' 00:00:00'
-                    end = date + ' 23:59:59'
-                    try:
-                        _api_results = self.client.get_agent_report(date_from=start, date_to=end)
-                    except ClientException as c_ex:
-                        raise UserException(c_ex) from c_ex
-                    _writer.writerows(_api_results, parentDict={'date': date})
-
-            elif obj == 'ranking_agents_report':
-                for dt in self.parameters.date_chunks:
-                    date = dt['start_date']
-                    start = date + ' 00:00:00'
-                    end = date + ' 23:59:59'
-                    try:
-                        _api_results = self.client.get_ranking_agents_report(date_from=start, date_to=end)
-                    except ClientException as c_ex:
-                        raise UserException(c_ex) from c_ex
-                    _writer.writerows(_api_results, parentDict={'date': date})
-
-            elif obj in ['tickets_messages', 'tickets']:
-                pass
-
-            else:
-                raise UserException(f"Unknown object {obj}.")
-
-        if 'tickets' in _objects or 'tickets_messages' in _objects:
-
-            logging.info("Downloading ticket data.")
-
-            _writer_tickets = LiveAgentWriter(self.tables_out_path, 'tickets', _incremental)
-            try:
-                _api_results = self.client.get_tickets()
-            except ClientException as c_ex:
-                raise UserException(c_ex) from c_ex
-            _writer_tickets.writerows(_api_results)
-
-            if 'tickets_messages' in _objects:
-
-                ticket_ids = [t['id'] for t in _api_results]
-
-                logging.info(f"The component will process messages for {len(ticket_ids)} tickets.")
-
-                _writer_messages = LiveAgentWriter(self.tables_out_path, 'tickets_messages', _incremental)
-                _writer_content = LiveAgentWriter(self.tables_out_path, 'tickets_messages_content',
-                                                  _incremental)
-
-                _out_messages = []
-                _out_contents = []
-
-                for tid in ticket_ids:
-                    try:
-                        _messages = self.client.get_ticket_messages(tid)
-
-                    except ClientException as c_ex:
-                        raise UserException(c_ex) from c_ex
-
-                    for msg in _messages:
-                        msg['ticket_id'] = tid
-                        msg_id = msg['id']
-
-                        _out_messages += [msg]
-
-                        for cont in msg['messages']:
-                            cont['message_id'] = msg_id
-                            _out_contents += [cont]
-
-                _writer_messages.writerows(_out_messages)
-                _writer_content.writerows(_out_contents)
-
-
-================================================
 File: /src/liveagent/result.py
 ================================================
 import os
@@ -955,47 +997,22 @@ class LiveAgentWriter:
 
 
 ================================================
-File: /src/liveagent/utils.py
+File: /src/main.py
 ================================================
-class Parameters:
-    pass
+from liveagent.component import Component, UserException
+import logging
 
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        comp.run()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
 
-class Writers:
-    pass
-
-
-================================================
-File: /LICENSE.md
-================================================
-The MIT License (MIT)
-
-Copyright (c) 2018 Keboola DS, http://keboola.com
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files, to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished
-to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
-================================================
-File: /requirements.txt
-================================================
-https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.9.zip#egg=kbc
-keboola.http-client
-retry
 
 ================================================
 File: /bitbucket-pipelines.yml
@@ -1072,9 +1089,21 @@ pipelines:
             - ./deploy.sh
 
 ================================================
+File: /component_config/component_long_description.md
+================================================
+# LiveAgent (Ladesk) extractor
+
+This extractor allows to download data from LiveAgent.
+
+================================================
 File: /component_config/component_short_description.md
 ================================================
 LiveAgent is a multi-channel customer service software that offers 175+ help desk and live chat features.
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
 
 ================================================
 File: /component_config/configSchema.json
@@ -1221,23 +1250,6 @@ File: /component_config/configSchema.json
 }
 
 ================================================
-File: /component_config/stack_parameters.json
-================================================
-{}
-
-================================================
-File: /component_config/component_long_description.md
-================================================
-# LiveAgent (Ladesk) extractor
-
-This extractor allows to download data from LiveAgent.
-
-================================================
-File: /component_config/sample-config/in/state.json
-================================================
-{"data_delta": "10222018"}
-
-================================================
 File: /component_config/sample-config/config.json
 ================================================
 {
@@ -1261,83 +1273,9 @@ File: /component_config/sample-config/config.json
 }
 
 ================================================
-File: /deploy.sh
+File: /component_config/sample-config/in/state.json
 ================================================
-#!/bin/sh
-set -e
-
-#check if deployment is triggered only in master
-if [ $BITBUCKET_BRANCH != "master" ]; then
-               echo Deploy on tagged commit can be only executed in master!
-               exit 1
-fi
-
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
-
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
-
-# Push to the repository
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${BITBUCKET_TAG}
-docker push ${REPOSITORY}:latest
-
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
-fi
-
-
-================================================
-File: /docker-compose.yml
-================================================
-version: "2"
-services:
-  # for development purposes
-  dev:
-    build: .
-    volumes:
-        - ./:/code
-        - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-  test:
-    # Use to run flake8 and unittests checks
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-    command:
-      - /bin/sh
-      - /code/scripts/build_n_test.sh
-
-================================================
-File: /scripts/build_n_test.sh
-================================================
-#!/bin/sh
-set -e
-
-flake8 --config=flake8.cfg
-python -m unittest discover
+{"data_delta": "10222018"}
 
 ================================================
 File: /scripts/update_dev_portal_properties.sh
@@ -1411,4 +1349,66 @@ else
     echo "shortDescription is empty!"
     exit 1
 fi
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.9.zip#egg=kbc
+keboola.http-client
+retry
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.8.6-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/main.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 

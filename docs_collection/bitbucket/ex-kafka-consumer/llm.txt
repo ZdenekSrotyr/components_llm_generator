@@ -1,110 +1,49 @@
 Directory structure:
 └── kds_consulting_team-ex-kafka-consumer/
-    ├── tests/
-    │   ├── __init__.py
-    │   └── test_component.py
-    ├── Dockerfile
     ├── flake8.cfg
+    ├── deploy.sh
+    ├── docker-compose.yml
     ├── src/
-    │   ├── kafka_kbc/
-    │   │   ├── __init__.py
-    │   │   └── client.py
-    │   └── component.py
-    ├── LICENSE.md
-    ├── docs/
-    │   └── imgs/
-    ├── requirements.txt
+    │   ├── component.py
+    │   └── kafka_kbc/
+    │       ├── __init__.py
+    │       └── client.py
     ├── bitbucket-pipelines.yml
+    ├── tests/
+    │   ├── test_component.py
+    │   └── __init__.py
     ├── component_config/
-    │   ├── component_short_description.md
-    │   ├── configSchema.json
-    │   ├── stack_parameters.json
-    │   ├── configuration_description.md
     │   ├── component_long_description.md
+    │   ├── configuration_description.md
+    │   ├── component_short_description.md
+    │   ├── stack_parameters.json
+    │   ├── configSchema.json
     │   └── sample-config/
+    │       ├── config.json
     │       ├── in/
+    │       │   ├── state.json
     │       │   ├── tables/
     │       │   │   ├── test.csv
     │       │   │   └── test.csv.manifest
-    │       │   ├── state.json
     │       │   └── files/
     │       │       └── order1.xml
-    │       ├── out/
-    │       │   ├── tables/
-    │       │   │   └── test.csv
-    │       │   └── files/
-    │       │       └── order1.xml
-    │       └── config.json
-    ├── deploy.sh
-    ├── docker-compose.yml
+    │       └── out/
+    │           ├── tables/
+    │           │   └── test.csv
+    │           └── files/
+    │               └── order1.xml
     ├── scripts/
-    │   ├── build_n_test.sh
     │   ├── update_dev_portal_properties.sh
-    │   ├── build_n_run.ps1
+    │   ├── run_kbc_tests.ps1
     │   ├── run.bat
-    │   └── run_kbc_tests.ps1
+    │   ├── build_n_run.ps1
+    │   └── build_n_test.sh
+    ├── requirements.txt
+    ├── docs/
+    │   └── imgs/
+    ├── Dockerfile
+    ├── LICENSE.md
     └── README.md
-
-================================================
-File: /tests/__init__.py
-================================================
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
-
-================================================
-File: /tests/test_component.py
-================================================
-'''
-Created on 12. 11. 2018
-
-@author: esner
-'''
-import unittest
-import mock
-import os
-from freezegun import freeze_time
-
-from component import Component
-
-
-class TestComponent(unittest.TestCase):
-
-    # set global time to 2010-10-10 - affects functions like datetime.now()
-    @freeze_time("2010-10-10")
-    # set KBC_DATADIR env to non-existing dir
-    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
-    def test_run_no_cfg_fails(self):
-        with self.assertRaises(ValueError):
-            comp = Component()
-            comp.run()
-
-
-if __name__ == "__main__":
-    # import sys;sys.argv = ['', 'Test.testName']
-    unittest.main()
-
-
-================================================
-File: /Dockerfile
-================================================
-FROM python:3.7.2-slim
-ENV PYTHONIOENCODING utf-8
-
-COPY . /code/
-
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
-
-RUN pip install flake8
-
-RUN pip install -r /code/requirements.txt
-
-WORKDIR /code/
-
-
-CMD ["python", "-u", "/code/src/component.py"]
-
 
 ================================================
 File: /flake8.cfg
@@ -130,113 +69,74 @@ max-line-length = 120
 
 
 ================================================
-File: /src/kafka_kbc/client.py
+File: /deploy.sh
 ================================================
-import logging
+#!/bin/sh
+set -e
 
-from confluent_kafka import Consumer, TopicPartition
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
 
-# maximum time (s) the consumer is waiting for next message
-NEXT_MSG_TIMEOUT = 60
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
 
 
-class Kbcconsumer():
-
-    def __init__(self, servers, group_id, client_id, name, password, logger, start_offset=None, config_params=None,
-                 debug=False):
-
-        configuration = {
-            "bootstrap.servers": servers,
-            "group.id": group_id,
-            "client.id": client_id,
-            "session.timeout.ms": 6000,
-            "security.protocol": "SASL_SSL",
-            "sasl.mechanisms": "SCRAM-SHA-256",
-            "sasl.username": name,
-            "sasl.password": password,
-            # we are controlling offset ourselves, by default start from start
-            "auto.offset.reset": "smallest",
-            "enable.auto.commit": True,
-            "logger": logger
-        }
-        if debug:
-            configuration['debug'] = 'consumer, broker'
-
-        if not start_offset:
-            logging.info("No start offset specified, smallest offset will be used.")
-        else:
-            logging.info("Start offset specified, continue from previous state: {0}".format(start_offset))
-
-        # convert offset keys to proper format
-        conv_offsets = dict()
-        for off in start_offset:
-            conv_offsets[off.replace('p', '')] = start_offset[off]
-
-        self.start_offset = conv_offsets
-        self.consumer = Consumer(**configuration)
-        logging.debug(self.consumer.assignment(servers))
-
-    def _set_start_offsets(self, consumer, partitions):
-        logging.debug(F'Setting starting offsets {self.start_offset} for partitions: {partitions}')
-        if self.start_offset:
-            for p in partitions:
-                p.offset = self.start_offset.get(str(p.partition), 0)
-        else:
-            for p in partitions:
-                p.offset = 0
-
-        consumer.assign(partitions)
-
-    def consume_message_batch(self, topics):
-
-        self.consumer.subscribe(topics, on_assign=self._set_start_offsets)
-
-        # get highest offset for current topic
-        max_offsets = self._get_max_offsets(topics[0])
-
-        logging.info(F"Subscribed to the topic {topics}")
-        # Data extraction
-        do_poll = True
-        # poll until timeout is reached or the max offset is received
-        while do_poll:
-            logging.info("Reading...")
-            consume_pars = dict()
-            consume_pars['timeout'] = NEXT_MSG_TIMEOUT
-
-            msgs = self.consumer.consume(**consume_pars)
-            if not msgs:
-                # polling timeouted, stop
-                logging.info(F'Polling timeouted, there was no message received for more than {NEXT_MSG_TIMEOUT}s')
-                do_poll = False
-
-            for msg in msgs:
-                if msg is None:
-                    continue
-
-                if max_offsets.get(msg.partition()) == msg.offset():
-                    max_offsets.pop(msg.partition())
-
-                # if all partitions max offset was reached, end
-                if not max_offsets:
-                    do_poll = False
-
-                yield msg
-
-    def _get_max_offsets(self, topic):
-        logging.debug('Getting offset boundaries for all partitions.')
-        offsets = dict()
-        curr_topics = self.consumer.list_topics(timeout=60).topics
-        if not curr_topics.get(topic):
-            raise ValueError(F'The topic: "{topic}" does not exist. Available topics are: {curr_topics}')
-        for p in curr_topics[topic].partitions:
-            boundaries = self.consumer.get_watermark_offsets(TopicPartition(topic, p))
-            # store only if there are some new messages
-            if boundaries[1] > 0:
-                # decrement to get max existing offset
-                offsets[p] = boundaries[1] - 1
-        logging.debug(F'Offset boundaries listed successfully. {offsets}')
-        return offsets
-
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
 
 ================================================
 File: /src/component.py
@@ -414,37 +314,113 @@ if __name__ == "__main__":
 
 
 ================================================
-File: /LICENSE.md
+File: /src/kafka_kbc/client.py
 ================================================
-The MIT License (MIT)
+import logging
 
-Copyright (c) 2018 Keboola DS, http://keboola.com
+from confluent_kafka import Consumer, TopicPartition
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files, to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished
-to do so, subject to the following conditions:
+# maximum time (s) the consumer is waiting for next message
+NEXT_MSG_TIMEOUT = 60
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+class Kbcconsumer():
 
-================================================
-File: /requirements.txt
-================================================
-https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.4.zip#egg=kbc
-mock
-freezegun
-confluent_kafka
+    def __init__(self, servers, group_id, client_id, name, password, logger, start_offset=None, config_params=None,
+                 debug=False):
+
+        configuration = {
+            "bootstrap.servers": servers,
+            "group.id": group_id,
+            "client.id": client_id,
+            "session.timeout.ms": 6000,
+            "security.protocol": "SASL_SSL",
+            "sasl.mechanisms": "SCRAM-SHA-256",
+            "sasl.username": name,
+            "sasl.password": password,
+            # we are controlling offset ourselves, by default start from start
+            "auto.offset.reset": "smallest",
+            "enable.auto.commit": True,
+            "logger": logger
+        }
+        if debug:
+            configuration['debug'] = 'consumer, broker'
+
+        if not start_offset:
+            logging.info("No start offset specified, smallest offset will be used.")
+        else:
+            logging.info("Start offset specified, continue from previous state: {0}".format(start_offset))
+
+        # convert offset keys to proper format
+        conv_offsets = dict()
+        for off in start_offset:
+            conv_offsets[off.replace('p', '')] = start_offset[off]
+
+        self.start_offset = conv_offsets
+        self.consumer = Consumer(**configuration)
+        logging.debug(self.consumer.assignment(servers))
+
+    def _set_start_offsets(self, consumer, partitions):
+        logging.debug(F'Setting starting offsets {self.start_offset} for partitions: {partitions}')
+        if self.start_offset:
+            for p in partitions:
+                p.offset = self.start_offset.get(str(p.partition), 0)
+        else:
+            for p in partitions:
+                p.offset = 0
+
+        consumer.assign(partitions)
+
+    def consume_message_batch(self, topics):
+
+        self.consumer.subscribe(topics, on_assign=self._set_start_offsets)
+
+        # get highest offset for current topic
+        max_offsets = self._get_max_offsets(topics[0])
+
+        logging.info(F"Subscribed to the topic {topics}")
+        # Data extraction
+        do_poll = True
+        # poll until timeout is reached or the max offset is received
+        while do_poll:
+            logging.info("Reading...")
+            consume_pars = dict()
+            consume_pars['timeout'] = NEXT_MSG_TIMEOUT
+
+            msgs = self.consumer.consume(**consume_pars)
+            if not msgs:
+                # polling timeouted, stop
+                logging.info(F'Polling timeouted, there was no message received for more than {NEXT_MSG_TIMEOUT}s')
+                do_poll = False
+
+            for msg in msgs:
+                if msg is None:
+                    continue
+
+                if max_offsets.get(msg.partition()) == msg.offset():
+                    max_offsets.pop(msg.partition())
+
+                # if all partitions max offset was reached, end
+                if not max_offsets:
+                    do_poll = False
+
+                yield msg
+
+    def _get_max_offsets(self, topic):
+        logging.debug('Getting offset boundaries for all partitions.')
+        offsets = dict()
+        curr_topics = self.consumer.list_topics(timeout=60).topics
+        if not curr_topics.get(topic):
+            raise ValueError(F'The topic: "{topic}" does not exist. Available topics are: {curr_topics}')
+        for p in curr_topics[topic].partitions:
+            boundaries = self.consumer.get_watermark_offsets(TopicPartition(topic, p))
+            # store only if there are some new messages
+            if boundaries[1] > 0:
+                # decrement to get max existing offset
+                offsets[p] = boundaries[1] - 1
+        logging.debug(F'Offset boundaries listed successfully. {offsets}')
+        return offsets
+
 
 ================================================
 File: /bitbucket-pipelines.yml
@@ -512,19 +488,49 @@ pipelines:
             - ./deploy.sh
 
 ================================================
-File: /component_config/component_short_description.md
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /component_config/component_long_description.md
 ================================================
 TBD
-
-================================================
-File: /component_config/configSchema.json
-================================================
-{}
-
-================================================
-File: /component_config/stack_parameters.json
-================================================
-{}
 
 ================================================
 File: /component_config/configuration_description.md
@@ -532,9 +538,82 @@ File: /component_config/configuration_description.md
 Testing configuration description.
 
 ================================================
-File: /component_config/component_long_description.md
+File: /component_config/component_short_description.md
 ================================================
 TBD
+
+================================================
+File: /component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: /component_config/configSchema.json
+================================================
+{}
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
 
 ================================================
 File: /component_config/sample-config/in/tables/test.csv
@@ -644,11 +723,6 @@ File: /component_config/sample-config/in/tables/test.csv.manifest
 }
 
 ================================================
-File: /component_config/sample-config/in/state.json
-================================================
-{"data_delta": "10222018"}
-
-================================================
 File: /component_config/sample-config/in/files/order1.xml
 ================================================
 <?xml version='1.0' ?>
@@ -718,143 +792,6 @@ File: /component_config/sample-config/out/files/order1.xml
         </order>
     </orders>
 </root_el>
-
-================================================
-File: /component_config/sample-config/config.json
-================================================
-{
-  "storage": {
-    "input": {
-      "files": [],
-      "tables": [
-        {
-          "source": "in.c-test.test",
-          "destination": "test.csv",
-          "limit": 50,
-          "columns": [],
-          "where_values": [],
-          "where_operator": "eq"
-        }
-      ]
-    },
-    "output": {
-      "files": [],
-      "tables": []
-    }
-  },
-  "parameters": {
-    "#api_token": "demo",
-    "period_from": "yesterday",
-    "endpoints": [
-      "deals",
-      "companies"
-    ],
-    "company_properties": "",
-    "deal_properties": "",
-    "debug": true
-  },
-  "image_parameters": {
-    "syrup_url": "https://syrup.keboola.com/"
-  },
-  "authorization": {
-    "oauth_api": {
-      "id": "OAUTH_API_ID",
-      "credentials": {
-        "id": "main",
-        "authorizedFor": "Myself",
-        "creator": {
-          "id": "1234",
-          "description": "me@keboola.com"
-        },
-        "created": "2016-01-31 00:13:30",
-        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
-        "oauthVersion": "2.0",
-        "appKey": "000000004C184A49",
-        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
-      }
-    }
-  }
-}
-
-
-================================================
-File: /deploy.sh
-================================================
-#!/bin/sh
-set -e
-
-#check if deployment is triggered only in master
-if [ $BITBUCKET_BRANCH != "master" ]; then
-               echo Deploy on tagged commit can be only executed in master!
-               exit 1
-fi
-
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
-
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
-
-# Push to the repository
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${BITBUCKET_TAG}
-docker push ${REPOSITORY}:latest
-
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
-fi
-
-
-================================================
-File: /docker-compose.yml
-================================================
-version: "2"
-services:
-  # for development purposes
-  dev:
-    build: .
-    volumes:
-        - ./:/code
-        - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-  test:
-    # Use to run flake8 and unittests checks
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-    command:
-      - /bin/sh
-      - /code/scripts/build_n_test.sh
-
-================================================
-File: /scripts/build_n_test.sh
-================================================
-#!/bin/sh
-set -e
-
-flake8 --config=flake8.cfg
-python -m unittest discover
 
 ================================================
 File: /scripts/update_dev_portal_properties.sh
@@ -930,46 +867,6 @@ else
 fi
 
 ================================================
-File: /scripts/build_n_run.ps1
-================================================
-echo Building component...
-$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
-docker build -rm -t $COMP_TAG ../
-
-echo Running component...
-Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
-    $Readhost = Read-Host " ( y / n ) " 
-    Switch ($ReadHost) 
-     { 
-       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
-       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
-       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
-     } 
-
-Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
-    $Readhost = Read-Host " ( y / n ) " 
-    Switch ($ReadHost) 
-     { 
-       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
-       N {Write-Host "No, execute the app normally"; 
-		    echo $DATA_PATH
-			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
-	   } 
-       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
-     } 
-
-
-
-
-================================================
-File: /scripts/run.bat
-================================================
-@echo off
-
-echo Running component...
-docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
-
-================================================
 File: /scripts/run_kbc_tests.ps1
 ================================================
 echo "Preparing KBC test image"
@@ -1005,6 +902,109 @@ docker push $REPOSITORY`:test
 echo 'running test config in KBC'
 docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
 
+
+================================================
+File: /scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.4.zip#egg=kbc
+mock
+freezegun
+confluent_kafka
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.7.2-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 ================================================
 File: /README.md
