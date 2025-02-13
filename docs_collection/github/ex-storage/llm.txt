@@ -1,104 +1,32 @@
 Directory structure:
 └── keboola-ex-storage/
+    ├── phpcs.xml
+    ├── composer.lock
+    ├── tests/
+    │   └── phpunit/
+    │       ├── bootstrap.php
+    │       ├── AuthorizationTest.php
+    │       └── StorageExtractorTest.php
+    ├── LICENSE
+    ├── composer.json
+    ├── Dockerfile
+    ├── src/
+    │   ├── Authorization.php
+    │   ├── run.php
+    │   ├── Config.php
+    │   ├── ConfigDefinition.php
+    │   └── Component.php
+    ├── phpstan.neon
+    ├── .dockerignore
+    ├── docker-compose.yml
     ├── docker/
     │   ├── php-prod.ini
     │   └── composer-install.sh
-    ├── LICENSE
-    ├── phpcs.xml
-    ├── docker-compose.yml
-    ├── src/
-    │   ├── Config.php
-    │   ├── Authorization.php
-    │   ├── Component.php
-    │   ├── run.php
-    │   └── ConfigDefinition.php
-    ├── composer.lock
-    ├── phpstan.neon
-    ├── tests/
-    │   └── phpunit/
-    │       ├── AuthorizationTest.php
-    │       ├── StorageExtractorTest.php
-    │       └── bootstrap.php
     ├── phpunit.xml.dist
-    ├── .github/
-    │   └── workflows/
-    │       └── push.yml
-    ├── composer.json
-    ├── .dockerignore
-    ├── Dockerfile
-    └── README.md
-
-================================================
-File: /docker/php-prod.ini
-================================================
-; Recommended production values
-display_errors = Off
-display_startup_errors = Off
-error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
-html_errors = On
-log_errors = On
-max_input_time = 60
-output_buffering = 4096
-register_argc_argv = Off
-request_order = "GP"
-session.gc_divisor = 1000
-session.sid_bits_per_character = 5
-short_open_tag = Off
-track_errors = Off
-variables_order = "GPCS"
-
-; Custom
-date.timezone = UTC
-memory_limit = -1
-
-
-================================================
-File: /docker/composer-install.sh
-================================================
-#!/bin/sh
-
-EXPECTED_SIGNATURE=$(curl -s https://composer.github.io/installer.sig)
-php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
-ACTUAL_SIGNATURE=$(php -r "echo hash_file('SHA384', 'composer-setup.php');")
-
-if [ "$EXPECTED_SIGNATURE" != "$ACTUAL_SIGNATURE" ]
-then
-    >&2 echo 'ERROR: Invalid installer signature'
-    rm composer-setup.php
-    exit 1
-fi
-
-php composer-setup.php --quiet --install-dir=/usr/local/bin/ --filename=composer
-RESULT=$?
-rm composer-setup.php
-exit $RESULT
-
-
-================================================
-File: /LICENSE
-================================================
-MIT License
-
-Copyright (c) Keboola :(){:|:&};: s.r.o.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
+    ├── README.md
+    └── .github/
+        └── workflows/
+            └── push.yml
 
 ================================================
 File: /phpcs.xml
@@ -112,419 +40,6 @@ File: /phpcs.xml
     </rule>
     <exclude-pattern>*/src/Kernel.php</exclude-pattern>
 </ruleset>
-
-
-================================================
-File: /docker-compose.yml
-================================================
-version: '2'
-services:
-  dev:
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-
-
-================================================
-File: /src/Config.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\StorageExtractor;
-
-use Keboola\Component\Config\BaseConfig;
-
-class Config extends BaseConfig
-{
-    public function getToken(): string
-    {
-        return $this->getValue(['parameters', '#token']);
-    }
-
-    public function getUrl(): string
-    {
-        return $this->getValue(['parameters', 'url']);
-    }
-
-    public function getIncremental(): bool
-    {
-        return (bool) $this->getValue(['parameters', 'incremental']);
-    }
-
-    public function getPrimaryKey(): array
-    {
-        return (array) $this->getValue(['parameters', 'primaryKey']);
-    }
-
-    public function getTableName(): string
-    {
-        return (string) $this->getValue(['parameters', 'tableName']);
-    }
-
-    public function getChangedSince(): string
-    {
-        return (string) $this->getValue(['parameters', 'changedSince']);
-    }
-
-    public function extractMetadata(): bool
-    {
-        return (bool) $this->getValue(['parameters', 'extractMetadata']);
-    }
-
-    public function isFullSync(): bool
-    {
-        return (bool) $this->getValue(['parameters', 'fullSync']);
-    }
-}
-
-
-================================================
-File: /src/Authorization.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\StorageExtractor;
-
-use Keboola\Component\BaseComponent;
-use Keboola\Component\Manifest\ManifestManager\Options\OutTableManifestOptions;
-use Keboola\Component\UserException;
-use Keboola\StorageApi\Client;
-use Keboola\StorageApi\ClientException;
-use Keboola\StorageApi\Metadata;
-use Keboola\StorageApi\TableExporter;
-
-class Authorization
-{
-    /**
-     * @var string
-     */
-    private $authorizedBucket;
-
-    /**
-     * @var string
-     */
-    private $authorizedProjectName;
-
-    /**
-     * @var int
-     */
-    private $authorizedProjectId;
-
-    public function __construct(Client $client)
-    {
-        $tokenInfo = $client->verifyToken();
-        $this->validateNumberOfBuckets($tokenInfo);
-        $bucket = (string) array_keys($tokenInfo['bucketPermissions'])[0];
-        $this->validateBucketPermissions($tokenInfo, $bucket);
-        $this->authorizedBucket = $bucket;
-        $this->authorizedProjectName = $tokenInfo['owner']['name'];
-        $this->authorizedProjectId = $tokenInfo['owner']['id'];
-    }
-
-    private function validateNumberOfBuckets(array $tokenInfo): void
-    {
-        if (count($tokenInfo['bucketPermissions']) !== 1) {
-            throw new UserException('The token must have read-only permissions to a single bucket only.');
-        }
-    }
-
-    private function validateBucketPermissions(array $tokenInfo, string $bucket): void
-    {
-        if ($tokenInfo['bucketPermissions'][$bucket] !== 'read') {
-            throw new UserException(
-                sprintf('The token must have read-only permissions to the bucket "%s".', $bucket)
-            );
-        }
-    }
-
-    public function getAuthorizedBucket(): string
-    {
-        return $this->authorizedBucket;
-    }
-
-    public function getAuthorizedProjectName(): string
-    {
-        return $this->authorizedProjectName;
-    }
-
-    public function getAuthorizedProjectId(): int
-    {
-        return $this->authorizedProjectId;
-    }
-}
-
-
-================================================
-File: /src/Component.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\StorageExtractor;
-
-use Keboola\Component\BaseComponent;
-use Keboola\Component\Manifest\ManifestManager\Options\OutTableManifestOptions;
-use Keboola\Component\UserException;
-use Keboola\StorageApi\Client;
-use Keboola\StorageApi\ClientException;
-use Keboola\StorageApi\Metadata;
-use Keboola\StorageApi\TableExporter;
-use function GuzzleHttp\json_encode;
-
-class Component extends BaseComponent
-{
-    private const ACTION_RUN = 'run';
-
-    private const ACTION_LIST = 'list';
-
-    private const ACTION_INFO = 'info';
-
-    private const ACTION_SOURCE_INFO = 'sourceInfo';
-
-    private Client $client;
-    private Authorization $authorization;
-
-    protected function getSyncActions(): array
-    {
-        return [
-            self::ACTION_LIST => 'listTablesAction',
-            self::ACTION_INFO => 'projectInfoAction',
-            self::ACTION_SOURCE_INFO => 'sourceInfoAction',
-        ];
-    }
-
-    protected function listTablesAction(): array
-    {
-        $this->authorize();
-        $bucket = $this->authorization->getAuthorizedBucket();
-        try {
-            return ['tables' => $this->listTables($this->client, $bucket)];
-        } catch (ClientException $e) {
-            throw new UserException($e->getMessage());
-        }
-    }
-
-    protected function projectInfoAction(): array
-    {
-        $this->authorize();
-        return $this->getProjectInfo($this->authorization);
-    }
-
-    protected function sourceInfoAction(): array
-    {
-        $this->authorize();
-        $bucket = $this->authorization->getAuthorizedBucket();
-        try {
-            return [
-                'tables' => $this->listTables($this->client, $bucket),
-                'project' => $this->getProjectInfo($this->authorization),
-            ];
-        } catch (ClientException $e) {
-            throw new UserException($e->getMessage());
-        }
-    }
-
-    protected function run(): void
-    {
-        /** @var Config $config */
-        $config = $this->getConfig();
-        $this->authorize();
-        $bucket = $this->authorization->getAuthorizedBucket();
-        try {
-            $this->extract($this->client, $config, $bucket);
-        } catch (ClientException $e) {
-            throw new UserException($e->getMessage());
-        }
-    }
-
-    private function authorize(): void
-    {
-        try {
-            /** @var Config $config */
-            $config = $this->getConfig();
-            $this->client = new Client(['token' => $config->getToken(), 'url' => $config->getUrl()]);
-            $this->authorization = new Authorization($this->client);
-        } catch (ClientException $e) {
-            throw new UserException($e->getMessage());
-        }
-    }
-
-    private function extract(Client $client, Config $config, string $bucket): void
-    {
-        if (empty($config->getTableName())) {
-            throw new UserException('The tableName parameter must be provided.');
-        }
-        $this->getLogger()->info(sprintf('Processing table "%s".', $config->getTableName()));
-        $exporter = new TableExporter($client);
-        $tableId = $bucket . '.' . $config->getTableName();
-        if (!empty($config->getChangedSince())) {
-            $options['changedSince'] = $config->getChangedSince();
-        } else {
-            $options = [];
-        }
-        $exporter->exportTable(
-            $tableId,
-            $this->getDataDir() . '/out/tables/' . $config->getTableName() . '.csv',
-            $options
-        );
-        $manifestOptions = new OutTableManifestOptions();
-        if ($config->isFullSync()) {
-            $tableInfo = $client->getTable($tableId);
-            $manifestOptions->setPrimaryKeyColumns($tableInfo['primaryKey']);
-            $manifestOptions->setIncremental(false);
-        } else {
-            $manifestOptions->setPrimaryKeyColumns($config->getPrimaryKey());
-            $manifestOptions->setIncremental($config->getIncremental());
-        }
-        if ($config->extractMetadata()) {
-            $tableInfo = $client->getTable($tableId);
-            $metadata = new Metadata($client);
-            $columnMetadata = [];
-            foreach ($tableInfo['columns'] as $column) {
-                $colMetadata = $this->filterMetadata(
-                    $metadata->listColumnMetadata($tableId . '.' . $column)
-                );
-                if ($colMetadata) {
-                    $columnMetadata[$column] = $colMetadata;
-                }
-            }
-            $tableMetadata = $this->filterMetadata($metadata->listTableMetadata($tableId));
-            if ($columnMetadata) {
-                $manifestOptions->setColumnMetadata($columnMetadata);
-            }
-            if ($tableMetadata) {
-                $manifestOptions->setMetadata($tableMetadata);
-            }
-        }
-        $this->getManifestManager()->writeTableManifest($config->getTableName() . '.csv', $manifestOptions);
-        $this->getLogger()->info(sprintf('Table "%s" processed.', $config->getTableName()));
-    }
-
-    private function listTables(Client $client, string $bucket): array
-    {
-        $tables = $client->listTables($bucket);
-        array_walk($tables, function (&$value): void {
-            $value = [
-                'name' => $value['name'],
-                'primaryKey' => $value['primaryKey'],
-            ];
-        });
-        return $tables;
-    }
-
-    private function filterMetadata(array $metadata): array
-    {
-        $result = [];
-        foreach ($metadata as $item) {
-            $result[] = array_filter(
-                $item,
-                function ($key) {
-                    return in_array($key, ['key', 'value']);
-                },
-                ARRAY_FILTER_USE_KEY
-            );
-        }
-        return $result;
-    }
-
-    protected function getConfigClass(): string
-    {
-        return Config::class;
-    }
-
-    protected function getConfigDefinitionClass(): string
-    {
-        return ConfigDefinition::class;
-    }
-
-    private function getProjectInfo(Authorization $authorization): array
-    {
-        return [
-            'projectId' => $authorization->getAuthorizedProjectId(),
-            'projectName' => $authorization->getAuthorizedProjectName(),
-            'bucket' => $authorization->getAuthorizedBucket(),
-        ];
-    }
-}
-
-
-================================================
-File: /src/run.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-use Keboola\Component\Logger;
-use Keboola\Component\UserException;
-use Keboola\StorageExtractor\Component;
-
-require __DIR__ . '/../vendor/autoload.php';
-
-$logger = new Logger();
-try {
-    $app = new Component($logger);
-    $app->execute();
-    exit(0);
-} catch (UserException $e) {
-    $logger->error($e->getMessage());
-    exit(1);
-} catch (Throwable $e) {
-    $logger->critical(
-        get_class($e) . ':' . $e->getMessage(),
-        [
-            'errFile' => $e->getFile(),
-            'errLine' => $e->getLine(),
-            'errCode' => $e->getCode(),
-            'errTrace' => $e->getTraceAsString(),
-            'errPrevious' => $e->getPrevious() ? get_class($e->getPrevious()) : '',
-        ]
-    );
-    exit(2);
-}
-
-
-================================================
-File: /src/ConfigDefinition.php
-================================================
-<?php
-
-declare(strict_types=1);
-
-namespace Keboola\StorageExtractor;
-
-use Keboola\Component\Config\BaseConfigDefinition;
-use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
-
-class ConfigDefinition extends BaseConfigDefinition
-{
-    protected function getParametersDefinition(): ArrayNodeDefinition
-    {
-        $parametersNode = parent::getParametersDefinition();
-        // @formatter:off
-        /** @noinspection NullPointerExceptionInspection */
-        $parametersNode
-            ->children()
-            ->scalarNode('#token')->isRequired()->cannotBeEmpty()->end()
-            ->scalarNode('url')->isRequired()->cannotBeEmpty()->end()
-            ->scalarNode('tableName')->defaultValue('')->end()
-            ->scalarNode('changedSince')->defaultValue('')->end()
-            ->booleanNode('extractMetadata')->defaultFalse()->end()
-            ->booleanNode('fullSync')->defaultFalse()->end()
-            ->arrayNode('primaryKey')->prototype('scalar')->end()->end()
-            ->booleanNode('incremental')->defaultFalse()->end()
-            ->end()
-        ;
-        // @formatter:on
-        return $parametersNode;
-    }
-}
 
 
 ================================================
@@ -5983,18 +5498,13 @@ File: /composer.lock
 
 
 ================================================
-File: /phpstan.neon
+File: /tests/phpunit/bootstrap.php
 ================================================
-parameters:
-    level: max
-    checkMissingIterableValueType: false
-    paths:
-        - src
-        - tests
-    ignoreErrors:
-        - '#Cannot call method scalarNode\(\) on Symfony\\Component\\Config\\Definition\\Builder\\NodeParentInterface\|null\.#'
-        - '#function get_class expects object, Throwable\|null given\.#'
-        - '#Parameter .1 \$array_arg of function sort expects array, array<bool\|float\|int\|string, mixed> given\.#'
+<?php
+
+declare(strict_types=1);
+
+require __DIR__ . '/../../vendor/autoload.php';
 
 
 ================================================
@@ -6584,154 +6094,29 @@ class StorageExtractorTest extends TestCase
 
 
 ================================================
-File: /tests/phpunit/bootstrap.php
+File: /LICENSE
 ================================================
-<?php
+MIT License
 
-declare(strict_types=1);
+Copyright (c) Keboola :(){:|:&};: s.r.o.
 
-require __DIR__ . '/../../vendor/autoload.php';
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-================================================
-File: /phpunit.xml.dist
-================================================
-<?xml version="1.0" encoding="UTF-8"?>
-<phpunit backupGlobals="false"
-         backupStaticAttributes="false"
-         colors="true"
-         convertErrorsToExceptions="true"
-         convertNoticesToExceptions="true"
-         convertWarningsToExceptions="true"
-         processIsolation="false"
-         stopOnFailure="false"
-         bootstrap="tests/phpunit/bootstrap.php">
-    <testsuite name="Main Test Suite">
-        <directory>tests/phpunit</directory>
-    </testsuite>
-</phpunit>
-
-
-================================================
-File: /.github/workflows/push.yml
-================================================
-name: GitHub Actions
-on: [ push ]
-concurrency: ci-${{ github.ref }} # to avoid tag collisions in the ECR
-env:
-  APP_IMAGE: keboola-ex-storage
-  KBC_DEVELOPERPORTAL_APP: "keboola.ex-storage"
-  KBC_DEVELOPERPORTAL_VENDOR: "keboola"
-  KBC_DEVELOPERPORTAL_USERNAME: "keboola+ex_storage_gh_actions"
-  KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
-  # https://connection.keboola.com/admin/projects/2703/extractors/keboola.ex-storage/764729155
-  KBC_TEST_PROJECT_CONFIGS: 764729155
-  KBC_TEST_BUCKET: in.c-ex-storage
-  KBC_TEST_URL: https://connection.keboola.com/
-  KBC_TEST_TOKEN: ${{ secrets.KBC_TEST_TOKEN }}
-  KBC_TEST_WRITE_TOKEN: ${{ secrets.KBC_TEST_WRITE_TOKEN }}
-  KBC_STORAGE_TOKEN: ${{ secrets.KBC_STORAGE_TOKEN }}
-
-  # DockerHub login
-  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
-  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    outputs:
-      app_image_tag: ${{ steps.tag.outputs.app_image_tag }}
-      is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
-    steps:
-      -
-        name: Check out the repo
-        uses: actions/checkout@v2
-      -
-        name: Print Docker version
-        run: docker -v
-      -
-        name: Docker login
-        if: env.DOCKERHUB_TOKEN
-        run: docker login --username "$DOCKERHUB_USER" --password "$DOCKERHUB_TOKEN"
-      -
-        name: Build image
-        run: docker build -t $APP_IMAGE .
-      -
-        name: Set image tag
-        id: tag
-        run: |
-          TAG="${GITHUB_REF##*/}"
-          IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
-          echo "Tag = '$TAG', is semantic tag = '$IS_SEMANTIC_TAG'"
-          echo "::set-output name=app_image_tag::$TAG"
-          echo "::set-output name=is_semantic_tag::$IS_SEMANTIC_TAG"
-      -
-        name: Push image to ECR
-        uses: keboola/action-push-to-ecr@master
-        with:
-          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
-          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
-          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
-          password: ${{ env.KBC_DEVELOPERPORTAL_PASSWORD }}
-          tag: ${{ steps.tag.outputs.app_image_tag }}
-          push_latest: ${{ steps.tag.outputs.is_semantic_tag }}
-          source_image: ${{ env.APP_IMAGE}}
-
-  tests:
-    needs: build
-    runs-on: ubuntu-latest
-    # strategy:
-    #   fail-fast: false
-    #   matrix: ...
-    steps:
-      -
-        name: Check out the repo
-        uses: actions/checkout@v2
-      -
-        name: Pull image from ECR
-        uses: keboola/action-pull-from-ecr@master
-        with:
-          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
-          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
-          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
-          password: ${{ env.KBC_DEVELOPERPORTAL_PASSWORD }}
-          tag: ${{ needs.build.outputs.app_image_tag }}
-          target_image: ${{ env.APP_IMAGE}}
-          tag_as_latest: true
-      -
-        name: Run tests
-        run: docker run -e KBC_TEST_TOKEN -e KBC_TEST_WRITE_TOKEN -e KBC_TEST_URL -e KBC_TEST_BUCKET ${{env.APP_IMAGE}} composer ci
-
-  tests-in-kbc:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      -
-        name: Run KBC test jobs
-        if: env.KBC_STORAGE_TOKEN && env.KBC_TEST_PROJECT_CONFIGS
-        uses: keboola/action-run-configs-parallel@master
-        with:
-          token: ${{ env.KBC_STORAGE_TOKEN }}
-          componentId: ${{ env.KBC_DEVELOPERPORTAL_APP }}
-          tag: ${{ needs.build.outputs.app_image_tag }}
-          configs: ${{ env.KBC_TEST_PROJECT_CONFIGS }}
-
-  deploy:
-    needs:
-      - build
-      - tests
-      - tests-in-kbc
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') && needs.build.outputs.is_semantic_tag == 'true'
-    steps:
-      -
-        name: Set tag in the Deloper Portal
-        uses: keboola/action-set-tag-developer-portal@master
-        with:
-          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
-          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
-          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
-          password: ${{ env.KBC_DEVELOPERPORTAL_PASSWORD }}
-          tag: ${{ needs.build.outputs.app_image_tag }}
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 
 ================================================
@@ -6799,12 +6184,6 @@ File: /composer.json
 
 
 ================================================
-File: /.dockerignore
-================================================
-vendor/
-
-
-================================================
 File: /Dockerfile
 ================================================
 FROM php:7-cli
@@ -6837,6 +6216,505 @@ COPY . /code/
 RUN composer install $COMPOSER_FLAGS
 
 CMD ["php", "/code/src/run.php"]
+
+
+================================================
+File: /src/Authorization.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\StorageExtractor;
+
+use Keboola\Component\BaseComponent;
+use Keboola\Component\Manifest\ManifestManager\Options\OutTableManifestOptions;
+use Keboola\Component\UserException;
+use Keboola\StorageApi\Client;
+use Keboola\StorageApi\ClientException;
+use Keboola\StorageApi\Metadata;
+use Keboola\StorageApi\TableExporter;
+
+class Authorization
+{
+    /**
+     * @var string
+     */
+    private $authorizedBucket;
+
+    /**
+     * @var string
+     */
+    private $authorizedProjectName;
+
+    /**
+     * @var int
+     */
+    private $authorizedProjectId;
+
+    public function __construct(Client $client)
+    {
+        $tokenInfo = $client->verifyToken();
+        $this->validateNumberOfBuckets($tokenInfo);
+        $bucket = (string) array_keys($tokenInfo['bucketPermissions'])[0];
+        $this->validateBucketPermissions($tokenInfo, $bucket);
+        $this->authorizedBucket = $bucket;
+        $this->authorizedProjectName = $tokenInfo['owner']['name'];
+        $this->authorizedProjectId = $tokenInfo['owner']['id'];
+    }
+
+    private function validateNumberOfBuckets(array $tokenInfo): void
+    {
+        if (count($tokenInfo['bucketPermissions']) !== 1) {
+            throw new UserException('The token must have read-only permissions to a single bucket only.');
+        }
+    }
+
+    private function validateBucketPermissions(array $tokenInfo, string $bucket): void
+    {
+        if ($tokenInfo['bucketPermissions'][$bucket] !== 'read') {
+            throw new UserException(
+                sprintf('The token must have read-only permissions to the bucket "%s".', $bucket)
+            );
+        }
+    }
+
+    public function getAuthorizedBucket(): string
+    {
+        return $this->authorizedBucket;
+    }
+
+    public function getAuthorizedProjectName(): string
+    {
+        return $this->authorizedProjectName;
+    }
+
+    public function getAuthorizedProjectId(): int
+    {
+        return $this->authorizedProjectId;
+    }
+}
+
+
+================================================
+File: /src/run.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+use Keboola\Component\Logger;
+use Keboola\Component\UserException;
+use Keboola\StorageExtractor\Component;
+
+require __DIR__ . '/../vendor/autoload.php';
+
+$logger = new Logger();
+try {
+    $app = new Component($logger);
+    $app->execute();
+    exit(0);
+} catch (UserException $e) {
+    $logger->error($e->getMessage());
+    exit(1);
+} catch (Throwable $e) {
+    $logger->critical(
+        get_class($e) . ':' . $e->getMessage(),
+        [
+            'errFile' => $e->getFile(),
+            'errLine' => $e->getLine(),
+            'errCode' => $e->getCode(),
+            'errTrace' => $e->getTraceAsString(),
+            'errPrevious' => $e->getPrevious() ? get_class($e->getPrevious()) : '',
+        ]
+    );
+    exit(2);
+}
+
+
+================================================
+File: /src/Config.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\StorageExtractor;
+
+use Keboola\Component\Config\BaseConfig;
+
+class Config extends BaseConfig
+{
+    public function getToken(): string
+    {
+        return $this->getValue(['parameters', '#token']);
+    }
+
+    public function getUrl(): string
+    {
+        return $this->getValue(['parameters', 'url']);
+    }
+
+    public function getIncremental(): bool
+    {
+        return (bool) $this->getValue(['parameters', 'incremental']);
+    }
+
+    public function getPrimaryKey(): array
+    {
+        return (array) $this->getValue(['parameters', 'primaryKey']);
+    }
+
+    public function getTableName(): string
+    {
+        return (string) $this->getValue(['parameters', 'tableName']);
+    }
+
+    public function getChangedSince(): string
+    {
+        return (string) $this->getValue(['parameters', 'changedSince']);
+    }
+
+    public function extractMetadata(): bool
+    {
+        return (bool) $this->getValue(['parameters', 'extractMetadata']);
+    }
+
+    public function isFullSync(): bool
+    {
+        return (bool) $this->getValue(['parameters', 'fullSync']);
+    }
+}
+
+
+================================================
+File: /src/ConfigDefinition.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\StorageExtractor;
+
+use Keboola\Component\Config\BaseConfigDefinition;
+use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
+
+class ConfigDefinition extends BaseConfigDefinition
+{
+    protected function getParametersDefinition(): ArrayNodeDefinition
+    {
+        $parametersNode = parent::getParametersDefinition();
+        // @formatter:off
+        /** @noinspection NullPointerExceptionInspection */
+        $parametersNode
+            ->children()
+            ->scalarNode('#token')->isRequired()->cannotBeEmpty()->end()
+            ->scalarNode('url')->isRequired()->cannotBeEmpty()->end()
+            ->scalarNode('tableName')->defaultValue('')->end()
+            ->scalarNode('changedSince')->defaultValue('')->end()
+            ->booleanNode('extractMetadata')->defaultFalse()->end()
+            ->booleanNode('fullSync')->defaultFalse()->end()
+            ->arrayNode('primaryKey')->prototype('scalar')->end()->end()
+            ->booleanNode('incremental')->defaultFalse()->end()
+            ->end()
+        ;
+        // @formatter:on
+        return $parametersNode;
+    }
+}
+
+
+================================================
+File: /src/Component.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\StorageExtractor;
+
+use Keboola\Component\BaseComponent;
+use Keboola\Component\Manifest\ManifestManager\Options\OutTableManifestOptions;
+use Keboola\Component\UserException;
+use Keboola\StorageApi\Client;
+use Keboola\StorageApi\ClientException;
+use Keboola\StorageApi\Metadata;
+use Keboola\StorageApi\TableExporter;
+use function GuzzleHttp\json_encode;
+
+class Component extends BaseComponent
+{
+    private const ACTION_RUN = 'run';
+
+    private const ACTION_LIST = 'list';
+
+    private const ACTION_INFO = 'info';
+
+    private const ACTION_SOURCE_INFO = 'sourceInfo';
+
+    private Client $client;
+    private Authorization $authorization;
+
+    protected function getSyncActions(): array
+    {
+        return [
+            self::ACTION_LIST => 'listTablesAction',
+            self::ACTION_INFO => 'projectInfoAction',
+            self::ACTION_SOURCE_INFO => 'sourceInfoAction',
+        ];
+    }
+
+    protected function listTablesAction(): array
+    {
+        $this->authorize();
+        $bucket = $this->authorization->getAuthorizedBucket();
+        try {
+            return ['tables' => $this->listTables($this->client, $bucket)];
+        } catch (ClientException $e) {
+            throw new UserException($e->getMessage());
+        }
+    }
+
+    protected function projectInfoAction(): array
+    {
+        $this->authorize();
+        return $this->getProjectInfo($this->authorization);
+    }
+
+    protected function sourceInfoAction(): array
+    {
+        $this->authorize();
+        $bucket = $this->authorization->getAuthorizedBucket();
+        try {
+            return [
+                'tables' => $this->listTables($this->client, $bucket),
+                'project' => $this->getProjectInfo($this->authorization),
+            ];
+        } catch (ClientException $e) {
+            throw new UserException($e->getMessage());
+        }
+    }
+
+    protected function run(): void
+    {
+        /** @var Config $config */
+        $config = $this->getConfig();
+        $this->authorize();
+        $bucket = $this->authorization->getAuthorizedBucket();
+        try {
+            $this->extract($this->client, $config, $bucket);
+        } catch (ClientException $e) {
+            throw new UserException($e->getMessage());
+        }
+    }
+
+    private function authorize(): void
+    {
+        try {
+            /** @var Config $config */
+            $config = $this->getConfig();
+            $this->client = new Client(['token' => $config->getToken(), 'url' => $config->getUrl()]);
+            $this->authorization = new Authorization($this->client);
+        } catch (ClientException $e) {
+            throw new UserException($e->getMessage());
+        }
+    }
+
+    private function extract(Client $client, Config $config, string $bucket): void
+    {
+        if (empty($config->getTableName())) {
+            throw new UserException('The tableName parameter must be provided.');
+        }
+        $this->getLogger()->info(sprintf('Processing table "%s".', $config->getTableName()));
+        $exporter = new TableExporter($client);
+        $tableId = $bucket . '.' . $config->getTableName();
+        if (!empty($config->getChangedSince())) {
+            $options['changedSince'] = $config->getChangedSince();
+        } else {
+            $options = [];
+        }
+        $exporter->exportTable(
+            $tableId,
+            $this->getDataDir() . '/out/tables/' . $config->getTableName() . '.csv',
+            $options
+        );
+        $manifestOptions = new OutTableManifestOptions();
+        if ($config->isFullSync()) {
+            $tableInfo = $client->getTable($tableId);
+            $manifestOptions->setPrimaryKeyColumns($tableInfo['primaryKey']);
+            $manifestOptions->setIncremental(false);
+        } else {
+            $manifestOptions->setPrimaryKeyColumns($config->getPrimaryKey());
+            $manifestOptions->setIncremental($config->getIncremental());
+        }
+        if ($config->extractMetadata()) {
+            $tableInfo = $client->getTable($tableId);
+            $metadata = new Metadata($client);
+            $columnMetadata = [];
+            foreach ($tableInfo['columns'] as $column) {
+                $colMetadata = $this->filterMetadata(
+                    $metadata->listColumnMetadata($tableId . '.' . $column)
+                );
+                if ($colMetadata) {
+                    $columnMetadata[$column] = $colMetadata;
+                }
+            }
+            $tableMetadata = $this->filterMetadata($metadata->listTableMetadata($tableId));
+            if ($columnMetadata) {
+                $manifestOptions->setColumnMetadata($columnMetadata);
+            }
+            if ($tableMetadata) {
+                $manifestOptions->setMetadata($tableMetadata);
+            }
+        }
+        $this->getManifestManager()->writeTableManifest($config->getTableName() . '.csv', $manifestOptions);
+        $this->getLogger()->info(sprintf('Table "%s" processed.', $config->getTableName()));
+    }
+
+    private function listTables(Client $client, string $bucket): array
+    {
+        $tables = $client->listTables($bucket);
+        array_walk($tables, function (&$value): void {
+            $value = [
+                'name' => $value['name'],
+                'primaryKey' => $value['primaryKey'],
+            ];
+        });
+        return $tables;
+    }
+
+    private function filterMetadata(array $metadata): array
+    {
+        $result = [];
+        foreach ($metadata as $item) {
+            $result[] = array_filter(
+                $item,
+                function ($key) {
+                    return in_array($key, ['key', 'value']);
+                },
+                ARRAY_FILTER_USE_KEY
+            );
+        }
+        return $result;
+    }
+
+    protected function getConfigClass(): string
+    {
+        return Config::class;
+    }
+
+    protected function getConfigDefinitionClass(): string
+    {
+        return ConfigDefinition::class;
+    }
+
+    private function getProjectInfo(Authorization $authorization): array
+    {
+        return [
+            'projectId' => $authorization->getAuthorizedProjectId(),
+            'projectName' => $authorization->getAuthorizedProjectName(),
+            'bucket' => $authorization->getAuthorizedBucket(),
+        ];
+    }
+}
+
+
+================================================
+File: /phpstan.neon
+================================================
+parameters:
+    level: max
+    checkMissingIterableValueType: false
+    paths:
+        - src
+        - tests
+    ignoreErrors:
+        - '#Cannot call method scalarNode\(\) on Symfony\\Component\\Config\\Definition\\Builder\\NodeParentInterface\|null\.#'
+        - '#function get_class expects object, Throwable\|null given\.#'
+        - '#Parameter .1 \$array_arg of function sort expects array, array<bool\|float\|int\|string, mixed> given\.#'
+
+
+================================================
+File: /.dockerignore
+================================================
+vendor/
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: '2'
+services:
+  dev:
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+
+
+================================================
+File: /docker/php-prod.ini
+================================================
+; Recommended production values
+display_errors = Off
+display_startup_errors = Off
+error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
+html_errors = On
+log_errors = On
+max_input_time = 60
+output_buffering = 4096
+register_argc_argv = Off
+request_order = "GP"
+session.gc_divisor = 1000
+session.sid_bits_per_character = 5
+short_open_tag = Off
+track_errors = Off
+variables_order = "GPCS"
+
+; Custom
+date.timezone = UTC
+memory_limit = -1
+
+
+================================================
+File: /docker/composer-install.sh
+================================================
+#!/bin/sh
+
+EXPECTED_SIGNATURE=$(curl -s https://composer.github.io/installer.sig)
+php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+ACTUAL_SIGNATURE=$(php -r "echo hash_file('SHA384', 'composer-setup.php');")
+
+if [ "$EXPECTED_SIGNATURE" != "$ACTUAL_SIGNATURE" ]
+then
+    >&2 echo 'ERROR: Invalid installer signature'
+    rm composer-setup.php
+    exit 1
+fi
+
+php composer-setup.php --quiet --install-dir=/usr/local/bin/ --filename=composer
+RESULT=$?
+rm composer-setup.php
+exit $RESULT
+
+
+================================================
+File: /phpunit.xml.dist
+================================================
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit backupGlobals="false"
+         backupStaticAttributes="false"
+         colors="true"
+         convertErrorsToExceptions="true"
+         convertNoticesToExceptions="true"
+         convertWarningsToExceptions="true"
+         processIsolation="false"
+         stopOnFailure="false"
+         bootstrap="tests/phpunit/bootstrap.php">
+    <testsuite name="Main Test Suite">
+        <directory>tests/phpunit</directory>
+    </testsuite>
+</phpunit>
 
 
 ================================================
@@ -6966,5 +6844,127 @@ For information about deployment and integration with KBC, please refer to the [
 ## License
 
 MIT licensed, see [LICENSE](./LICENSE) file.
+
+
+================================================
+File: /.github/workflows/push.yml
+================================================
+name: GitHub Actions
+on: [ push ]
+concurrency: ci-${{ github.ref }} # to avoid tag collisions in the ECR
+env:
+  APP_IMAGE: keboola-ex-storage
+  KBC_DEVELOPERPORTAL_APP: "keboola.ex-storage"
+  KBC_DEVELOPERPORTAL_VENDOR: "keboola"
+  KBC_DEVELOPERPORTAL_USERNAME: "keboola+ex_storage_gh_actions"
+  KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+  # https://connection.keboola.com/admin/projects/2703/extractors/keboola.ex-storage/764729155
+  KBC_TEST_PROJECT_CONFIGS: 764729155
+  KBC_TEST_BUCKET: in.c-ex-storage
+  KBC_TEST_URL: https://connection.keboola.com/
+  KBC_TEST_TOKEN: ${{ secrets.KBC_TEST_TOKEN }}
+  KBC_TEST_WRITE_TOKEN: ${{ secrets.KBC_TEST_WRITE_TOKEN }}
+  KBC_STORAGE_TOKEN: ${{ secrets.KBC_STORAGE_TOKEN }}
+
+  # DockerHub login
+  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      app_image_tag: ${{ steps.tag.outputs.app_image_tag }}
+      is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
+    steps:
+      -
+        name: Check out the repo
+        uses: actions/checkout@v2
+      -
+        name: Print Docker version
+        run: docker -v
+      -
+        name: Docker login
+        if: env.DOCKERHUB_TOKEN
+        run: docker login --username "$DOCKERHUB_USER" --password "$DOCKERHUB_TOKEN"
+      -
+        name: Build image
+        run: docker build -t $APP_IMAGE .
+      -
+        name: Set image tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
+          echo "Tag = '$TAG', is semantic tag = '$IS_SEMANTIC_TAG'"
+          echo "::set-output name=app_image_tag::$TAG"
+          echo "::set-output name=is_semantic_tag::$IS_SEMANTIC_TAG"
+      -
+        name: Push image to ECR
+        uses: keboola/action-push-to-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ env.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ steps.tag.outputs.app_image_tag }}
+          push_latest: ${{ steps.tag.outputs.is_semantic_tag }}
+          source_image: ${{ env.APP_IMAGE}}
+
+  tests:
+    needs: build
+    runs-on: ubuntu-latest
+    # strategy:
+    #   fail-fast: false
+    #   matrix: ...
+    steps:
+      -
+        name: Check out the repo
+        uses: actions/checkout@v2
+      -
+        name: Pull image from ECR
+        uses: keboola/action-pull-from-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ env.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.build.outputs.app_image_tag }}
+          target_image: ${{ env.APP_IMAGE}}
+          tag_as_latest: true
+      -
+        name: Run tests
+        run: docker run -e KBC_TEST_TOKEN -e KBC_TEST_WRITE_TOKEN -e KBC_TEST_URL -e KBC_TEST_BUCKET ${{env.APP_IMAGE}} composer ci
+
+  tests-in-kbc:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Run KBC test jobs
+        if: env.KBC_STORAGE_TOKEN && env.KBC_TEST_PROJECT_CONFIGS
+        uses: keboola/action-run-configs-parallel@master
+        with:
+          token: ${{ env.KBC_STORAGE_TOKEN }}
+          componentId: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          tag: ${{ needs.build.outputs.app_image_tag }}
+          configs: ${{ env.KBC_TEST_PROJECT_CONFIGS }}
+
+  deploy:
+    needs:
+      - build
+      - tests
+      - tests-in-kbc
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && needs.build.outputs.is_semantic_tag == 'true'
+    steps:
+      -
+        name: Set tag in the Deloper Portal
+        uses: keboola/action-set-tag-developer-portal@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ env.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.build.outputs.app_image_tag }}
 
 

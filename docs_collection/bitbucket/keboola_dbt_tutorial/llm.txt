@@ -1,609 +1,33 @@
 Directory structure:
 └── kds_consulting_team-keboola_dbt_tutorial/
-    ├── models/
-    │   └── beers/
-    │       ├── beers_with_breweries.sql
-    │       ├── sales.sql
-    │       ├── breweries.sql
-    │       ├── beers.sql
-    │       ├── order_lines.sql
-    │       ├── schema.yml
-    │       ├── orders.sql
-    │       └── promo_deliveries.sql
-    ├── dbt_project.yml
     ├── tests/
-    │   ├── assert_ibu_0_100_range.sql
-    │   └── .gitkeep
-    ├── macros/
-    │   ├── randint.sql
-    │   ├── date_format.sql
-    │   └── yyyymmdd.sql
-    ├── analysis/
     │   ├── .gitkeep
-    │   ├── dbt_artifacts.ipynb
+    │   └── assert_ibu_0_100_range.sql
+    ├── analysis/
     │   ├── dag.html
     │   ├── sqlparsing.ipynb
+    │   ├── .gitkeep
+    │   ├── dbt_artifacts.ipynb
     │   └── freshness.yml
     ├── snapshots/
     │   └── .gitkeep
     ├── packages.yml
+    ├── models/
+    │   └── beers/
+    │       ├── order_lines.sql
+    │       ├── beers_with_breweries.sql
+    │       ├── breweries.sql
+    │       ├── schema.yml
+    │       ├── sales.sql
+    │       ├── orders.sql
+    │       ├── promo_deliveries.sql
+    │       └── beers.sql
+    ├── macros/
+    │   ├── yyyymmdd.sql
+    │   ├── randint.sql
+    │   └── date_format.sql
+    ├── dbt_project.yml
     └── README.md
-
-================================================
-File: /models/beers/beers_with_breweries.sql
-================================================
-{{ config(
-    materialized="table",
-    persist_docs={"relation": true, "columns": true}
-) }}
-
-SELECT *
-FROM {{ ref('beers') }} beers
-JOIN {{ ref('breweries') }} breweries USING (brewery_id)
-
-
-================================================
-File: /models/beers/sales.sql
-================================================
-{{ config(
-    materialized="table",
-    persist_docs={"relation": true, "columns": true},
-    transient=false
-) }}
-
-SELECT
- "beers_with_breweries".beer_id               AS beer_id,
- "beers_with_breweries".beer_name             AS beer_name,
- "beers_with_breweries".beer_style            AS beer_style,
- "beers_with_breweries".abv                   AS abv,
- "beers_with_breweries".ibu                   AS ibu,
- "beers_with_breweries".bitterness           AS bitterness,
- "beers_with_breweries".ounces                AS ounces,
-
- "beers_with_breweries".brewery_id            AS brewery_id,
- "beers_with_breweries".brewery_name          AS brewery_name,
- "beers_with_breweries".brewery_city          AS brewery_city,
- "beers_with_breweries".brewery_state         AS brewery_state,
- "beers_with_breweries".brewery_country       AS brewery_country,
-
- "orders".order_no                           AS order_no,
- "order_lines".order_line                     AS order_line,
- "orders".created_at                          AS order_created_at,
- "order_lines".quantity                       AS order_li_quantity,
- "order_lines".price                          AS order_li_price_each,
- "order_lines".quantity * "order_lines".price   AS order_li_price_total
-
-FROM {{ ref('orders') }} "orders"
-JOIN {{ ref('order_lines') }} "order_lines" USING (order_no)
-JOIN {{ ref('beers_with_breweries') }} "beers_with_breweries" USING (beer_id)
-
-WHERE "orders".status = 'DELIVERED'
-
-
-================================================
-File: /models/beers/breweries.sql
-================================================
-
-{{ config(
-    materialized="view"
-) }}
-
-SELECT
-  "id"                    AS brewery_id,
-  trim("name")            AS brewery_name,
-  trim("city")            AS brewery_city,
-  trim("state")           AS brewery_state,
-  'USA'                 AS brewery_country
-FROM
-  {{ source('in.c-keboola-ex-http-28681838', 'seed_breweries') }}
-
-
-================================================
-File: /models/beers/beers.sql
-================================================
-{{ config(
-    materialized="view"
-) }}
-
-SELECT
-  "id"            AS beer_id,
-  TRIM("name")    AS beer_name,
-  "style"         AS beer_style,
-  TRY_TO_NUMERIC("abv",14,8)           AS abv,
-  TRY_TO_NUMERIC("ibu",14,8)           AS ibu,
-  CASE 
-       WHEN ibu <= 50 THEN 'Malty'
-       WHEN ibu > 50 THEN 'Hoppy'
-   END AS bitterness,
-  "brewery_id"    AS brewery_id,
-  "ounces"        AS ounces
-FROM
-  {{ source('in.c-keboola-ex-http-28681838', 'seed_beers') }}
-
-
-================================================
-File: /models/beers/order_lines.sql
-================================================
-{{ config(
-    materialized='table',
-    unique_key='order_line',
-    persist_docs={"relation": true, "columns": true}
-) }}
-
--- We'll fake some data, since this is an example repository
--- we want to make sure that we continue to generate data up
--- to today
-
-WITH generated_order_lines AS (
-    {% for day_ago in range(30) %}
-        {% for order_number in range(10) %}
-            -- Each order has between 1 and 5 order_lines
-            {% for order_line in range(3) %}
-                SELECT CONCAT(
-                            {{ date_format() }}(
-                                DATEADD(Day, -1 * {{ day_ago }}, current_timestamp),
-                                {{ yyymmdd() }}
-                            ),
-                            '{{ order_number }}'
-                       )                                   AS order_no,
-                       CONCAT(
-                           {{ date_format() }}(
-                                DATEADD(Day, -1 * {{ day_ago }}, current_timestamp),
-                                {{ yyymmdd() }}
-                           ),
-                           '{{ order_number }}{{ order_line }}'
-                       ) AS order_line,
-                       (
-                            -- Deterministically select a random beer
-                            SELECT MOD(
-                                ABS(HASH({{ order_number + order_line }})),
-                                (
-                                    SELECT MAX(beer_id) FROM {{ ref('beers') }}
-                                )
-                            )
-                       )                                                          AS beer_id,
-                       1 +MOD(ABS(HASH({{ order_number + order_line }})), 3)      AS quantity,
-                       MOD(ABS(HASH({{ order_number + order_line }})), 300) / 100 AS price,
-                       DATEADD(Day, -1 * {{ day_ago }}, current_timestamp)        AS created_at,
-                       current_timestamp                                          AS changed_at
-
-                {% if not loop.last %}
-                  UNION ALL
-                {% endif %}
-            {% endfor %}
-            {% if not loop.last %}
-            UNION ALL
-            {% endif %}
-      {% endfor %}
-
-      {% if not loop.last %}
-        UNION ALL
-      {% endif %}
-    {% endfor %}
-)
-
-SELECT *
-FROM generated_order_lines
-
-{% if is_incremental() %}
-    WHERE created_at::date > (SELECT MAX(created_at)::date FROM {{ this }})
-{% endif %}
-
-
-================================================
-File: /models/beers/schema.yml
-================================================
-version: 2
-
-models:
-  - name: beers_with_breweries
-    tags:
-      - operations
-    meta:
-      owner: fisa@keboola.com
-    description: "Beers joined with their breweries"
-    columns:
-      - name: brewery_id
-        description: "The unique identifier for the brewery"
-        tests:
-          - not_null
-        meta:
-          primary-key: true
-          dimension:
-            sql: ${TABLE}.brewery_id
-          meta:
-          metrics:
-            num_unique_breweries: # name of your metric
-              type: count_distinct # metric type
-      - name: beer_id
-        description: "The unique identifier for the beer"
-        tests:
-          - unique
-          - not_null
-        meta:
-          primary-key: true
-          dimension:
-            sql: ${TABLE}.beer_id
-      - name: beer_name
-        description: The name of the beer
-        meta:
-          primary-key: true
-      - name: beer_style
-        description: Style of the beer (IPA, Porter, etc)
-        meta:
-          dimension:
-            sql: ${TABLE}.beer_style
-          metrics:
-            num_unique_beer_styles: # name of your metric
-              type: count_distinct # metric type
-      - name: abv
-        description: Alcohol percentage in the beer
-      - name: ibu
-        description: The bitterness of the beer in IBUs
-      - name: bitterness
-        description: The bitterness category of the beer (based on IBUs)
-      - name: ounces
-        description: The volume of the beer
-      - name: brewery_name
-        description: Name of the brewery
-      - name: brewery_city
-        description: City of the brewery
-      - name: brewery_state
-        description: State of the brewery
-
-  - name: beers
-    tags:
-      - operations
-    meta:
-      owner: fisa@keboola.com
-    description: "Beer List"
-    tags: 
-      - products
-      - sales
-      - ecommerce
-    columns:
-      - name: beer_id
-        tests:
-          - unique
-          - not_null
-        meta:
-          primary-key: true
-          dimension:
-            sql: ${TABLE}.beer_id
-          metrics:
-            num_unique_beers: # name of your metric
-              type: count_distinct # metric type
-        description: The unique indentifier of the beer
-
-      - name: beer_name
-        description: The name of the beer as on the label
-        meta:
-          dimension:
-            sql: ${TABLE}.beer_name
-
-      - name: beer_style
-        description: The style of the beer (IPA, Porter, etc)
-        meta:
-          dimension:
-            sql: ${TABLE}.beer_style
-          metrics:
-            num_unique_beer_styles: # name of your metric
-              type: count_distinct
-              description: "Distinct Beer Styles"
-
-      - name: abv
-        description: Alcohol by volume
-        meta:
-          metrics:
-            avg_abv:
-              type: average
-              description: "Average Alcohol by volume"
-
-      - name: ibu
-        description: Bitterness in International Bitterness Units
-        meta:
-          metrics:
-            avg_ibu:
-              type: average
-              description: "Average Bitterness in International Bitterness Units"
-
-      - name: bitterness
-        description: The bitterness category of the beer (based on IBUs)
-        meta:
-          dimension:
-            sql: ${TABLE}.bitterness
-            description: "Bitterness Types"
-
-      - name: brewery_id
-        description: The unique indentifier of the brewery
-        metrics:
-            num_unique_breweries: # name of your metric
-              type: count_distinct
-              description: "Distinct Number of Breweries"
-      
-      - name: ounces
-        description: Volume of a single unit
-        meta:
-          metrics:
-            avg_ounces:
-              type: average
-              description: "Average Volume of a single unit"
-
-
-  - name: breweries
-    tags:
-      - operations
-    meta:
-      owner: fisa@keboola.com
-    columns:
-      - name: brewery_id
-        meta:
-         primary-key: true
-         metrics:
-            num_unique_breweries: # name of your metric
-              type: count_distinct # metric type
-
-  - name: orders
-    tags:
-      - ecommerce
-    meta:
-      owner: jordan.burger@keboola.com
-    columns:
-      - name: order_no
-        meta:
-         primary-key: true
-         metrics:
-            num_unique_orders: # name of your metric
-              type: count_distinct # metric type
-
-  - name: order_lines
-    tags:
-      - ecommerce
-    meta:
-      owner: jordan.burger@keboola.com
-    columns:
-      - name: order_no
-        meta:
-          primary-key: true
-        tests:
-          - relationships:
-              to: ref('orders')
-              field: order_no
-
-      - name: order_line
-        meta:
-          primary-key: true
-        tests:
-          - unique
-
-  - name: sales
-    tags:
-      - finance
-    meta:
-      owner: fisa@keboola.com
-    description: "Beer Sales"
-    columns:
-      - name: beer_id
-        description: The unique indentifier of the beer
-      - name: beer_name
-        description: The name of the beer as on the label
-      - name: beer_style
-        description: The style of the beer (IPA, Porter, etc)
-      - name: abv
-        description: Alcohol by volume
-      - name: ibu
-        description: International Bitterness Unit
-      - name: bitterness
-        description: The bitterness category of the beer (based on IBUs)
-      - name: ounces
-        description: Volume of a single unit
-      - name: brewery_id
-        description: The unique indentifier of the brewery
-      - name: brewery_name
-        description: The official name of the brewery
-      - name: brewery_city
-      - name: brewery_state
-      - name: brewery_country
-      - name: order_no
-        description: The order number
-        tests:
-          - not_null
-        tags:
-          - primary-key
-        meta:
-          primary-key: true
-      - name: order_line
-        description: The order line number
-        tests:
-          - not_null
-        tags:
-          - primary-key
-        meta:
-          primary-key: true
-      - name: order_created_at
-        description: When the order was created
-      - name: order_li_quantity
-        description: The number of units for the order line
-      - name: order_li_price_each
-        description: Price for a single unit
-      - name: order_li_price_total
-        description: The total price for the order line
-
-  - name: promo_deliveries
-    tags:
-      - marketing
-    meta:
-      owner: david.pospisil@keboola.com
-    columns:
-      - name: customer_id
-        description: "Customer id"
-        meta: 
-          primary-key: true
-        tags:
-          - primary-key
-
-
-
-================================================
-File: /models/beers/orders.sql
-================================================
-{{ config(
-    materialized='table',
-    unique_key='order_no',
-    persist_docs={"relation": true, "columns": true}
-) }}
-
--- We'll fake some data, since this is an example repository
--- we want to make sure that we continue to generate data up
--- to today
-
-WITH generated_orders AS (
-    {% for day_ago in range(30) %}
-        {% for order_number in range(10) %}
-          SELECT
-              CONCAT(
-                   {{ date_format() }}(
-                        DATEADD(Day, -1 * {{ day_ago }}, CURRENT_DATE),
-                        {{ yyymmdd() }}
-                   ),
-                   '{{ order_number }}'
-             )::int                                                            AS order_no,
-
-             {{ randint(123456, 654321) }}                                  AS customer_id,
-
-             {% if order_number is divisibleby 13 %}
-                'PENDING'                                                      AS status,
-             {% else %}
-                'DELIVERED'                                                    AS status,
-             {% endif %}
-             DATEADD(Day, -1 * {{ day_ago }}, CURRENT_DATE)                    AS created_at,
-             current_timestamp                                                 AS changed_at
-
-          {% if not loop.last %}
-            UNION ALL
-          {% endif %}
-        {% endfor %}
-
-        {% if not loop.last %}
-            UNION ALL
-        {% endif %}
-    {% endfor %}
-)
-
-SELECT *
-FROM generated_orders
-
-{% if is_incremental() %}
-    WHERE created_at::date > (SELECT MAX(created_at)::date FROM {{ this }})
-{% endif %}
-
-
-================================================
-File: /models/beers/promo_deliveries.sql
-================================================
-{{ config(
-    materialized="table",
-    persist_docs={"relation": true, "columns": true},
-    transient=false
-) }}
-
-SELECT customer_id,
-       'Hoppy' AS promo,
-       COUNT(DISTINCT b.beer_name) AS cnt_beers_purchased    
-  FROM {{ ref('orders') }} o
-  JOIN {{ ref('order_lines') }} ol
-  USING (order_no)
-  JOIN {{ ref('beers') }} b
-  USING(beer_id)
-  GROUP BY 1
-  HAVING COUNT(CASE WHEN b.bitterness = 'Hoppy' THEN 1 END)
-         >
-         COUNT(CASE WHEN b.bitterness = 'Malty' THEN 1 END)
-
-UNION
-
-SELECT customer_id,
-       'Malty' AS promo,
-       COUNT(DISTINCT b.beer_name) AS cnt_beers_purchased
-  FROM {{ ref('orders') }} o
-  JOIN {{ ref('order_lines') }} ol
-  USING (order_no)
-  JOIN {{ ref('beers') }} b
-  USING(beer_id)
-  GROUP BY 1
-  HAVING COUNT(CASE WHEN b.bitterness = 'Malty' THEN 1 END)
-         >
-         COUNT(CASE WHEN b.bitterness = 'Hoppy' THEN 1 END)
-
-
-
-================================================
-File: /dbt_project.yml
-================================================
-
-# Name your project! Project names should contain only lowercase characters
-# and underscores. A good package name should reflect your organization's
-# name or the intended use of these models
-
-name: 'beer_analytics'
-version: '1.0.0'
-config-version: 2
-
-
-
-# This setting configures which "profile" dbt uses for this project.
-profile: beer_analytics
-
-# These configurations specify where dbt should look for different types of files.
-# The `source-paths` config, for example, states that models in this project can be
-# found in the "models/" directory. You probably won't need to change these!
-model-paths: ["models"]
-analysis-paths: ["analysis"]
-test-paths: ["tests"]
-seed-paths: ["data"]
-macro-paths: ["macros"]
-snapshot-paths: ["snapshots"]
-
-target-path: "target"  # directory which will store compiled SQL files
-clean-targets:         # directories to be removed by `dbt clean`
-    - "target"
-    - "dbt_modules"
-
-
-# https://docs.getdbt.com/reference/project-configs/quoting
-quoting:
-  database: true
-  schema: true
-  identifier: true
-
-
-#sources:
-#  freshness: # default freshness
-#    warn_after: {count: 1, period: day}
-#    error_after: {count: 7, period: day}
-
-# Seeds are handled by Keboola platform (uploaded files)
-#seeds:
-#  beer_analytics:
-#    +enabled: true
-#    seed_beers:
-#      +column_types:
-#        ibu: decimal
-#        abv: decimal
-
-
-# Configuring models
-# Full documentation: https://docs.getdbt.com/docs/configuring-models
-
-# In this example config, we tell dbt to build all models in the example/ directory
-# as tables. These settings can be overridden in the individual model files
-# using the `{{ config(...) }}` macro.
-models:
-  beer_analytics:
-      # Applies to all files under models/example/
-      beers:
-          materialized: view
-
 
 ================================================
 File: /tests/assert_ibu_0_100_range.sql
@@ -617,84 +41,300 @@ WHERE ibu < 0 OR ibu > 140
 
 
 ================================================
-File: /macros/randint.sql
+File: /analysis/dag.html
 ================================================
-{#
-Not every DB has a function to return random integer within the given range.
+<html>
+<head>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vis-network@latest/styles/vis-network.css" type="text/css" />
+<script type="text/javascript" src="https://cdn.jsdelivr.net/npm/vis-network@latest/dist/vis-network.min.js"> </script>
+<center>
+<h1></h1>
+</center>
 
-* For Snowflake, there is a native implementation;
-* For Databricks, we have to use a custom expression.
+<!-- <link rel="stylesheet" href="../node_modules/vis/dist/vis.min.css" type="text/css" />
+<script type="text/javascript" src="../node_modules/vis/dist/vis.js"> </script>-->
 
-The name of the macro is borrowed from the analogous Python `random.randint()` function.
-#}
+<style type="text/css">
 
-{%- macro randint(min, max) -%}
-    {{ return(adapter.dispatch('randint')(min, max)) }}
-{%- endmacro -%}
+        #mynetwork {
+            width: 800px;
+            height: 1200px;
+            background-color: #ffffff;
+            border: 1px solid lightgray;
+            position: relative;
+            float: left;
+        }
+
+        
+
+        
+
+        
+</style>
+
+</head>
+
+<body>
+<div id = "mynetwork"></div>
 
 
-{%- macro default__randint(min, max) -%}
-    UNIFORM({{ min }}, {{ max }}, RANDOM())
-{%- endmacro -%}
+<script type="text/javascript">
+
+    // initialize global variables.
+    var edges;
+    var nodes;
+    var network; 
+    var container;
+    var options, data;
+
+    
+    // This method is responsible for drawing the graph, returns the drawn network
+    function drawGraph() {
+        var container = document.getElementById('mynetwork');
+        
+        
+
+        // parsing and collecting nodes and edges from the python
+        nodes = new vis.DataSet([{"columns": {"\"abv\"": {"description": "", "meta": {}, "name": "\"abv\"", "tags": []}, "\"brewery_id\"": {"description": "", "meta": {}, "name": "\"brewery_id\"", "tags": []}, "\"ibu\"": {"description": "", "meta": {}, "name": "\"ibu\"", "tags": []}, "\"id\"": {"description": "", "meta": {}, "name": "\"id\"", "tags": []}, "\"name\"": {"description": "", "meta": {}, "name": "\"name\"", "tags": []}, "\"ounces\"": {"description": "", "meta": {}, "name": "\"ounces\"", "tags": []}, "\"style\"": {"description": "", "meta": {}, "name": "\"style\"", "tags": []}}, "config": {"enabled": true}, "created_at": 1658792883.997974, "database": "SAPI_9119", "description": "list of beers", "fqn": ["beer_analytics", "beers", "WORKSPACE_863912091", "beers"], "freshness": {"error_after": {"count": 30, "period": "day"}, "warn_after": {"count": 7, "period": "day"}}, "id": "source.beer_analytics.WORKSPACE_863912091.beers", "identifier": "seed_beers", "label": "source.beer_analytics.WORKSPACE_863912091.beers", "loaded_at_field": "\"_timestamp\"", "loader": "", "meta": {}, "name": "beers", "original_file_path": "models/beers/sources.yml", "package_name": "beer_analytics", "path": "models/beers/sources.yml", "quoting": {"database": true, "identifier": true, "schema": true}, "relation_name": "\"SAPI_9119\".\"WORKSPACE_863912091\".\"seed_beers\"", "resource_type": "source", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "source_description": "", "source_meta": {}, "source_name": "WORKSPACE_863912091", "tags": ["beers", "ecommerce"], "unique_id": "source.beer_analytics.WORKSPACE_863912091.beers", "unrendered_config": {}}, {"alias": "beers", "checksum": {"checksum": "5ee6626d03f728f9b7510871fb582ff7f526636a41a725bb28b3d659c3f1f5f9", "name": "sha256"}, "columns": {"abv": {"description": "Alcohol by volume", "meta": {"metrics": {"avg_abv": {"description": "Average Alcohol by volume", "type": "average"}}}, "name": "abv", "tags": []}, "beer_id": {"description": "The unique indentifier of the beer", "meta": {"dimension": {"sql": "${TABLE}.beer_id"}, "metrics": {"num_unique_beers": {"type": "count_distinct"}}, "primary-key": true}, "name": "beer_id", "tags": []}, "beer_name": {"description": "The name of the beer as on the label", "meta": {"dimension": {"sql": "${TABLE}.beer_name"}}, "name": "beer_name", "tags": []}, "beer_style": {"description": "The style of the beer (IPA, Porter, etc)", "meta": {"dimension": {"sql": "${TABLE}.beer_style"}, "metrics": {"num_unique_beer_styles": {"description": "Distinct Beer Styles", "type": "count_distinct"}}}, "name": "beer_style", "tags": []}, "bitterness": {"description": "The bitterness category of the beer (based on IBUs)", "meta": {"dimension": {"description": "Bitterness Types", "sql": "${TABLE}.bitterness"}}, "name": "bitterness", "tags": []}, "brewery_id": {"description": "The unique indentifier of the brewery", "meta": {}, "metrics": {"num_unique_breweries": {"description": "Distinct Number of Breweries", "type": "count_distinct"}}, "name": "brewery_id", "tags": []}, "ibu": {"description": "Bitterness in International Bitterness Units", "meta": {"metrics": {"avg_ibu": {"description": "Average Bitterness in International Bitterness Units", "type": "average"}}}, "name": "ibu", "tags": []}, "ounces": {"description": "Volume of a single unit", "meta": {"metrics": {"avg_ounces": {"description": "Average Volume of a single unit", "type": "average"}}}, "name": "ounces", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "fisa@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": []}, "created_at": 1658792883.9402492, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": [], "nodes": ["source.beer_analytics.WORKSPACE_863912091.beers"]}, "description": "Beer List", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "beers"], "id": "model.beer_analytics.beers", "label": "model.beer_analytics.beers", "meta": {"owner": "fisa@keboola.com"}, "name": "beers", "original_file_path": "models/beers/beers.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/beers.sql", "raw_sql": "{{ config(\n    materialized=\"table\"\n) }}\n\nSELECT\n  \"id\"            AS beer_id,\n  TRIM(\"name\")    AS beer_name,\n  \"style\"         AS beer_style,\n  \"abv\"           AS abv,\n  \"ibu\"           AS ibu,\n  CASE \n       WHEN \"ibu\" \u003c= 50 THEN \u0027Malty\u0027\n       WHEN \"ibu\" \u003e 50 THEN \u0027Hoppy\u0027\n   END AS bitterness,\n  \"brewery_id\"    AS brewery_id,\n  \"ounces\"        AS ounces\nFROM\n  {{ source(\u0027WORKSPACE_863912091\u0027, \u0027beers\u0027) }}", "refs": [], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [["WORKSPACE_863912091", "beers"]], "tags": [], "unique_id": "model.beer_analytics.beers", "unrendered_config": {"materialized": "table"}}, {"columns": {}, "config": {"enabled": true}, "created_at": 1658792883.99808, "database": "SAPI_9119", "description": "list of breweries", "fqn": ["beer_analytics", "beers", "WORKSPACE_863912091", "breweries"], "freshness": {"error_after": {"count": 30, "period": "day"}, "warn_after": {"count": 7, "period": "day"}}, "id": "source.beer_analytics.WORKSPACE_863912091.breweries", "identifier": "seed_breweries", "label": "source.beer_analytics.WORKSPACE_863912091.breweries", "loaded_at_field": "\"_timestamp\"", "loader": "", "meta": {}, "name": "breweries", "original_file_path": "models/beers/sources.yml", "package_name": "beer_analytics", "path": "models/beers/sources.yml", "quoting": {"database": true, "identifier": true, "schema": true}, "relation_name": "\"SAPI_9119\".\"WORKSPACE_863912091\".\"seed_breweries\"", "resource_type": "source", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "source_description": "", "source_meta": {}, "source_name": "WORKSPACE_863912091", "tags": ["breweries", "brewery", "ecommerce"], "unique_id": "source.beer_analytics.WORKSPACE_863912091.breweries", "unrendered_config": {}}, {"alias": "breweries", "checksum": {"checksum": "343005a9e749b3a3efa99b9d24b1b259ce716f881cd80752fdbc718160c1ee71", "name": "sha256"}, "columns": {"brewery_id": {"description": "", "meta": {"metrics": {"num_unique_breweries": {"type": "count_distinct"}}, "primary-key": true}, "name": "brewery_id", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "fisa@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": []}, "created_at": 1658792883.942038, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": [], "nodes": ["source.beer_analytics.WORKSPACE_863912091.breweries"]}, "description": "", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "breweries"], "id": "model.beer_analytics.breweries", "label": "model.beer_analytics.breweries", "meta": {"owner": "fisa@keboola.com"}, "name": "breweries", "original_file_path": "models/beers/breweries.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/breweries.sql", "raw_sql": "{{ config(\n    materialized=\"table\"\n) }}\n\nSELECT\n  \"id\"                    AS brewery_id,\n  trim(\"name\")            AS brewery_name,\n  trim(\"city\")            AS brewery_city,\n  trim(\"state\")           AS brewery_state,\n  \u0027USA\u0027                 AS brewery_country\nFROM\n  {{ source(\u0027WORKSPACE_863912091\u0027, \u0027breweries\u0027) }}", "refs": [], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [["WORKSPACE_863912091", "breweries"]], "tags": [], "unique_id": "model.beer_analytics.breweries", "unrendered_config": {"materialized": "table"}}, {"alias": "beers_with_breweries", "checksum": {"checksum": "553c08f8745db1db963f39346b0516848ef19e4c3f1ff29b1ca1df0ceef3910a", "name": "sha256"}, "columns": {"abv": {"description": "Alcohol percentage in the beer", "meta": {}, "name": "abv", "tags": []}, "beer_id": {"description": "The unique identifier for the beer", "meta": {"dimension": {"sql": "${TABLE}.beer_id"}, "primary-key": true}, "name": "beer_id", "tags": []}, "beer_name": {"description": "The name of the beer", "meta": {"primary-key": true}, "name": "beer_name", "tags": []}, "beer_style": {"description": "Style of the beer (IPA, Porter, etc)", "meta": {"dimension": {"sql": "${TABLE}.beer_style"}, "metrics": {"num_unique_beer_styles": {"type": "count_distinct"}}}, "name": "beer_style", "tags": []}, "bitterness": {"description": "The bitterness category of the beer (based on IBUs)", "meta": {}, "name": "bitterness", "tags": []}, "brewery_city": {"description": "City of the brewery", "meta": {}, "name": "brewery_city", "tags": []}, "brewery_id": {"description": "The unique identifier for the brewery", "meta": {"dimension": {"sql": "${TABLE}.brewery_id"}, "meta": null, "metrics": {"num_unique_breweries": {"type": "count_distinct"}}, "primary-key": true}, "name": "brewery_id", "tags": []}, "brewery_name": {"description": "Name of the brewery", "meta": {}, "name": "brewery_name", "tags": []}, "brewery_state": {"description": "State of the brewery", "meta": {}, "name": "brewery_state", "tags": []}, "ibu": {"description": "The bitterness of the beer in IBUs", "meta": {}, "name": "ibu", "tags": []}, "ounces": {"description": "The volume of the beer", "meta": {}, "name": "ounces", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "fisa@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {"columns": true, "relation": true}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": []}, "created_at": 1658792883.932836, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": [], "nodes": ["model.beer_analytics.beers", "model.beer_analytics.breweries"]}, "description": "Beers joined with their breweries", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "beers_with_breweries"], "id": "model.beer_analytics.beers_with_breweries", "label": "model.beer_analytics.beers_with_breweries", "meta": {"owner": "fisa@keboola.com"}, "name": "beers_with_breweries", "original_file_path": "models/beers/beers_with_breweries.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/beers_with_breweries.sql", "raw_sql": "{{ config(\n    materialized=\"table\",\n    persist_docs={\"relation\": true, \"columns\": true}\n) }}\n\nSELECT *\nFROM {{ ref(\u0027beers\u0027) }} beers\nJOIN {{ ref(\u0027breweries\u0027) }} breweries USING (brewery_id)", "refs": [["beers"], ["breweries"]], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [], "tags": [], "unique_id": "model.beer_analytics.beers_with_breweries", "unrendered_config": {"materialized": "table", "persist_docs": {"columns": true, "relation": true}}}, {"alias": "sales", "checksum": {"checksum": "1b2264d4e9631c9d0c6c15536a832b75a6479d0462d2477acb51c6fbcd25179f", "name": "sha256"}, "columns": {"abv": {"description": "Alcohol by volume", "meta": {}, "name": "abv", "tags": []}, "beer_id": {"description": "The unique indentifier of the beer", "meta": {}, "name": "beer_id", "tags": []}, "beer_name": {"description": "The name of the beer as on the label", "meta": {}, "name": "beer_name", "tags": []}, "beer_style": {"description": "The style of the beer (IPA, Porter, etc)", "meta": {}, "name": "beer_style", "tags": []}, "bitterness": {"description": "The bitterness category of the beer (based on IBUs)", "meta": {}, "name": "bitterness", "tags": []}, "brewery_city": {"description": "", "meta": {}, "name": "brewery_city", "tags": []}, "brewery_country": {"description": "", "meta": {}, "name": "brewery_country", "tags": []}, "brewery_id": {"description": "The unique indentifier of the brewery", "meta": {}, "name": "brewery_id", "tags": []}, "brewery_name": {"description": "The official name of the brewery", "meta": {}, "name": "brewery_name", "tags": []}, "brewery_state": {"description": "", "meta": {}, "name": "brewery_state", "tags": []}, "ibu": {"description": "International Bitterness Unit", "meta": {}, "name": "ibu", "tags": []}, "order_created_at": {"description": "When the order was created", "meta": {}, "name": "order_created_at", "tags": []}, "order_li_price_each": {"description": "Price for a single unit", "meta": {}, "name": "order_li_price_each", "tags": []}, "order_li_price_total": {"description": "The total price for the order line", "meta": {}, "name": "order_li_price_total", "tags": []}, "order_li_quantity": {"description": "The number of units for the order line", "meta": {}, "name": "order_li_quantity", "tags": []}, "order_line": {"description": "The order line number", "meta": {"primary-key": true}, "name": "order_line", "tags": ["primary-key"]}, "order_no": {"description": "The order number", "meta": {"primary-key": true}, "name": "order_no", "tags": ["primary-key"]}, "ounces": {"description": "Volume of a single unit", "meta": {}, "name": "ounces", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "fisa@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {"columns": true, "relation": true}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": [], "transient": false}, "created_at": 1658792883.951624, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": [], "nodes": ["model.beer_analytics.orders", "model.beer_analytics.order_lines", "model.beer_analytics.beers_with_breweries"]}, "description": "Beer Sales", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "sales"], "id": "model.beer_analytics.sales", "label": "model.beer_analytics.sales", "meta": {"owner": "fisa@keboola.com"}, "name": "sales", "original_file_path": "models/beers/sales.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/sales.sql", "raw_sql": "{{ config(\n    materialized=\"table\",\n    persist_docs={\"relation\": true, \"columns\": true},\n    transient=false\n) }}\n\nSELECT\n \"beers_with_breweries\".beer_id               AS beer_id,\n \"beers_with_breweries\".beer_name             AS beer_name,\n \"beers_with_breweries\".beer_style            AS beer_style,\n \"beers_with_breweries\".abv                   AS abv,\n \"beers_with_breweries\".ibu                   AS ibu,\n \"beers_with_breweries\".bitterness           AS bitterness,\n \"beers_with_breweries\".ounces                AS ounces,\n\n \"beers_with_breweries\".brewery_id            AS brewery_id,\n \"beers_with_breweries\".brewery_name          AS brewery_name,\n \"beers_with_breweries\".brewery_city          AS brewery_city,\n \"beers_with_breweries\".brewery_state         AS brewery_state,\n \"beers_with_breweries\".brewery_country       AS brewery_country,\n\n \"orders\".order_no                           AS order_no,\n \"order_lines\".order_line                     AS order_line,\n \"orders\".created_at                          AS order_created_at,\n \"order_lines\".quantity                       AS order_li_quantity,\n \"order_lines\".price                          AS order_li_price_each,\n \"order_lines\".quantity * \"order_lines\".price   AS order_li_price_total\n\nFROM {{ ref(\u0027orders\u0027) }} \"orders\"\nJOIN {{ ref(\u0027order_lines\u0027) }} \"order_lines\" USING (order_no)\nJOIN {{ ref(\u0027beers_with_breweries\u0027) }} \"beers_with_breweries\" USING (beer_id)\n\nWHERE \"orders\".status = \u0027DELIVERED\u0027", "refs": [["orders"], ["order_lines"], ["beers_with_breweries"]], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [], "tags": [], "unique_id": "model.beer_analytics.sales", "unrendered_config": {"materialized": "table", "persist_docs": {"columns": true, "relation": true}, "transient": false}}, {"created_at": 1658792883.9794931, "depends_on": {"macros": [], "nodes": ["model.beer_analytics.beers", "model.beer_analytics.beers_with_breweries", "model.beer_analytics.breweries", "model.beer_analytics.order_lines", "model.beer_analytics.orders", "model.beer_analytics.promo_deliveries", "model.beer_analytics.sales"]}, "description": "Lightdash Demo Instance", "fqn": ["beer_analytics", "beers", "lightdash"], "id": "exposure.beer_analytics.lightdash", "label": "exposure.beer_analytics.lightdash", "maturity": "high", "meta": {}, "name": "lightdash", "original_file_path": "models/beers/exposures.yml", "owner": {"email": "fisa@keboola.com", "name": "Martin Fiser"}, "package_name": "beer_analytics", "path": "beers/exposures.yml", "refs": [["beers"], ["beers_with_breweries"], ["breweries"], ["order_lines"], ["orders"], ["promo_deliveries"], ["sales"]], "resource_type": "exposure", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "shape": "dot", "size": 10, "sources": [], "tags": ["business_intelligence"], "type": "dashboard", "unique_id": "exposure.beer_analytics.lightdash", "url": "https://fisa-lightdash.herokuapp.com/projects/b2e4799b-db5e-4e72-a483-fded20d227a9/"}, {"alias": "order_lines", "checksum": {"checksum": "5074fad406e6f43c44e8f2d6c8a6bcc15a968dcbd653641faca4324859305cf3", "name": "sha256"}, "columns": {"order_line": {"description": "", "meta": {"primary-key": true}, "name": "order_line", "tags": []}, "order_no": {"description": "", "meta": {"primary-key": true}, "name": "order_no", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "jordan.burger@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {"columns": true, "relation": true}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": [], "unique_key": "order_line"}, "created_at": 1658792883.9460402, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": ["macro.beer_analytics.date_format", "macro.beer_analytics.yyymmdd", "macro.dbt.is_incremental"], "nodes": ["model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers"]}, "description": "", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "order_lines"], "id": "model.beer_analytics.order_lines", "label": "model.beer_analytics.order_lines", "meta": {"owner": "jordan.burger@keboola.com"}, "name": "order_lines", "original_file_path": "models/beers/order_lines.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/order_lines.sql", "raw_sql": "{{ config(\n    materialized=\u0027table\u0027,\n    unique_key=\u0027order_line\u0027,\n    persist_docs={\"relation\": true, \"columns\": true}\n) }}\n\n-- We\u0027ll fake some data, since this is an example repository\n-- we want to make sure that we continue to generate data up\n-- to today\n\nWITH generated_order_lines AS (\n    {% for day_ago in range(30) %}\n        {% for order_number in range(10) %}\n            -- Each order has between 1 and 5 order_lines\n            {% for order_line in range(3) %}\n                SELECT CONCAT(\n                            {{ date_format() }}(\n                                DATEADD(Day, -1 * {{ day_ago }}, current_timestamp),\n                                {{ yyymmdd() }}\n                            ),\n                            \u0027{{ order_number }}\u0027\n                       )                                   AS order_no,\n                       CONCAT(\n                           {{ date_format() }}(\n                                DATEADD(Day, -1 * {{ day_ago }}, current_timestamp),\n                                {{ yyymmdd() }}\n                           ),\n                           \u0027{{ order_number }}{{ order_line }}\u0027\n                       ) AS order_line,\n                       (\n                            -- Deterministically select a random beer\n                            SELECT MOD(\n                                ABS(HASH({{ order_number + order_line }})),\n                                (\n                                    SELECT MAX(beer_id) FROM {{ ref(\u0027beers\u0027) }}\n                                )\n                            )\n                       )                                                          AS beer_id,\n                       1 +MOD(ABS(HASH({{ order_number + order_line }})), 3)      AS quantity,\n                       MOD(ABS(HASH({{ order_number + order_line }})), 300) / 100 AS price,\n                       DATEADD(Day, -1 * {{ day_ago }}, current_timestamp)        AS created_at,\n                       current_timestamp                                          AS changed_at\n\n                {% if not loop.last %}\n                  UNION ALL\n                {% endif %}\n            {% endfor %}\n            {% if not loop.last %}\n            UNION ALL\n            {% endif %}\n      {% endfor %}\n\n      {% if not loop.last %}\n        UNION ALL\n      {% endif %}\n    {% endfor %}\n)\n\nSELECT *\nFROM generated_order_lines\n\n{% if is_incremental() %}\n    WHERE created_at::date \u003e (SELECT MAX(created_at)::date FROM {{ this }})\n{% endif %}", "refs": [["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"]], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [], "tags": [], "unique_id": "model.beer_analytics.order_lines", "unrendered_config": {"materialized": "table", "persist_docs": {"columns": true, "relation": true}, "unique_key": "order_line"}}, {"alias": "promo_deliveries", "checksum": {"checksum": "b230df8807bab3cb18bcc650c9b26b3de346fd0e764f41034b73f1881e6e02f2", "name": "sha256"}, "columns": {"customer_id": {"description": "Customer id", "meta": {"primary-key": true}, "name": "customer_id", "tags": ["primary-key"]}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "david.pospisil@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {"columns": true, "relation": true}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": [], "transient": false}, "created_at": 1658792883.9539661, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": [], "nodes": ["model.beer_analytics.orders", "model.beer_analytics.order_lines", "model.beer_analytics.beers", "model.beer_analytics.orders", "model.beer_analytics.order_lines", "model.beer_analytics.beers"]}, "description": "", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "promo_deliveries"], "id": "model.beer_analytics.promo_deliveries", "label": "model.beer_analytics.promo_deliveries", "meta": {"owner": "david.pospisil@keboola.com"}, "name": "promo_deliveries", "original_file_path": "models/beers/promo_deliveries.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/promo_deliveries.sql", "raw_sql": "{{ config(\n    materialized=\"table\",\n    persist_docs={\"relation\": true, \"columns\": true},\n    transient=false\n) }}\n\nSELECT customer_id,\n       \u0027Hoppy\u0027 AS promo,\n       COUNT(DISTINCT b.beer_name) AS cnt_beers_purchased    \n  FROM {{ ref(\u0027orders\u0027) }} o\n  JOIN {{ ref(\u0027order_lines\u0027) }} ol\n  USING (order_no)\n  JOIN {{ ref(\u0027beers\u0027) }} b\n  USING(beer_id)\n  GROUP BY 1\n  HAVING COUNT(CASE WHEN b.bitterness = \u0027Hoppy\u0027 THEN 1 END)\n         \u003e\n         COUNT(CASE WHEN b.bitterness = \u0027Malty\u0027 THEN 1 END)\n\nUNION\n\nSELECT customer_id,\n       \u0027Malty\u0027 AS promo,\n       COUNT(DISTINCT b.beer_name) AS cnt_beers_purchased\n  FROM {{ ref(\u0027orders\u0027) }} o\n  JOIN {{ ref(\u0027order_lines\u0027) }} ol\n  USING (order_no)\n  JOIN {{ ref(\u0027beers\u0027) }} b\n  USING(beer_id)\n  GROUP BY 1\n  HAVING COUNT(CASE WHEN b.bitterness = \u0027Malty\u0027 THEN 1 END)\n         \u003e\n         COUNT(CASE WHEN b.bitterness = \u0027Hoppy\u0027 THEN 1 END)", "refs": [["orders"], ["order_lines"], ["beers"], ["orders"], ["order_lines"], ["beers"]], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [], "tags": [], "unique_id": "model.beer_analytics.promo_deliveries", "unrendered_config": {"materialized": "table", "persist_docs": {"columns": true, "relation": true}, "transient": false}}, {"alias": "orders", "checksum": {"checksum": "062724c6f90e2e885412d73e345a4119a308c52140c855b706304d34e75d1603", "name": "sha256"}, "columns": {"order_no": {"description": "", "meta": {"metrics": {"num_unique_orders": {"type": "count_distinct"}}, "primary-key": true}, "name": "order_no", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "jordan.burger@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {"columns": true, "relation": true}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": [], "unique_key": "order_no"}, "created_at": 1658792883.944114, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": ["macro.beer_analytics.date_format", "macro.beer_analytics.yyymmdd", "macro.beer_analytics.randint", "macro.dbt.is_incremental"], "nodes": []}, "description": "", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "orders"], "id": "model.beer_analytics.orders", "label": "model.beer_analytics.orders", "meta": {"owner": "jordan.burger@keboola.com"}, "name": "orders", "original_file_path": "models/beers/orders.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/orders.sql", "raw_sql": "{{ config(\n    materialized=\u0027table\u0027,\n    unique_key=\u0027order_no\u0027,\n    persist_docs={\"relation\": true, \"columns\": true}\n) }}\n\n-- We\u0027ll fake some data, since this is an example repository\n-- we want to make sure that we continue to generate data up\n-- to today\n\nWITH generated_orders AS (\n    {% for day_ago in range(30) %}\n        {% for order_number in range(10) %}\n          SELECT\n              CONCAT(\n                   {{ date_format() }}(\n                        DATEADD(Day, -1 * {{ day_ago }}, CURRENT_DATE),\n                        {{ yyymmdd() }}\n                   ),\n                   \u0027{{ order_number }}\u0027\n             )::int                                                            AS order_no,\n\n             {{ randint(123456, 654321) }}                                  AS customer_id,\n\n             {% if order_number is divisibleby 13 %}\n                \u0027PENDING\u0027                                                      AS status,\n             {% else %}\n                \u0027DELIVERED\u0027                                                    AS status,\n             {% endif %}\n             DATEADD(Day, -1 * {{ day_ago }}, CURRENT_DATE)                    AS created_at,\n             current_timestamp                                                 AS changed_at\n\n          {% if not loop.last %}\n            UNION ALL\n          {% endif %}\n        {% endfor %}\n\n        {% if not loop.last %}\n            UNION ALL\n        {% endif %}\n    {% endfor %}\n)\n\nSELECT *\nFROM generated_orders\n\n{% if is_incremental() %}\n    WHERE created_at::date \u003e (SELECT MAX(created_at)::date FROM {{ this }})\n{% endif %}", "refs": [], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [], "tags": [], "unique_id": "model.beer_analytics.orders", "unrendered_config": {"materialized": "table", "persist_docs": {"columns": true, "relation": true}, "unique_key": "order_no"}}]);
+        edges = new vis.DataSet([{"from": "source.beer_analytics.WORKSPACE_863912091.beers", "label": 1, "to": "model.beer_analytics.beers", "weight": 1}, {"from": "source.beer_analytics.WORKSPACE_863912091.breweries", "label": 1, "to": "model.beer_analytics.breweries", "weight": 1}, {"from": "model.beer_analytics.beers_with_breweries", "label": 1, "to": "model.beer_analytics.sales", "weight": 1}, {"from": "model.beer_analytics.beers_with_breweries", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.beers", "label": 1, "to": "model.beer_analytics.beers_with_breweries", "weight": 1}, {"from": "model.beer_analytics.beers", "label": 1, "to": "model.beer_analytics.order_lines", "weight": 1}, {"from": "model.beer_analytics.beers", "label": 1, "to": "model.beer_analytics.promo_deliveries", "weight": 1}, {"from": "model.beer_analytics.beers", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.breweries", "label": 1, "to": "model.beer_analytics.beers_with_breweries", "weight": 1}, {"from": "model.beer_analytics.breweries", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.orders", "label": 1, "to": "model.beer_analytics.sales", "weight": 1}, {"from": "model.beer_analytics.orders", "label": 1, "to": "model.beer_analytics.promo_deliveries", "weight": 1}, {"from": "model.beer_analytics.orders", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.order_lines", "label": 1, "to": "model.beer_analytics.sales", "weight": 1}, {"from": "model.beer_analytics.order_lines", "label": 1, "to": "model.beer_analytics.promo_deliveries", "weight": 1}, {"from": "model.beer_analytics.order_lines", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.sales", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.promo_deliveries", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}]);
+
+        // adding nodes and edges to the graph
+        data = {nodes: nodes, edges: edges};
+
+        var options = {
+    "configure": {
+        "enabled": false
+    },
+    "edges": {
+        "color": {
+            "inherit": true
+        },
+        "smooth": {
+            "enabled": true,
+            "type": "dynamic"
+        }
+    },
+    "interaction": {
+        "dragNodes": true,
+        "hideEdgesOnDrag": false,
+        "hideNodesOnDrag": false
+    },
+    "physics": {
+        "enabled": true,
+        "stabilization": {
+            "enabled": true,
+            "fit": true,
+            "iterations": 1000,
+            "onlyDynamicEdges": false,
+            "updateInterval": 50
+        }
+    }
+};
+        
+        
+
+        
+
+        network = new vis.Network(container, data, options);
+	 
+        
 
 
-{%- macro databricks__randint(min, max) -%}
-    (RANDOM() * {{ max - min }} + {{ min }})::int
-{%- endmacro -%}
+        
 
+        return network;
+
+    }
+
+    drawGraph();
+
+</script>
+</body>
+</html>
 
 ================================================
-File: /macros/date_format.sql
+File: /analysis/sqlparsing.ipynb
 ================================================
-{#
-Conversion function from date to string is differently named in different databases.
-
-There are certain differences in the format string treatment:
-
-  * Snowflake will pass unrecognized symbols as they were,
-  * Whereas Databricks will fail on them.
-
-It is thus recommended to only use the recognized formatting symbols in format expressions.
-#}
-{%- macro date_format() -%}
-    {{ return(adapter.dispatch('date_format')()) }}
-{%- endmacro -%}
-
-
-{%- macro databricks__date_format() -%}
-    {# https://docs.databricks.com/sql/language-manual/functions/date_format.html #}
-    DATE_FORMAT
-{%- endmacro -%}
-
-
-{%- macro default__date_format() -%}
-    {# https://docs.snowflake.com/en/sql-reference/functions/to_char.html #}
-    TO_VARCHAR
-{%- endmacro -%}
-
-
-================================================
-File: /macros/yyyymmdd.sql
-================================================
-{#
-Convert a date to a YYYYMMDD string.
-
-This macro is needed because the date format string differs from one database backend to another.
-#}
-{%- macro yyymmdd() -%}
-    {{ return(adapter.dispatch('yyymmdd')()) }}
-{%- endmacro -%}
-
-
-{%- macro default__yyymmdd() -%}
-    'YYYYMMDD'
-{%- endmacro -%}
-
-
-{%- macro databricks__yyymmdd() -%}
-    {# Reference: https://docs.databricks.com/sql/language-manual/sql-ref-datetime-pattern.html #}
-    'yMMdd'
-{%- endmacro -%}
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import json\n",
+    "import os\n",
+    "from sqllineage.runner import LineageRunner\n",
+    "import sqllineage as sq\n",
+    "from sqlparse.sql import Statement\n",
+    "from sqllineage.core import LineageAnalyzer"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "## test queries\n",
+    "sql = \"insert into db1.table11 select * from db2.table21 union select * from db2.table22;\"\n",
+    "#sql += \"insert into db3.table3 select * from db1.table11 join db1.table12;\"\n",
+    "\n",
+    "sql = \"\"\"CREATE OR REPLACE TABLE \"out_commercial_bonus\" AS SELECT RI.\"id\" || '_' || CBPDWI.\"unique_id\" AS \"unique_id\", RI.\"id\" AS \"warehouse_replenishment_id\", S.\"name\", CBPDWI.\"unique_id\" AS \"commercial_bonus_unique_id\", CBPDWI.\"commercial_bonus_periods_unique_id\", RI.\"inventory_item_id\"::VARCHAR(255) AS \"warehouse_inventory_id\", R.\"closed_at\"::TIMESTAMP_NTZ AS \"closed_at\", RI.\"amount\"::DECIMAL( 20, 4 ) AS \"amount\", ( RI.\"price\"::DECIMAL( 16, 6 )/ RI.\"amount\"::DECIMAL( 16, 6 ) )::DECIMAL( 16 ... ue_id\" = R.\"supplier_unique_id\" LEFT JOIN \"commercial_bonuses_periods\" cbp ON CBP.\"unique_id\" = CBPDWI.\"unique_id\" LEFT JOIN \"commercial_bonuses\" cb ON CB.\"unique_id\" = CBP.\"commercial_bonus_unique_id\" LEFT JOIN \"lov_commercial_bonuses\" lcb ON LCB.\"unique_id\" = CB.\"lov_commercial_bonuses_unique_id\" LEFT JOIN \"tmp_supplier\" S ON S.\"unique_id\" = CBPDWI.\"warehouse_supplier_unique_id\" WHERE R.\"closed_at\" > '2020-01-01 00:00:00' AND RI.\"amount\"::DECIMAL( 20, 6 )> 0 AND R.\"found_in_stock\" = 0;\"\"\"\n",
+    "\n",
+    "sql = sql.replace('\"','')\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 48,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "f = open(\"/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold/target/compiled/beer_analytics/models/beers/beers_with_breweries.sql\", \"r\")\n",
+    "sql = f.read()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [
+    {
+     "ename": "AttributeError",
+     "evalue": "'LineageRunner' object has no attribute 'source_tables'",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[0;31mAttributeError\u001b[0m                            Traceback (most recent call last)",
+      "\u001b[1;32m/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold/analysis/sqlparsing.ipynb Cell 4\u001b[0m in \u001b[0;36m<module>\u001b[0;34m\u001b[0m\n\u001b[1;32m      <a href='vscode-notebook-cell:/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold/analysis/sqlparsing.ipynb#ch0000003?line=0'>1</a>\u001b[0m result \u001b[39m=\u001b[39m LineageRunner(sql)\n\u001b[1;32m      <a href='vscode-notebook-cell:/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold/analysis/sqlparsing.ipynb#ch0000003?line=1'>2</a>\u001b[0m \u001b[39m# To show lineage summary\u001b[39;00m\n\u001b[0;32m----> <a href='vscode-notebook-cell:/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold/analysis/sqlparsing.ipynb#ch0000003?line=2'>3</a>\u001b[0m \u001b[39mprint\u001b[39;49m(result)\n",
+      "File \u001b[0;32m~/Library/Python/3.8/lib/python/site-packages/sqllineage/runner.py:21\u001b[0m, in \u001b[0;36mlazy_method.<locals>.wrapper\u001b[0;34m(*args, **kwargs)\u001b[0m\n\u001b[1;32m     19\u001b[0m \u001b[39mif\u001b[39;00m \u001b[39mnot\u001b[39;00m \u001b[39mself\u001b[39m\u001b[39m.\u001b[39m_evaluated:\n\u001b[1;32m     20\u001b[0m     \u001b[39mself\u001b[39m\u001b[39m.\u001b[39m_eval()\n\u001b[0;32m---> 21\u001b[0m \u001b[39mreturn\u001b[39;00m func(\u001b[39m*\u001b[39;49margs, \u001b[39m*\u001b[39;49m\u001b[39m*\u001b[39;49mkwargs)\n",
+      "File \u001b[0;32m~/Library/Python/3.8/lib/python/site-packages/sqllineage/runner.py:58\u001b[0m, in \u001b[0;36mLineageRunner.__str__\u001b[0;34m(self)\u001b[0m\n\u001b[1;32m     54\u001b[0m         \u001b[39m\"\"\"\u001b[39;00m\n\u001b[1;32m     55\u001b[0m \u001b[39m        print out the Lineage Summary.\u001b[39;00m\n\u001b[1;32m     56\u001b[0m \u001b[39m        \"\"\"\u001b[39;00m\n\u001b[1;32m     57\u001b[0m         statements \u001b[39m=\u001b[39m \u001b[39mself\u001b[39m\u001b[39m.\u001b[39mstatements(strip_comments\u001b[39m=\u001b[39m\u001b[39mTrue\u001b[39;00m)\n\u001b[0;32m---> 58\u001b[0m         source_tables \u001b[39m=\u001b[39m \u001b[39m\"\u001b[39m\u001b[39m\\n\u001b[39;00m\u001b[39m    \u001b[39m\u001b[39m\"\u001b[39m\u001b[39m.\u001b[39mjoin(\u001b[39mstr\u001b[39m(t) \u001b[39mfor\u001b[39;00m t \u001b[39min\u001b[39;00m \u001b[39mself\u001b[39;49m\u001b[39m.\u001b[39;49msource_tables)\n\u001b[1;32m     59\u001b[0m         target_tables \u001b[39m=\u001b[39m \u001b[39m\"\u001b[39m\u001b[39m\\n\u001b[39;00m\u001b[39m    \u001b[39m\u001b[39m\"\u001b[39m\u001b[39m.\u001b[39mjoin(\u001b[39mstr\u001b[39m(t) \u001b[39mfor\u001b[39;00m t \u001b[39min\u001b[39;00m \u001b[39mself\u001b[39m\u001b[39m.\u001b[39mtarget_tables)\n\u001b[1;32m     60\u001b[0m         combined \u001b[39m=\u001b[39m \u001b[39mf\u001b[39m\u001b[39m\"\"\"\u001b[39m\u001b[39mStatements(#): \u001b[39m\u001b[39m{\u001b[39;00m\u001b[39mlen\u001b[39m(statements)\u001b[39m}\u001b[39;00m\n\u001b[1;32m     61\u001b[0m \u001b[39mSource Tables:\u001b[39m\n\u001b[1;32m     62\u001b[0m \u001b[39m    \u001b[39m\u001b[39m{\u001b[39;00msource_tables\u001b[39m}\u001b[39;00m\n\u001b[1;32m     63\u001b[0m \u001b[39mTarget Tables:\u001b[39m\n\u001b[1;32m     64\u001b[0m \u001b[39m    \u001b[39m\u001b[39m{\u001b[39;00mtarget_tables\u001b[39m}\u001b[39;00m\n\u001b[1;32m     65\u001b[0m \u001b[39m\"\"\"\u001b[39m\n",
+      "\u001b[0;31mAttributeError\u001b[0m: 'LineageRunner' object has no attribute 'source_tables'"
+     ]
+    }
+   ],
+   "source": [
+    "result = LineageRunner(sql)\n",
+    "# To show lineage summary\n",
+    "print(result)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 50,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "[{'data': {'id': 'sapi_9119.workspace_863912091.breweries'}},\n",
+       " {'data': {'id': 'sapi_9119.workspace_863912091.beers'}}]"
+      ]
+     },
+     "execution_count": 50,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "result.to_cytoscape()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 51,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "Schema: sapi_9119.workspace_863912091"
+      ]
+     },
+     "execution_count": 51,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "result.source_tables[0].schema"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 52,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "sapi_9119.workspace_863912091.beers\n",
+      "sapi_9119.workspace_863912091.breweries\n"
+     ]
+    }
+   ],
+   "source": [
+    "for tbl in result.source_tables: print(tbl)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 53,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "for tbl in result.target_tables: print(tbl)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 54,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      " * SQLLineage Running on http://localhost:5000/?e=%0A%0ASELECT+%2A%0AFROM+%22SAPI_9119%22.%22WORKSPACE_863912091%22.%22beers%22+beers%0AJOIN+%22SAPI_9119%22.%22WORKSPACE_863912091%22.%22breweries%22+breweries+USING+%28brewery_id%29\n"
+     ]
+    }
+   ],
+   "source": [
+    "result.draw()"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3.8.9 64-bit",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.8.9"
+  },
+  "orig_nbformat": 4,
+  "vscode": {
+   "interpreter": {
+    "hash": "31f2aee4e71d21fbe5cf8b01ff0e069b9275f58929596ceb00d14d90e3e16cd6"
+   }
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
 
 
 ================================================
@@ -1325,303 +965,6 @@ File: /analysis/dbt_artifacts.ipynb
 
 
 ================================================
-File: /analysis/dag.html
-================================================
-<html>
-<head>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vis-network@latest/styles/vis-network.css" type="text/css" />
-<script type="text/javascript" src="https://cdn.jsdelivr.net/npm/vis-network@latest/dist/vis-network.min.js"> </script>
-<center>
-<h1></h1>
-</center>
-
-<!-- <link rel="stylesheet" href="../node_modules/vis/dist/vis.min.css" type="text/css" />
-<script type="text/javascript" src="../node_modules/vis/dist/vis.js"> </script>-->
-
-<style type="text/css">
-
-        #mynetwork {
-            width: 800px;
-            height: 1200px;
-            background-color: #ffffff;
-            border: 1px solid lightgray;
-            position: relative;
-            float: left;
-        }
-
-        
-
-        
-
-        
-</style>
-
-</head>
-
-<body>
-<div id = "mynetwork"></div>
-
-
-<script type="text/javascript">
-
-    // initialize global variables.
-    var edges;
-    var nodes;
-    var network; 
-    var container;
-    var options, data;
-
-    
-    // This method is responsible for drawing the graph, returns the drawn network
-    function drawGraph() {
-        var container = document.getElementById('mynetwork');
-        
-        
-
-        // parsing and collecting nodes and edges from the python
-        nodes = new vis.DataSet([{"columns": {"\"abv\"": {"description": "", "meta": {}, "name": "\"abv\"", "tags": []}, "\"brewery_id\"": {"description": "", "meta": {}, "name": "\"brewery_id\"", "tags": []}, "\"ibu\"": {"description": "", "meta": {}, "name": "\"ibu\"", "tags": []}, "\"id\"": {"description": "", "meta": {}, "name": "\"id\"", "tags": []}, "\"name\"": {"description": "", "meta": {}, "name": "\"name\"", "tags": []}, "\"ounces\"": {"description": "", "meta": {}, "name": "\"ounces\"", "tags": []}, "\"style\"": {"description": "", "meta": {}, "name": "\"style\"", "tags": []}}, "config": {"enabled": true}, "created_at": 1658792883.997974, "database": "SAPI_9119", "description": "list of beers", "fqn": ["beer_analytics", "beers", "WORKSPACE_863912091", "beers"], "freshness": {"error_after": {"count": 30, "period": "day"}, "warn_after": {"count": 7, "period": "day"}}, "id": "source.beer_analytics.WORKSPACE_863912091.beers", "identifier": "seed_beers", "label": "source.beer_analytics.WORKSPACE_863912091.beers", "loaded_at_field": "\"_timestamp\"", "loader": "", "meta": {}, "name": "beers", "original_file_path": "models/beers/sources.yml", "package_name": "beer_analytics", "path": "models/beers/sources.yml", "quoting": {"database": true, "identifier": true, "schema": true}, "relation_name": "\"SAPI_9119\".\"WORKSPACE_863912091\".\"seed_beers\"", "resource_type": "source", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "source_description": "", "source_meta": {}, "source_name": "WORKSPACE_863912091", "tags": ["beers", "ecommerce"], "unique_id": "source.beer_analytics.WORKSPACE_863912091.beers", "unrendered_config": {}}, {"alias": "beers", "checksum": {"checksum": "5ee6626d03f728f9b7510871fb582ff7f526636a41a725bb28b3d659c3f1f5f9", "name": "sha256"}, "columns": {"abv": {"description": "Alcohol by volume", "meta": {"metrics": {"avg_abv": {"description": "Average Alcohol by volume", "type": "average"}}}, "name": "abv", "tags": []}, "beer_id": {"description": "The unique indentifier of the beer", "meta": {"dimension": {"sql": "${TABLE}.beer_id"}, "metrics": {"num_unique_beers": {"type": "count_distinct"}}, "primary-key": true}, "name": "beer_id", "tags": []}, "beer_name": {"description": "The name of the beer as on the label", "meta": {"dimension": {"sql": "${TABLE}.beer_name"}}, "name": "beer_name", "tags": []}, "beer_style": {"description": "The style of the beer (IPA, Porter, etc)", "meta": {"dimension": {"sql": "${TABLE}.beer_style"}, "metrics": {"num_unique_beer_styles": {"description": "Distinct Beer Styles", "type": "count_distinct"}}}, "name": "beer_style", "tags": []}, "bitterness": {"description": "The bitterness category of the beer (based on IBUs)", "meta": {"dimension": {"description": "Bitterness Types", "sql": "${TABLE}.bitterness"}}, "name": "bitterness", "tags": []}, "brewery_id": {"description": "The unique indentifier of the brewery", "meta": {}, "metrics": {"num_unique_breweries": {"description": "Distinct Number of Breweries", "type": "count_distinct"}}, "name": "brewery_id", "tags": []}, "ibu": {"description": "Bitterness in International Bitterness Units", "meta": {"metrics": {"avg_ibu": {"description": "Average Bitterness in International Bitterness Units", "type": "average"}}}, "name": "ibu", "tags": []}, "ounces": {"description": "Volume of a single unit", "meta": {"metrics": {"avg_ounces": {"description": "Average Volume of a single unit", "type": "average"}}}, "name": "ounces", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "fisa@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": []}, "created_at": 1658792883.9402492, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": [], "nodes": ["source.beer_analytics.WORKSPACE_863912091.beers"]}, "description": "Beer List", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "beers"], "id": "model.beer_analytics.beers", "label": "model.beer_analytics.beers", "meta": {"owner": "fisa@keboola.com"}, "name": "beers", "original_file_path": "models/beers/beers.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/beers.sql", "raw_sql": "{{ config(\n    materialized=\"table\"\n) }}\n\nSELECT\n  \"id\"            AS beer_id,\n  TRIM(\"name\")    AS beer_name,\n  \"style\"         AS beer_style,\n  \"abv\"           AS abv,\n  \"ibu\"           AS ibu,\n  CASE \n       WHEN \"ibu\" \u003c= 50 THEN \u0027Malty\u0027\n       WHEN \"ibu\" \u003e 50 THEN \u0027Hoppy\u0027\n   END AS bitterness,\n  \"brewery_id\"    AS brewery_id,\n  \"ounces\"        AS ounces\nFROM\n  {{ source(\u0027WORKSPACE_863912091\u0027, \u0027beers\u0027) }}", "refs": [], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [["WORKSPACE_863912091", "beers"]], "tags": [], "unique_id": "model.beer_analytics.beers", "unrendered_config": {"materialized": "table"}}, {"columns": {}, "config": {"enabled": true}, "created_at": 1658792883.99808, "database": "SAPI_9119", "description": "list of breweries", "fqn": ["beer_analytics", "beers", "WORKSPACE_863912091", "breweries"], "freshness": {"error_after": {"count": 30, "period": "day"}, "warn_after": {"count": 7, "period": "day"}}, "id": "source.beer_analytics.WORKSPACE_863912091.breweries", "identifier": "seed_breweries", "label": "source.beer_analytics.WORKSPACE_863912091.breweries", "loaded_at_field": "\"_timestamp\"", "loader": "", "meta": {}, "name": "breweries", "original_file_path": "models/beers/sources.yml", "package_name": "beer_analytics", "path": "models/beers/sources.yml", "quoting": {"database": true, "identifier": true, "schema": true}, "relation_name": "\"SAPI_9119\".\"WORKSPACE_863912091\".\"seed_breweries\"", "resource_type": "source", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "source_description": "", "source_meta": {}, "source_name": "WORKSPACE_863912091", "tags": ["breweries", "brewery", "ecommerce"], "unique_id": "source.beer_analytics.WORKSPACE_863912091.breweries", "unrendered_config": {}}, {"alias": "breweries", "checksum": {"checksum": "343005a9e749b3a3efa99b9d24b1b259ce716f881cd80752fdbc718160c1ee71", "name": "sha256"}, "columns": {"brewery_id": {"description": "", "meta": {"metrics": {"num_unique_breweries": {"type": "count_distinct"}}, "primary-key": true}, "name": "brewery_id", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "fisa@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": []}, "created_at": 1658792883.942038, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": [], "nodes": ["source.beer_analytics.WORKSPACE_863912091.breweries"]}, "description": "", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "breweries"], "id": "model.beer_analytics.breweries", "label": "model.beer_analytics.breweries", "meta": {"owner": "fisa@keboola.com"}, "name": "breweries", "original_file_path": "models/beers/breweries.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/breweries.sql", "raw_sql": "{{ config(\n    materialized=\"table\"\n) }}\n\nSELECT\n  \"id\"                    AS brewery_id,\n  trim(\"name\")            AS brewery_name,\n  trim(\"city\")            AS brewery_city,\n  trim(\"state\")           AS brewery_state,\n  \u0027USA\u0027                 AS brewery_country\nFROM\n  {{ source(\u0027WORKSPACE_863912091\u0027, \u0027breweries\u0027) }}", "refs": [], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [["WORKSPACE_863912091", "breweries"]], "tags": [], "unique_id": "model.beer_analytics.breweries", "unrendered_config": {"materialized": "table"}}, {"alias": "beers_with_breweries", "checksum": {"checksum": "553c08f8745db1db963f39346b0516848ef19e4c3f1ff29b1ca1df0ceef3910a", "name": "sha256"}, "columns": {"abv": {"description": "Alcohol percentage in the beer", "meta": {}, "name": "abv", "tags": []}, "beer_id": {"description": "The unique identifier for the beer", "meta": {"dimension": {"sql": "${TABLE}.beer_id"}, "primary-key": true}, "name": "beer_id", "tags": []}, "beer_name": {"description": "The name of the beer", "meta": {"primary-key": true}, "name": "beer_name", "tags": []}, "beer_style": {"description": "Style of the beer (IPA, Porter, etc)", "meta": {"dimension": {"sql": "${TABLE}.beer_style"}, "metrics": {"num_unique_beer_styles": {"type": "count_distinct"}}}, "name": "beer_style", "tags": []}, "bitterness": {"description": "The bitterness category of the beer (based on IBUs)", "meta": {}, "name": "bitterness", "tags": []}, "brewery_city": {"description": "City of the brewery", "meta": {}, "name": "brewery_city", "tags": []}, "brewery_id": {"description": "The unique identifier for the brewery", "meta": {"dimension": {"sql": "${TABLE}.brewery_id"}, "meta": null, "metrics": {"num_unique_breweries": {"type": "count_distinct"}}, "primary-key": true}, "name": "brewery_id", "tags": []}, "brewery_name": {"description": "Name of the brewery", "meta": {}, "name": "brewery_name", "tags": []}, "brewery_state": {"description": "State of the brewery", "meta": {}, "name": "brewery_state", "tags": []}, "ibu": {"description": "The bitterness of the beer in IBUs", "meta": {}, "name": "ibu", "tags": []}, "ounces": {"description": "The volume of the beer", "meta": {}, "name": "ounces", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "fisa@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {"columns": true, "relation": true}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": []}, "created_at": 1658792883.932836, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": [], "nodes": ["model.beer_analytics.beers", "model.beer_analytics.breweries"]}, "description": "Beers joined with their breweries", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "beers_with_breweries"], "id": "model.beer_analytics.beers_with_breweries", "label": "model.beer_analytics.beers_with_breweries", "meta": {"owner": "fisa@keboola.com"}, "name": "beers_with_breweries", "original_file_path": "models/beers/beers_with_breweries.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/beers_with_breweries.sql", "raw_sql": "{{ config(\n    materialized=\"table\",\n    persist_docs={\"relation\": true, \"columns\": true}\n) }}\n\nSELECT *\nFROM {{ ref(\u0027beers\u0027) }} beers\nJOIN {{ ref(\u0027breweries\u0027) }} breweries USING (brewery_id)", "refs": [["beers"], ["breweries"]], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [], "tags": [], "unique_id": "model.beer_analytics.beers_with_breweries", "unrendered_config": {"materialized": "table", "persist_docs": {"columns": true, "relation": true}}}, {"alias": "sales", "checksum": {"checksum": "1b2264d4e9631c9d0c6c15536a832b75a6479d0462d2477acb51c6fbcd25179f", "name": "sha256"}, "columns": {"abv": {"description": "Alcohol by volume", "meta": {}, "name": "abv", "tags": []}, "beer_id": {"description": "The unique indentifier of the beer", "meta": {}, "name": "beer_id", "tags": []}, "beer_name": {"description": "The name of the beer as on the label", "meta": {}, "name": "beer_name", "tags": []}, "beer_style": {"description": "The style of the beer (IPA, Porter, etc)", "meta": {}, "name": "beer_style", "tags": []}, "bitterness": {"description": "The bitterness category of the beer (based on IBUs)", "meta": {}, "name": "bitterness", "tags": []}, "brewery_city": {"description": "", "meta": {}, "name": "brewery_city", "tags": []}, "brewery_country": {"description": "", "meta": {}, "name": "brewery_country", "tags": []}, "brewery_id": {"description": "The unique indentifier of the brewery", "meta": {}, "name": "brewery_id", "tags": []}, "brewery_name": {"description": "The official name of the brewery", "meta": {}, "name": "brewery_name", "tags": []}, "brewery_state": {"description": "", "meta": {}, "name": "brewery_state", "tags": []}, "ibu": {"description": "International Bitterness Unit", "meta": {}, "name": "ibu", "tags": []}, "order_created_at": {"description": "When the order was created", "meta": {}, "name": "order_created_at", "tags": []}, "order_li_price_each": {"description": "Price for a single unit", "meta": {}, "name": "order_li_price_each", "tags": []}, "order_li_price_total": {"description": "The total price for the order line", "meta": {}, "name": "order_li_price_total", "tags": []}, "order_li_quantity": {"description": "The number of units for the order line", "meta": {}, "name": "order_li_quantity", "tags": []}, "order_line": {"description": "The order line number", "meta": {"primary-key": true}, "name": "order_line", "tags": ["primary-key"]}, "order_no": {"description": "The order number", "meta": {"primary-key": true}, "name": "order_no", "tags": ["primary-key"]}, "ounces": {"description": "Volume of a single unit", "meta": {}, "name": "ounces", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "fisa@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {"columns": true, "relation": true}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": [], "transient": false}, "created_at": 1658792883.951624, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": [], "nodes": ["model.beer_analytics.orders", "model.beer_analytics.order_lines", "model.beer_analytics.beers_with_breweries"]}, "description": "Beer Sales", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "sales"], "id": "model.beer_analytics.sales", "label": "model.beer_analytics.sales", "meta": {"owner": "fisa@keboola.com"}, "name": "sales", "original_file_path": "models/beers/sales.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/sales.sql", "raw_sql": "{{ config(\n    materialized=\"table\",\n    persist_docs={\"relation\": true, \"columns\": true},\n    transient=false\n) }}\n\nSELECT\n \"beers_with_breweries\".beer_id               AS beer_id,\n \"beers_with_breweries\".beer_name             AS beer_name,\n \"beers_with_breweries\".beer_style            AS beer_style,\n \"beers_with_breweries\".abv                   AS abv,\n \"beers_with_breweries\".ibu                   AS ibu,\n \"beers_with_breweries\".bitterness           AS bitterness,\n \"beers_with_breweries\".ounces                AS ounces,\n\n \"beers_with_breweries\".brewery_id            AS brewery_id,\n \"beers_with_breweries\".brewery_name          AS brewery_name,\n \"beers_with_breweries\".brewery_city          AS brewery_city,\n \"beers_with_breweries\".brewery_state         AS brewery_state,\n \"beers_with_breweries\".brewery_country       AS brewery_country,\n\n \"orders\".order_no                           AS order_no,\n \"order_lines\".order_line                     AS order_line,\n \"orders\".created_at                          AS order_created_at,\n \"order_lines\".quantity                       AS order_li_quantity,\n \"order_lines\".price                          AS order_li_price_each,\n \"order_lines\".quantity * \"order_lines\".price   AS order_li_price_total\n\nFROM {{ ref(\u0027orders\u0027) }} \"orders\"\nJOIN {{ ref(\u0027order_lines\u0027) }} \"order_lines\" USING (order_no)\nJOIN {{ ref(\u0027beers_with_breweries\u0027) }} \"beers_with_breweries\" USING (beer_id)\n\nWHERE \"orders\".status = \u0027DELIVERED\u0027", "refs": [["orders"], ["order_lines"], ["beers_with_breweries"]], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [], "tags": [], "unique_id": "model.beer_analytics.sales", "unrendered_config": {"materialized": "table", "persist_docs": {"columns": true, "relation": true}, "transient": false}}, {"created_at": 1658792883.9794931, "depends_on": {"macros": [], "nodes": ["model.beer_analytics.beers", "model.beer_analytics.beers_with_breweries", "model.beer_analytics.breweries", "model.beer_analytics.order_lines", "model.beer_analytics.orders", "model.beer_analytics.promo_deliveries", "model.beer_analytics.sales"]}, "description": "Lightdash Demo Instance", "fqn": ["beer_analytics", "beers", "lightdash"], "id": "exposure.beer_analytics.lightdash", "label": "exposure.beer_analytics.lightdash", "maturity": "high", "meta": {}, "name": "lightdash", "original_file_path": "models/beers/exposures.yml", "owner": {"email": "fisa@keboola.com", "name": "Martin Fiser"}, "package_name": "beer_analytics", "path": "beers/exposures.yml", "refs": [["beers"], ["beers_with_breweries"], ["breweries"], ["order_lines"], ["orders"], ["promo_deliveries"], ["sales"]], "resource_type": "exposure", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "shape": "dot", "size": 10, "sources": [], "tags": ["business_intelligence"], "type": "dashboard", "unique_id": "exposure.beer_analytics.lightdash", "url": "https://fisa-lightdash.herokuapp.com/projects/b2e4799b-db5e-4e72-a483-fded20d227a9/"}, {"alias": "order_lines", "checksum": {"checksum": "5074fad406e6f43c44e8f2d6c8a6bcc15a968dcbd653641faca4324859305cf3", "name": "sha256"}, "columns": {"order_line": {"description": "", "meta": {"primary-key": true}, "name": "order_line", "tags": []}, "order_no": {"description": "", "meta": {"primary-key": true}, "name": "order_no", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "jordan.burger@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {"columns": true, "relation": true}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": [], "unique_key": "order_line"}, "created_at": 1658792883.9460402, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": ["macro.beer_analytics.date_format", "macro.beer_analytics.yyymmdd", "macro.dbt.is_incremental"], "nodes": ["model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers", "model.beer_analytics.beers"]}, "description": "", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "order_lines"], "id": "model.beer_analytics.order_lines", "label": "model.beer_analytics.order_lines", "meta": {"owner": "jordan.burger@keboola.com"}, "name": "order_lines", "original_file_path": "models/beers/order_lines.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/order_lines.sql", "raw_sql": "{{ config(\n    materialized=\u0027table\u0027,\n    unique_key=\u0027order_line\u0027,\n    persist_docs={\"relation\": true, \"columns\": true}\n) }}\n\n-- We\u0027ll fake some data, since this is an example repository\n-- we want to make sure that we continue to generate data up\n-- to today\n\nWITH generated_order_lines AS (\n    {% for day_ago in range(30) %}\n        {% for order_number in range(10) %}\n            -- Each order has between 1 and 5 order_lines\n            {% for order_line in range(3) %}\n                SELECT CONCAT(\n                            {{ date_format() }}(\n                                DATEADD(Day, -1 * {{ day_ago }}, current_timestamp),\n                                {{ yyymmdd() }}\n                            ),\n                            \u0027{{ order_number }}\u0027\n                       )                                   AS order_no,\n                       CONCAT(\n                           {{ date_format() }}(\n                                DATEADD(Day, -1 * {{ day_ago }}, current_timestamp),\n                                {{ yyymmdd() }}\n                           ),\n                           \u0027{{ order_number }}{{ order_line }}\u0027\n                       ) AS order_line,\n                       (\n                            -- Deterministically select a random beer\n                            SELECT MOD(\n                                ABS(HASH({{ order_number + order_line }})),\n                                (\n                                    SELECT MAX(beer_id) FROM {{ ref(\u0027beers\u0027) }}\n                                )\n                            )\n                       )                                                          AS beer_id,\n                       1 +MOD(ABS(HASH({{ order_number + order_line }})), 3)      AS quantity,\n                       MOD(ABS(HASH({{ order_number + order_line }})), 300) / 100 AS price,\n                       DATEADD(Day, -1 * {{ day_ago }}, current_timestamp)        AS created_at,\n                       current_timestamp                                          AS changed_at\n\n                {% if not loop.last %}\n                  UNION ALL\n                {% endif %}\n            {% endfor %}\n            {% if not loop.last %}\n            UNION ALL\n            {% endif %}\n      {% endfor %}\n\n      {% if not loop.last %}\n        UNION ALL\n      {% endif %}\n    {% endfor %}\n)\n\nSELECT *\nFROM generated_order_lines\n\n{% if is_incremental() %}\n    WHERE created_at::date \u003e (SELECT MAX(created_at)::date FROM {{ this }})\n{% endif %}", "refs": [["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"], ["beers"]], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [], "tags": [], "unique_id": "model.beer_analytics.order_lines", "unrendered_config": {"materialized": "table", "persist_docs": {"columns": true, "relation": true}, "unique_key": "order_line"}}, {"alias": "promo_deliveries", "checksum": {"checksum": "b230df8807bab3cb18bcc650c9b26b3de346fd0e764f41034b73f1881e6e02f2", "name": "sha256"}, "columns": {"customer_id": {"description": "Customer id", "meta": {"primary-key": true}, "name": "customer_id", "tags": ["primary-key"]}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "david.pospisil@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {"columns": true, "relation": true}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": [], "transient": false}, "created_at": 1658792883.9539661, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": [], "nodes": ["model.beer_analytics.orders", "model.beer_analytics.order_lines", "model.beer_analytics.beers", "model.beer_analytics.orders", "model.beer_analytics.order_lines", "model.beer_analytics.beers"]}, "description": "", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "promo_deliveries"], "id": "model.beer_analytics.promo_deliveries", "label": "model.beer_analytics.promo_deliveries", "meta": {"owner": "david.pospisil@keboola.com"}, "name": "promo_deliveries", "original_file_path": "models/beers/promo_deliveries.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/promo_deliveries.sql", "raw_sql": "{{ config(\n    materialized=\"table\",\n    persist_docs={\"relation\": true, \"columns\": true},\n    transient=false\n) }}\n\nSELECT customer_id,\n       \u0027Hoppy\u0027 AS promo,\n       COUNT(DISTINCT b.beer_name) AS cnt_beers_purchased    \n  FROM {{ ref(\u0027orders\u0027) }} o\n  JOIN {{ ref(\u0027order_lines\u0027) }} ol\n  USING (order_no)\n  JOIN {{ ref(\u0027beers\u0027) }} b\n  USING(beer_id)\n  GROUP BY 1\n  HAVING COUNT(CASE WHEN b.bitterness = \u0027Hoppy\u0027 THEN 1 END)\n         \u003e\n         COUNT(CASE WHEN b.bitterness = \u0027Malty\u0027 THEN 1 END)\n\nUNION\n\nSELECT customer_id,\n       \u0027Malty\u0027 AS promo,\n       COUNT(DISTINCT b.beer_name) AS cnt_beers_purchased\n  FROM {{ ref(\u0027orders\u0027) }} o\n  JOIN {{ ref(\u0027order_lines\u0027) }} ol\n  USING (order_no)\n  JOIN {{ ref(\u0027beers\u0027) }} b\n  USING(beer_id)\n  GROUP BY 1\n  HAVING COUNT(CASE WHEN b.bitterness = \u0027Malty\u0027 THEN 1 END)\n         \u003e\n         COUNT(CASE WHEN b.bitterness = \u0027Hoppy\u0027 THEN 1 END)", "refs": [["orders"], ["order_lines"], ["beers"], ["orders"], ["order_lines"], ["beers"]], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [], "tags": [], "unique_id": "model.beer_analytics.promo_deliveries", "unrendered_config": {"materialized": "table", "persist_docs": {"columns": true, "relation": true}, "transient": false}}, {"alias": "orders", "checksum": {"checksum": "062724c6f90e2e885412d73e345a4119a308c52140c855b706304d34e75d1603", "name": "sha256"}, "columns": {"order_no": {"description": "", "meta": {"metrics": {"num_unique_orders": {"type": "count_distinct"}}, "primary-key": true}, "name": "order_no", "tags": []}}, "config": {"column_types": {}, "enabled": true, "materialized": "table", "meta": {"owner": "jordan.burger@keboola.com"}, "on_schema_change": "ignore", "persist_docs": {"columns": true, "relation": true}, "post-hook": [], "pre-hook": [], "quoting": {}, "tags": [], "unique_key": "order_no"}, "created_at": 1658792883.944114, "database": "SAPI_9119", "deferred": false, "depends_on": {"macros": ["macro.beer_analytics.date_format", "macro.beer_analytics.yyymmdd", "macro.beer_analytics.randint", "macro.dbt.is_incremental"], "nodes": []}, "description": "", "docs": {"show": true}, "fqn": ["beer_analytics", "beers", "orders"], "id": "model.beer_analytics.orders", "label": "model.beer_analytics.orders", "meta": {"owner": "jordan.burger@keboola.com"}, "name": "orders", "original_file_path": "models/beers/orders.sql", "package_name": "beer_analytics", "patch_path": "beer_analytics://models/beers/schema.yml", "path": "beers/orders.sql", "raw_sql": "{{ config(\n    materialized=\u0027table\u0027,\n    unique_key=\u0027order_no\u0027,\n    persist_docs={\"relation\": true, \"columns\": true}\n) }}\n\n-- We\u0027ll fake some data, since this is an example repository\n-- we want to make sure that we continue to generate data up\n-- to today\n\nWITH generated_orders AS (\n    {% for day_ago in range(30) %}\n        {% for order_number in range(10) %}\n          SELECT\n              CONCAT(\n                   {{ date_format() }}(\n                        DATEADD(Day, -1 * {{ day_ago }}, CURRENT_DATE),\n                        {{ yyymmdd() }}\n                   ),\n                   \u0027{{ order_number }}\u0027\n             )::int                                                            AS order_no,\n\n             {{ randint(123456, 654321) }}                                  AS customer_id,\n\n             {% if order_number is divisibleby 13 %}\n                \u0027PENDING\u0027                                                      AS status,\n             {% else %}\n                \u0027DELIVERED\u0027                                                    AS status,\n             {% endif %}\n             DATEADD(Day, -1 * {{ day_ago }}, CURRENT_DATE)                    AS created_at,\n             current_timestamp                                                 AS changed_at\n\n          {% if not loop.last %}\n            UNION ALL\n          {% endif %}\n        {% endfor %}\n\n        {% if not loop.last %}\n            UNION ALL\n        {% endif %}\n    {% endfor %}\n)\n\nSELECT *\nFROM generated_orders\n\n{% if is_incremental() %}\n    WHERE created_at::date \u003e (SELECT MAX(created_at)::date FROM {{ this }})\n{% endif %}", "refs": [], "resource_type": "model", "root_path": "/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold", "schema": "WORKSPACE_863912091", "shape": "dot", "size": 10, "sources": [], "tags": [], "unique_id": "model.beer_analytics.orders", "unrendered_config": {"materialized": "table", "persist_docs": {"columns": true, "relation": true}, "unique_key": "order_no"}}]);
-        edges = new vis.DataSet([{"from": "source.beer_analytics.WORKSPACE_863912091.beers", "label": 1, "to": "model.beer_analytics.beers", "weight": 1}, {"from": "source.beer_analytics.WORKSPACE_863912091.breweries", "label": 1, "to": "model.beer_analytics.breweries", "weight": 1}, {"from": "model.beer_analytics.beers_with_breweries", "label": 1, "to": "model.beer_analytics.sales", "weight": 1}, {"from": "model.beer_analytics.beers_with_breweries", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.beers", "label": 1, "to": "model.beer_analytics.beers_with_breweries", "weight": 1}, {"from": "model.beer_analytics.beers", "label": 1, "to": "model.beer_analytics.order_lines", "weight": 1}, {"from": "model.beer_analytics.beers", "label": 1, "to": "model.beer_analytics.promo_deliveries", "weight": 1}, {"from": "model.beer_analytics.beers", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.breweries", "label": 1, "to": "model.beer_analytics.beers_with_breweries", "weight": 1}, {"from": "model.beer_analytics.breweries", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.orders", "label": 1, "to": "model.beer_analytics.sales", "weight": 1}, {"from": "model.beer_analytics.orders", "label": 1, "to": "model.beer_analytics.promo_deliveries", "weight": 1}, {"from": "model.beer_analytics.orders", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.order_lines", "label": 1, "to": "model.beer_analytics.sales", "weight": 1}, {"from": "model.beer_analytics.order_lines", "label": 1, "to": "model.beer_analytics.promo_deliveries", "weight": 1}, {"from": "model.beer_analytics.order_lines", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.sales", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}, {"from": "model.beer_analytics.promo_deliveries", "label": 1, "to": "exposure.beer_analytics.lightdash", "weight": 1}]);
-
-        // adding nodes and edges to the graph
-        data = {nodes: nodes, edges: edges};
-
-        var options = {
-    "configure": {
-        "enabled": false
-    },
-    "edges": {
-        "color": {
-            "inherit": true
-        },
-        "smooth": {
-            "enabled": true,
-            "type": "dynamic"
-        }
-    },
-    "interaction": {
-        "dragNodes": true,
-        "hideEdgesOnDrag": false,
-        "hideNodesOnDrag": false
-    },
-    "physics": {
-        "enabled": true,
-        "stabilization": {
-            "enabled": true,
-            "fit": true,
-            "iterations": 1000,
-            "onlyDynamicEdges": false,
-            "updateInterval": 50
-        }
-    }
-};
-        
-        
-
-        
-
-        network = new vis.Network(container, data, options);
-	 
-        
-
-
-        
-
-        return network;
-
-    }
-
-    drawGraph();
-
-</script>
-</body>
-</html>
-
-================================================
-File: /analysis/sqlparsing.ipynb
-================================================
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": 1,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "import json\n",
-    "import os\n",
-    "from sqllineage.runner import LineageRunner\n",
-    "import sqllineage as sq\n",
-    "from sqlparse.sql import Statement\n",
-    "from sqllineage.core import LineageAnalyzer"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 6,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "## test queries\n",
-    "sql = \"insert into db1.table11 select * from db2.table21 union select * from db2.table22;\"\n",
-    "#sql += \"insert into db3.table3 select * from db1.table11 join db1.table12;\"\n",
-    "\n",
-    "sql = \"\"\"CREATE OR REPLACE TABLE \"out_commercial_bonus\" AS SELECT RI.\"id\" || '_' || CBPDWI.\"unique_id\" AS \"unique_id\", RI.\"id\" AS \"warehouse_replenishment_id\", S.\"name\", CBPDWI.\"unique_id\" AS \"commercial_bonus_unique_id\", CBPDWI.\"commercial_bonus_periods_unique_id\", RI.\"inventory_item_id\"::VARCHAR(255) AS \"warehouse_inventory_id\", R.\"closed_at\"::TIMESTAMP_NTZ AS \"closed_at\", RI.\"amount\"::DECIMAL( 20, 4 ) AS \"amount\", ( RI.\"price\"::DECIMAL( 16, 6 )/ RI.\"amount\"::DECIMAL( 16, 6 ) )::DECIMAL( 16 ... ue_id\" = R.\"supplier_unique_id\" LEFT JOIN \"commercial_bonuses_periods\" cbp ON CBP.\"unique_id\" = CBPDWI.\"unique_id\" LEFT JOIN \"commercial_bonuses\" cb ON CB.\"unique_id\" = CBP.\"commercial_bonus_unique_id\" LEFT JOIN \"lov_commercial_bonuses\" lcb ON LCB.\"unique_id\" = CB.\"lov_commercial_bonuses_unique_id\" LEFT JOIN \"tmp_supplier\" S ON S.\"unique_id\" = CBPDWI.\"warehouse_supplier_unique_id\" WHERE R.\"closed_at\" > '2020-01-01 00:00:00' AND RI.\"amount\"::DECIMAL( 20, 6 )> 0 AND R.\"found_in_stock\" = 0;\"\"\"\n",
-    "\n",
-    "sql = sql.replace('\"','')\n"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 48,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "f = open(\"/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold/target/compiled/beer_analytics/models/beers/beers_with_breweries.sql\", \"r\")\n",
-    "sql = f.read()"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 7,
-   "metadata": {},
-   "outputs": [
-    {
-     "ename": "AttributeError",
-     "evalue": "'LineageRunner' object has no attribute 'source_tables'",
-     "output_type": "error",
-     "traceback": [
-      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
-      "\u001b[0;31mAttributeError\u001b[0m                            Traceback (most recent call last)",
-      "\u001b[1;32m/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold/analysis/sqlparsing.ipynb Cell 4\u001b[0m in \u001b[0;36m<module>\u001b[0;34m\u001b[0m\n\u001b[1;32m      <a href='vscode-notebook-cell:/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold/analysis/sqlparsing.ipynb#ch0000003?line=0'>1</a>\u001b[0m result \u001b[39m=\u001b[39m LineageRunner(sql)\n\u001b[1;32m      <a href='vscode-notebook-cell:/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold/analysis/sqlparsing.ipynb#ch0000003?line=1'>2</a>\u001b[0m \u001b[39m# To show lineage summary\u001b[39;00m\n\u001b[0;32m----> <a href='vscode-notebook-cell:/Users/martin/Dropbox/Development/keboola_dbt_beer_demo_datafold/analysis/sqlparsing.ipynb#ch0000003?line=2'>3</a>\u001b[0m \u001b[39mprint\u001b[39;49m(result)\n",
-      "File \u001b[0;32m~/Library/Python/3.8/lib/python/site-packages/sqllineage/runner.py:21\u001b[0m, in \u001b[0;36mlazy_method.<locals>.wrapper\u001b[0;34m(*args, **kwargs)\u001b[0m\n\u001b[1;32m     19\u001b[0m \u001b[39mif\u001b[39;00m \u001b[39mnot\u001b[39;00m \u001b[39mself\u001b[39m\u001b[39m.\u001b[39m_evaluated:\n\u001b[1;32m     20\u001b[0m     \u001b[39mself\u001b[39m\u001b[39m.\u001b[39m_eval()\n\u001b[0;32m---> 21\u001b[0m \u001b[39mreturn\u001b[39;00m func(\u001b[39m*\u001b[39;49margs, \u001b[39m*\u001b[39;49m\u001b[39m*\u001b[39;49mkwargs)\n",
-      "File \u001b[0;32m~/Library/Python/3.8/lib/python/site-packages/sqllineage/runner.py:58\u001b[0m, in \u001b[0;36mLineageRunner.__str__\u001b[0;34m(self)\u001b[0m\n\u001b[1;32m     54\u001b[0m         \u001b[39m\"\"\"\u001b[39;00m\n\u001b[1;32m     55\u001b[0m \u001b[39m        print out the Lineage Summary.\u001b[39;00m\n\u001b[1;32m     56\u001b[0m \u001b[39m        \"\"\"\u001b[39;00m\n\u001b[1;32m     57\u001b[0m         statements \u001b[39m=\u001b[39m \u001b[39mself\u001b[39m\u001b[39m.\u001b[39mstatements(strip_comments\u001b[39m=\u001b[39m\u001b[39mTrue\u001b[39;00m)\n\u001b[0;32m---> 58\u001b[0m         source_tables \u001b[39m=\u001b[39m \u001b[39m\"\u001b[39m\u001b[39m\\n\u001b[39;00m\u001b[39m    \u001b[39m\u001b[39m\"\u001b[39m\u001b[39m.\u001b[39mjoin(\u001b[39mstr\u001b[39m(t) \u001b[39mfor\u001b[39;00m t \u001b[39min\u001b[39;00m \u001b[39mself\u001b[39;49m\u001b[39m.\u001b[39;49msource_tables)\n\u001b[1;32m     59\u001b[0m         target_tables \u001b[39m=\u001b[39m \u001b[39m\"\u001b[39m\u001b[39m\\n\u001b[39;00m\u001b[39m    \u001b[39m\u001b[39m\"\u001b[39m\u001b[39m.\u001b[39mjoin(\u001b[39mstr\u001b[39m(t) \u001b[39mfor\u001b[39;00m t \u001b[39min\u001b[39;00m \u001b[39mself\u001b[39m\u001b[39m.\u001b[39mtarget_tables)\n\u001b[1;32m     60\u001b[0m         combined \u001b[39m=\u001b[39m \u001b[39mf\u001b[39m\u001b[39m\"\"\"\u001b[39m\u001b[39mStatements(#): \u001b[39m\u001b[39m{\u001b[39;00m\u001b[39mlen\u001b[39m(statements)\u001b[39m}\u001b[39;00m\n\u001b[1;32m     61\u001b[0m \u001b[39mSource Tables:\u001b[39m\n\u001b[1;32m     62\u001b[0m \u001b[39m    \u001b[39m\u001b[39m{\u001b[39;00msource_tables\u001b[39m}\u001b[39;00m\n\u001b[1;32m     63\u001b[0m \u001b[39mTarget Tables:\u001b[39m\n\u001b[1;32m     64\u001b[0m \u001b[39m    \u001b[39m\u001b[39m{\u001b[39;00mtarget_tables\u001b[39m}\u001b[39;00m\n\u001b[1;32m     65\u001b[0m \u001b[39m\"\"\"\u001b[39m\n",
-      "\u001b[0;31mAttributeError\u001b[0m: 'LineageRunner' object has no attribute 'source_tables'"
-     ]
-    }
-   ],
-   "source": [
-    "result = LineageRunner(sql)\n",
-    "# To show lineage summary\n",
-    "print(result)"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 50,
-   "metadata": {},
-   "outputs": [
-    {
-     "data": {
-      "text/plain": [
-       "[{'data': {'id': 'sapi_9119.workspace_863912091.breweries'}},\n",
-       " {'data': {'id': 'sapi_9119.workspace_863912091.beers'}}]"
-      ]
-     },
-     "execution_count": 50,
-     "metadata": {},
-     "output_type": "execute_result"
-    }
-   ],
-   "source": [
-    "result.to_cytoscape()"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 51,
-   "metadata": {},
-   "outputs": [
-    {
-     "data": {
-      "text/plain": [
-       "Schema: sapi_9119.workspace_863912091"
-      ]
-     },
-     "execution_count": 51,
-     "metadata": {},
-     "output_type": "execute_result"
-    }
-   ],
-   "source": [
-    "result.source_tables[0].schema"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 52,
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      "sapi_9119.workspace_863912091.beers\n",
-      "sapi_9119.workspace_863912091.breweries\n"
-     ]
-    }
-   ],
-   "source": [
-    "for tbl in result.source_tables: print(tbl)"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 53,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "for tbl in result.target_tables: print(tbl)"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 54,
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      " * SQLLineage Running on http://localhost:5000/?e=%0A%0ASELECT+%2A%0AFROM+%22SAPI_9119%22.%22WORKSPACE_863912091%22.%22beers%22+beers%0AJOIN+%22SAPI_9119%22.%22WORKSPACE_863912091%22.%22breweries%22+breweries+USING+%28brewery_id%29\n"
-     ]
-    }
-   ],
-   "source": [
-    "result.draw()"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3.8.9 64-bit",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.8.9"
-  },
-  "orig_nbformat": 4,
-  "vscode": {
-   "interpreter": {
-    "hash": "31f2aee4e71d21fbe5cf8b01ff0e069b9275f58929596ceb00d14d90e3e16cd6"
-   }
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 2
-}
-
-
-================================================
 File: /analysis/freshness.yml
 ================================================
 version: 2
@@ -1644,6 +987,663 @@ packages:
 
   - package: data-mie/dbt_profiler
     version: 0.4.1
+
+
+================================================
+File: /models/beers/order_lines.sql
+================================================
+{{ config(
+    materialized='table',
+    unique_key='order_line',
+    persist_docs={"relation": true, "columns": true}
+) }}
+
+-- We'll fake some data, since this is an example repository
+-- we want to make sure that we continue to generate data up
+-- to today
+
+WITH generated_order_lines AS (
+    {% for day_ago in range(30) %}
+        {% for order_number in range(10) %}
+            -- Each order has between 1 and 5 order_lines
+            {% for order_line in range(3) %}
+                SELECT CONCAT(
+                            {{ date_format() }}(
+                                DATEADD(Day, -1 * {{ day_ago }}, current_timestamp),
+                                {{ yyymmdd() }}
+                            ),
+                            '{{ order_number }}'
+                       )                                   AS order_no,
+                       CONCAT(
+                           {{ date_format() }}(
+                                DATEADD(Day, -1 * {{ day_ago }}, current_timestamp),
+                                {{ yyymmdd() }}
+                           ),
+                           '{{ order_number }}{{ order_line }}'
+                       ) AS order_line,
+                       (
+                            -- Deterministically select a random beer
+                            SELECT MOD(
+                                ABS(HASH({{ order_number + order_line }})),
+                                (
+                                    SELECT MAX(beer_id) FROM {{ ref('beers') }}
+                                )
+                            )
+                       )                                                          AS beer_id,
+                       1 +MOD(ABS(HASH({{ order_number + order_line }})), 3)      AS quantity,
+                       MOD(ABS(HASH({{ order_number + order_line }})), 300) / 100 AS price,
+                       DATEADD(Day, -1 * {{ day_ago }}, current_timestamp)        AS created_at,
+                       current_timestamp                                          AS changed_at
+
+                {% if not loop.last %}
+                  UNION ALL
+                {% endif %}
+            {% endfor %}
+            {% if not loop.last %}
+            UNION ALL
+            {% endif %}
+      {% endfor %}
+
+      {% if not loop.last %}
+        UNION ALL
+      {% endif %}
+    {% endfor %}
+)
+
+SELECT *
+FROM generated_order_lines
+
+{% if is_incremental() %}
+    WHERE created_at::date > (SELECT MAX(created_at)::date FROM {{ this }})
+{% endif %}
+
+
+================================================
+File: /models/beers/beers_with_breweries.sql
+================================================
+{{ config(
+    materialized="table",
+    persist_docs={"relation": true, "columns": true}
+) }}
+
+SELECT *
+FROM {{ ref('beers') }} beers
+JOIN {{ ref('breweries') }} breweries USING (brewery_id)
+
+
+================================================
+File: /models/beers/breweries.sql
+================================================
+
+{{ config(
+    materialized="view"
+) }}
+
+SELECT
+  "id"                    AS brewery_id,
+  trim("name")            AS brewery_name,
+  trim("city")            AS brewery_city,
+  trim("state")           AS brewery_state,
+  'USA'                 AS brewery_country
+FROM
+  {{ source('in.c-keboola-ex-http-28681838', 'seed_breweries') }}
+
+
+================================================
+File: /models/beers/schema.yml
+================================================
+version: 2
+
+models:
+  - name: beers_with_breweries
+    tags:
+      - operations
+    meta:
+      owner: fisa@keboola.com
+    description: "Beers joined with their breweries"
+    columns:
+      - name: brewery_id
+        description: "The unique identifier for the brewery"
+        tests:
+          - not_null
+        meta:
+          primary-key: true
+          dimension:
+            sql: ${TABLE}.brewery_id
+          meta:
+          metrics:
+            num_unique_breweries: # name of your metric
+              type: count_distinct # metric type
+      - name: beer_id
+        description: "The unique identifier for the beer"
+        tests:
+          - unique
+          - not_null
+        meta:
+          primary-key: true
+          dimension:
+            sql: ${TABLE}.beer_id
+      - name: beer_name
+        description: The name of the beer
+        meta:
+          primary-key: true
+      - name: beer_style
+        description: Style of the beer (IPA, Porter, etc)
+        meta:
+          dimension:
+            sql: ${TABLE}.beer_style
+          metrics:
+            num_unique_beer_styles: # name of your metric
+              type: count_distinct # metric type
+      - name: abv
+        description: Alcohol percentage in the beer
+      - name: ibu
+        description: The bitterness of the beer in IBUs
+      - name: bitterness
+        description: The bitterness category of the beer (based on IBUs)
+      - name: ounces
+        description: The volume of the beer
+      - name: brewery_name
+        description: Name of the brewery
+      - name: brewery_city
+        description: City of the brewery
+      - name: brewery_state
+        description: State of the brewery
+
+  - name: beers
+    tags:
+      - operations
+    meta:
+      owner: fisa@keboola.com
+    description: "Beer List"
+    tags: 
+      - products
+      - sales
+      - ecommerce
+    columns:
+      - name: beer_id
+        tests:
+          - unique
+          - not_null
+        meta:
+          primary-key: true
+          dimension:
+            sql: ${TABLE}.beer_id
+          metrics:
+            num_unique_beers: # name of your metric
+              type: count_distinct # metric type
+        description: The unique indentifier of the beer
+
+      - name: beer_name
+        description: The name of the beer as on the label
+        meta:
+          dimension:
+            sql: ${TABLE}.beer_name
+
+      - name: beer_style
+        description: The style of the beer (IPA, Porter, etc)
+        meta:
+          dimension:
+            sql: ${TABLE}.beer_style
+          metrics:
+            num_unique_beer_styles: # name of your metric
+              type: count_distinct
+              description: "Distinct Beer Styles"
+
+      - name: abv
+        description: Alcohol by volume
+        meta:
+          metrics:
+            avg_abv:
+              type: average
+              description: "Average Alcohol by volume"
+
+      - name: ibu
+        description: Bitterness in International Bitterness Units
+        meta:
+          metrics:
+            avg_ibu:
+              type: average
+              description: "Average Bitterness in International Bitterness Units"
+
+      - name: bitterness
+        description: The bitterness category of the beer (based on IBUs)
+        meta:
+          dimension:
+            sql: ${TABLE}.bitterness
+            description: "Bitterness Types"
+
+      - name: brewery_id
+        description: The unique indentifier of the brewery
+        metrics:
+            num_unique_breweries: # name of your metric
+              type: count_distinct
+              description: "Distinct Number of Breweries"
+      
+      - name: ounces
+        description: Volume of a single unit
+        meta:
+          metrics:
+            avg_ounces:
+              type: average
+              description: "Average Volume of a single unit"
+
+
+  - name: breweries
+    tags:
+      - operations
+    meta:
+      owner: fisa@keboola.com
+    columns:
+      - name: brewery_id
+        meta:
+         primary-key: true
+         metrics:
+            num_unique_breweries: # name of your metric
+              type: count_distinct # metric type
+
+  - name: orders
+    tags:
+      - ecommerce
+    meta:
+      owner: jordan.burger@keboola.com
+    columns:
+      - name: order_no
+        meta:
+         primary-key: true
+         metrics:
+            num_unique_orders: # name of your metric
+              type: count_distinct # metric type
+
+  - name: order_lines
+    tags:
+      - ecommerce
+    meta:
+      owner: jordan.burger@keboola.com
+    columns:
+      - name: order_no
+        meta:
+          primary-key: true
+        tests:
+          - relationships:
+              to: ref('orders')
+              field: order_no
+
+      - name: order_line
+        meta:
+          primary-key: true
+        tests:
+          - unique
+
+  - name: sales
+    tags:
+      - finance
+    meta:
+      owner: fisa@keboola.com
+    description: "Beer Sales"
+    columns:
+      - name: beer_id
+        description: The unique indentifier of the beer
+      - name: beer_name
+        description: The name of the beer as on the label
+      - name: beer_style
+        description: The style of the beer (IPA, Porter, etc)
+      - name: abv
+        description: Alcohol by volume
+      - name: ibu
+        description: International Bitterness Unit
+      - name: bitterness
+        description: The bitterness category of the beer (based on IBUs)
+      - name: ounces
+        description: Volume of a single unit
+      - name: brewery_id
+        description: The unique indentifier of the brewery
+      - name: brewery_name
+        description: The official name of the brewery
+      - name: brewery_city
+      - name: brewery_state
+      - name: brewery_country
+      - name: order_no
+        description: The order number
+        tests:
+          - not_null
+        tags:
+          - primary-key
+        meta:
+          primary-key: true
+      - name: order_line
+        description: The order line number
+        tests:
+          - not_null
+        tags:
+          - primary-key
+        meta:
+          primary-key: true
+      - name: order_created_at
+        description: When the order was created
+      - name: order_li_quantity
+        description: The number of units for the order line
+      - name: order_li_price_each
+        description: Price for a single unit
+      - name: order_li_price_total
+        description: The total price for the order line
+
+  - name: promo_deliveries
+    tags:
+      - marketing
+    meta:
+      owner: david.pospisil@keboola.com
+    columns:
+      - name: customer_id
+        description: "Customer id"
+        meta: 
+          primary-key: true
+        tags:
+          - primary-key
+
+
+
+================================================
+File: /models/beers/sales.sql
+================================================
+{{ config(
+    materialized="table",
+    persist_docs={"relation": true, "columns": true},
+    transient=false
+) }}
+
+SELECT
+ "beers_with_breweries".beer_id               AS beer_id,
+ "beers_with_breweries".beer_name             AS beer_name,
+ "beers_with_breweries".beer_style            AS beer_style,
+ "beers_with_breweries".abv                   AS abv,
+ "beers_with_breweries".ibu                   AS ibu,
+ "beers_with_breweries".bitterness           AS bitterness,
+ "beers_with_breweries".ounces                AS ounces,
+
+ "beers_with_breweries".brewery_id            AS brewery_id,
+ "beers_with_breweries".brewery_name          AS brewery_name,
+ "beers_with_breweries".brewery_city          AS brewery_city,
+ "beers_with_breweries".brewery_state         AS brewery_state,
+ "beers_with_breweries".brewery_country       AS brewery_country,
+
+ "orders".order_no                           AS order_no,
+ "order_lines".order_line                     AS order_line,
+ "orders".created_at                          AS order_created_at,
+ "order_lines".quantity                       AS order_li_quantity,
+ "order_lines".price                          AS order_li_price_each,
+ "order_lines".quantity * "order_lines".price   AS order_li_price_total
+
+FROM {{ ref('orders') }} "orders"
+JOIN {{ ref('order_lines') }} "order_lines" USING (order_no)
+JOIN {{ ref('beers_with_breweries') }} "beers_with_breweries" USING (beer_id)
+
+WHERE "orders".status = 'DELIVERED'
+
+
+================================================
+File: /models/beers/orders.sql
+================================================
+{{ config(
+    materialized='table',
+    unique_key='order_no',
+    persist_docs={"relation": true, "columns": true}
+) }}
+
+-- We'll fake some data, since this is an example repository
+-- we want to make sure that we continue to generate data up
+-- to today
+
+WITH generated_orders AS (
+    {% for day_ago in range(30) %}
+        {% for order_number in range(10) %}
+          SELECT
+              CONCAT(
+                   {{ date_format() }}(
+                        DATEADD(Day, -1 * {{ day_ago }}, CURRENT_DATE),
+                        {{ yyymmdd() }}
+                   ),
+                   '{{ order_number }}'
+             )::int                                                            AS order_no,
+
+             {{ randint(123456, 654321) }}                                  AS customer_id,
+
+             {% if order_number is divisibleby 13 %}
+                'PENDING'                                                      AS status,
+             {% else %}
+                'DELIVERED'                                                    AS status,
+             {% endif %}
+             DATEADD(Day, -1 * {{ day_ago }}, CURRENT_DATE)                    AS created_at,
+             current_timestamp                                                 AS changed_at
+
+          {% if not loop.last %}
+            UNION ALL
+          {% endif %}
+        {% endfor %}
+
+        {% if not loop.last %}
+            UNION ALL
+        {% endif %}
+    {% endfor %}
+)
+
+SELECT *
+FROM generated_orders
+
+{% if is_incremental() %}
+    WHERE created_at::date > (SELECT MAX(created_at)::date FROM {{ this }})
+{% endif %}
+
+
+================================================
+File: /models/beers/promo_deliveries.sql
+================================================
+{{ config(
+    materialized="table",
+    persist_docs={"relation": true, "columns": true},
+    transient=false
+) }}
+
+SELECT customer_id,
+       'Hoppy' AS promo,
+       COUNT(DISTINCT b.beer_name) AS cnt_beers_purchased    
+  FROM {{ ref('orders') }} o
+  JOIN {{ ref('order_lines') }} ol
+  USING (order_no)
+  JOIN {{ ref('beers') }} b
+  USING(beer_id)
+  GROUP BY 1
+  HAVING COUNT(CASE WHEN b.bitterness = 'Hoppy' THEN 1 END)
+         >
+         COUNT(CASE WHEN b.bitterness = 'Malty' THEN 1 END)
+
+UNION
+
+SELECT customer_id,
+       'Malty' AS promo,
+       COUNT(DISTINCT b.beer_name) AS cnt_beers_purchased
+  FROM {{ ref('orders') }} o
+  JOIN {{ ref('order_lines') }} ol
+  USING (order_no)
+  JOIN {{ ref('beers') }} b
+  USING(beer_id)
+  GROUP BY 1
+  HAVING COUNT(CASE WHEN b.bitterness = 'Malty' THEN 1 END)
+         >
+         COUNT(CASE WHEN b.bitterness = 'Hoppy' THEN 1 END)
+
+
+
+================================================
+File: /models/beers/beers.sql
+================================================
+{{ config(
+    materialized="view"
+) }}
+
+SELECT
+  "id"            AS beer_id,
+  TRIM("name")    AS beer_name,
+  "style"         AS beer_style,
+  TRY_TO_NUMERIC("abv",14,8)           AS abv,
+  TRY_TO_NUMERIC("ibu",14,8)           AS ibu,
+  CASE 
+       WHEN ibu <= 50 THEN 'Malty'
+       WHEN ibu > 50 THEN 'Hoppy'
+   END AS bitterness,
+  "brewery_id"    AS brewery_id,
+  "ounces"        AS ounces
+FROM
+  {{ source('in.c-keboola-ex-http-28681838', 'seed_beers') }}
+
+
+================================================
+File: /macros/yyyymmdd.sql
+================================================
+{#
+Convert a date to a YYYYMMDD string.
+
+This macro is needed because the date format string differs from one database backend to another.
+#}
+{%- macro yyymmdd() -%}
+    {{ return(adapter.dispatch('yyymmdd')()) }}
+{%- endmacro -%}
+
+
+{%- macro default__yyymmdd() -%}
+    'YYYYMMDD'
+{%- endmacro -%}
+
+
+{%- macro databricks__yyymmdd() -%}
+    {# Reference: https://docs.databricks.com/sql/language-manual/sql-ref-datetime-pattern.html #}
+    'yMMdd'
+{%- endmacro -%}
+
+
+================================================
+File: /macros/randint.sql
+================================================
+{#
+Not every DB has a function to return random integer within the given range.
+
+* For Snowflake, there is a native implementation;
+* For Databricks, we have to use a custom expression.
+
+The name of the macro is borrowed from the analogous Python `random.randint()` function.
+#}
+
+{%- macro randint(min, max) -%}
+    {{ return(adapter.dispatch('randint')(min, max)) }}
+{%- endmacro -%}
+
+
+{%- macro default__randint(min, max) -%}
+    UNIFORM({{ min }}, {{ max }}, RANDOM())
+{%- endmacro -%}
+
+
+{%- macro databricks__randint(min, max) -%}
+    (RANDOM() * {{ max - min }} + {{ min }})::int
+{%- endmacro -%}
+
+
+================================================
+File: /macros/date_format.sql
+================================================
+{#
+Conversion function from date to string is differently named in different databases.
+
+There are certain differences in the format string treatment:
+
+  * Snowflake will pass unrecognized symbols as they were,
+  * Whereas Databricks will fail on them.
+
+It is thus recommended to only use the recognized formatting symbols in format expressions.
+#}
+{%- macro date_format() -%}
+    {{ return(adapter.dispatch('date_format')()) }}
+{%- endmacro -%}
+
+
+{%- macro databricks__date_format() -%}
+    {# https://docs.databricks.com/sql/language-manual/functions/date_format.html #}
+    DATE_FORMAT
+{%- endmacro -%}
+
+
+{%- macro default__date_format() -%}
+    {# https://docs.snowflake.com/en/sql-reference/functions/to_char.html #}
+    TO_VARCHAR
+{%- endmacro -%}
+
+
+================================================
+File: /dbt_project.yml
+================================================
+
+# Name your project! Project names should contain only lowercase characters
+# and underscores. A good package name should reflect your organization's
+# name or the intended use of these models
+
+name: 'beer_analytics'
+version: '1.0.0'
+config-version: 2
+
+
+
+# This setting configures which "profile" dbt uses for this project.
+profile: beer_analytics
+
+# These configurations specify where dbt should look for different types of files.
+# The `source-paths` config, for example, states that models in this project can be
+# found in the "models/" directory. You probably won't need to change these!
+model-paths: ["models"]
+analysis-paths: ["analysis"]
+test-paths: ["tests"]
+seed-paths: ["data"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"  # directory which will store compiled SQL files
+clean-targets:         # directories to be removed by `dbt clean`
+    - "target"
+    - "dbt_modules"
+
+
+# https://docs.getdbt.com/reference/project-configs/quoting
+quoting:
+  database: true
+  schema: true
+  identifier: true
+
+
+#sources:
+#  freshness: # default freshness
+#    warn_after: {count: 1, period: day}
+#    error_after: {count: 7, period: day}
+
+# Seeds are handled by Keboola platform (uploaded files)
+#seeds:
+#  beer_analytics:
+#    +enabled: true
+#    seed_beers:
+#      +column_types:
+#        ibu: decimal
+#        abv: decimal
+
+
+# Configuring models
+# Full documentation: https://docs.getdbt.com/docs/configuring-models
+
+# In this example config, we tell dbt to build all models in the example/ directory
+# as tables. These settings can be overridden in the individual model files
+# using the `{{ config(...) }}` macro.
+models:
+  beer_analytics:
+      # Applies to all files under models/example/
+      beers:
+          materialized: view
 
 
 ================================================

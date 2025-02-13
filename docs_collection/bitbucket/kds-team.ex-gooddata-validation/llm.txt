@@ -1,45 +1,69 @@
 Directory structure:
 └── kds_consulting_team-kds-team.ex-gooddata-validation/
-    ├── flake8.cfg
-    ├── deploy.sh
-    ├── docker-compose.yml
-    ├── change_log.md
-    ├── src/
-    │   ├── gooddata/
-    │   │   ├── component.py
-    │   │   └── client.py
-    │   └── main.py
-    ├── bitbucket-pipelines.yml
     ├── tests/
-    │   ├── test_component.py
-    │   └── __init__.py
+    │   ├── __init__.py
+    │   └── test_component.py
+    ├── change_log.md
+    ├── Dockerfile
+    ├── flake8.cfg
+    ├── src/
+    │   ├── main.py
+    │   └── gooddata/
+    │       ├── client.py
+    │       └── component.py
+    ├── LICENSE.md
+    ├── requirements.txt
+    ├── bitbucket-pipelines.yml
     ├── component_config/
-    │   ├── component_long_description.md
-    │   ├── configuration_description.md
     │   ├── component_short_description.md
-    │   ├── stack_parameters.json
     │   ├── configSchema.json
+    │   ├── stack_parameters.json
+    │   ├── configuration_description.md
+    │   ├── component_long_description.md
     │   └── sample-config/
-    │       ├── config.json
     │       ├── in/
-    │       │   ├── state.json
     │       │   ├── tables/
     │       │   │   ├── test.csv
     │       │   │   └── test.csv.manifest
+    │       │   ├── state.json
     │       │   └── files/
     │       │       └── order1.xml
-    │       └── out/
-    │           ├── tables/
-    │           │   └── test.csv
-    │           └── files/
-    │               └── order1.xml
+    │       ├── out/
+    │       │   ├── tables/
+    │       │   │   └── test.csv
+    │       │   └── files/
+    │       │       └── order1.xml
+    │       └── config.json
+    ├── deploy.sh
+    ├── docker-compose.yml
     ├── scripts/
-    │   ├── update_dev_portal_properties.sh
-    │   └── build_n_test.sh
-    ├── requirements.txt
-    ├── Dockerfile
-    ├── LICENSE.md
+    │   ├── build_n_test.sh
+    │   └── update_dev_portal_properties.sh
     └── README.md
+
+================================================
+File: /change_log.md
+================================================
+**0.0.1**
+Working version of the extractor
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.7.2-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+RUN pip install -r /code/requirements.txt
+WORKDIR /code/
+
+
+CMD ["python3", "-u", "/code/src/main.py"]
+
 
 ================================================
 File: /flake8.cfg
@@ -65,229 +89,46 @@ max-line-length = 120
 
 
 ================================================
-File: /deploy.sh
+File: /src/main.py
 ================================================
-#!/bin/sh
-set -e
-
-#check if deployment is triggered only in master
-if [ $BITBUCKET_BRANCH != "master" ]; then
-               echo Deploy on tagged commit can be only executed in master!
-               exit 1
-fi
-
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
-
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
-
-# Push to the repository
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${BITBUCKET_TAG}
-docker push ${REPOSITORY}:latest
-
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
-fi
-
-
-================================================
-File: /docker-compose.yml
-================================================
-version: "2"
-services:
-  # for development purposes
-  dev:
-    build: .
-    volumes:
-        - ./:/code
-        - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-  test:
-    # Use to run flake8 and unittests checks
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-    command:
-      - /bin/sh
-      - /code/scripts/build_n_test.sh
-
-================================================
-File: /change_log.md
-================================================
-**0.0.1**
-Working version of the extractor
-
-================================================
-File: /src/gooddata/component.py
-================================================
-import csv
-# import json
 import logging
 import os
-import re
 import sys
-from gooddata.client import ValidationClient
-from kbc.env_handler import KBCEnvHandler
+import logging_gelf.handlers
+import logging_gelf.formatters
+from gooddata.component import ValidationComponent
 
+# Environment setup
+sys.tracebacklimit = 0
 
-KEY_USERNAME = 'username'
-KEY_PASSWORD = '#password'
-KEY_PROJECTID = 'projectId'
-KEY_METRICS = 'validationMetrics'
-KEY_CUSTOMDOMAIN = 'customDomain'
-KEY_GDURL = 'gooddataUrl'
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)-8s : [line:%(lineno)3s] %(message)s',
+    datefmt="%Y-%m-%d %H:%M:%S")
 
-MANDATORY_PARAMETERS = [KEY_USERNAME, KEY_PASSWORD, KEY_PROJECTID, KEY_METRICS]
+if 'KBC_LOGGER_ADDR' in os.environ and 'KBC_LOGGER_PORT' in os.environ:
 
-SUPPORTED_METRICS = ["pdm::pdm_vs_dwh", "pdm::pk_fk_consistency", "pdm::elem_validation",
-                     "invalid_objects", "pdm::transitivity", "metric_filter", "ldm"]
+    logger = logging.getLogger()
+    logging_gelf_handler = logging_gelf.handlers.GELFTCPSocketHandler(
+        host=os.getenv('KBC_LOGGER_ADDR'),
+        port=int(os.getenv('KBC_LOGGER_PORT'))
+    )
+    logging_gelf_handler.setFormatter(
+        logging_gelf.formatters.GELFFormatter(null_character=True))
+    logger.addHandler(logging_gelf_handler)
 
-FIELDS_VALIDATION = ['validation_metric', 'category', 'level', 'message']
+    # removes the initial stdout logging
+    logger.removeHandler(logger.handlers[0])
 
+APP_VERSION = '0.0.1'
 
-class ValidationComponent(KBCEnvHandler):
+if __name__ == '__main__':
 
-    def __init__(self):
+    logging.info("Running component version %s..." % APP_VERSION)
 
-        KBCEnvHandler.__init__(self, MANDATORY_PARAMETERS)
-        self.validate_config(MANDATORY_PARAMETERS)
-
-        self.paramUsername = self.cfg_params[KEY_USERNAME]
-        self.paramPassword = self.cfg_params[KEY_PASSWORD]
-        self.paramProjectId = self.cfg_params[KEY_PROJECTID]
-        self.paramMetrics = self.cfg_params[KEY_METRICS]
-        self.paramCustomDomain = self.cfg_params[KEY_CUSTOMDOMAIN]
-        self.paramGooddataUrl = self.image_params[KEY_GDURL]
-
-        self._processAndValidateParameters()
-
-        self.client = ValidationClient(username=self.paramUsername,
-                                       password=self.paramPassword,
-                                       projectId=self.paramProjectId,
-                                       baseGoodDataUrl=self.paramGooddataUrl)
-
-        self.writer = csv.DictWriter(open(os.path.join(self.tables_out_path, 'validation.csv'), 'w'),
-                                     fieldnames=FIELDS_VALIDATION, extrasaction='ignore', restval='',
-                                     quotechar='\"', quoting=csv.QUOTE_ALL)
-        self.writer.writeheader()
-
-    def _processAndValidateParameters(self):
-
-        custDomain = re.sub(r'\s', '', self.paramCustomDomain)
-
-        if custDomain != '':
-
-            rxgString = r'https://.*\.gooddata\.com/*'
-            rgxCheck = re.fullmatch(rxgString, custDomain)
-
-            if rgxCheck is None:
-
-                logging.error("%s is not a valid GoodData domain." %
-                              custDomain)
-                sys.exit(1)
-
-            else:
-
-                self.paramGooddataUrl = custDomain
-
-        logging.info("Using domain %s." % self.paramGooddataUrl)
-
-        for metric in self.paramMetrics:
-
-            if metric not in SUPPORTED_METRICS:
-
-                logging.error("Metric %s is not supported. Please choose from: %s" % (
-                    metric, SUPPORTED_METRICS))
-                sys.exit(1)
-
-    def run(self):
-
-        reqValidationSc, reqValidationJs = self.client.triggerValidation(
-            self.paramMetrics)
-
-        if reqValidationSc == 201:
-
-            integrationId = reqValidationJs['asyncTask']['link']['poll'].split(
-                '/')[-1]
-
-        else:
-
-            logging.error("There was an error triggering the validation task.")
-            logging.error("Received: %s - %s." %
-                          (reqValidationSc, reqValidationJs))
-            sys.exit(1)
-
-        validJs = self.client.checkValidationStatus(
-            integrationId)['projectValidateResult']['results']
-
-        for result in validJs:
-
-            if result['body']['error'] == 0:
-
-                continue
-
-            else:
-
-                validationMetric = result['from']
-                logMessages = result['body']['log']
-
-                for message in logMessages:
-
-                    msg = message['msg']
-                    level = message['level']
-                    category = message['ecat']
-                    pars = message['pars']
-                    parameters = []
-
-                    for p in pars:
-
-                        concatPar = ''
-
-                        if 'object' in p:
-
-                            name = p['object']['name']
-                            obId = p['object']['id']
-                            oUri = p['object']['uri']
-
-                            concatPar = f'{name} ({obId} - {oUri})'
-
-                            parameters += [concatPar]
-
-                        elif 'common' in p:
-
-                            parameters += [p['common']]
-
-                        elif 'sli_el' in p:
-
-                            parameters += [','.join(p['sli_el']['vals'])]
-
-                    self.writer.writerow({'validation_metric': validationMetric,
-                                          'category': category,
-                                          'level': level,
-                                          'message': msg % tuple(parameters)})
+    v = ValidationComponent()
+    v.run()
 
 
 ================================================
@@ -447,47 +288,185 @@ class ValidationClient(HttpClientBase):
 
 
 ================================================
-File: /src/main.py
+File: /src/gooddata/component.py
 ================================================
+import csv
+# import json
 import logging
 import os
+import re
 import sys
-import logging_gelf.handlers
-import logging_gelf.formatters
-from gooddata.component import ValidationComponent
+from gooddata.client import ValidationClient
+from kbc.env_handler import KBCEnvHandler
 
-# Environment setup
-sys.tracebacklimit = 0
 
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)-8s : [line:%(lineno)3s] %(message)s',
-    datefmt="%Y-%m-%d %H:%M:%S")
+KEY_USERNAME = 'username'
+KEY_PASSWORD = '#password'
+KEY_PROJECTID = 'projectId'
+KEY_METRICS = 'validationMetrics'
+KEY_CUSTOMDOMAIN = 'customDomain'
+KEY_GDURL = 'gooddataUrl'
 
-if 'KBC_LOGGER_ADDR' in os.environ and 'KBC_LOGGER_PORT' in os.environ:
+MANDATORY_PARAMETERS = [KEY_USERNAME, KEY_PASSWORD, KEY_PROJECTID, KEY_METRICS]
 
-    logger = logging.getLogger()
-    logging_gelf_handler = logging_gelf.handlers.GELFTCPSocketHandler(
-        host=os.getenv('KBC_LOGGER_ADDR'),
-        port=int(os.getenv('KBC_LOGGER_PORT'))
-    )
-    logging_gelf_handler.setFormatter(
-        logging_gelf.formatters.GELFFormatter(null_character=True))
-    logger.addHandler(logging_gelf_handler)
+SUPPORTED_METRICS = ["pdm::pdm_vs_dwh", "pdm::pk_fk_consistency", "pdm::elem_validation",
+                     "invalid_objects", "pdm::transitivity", "metric_filter", "ldm"]
 
-    # removes the initial stdout logging
-    logger.removeHandler(logger.handlers[0])
+FIELDS_VALIDATION = ['validation_metric', 'category', 'level', 'message']
 
-APP_VERSION = '0.0.1'
 
-if __name__ == '__main__':
+class ValidationComponent(KBCEnvHandler):
 
-    logging.info("Running component version %s..." % APP_VERSION)
+    def __init__(self):
 
-    v = ValidationComponent()
-    v.run()
+        KBCEnvHandler.__init__(self, MANDATORY_PARAMETERS)
+        self.validate_config(MANDATORY_PARAMETERS)
 
+        self.paramUsername = self.cfg_params[KEY_USERNAME]
+        self.paramPassword = self.cfg_params[KEY_PASSWORD]
+        self.paramProjectId = self.cfg_params[KEY_PROJECTID]
+        self.paramMetrics = self.cfg_params[KEY_METRICS]
+        self.paramCustomDomain = self.cfg_params[KEY_CUSTOMDOMAIN]
+        self.paramGooddataUrl = self.image_params[KEY_GDURL]
+
+        self._processAndValidateParameters()
+
+        self.client = ValidationClient(username=self.paramUsername,
+                                       password=self.paramPassword,
+                                       projectId=self.paramProjectId,
+                                       baseGoodDataUrl=self.paramGooddataUrl)
+
+        self.writer = csv.DictWriter(open(os.path.join(self.tables_out_path, 'validation.csv'), 'w'),
+                                     fieldnames=FIELDS_VALIDATION, extrasaction='ignore', restval='',
+                                     quotechar='\"', quoting=csv.QUOTE_ALL)
+        self.writer.writeheader()
+
+    def _processAndValidateParameters(self):
+
+        custDomain = re.sub(r'\s', '', self.paramCustomDomain)
+
+        if custDomain != '':
+
+            rxgString = r'https://.*\.gooddata\.com/*'
+            rgxCheck = re.fullmatch(rxgString, custDomain)
+
+            if rgxCheck is None:
+
+                logging.error("%s is not a valid GoodData domain." %
+                              custDomain)
+                sys.exit(1)
+
+            else:
+
+                self.paramGooddataUrl = custDomain
+
+        logging.info("Using domain %s." % self.paramGooddataUrl)
+
+        for metric in self.paramMetrics:
+
+            if metric not in SUPPORTED_METRICS:
+
+                logging.error("Metric %s is not supported. Please choose from: %s" % (
+                    metric, SUPPORTED_METRICS))
+                sys.exit(1)
+
+    def run(self):
+
+        reqValidationSc, reqValidationJs = self.client.triggerValidation(
+            self.paramMetrics)
+
+        if reqValidationSc == 201:
+
+            integrationId = reqValidationJs['asyncTask']['link']['poll'].split(
+                '/')[-1]
+
+        else:
+
+            logging.error("There was an error triggering the validation task.")
+            logging.error("Received: %s - %s." %
+                          (reqValidationSc, reqValidationJs))
+            sys.exit(1)
+
+        validJs = self.client.checkValidationStatus(
+            integrationId)['projectValidateResult']['results']
+
+        for result in validJs:
+
+            if result['body']['error'] == 0:
+
+                continue
+
+            else:
+
+                validationMetric = result['from']
+                logMessages = result['body']['log']
+
+                for message in logMessages:
+
+                    msg = message['msg']
+                    level = message['level']
+                    category = message['ecat']
+                    pars = message['pars']
+                    parameters = []
+
+                    for p in pars:
+
+                        concatPar = ''
+
+                        if 'object' in p:
+
+                            name = p['object']['name']
+                            obId = p['object']['id']
+                            oUri = p['object']['uri']
+
+                            concatPar = f'{name} ({obId} - {oUri})'
+
+                            parameters += [concatPar]
+
+                        elif 'common' in p:
+
+                            parameters += [p['common']]
+
+                        elif 'sli_el' in p:
+
+                            parameters += [','.join(p['sli_el']['vals'])]
+
+                    self.writer.writerow({'validation_metric': validationMetric,
+                                          'category': category,
+                                          'level': level,
+                                          'message': msg % tuple(parameters)})
+
+
+================================================
+File: /LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: /requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.4.zip#egg=kbc
+logging_gelf==0.0.18
 
 ================================================
 File: /bitbucket-pipelines.yml
@@ -555,56 +534,9 @@ pipelines:
             - ./deploy.sh
 
 ================================================
-File: /component_config/component_long_description.md
-================================================
-# GoodData Validation Extractor
-
-The component allows to download validation report from GoodData project. The validation may take several minutes.
-
-## Configuration
-
-A sample of the configuration can be found in the [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.ex-gooddata-validation/src/master/component_config/sample-config/).
-
-### Parameters
-
-The component accepts following parameters:
-
-- login - login to GoodData, must have admin privileges,
-- password - password associated with login,
-- project ID - GoodData project ID,
-- metrics - a list of validation metrics,
-- custom domain (opt.) - if whitelabelled domain is used, specify it.
-
-================================================
-File: /component_config/configuration_description.md
-================================================
-The component accepts following parameters:
-
-- login - login to GoodData, must have admin privileges,
-- password - password associated with login,
-- project ID - GoodData project ID,
-- metrics - a list of validation metrics,
-- custom domain (opt.) - if whitelabelled domain is used, specify it.
-
-================================================
 File: /component_config/component_short_description.md
 ================================================
 A validation tool for GoodData allows to monitor status of each project.
-
-================================================
-File: /component_config/stack_parameters.json
-================================================
-{
-    "connection.keboola.com": {
-      "gooddataUrl": "https://secure.gooddata.com"
-    },
-    "connection.eu-central-1.keboola.com": {
-      "gooddataUrl": "https://keboola.eu.gooddata.com"
-    },
-    "connection.ap-southeast-2.keboola.com": {
-        "gooddataUrl": "https://secure.gooddata.com"
-    }
-  }
 
 ================================================
 File: /component_config/configSchema.json
@@ -678,33 +610,51 @@ File: /component_config/configSchema.json
 }
 
 ================================================
-File: /component_config/sample-config/config.json
+File: /component_config/stack_parameters.json
 ================================================
 {
-  "parameters": {
-    "username": "mail@mail.com",
-    "#password": "p@assw0rd",
-    "projectId": "dsadsfgsadasgsaerfgasde",
-    "customDomain": "",
-    "validationMetrics": [
-      "pdm::pdm_vs_dwh",
-      "pdm::pk_fk_consistency",
-      "pdm::elem_validation",
-      "invalid_objects",
-      "pdm::transitivity",
-      "metric_filter",
-      "ldm"
-    ]
-  },
-  "image_parameters": {
-    "gooddataUrl": "https://keboola.eu.gooddata.com"
+    "connection.keboola.com": {
+      "gooddataUrl": "https://secure.gooddata.com"
+    },
+    "connection.eu-central-1.keboola.com": {
+      "gooddataUrl": "https://keboola.eu.gooddata.com"
+    },
+    "connection.ap-southeast-2.keboola.com": {
+        "gooddataUrl": "https://secure.gooddata.com"
+    }
   }
-}
 
 ================================================
-File: /component_config/sample-config/in/state.json
+File: /component_config/configuration_description.md
 ================================================
-{"data_delta": "10222018"}
+The component accepts following parameters:
+
+- login - login to GoodData, must have admin privileges,
+- password - password associated with login,
+- project ID - GoodData project ID,
+- metrics - a list of validation metrics,
+- custom domain (opt.) - if whitelabelled domain is used, specify it.
+
+================================================
+File: /component_config/component_long_description.md
+================================================
+# GoodData Validation Extractor
+
+The component allows to download validation report from GoodData project. The validation may take several minutes.
+
+## Configuration
+
+A sample of the configuration can be found in the [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.ex-gooddata-validation/src/master/component_config/sample-config/).
+
+### Parameters
+
+The component accepts following parameters:
+
+- login - login to GoodData, must have admin privileges,
+- password - password associated with login,
+- project ID - GoodData project ID,
+- metrics - a list of validation metrics,
+- custom domain (opt.) - if whitelabelled domain is used, specify it.
 
 ================================================
 File: /component_config/sample-config/in/tables/test.csv
@@ -814,6 +764,11 @@ File: /component_config/sample-config/in/tables/test.csv.manifest
 }
 
 ================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
 File: /component_config/sample-config/in/files/order1.xml
 ================================================
 <?xml version='1.0' ?>
@@ -883,6 +838,109 @@ File: /component_config/sample-config/out/files/order1.xml
         </order>
     </orders>
 </root_el>
+
+================================================
+File: /component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "username": "mail@mail.com",
+    "#password": "p@assw0rd",
+    "projectId": "dsadsfgsadasgsaerfgasde",
+    "customDomain": "",
+    "validationMetrics": [
+      "pdm::pdm_vs_dwh",
+      "pdm::pk_fk_consistency",
+      "pdm::elem_validation",
+      "invalid_objects",
+      "pdm::transitivity",
+      "metric_filter",
+      "ldm"
+    ]
+  },
+  "image_parameters": {
+    "gooddataUrl": "https://keboola.eu.gooddata.com"
+  }
+}
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
 
 ================================================
 File: /scripts/update_dev_portal_properties.sh
@@ -956,64 +1014,6 @@ else
     echo "shortDescription is empty!"
     exit 1
 fi
-
-================================================
-File: /scripts/build_n_test.sh
-================================================
-#!/bin/sh
-set -e
-
-flake8 --config=flake8.cfg
-python -m unittest discover
-
-================================================
-File: /requirements.txt
-================================================
-https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.4.zip#egg=kbc
-logging_gelf==0.0.18
-
-================================================
-File: /Dockerfile
-================================================
-FROM python:3.7.2-slim
-ENV PYTHONIOENCODING utf-8
-
-COPY . /code/
-
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
-RUN pip install flake8
-RUN pip install -r /code/requirements.txt
-WORKDIR /code/
-
-
-CMD ["python3", "-u", "/code/src/main.py"]
-
-
-================================================
-File: /LICENSE.md
-================================================
-The MIT License (MIT)
-
-Copyright (c) 2018 Keboola DS, http://keboola.com
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files, to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished
-to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
 
 ================================================
 File: /README.md

@@ -1,62 +1,127 @@
 Directory structure:
 └── keboola-component-zendesk/
+    ├── tests/
+    │   ├── __init__.py
+    │   └── test_component.py
+    ├── Dockerfile
     ├── flake8.cfg
-    ├── deploy.sh
-    ├── docker-compose.yml
     ├── src/
     │   ├── dlt_zendesk/
-    │   │   ├── zendesk_mapping.py
-    │   │   ├── zendesk_objects.py
+    │   │   ├── __init__.py
     │   │   ├── helpers/
     │   │   │   ├── api_client.py
     │   │   │   └── credentials.py
-    │   │   └── __init__.py
+    │   │   ├── zendesk_objects.py
+    │   │   └── zendesk_mapping.py
     │   ├── component.py
     │   └── configuration.py
-    ├── tests/
-    │   ├── test_component.py
-    │   └── __init__.py
+    ├── LICENSE.md
+    ├── docs/
+    │   └── imgs/
+    ├── requirements.txt
     ├── component_config/
-    │   ├── logger
-    │   ├── component_long_description.md
-    │   ├── licenseUrl.md
-    │   ├── sourceCodeUrl.md
-    │   ├── configuration_description.md
     │   ├── component_short_description.md
-    │   ├── loggerConfiguration.json
     │   ├── configSchema.json
+    │   ├── licenseUrl.md
+    │   ├── documentationUrl.md
+    │   ├── configuration_description.md
     │   ├── configRowSchema.json
+    │   ├── component_long_description.md
     │   ├── sample-config/
-    │   │   ├── config.json
     │   │   ├── in/
-    │   │   │   ├── state.json
     │   │   │   ├── tables/
     │   │   │   │   ├── test.csv
     │   │   │   │   └── test.csv.manifest
+    │   │   │   ├── state.json
     │   │   │   └── files/
     │   │   │       └── order1.xml
-    │   │   └── out/
-    │   │       ├── tables/
-    │   │       │   └── test.csv
-    │   │       └── files/
-    │   │           └── order1.xml
-    │   └── documentationUrl.md
+    │   │   ├── out/
+    │   │   │   ├── tables/
+    │   │   │   │   └── test.csv
+    │   │   │   └── files/
+    │   │   │       └── order1.xml
+    │   │   └── config.json
+    │   ├── loggerConfiguration.json
+    │   ├── logger
+    │   └── sourceCodeUrl.md
+    ├── deploy.sh
+    ├── docker-compose.yml
     ├── scripts/
-    │   ├── run_kbc_tests.ps1
-    │   ├── developer_portal/
-    │   │   ├── update_properties.sh
-    │   │   └── fn_actions_md_update.sh
+    │   ├── build_n_test.sh
     │   ├── build_n_run.ps1
-    │   └── build_n_test.sh
-    ├── requirements.txt
-    ├── .github/
-    │   └── workflows/
-    │       └── push.yml
-    ├── docs/
-    │   └── imgs/
-    ├── Dockerfile
-    ├── LICENSE.md
-    └── README.md
+    │   ├── run_kbc_tests.ps1
+    │   └── developer_portal/
+    │       ├── fn_actions_md_update.sh
+    │       └── update_properties.sh
+    ├── README.md
+    └── .github/
+        └── workflows/
+            └── push.yml
+
+================================================
+File: /tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: /tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: /Dockerfile
+================================================
+FROM python:3.12-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+CMD ["python", "-u", "/code/src/component.py"]
+
 
 ================================================
 File: /flake8.cfg
@@ -84,99 +149,473 @@ max-line-length = 120
 
 
 ================================================
-File: /deploy.sh
+File: /src/dlt_zendesk/__init__.py
 ================================================
-#!/bin/sh
-set -e
+import logging
+from typing import Iterable, Iterator
 
-env
+import dlt
+import pendulum
 
-# compatibility with travis and bitbucket
-if [ ! -z ${BITBUCKET_TAG} ]
-then
-	echo "assigning bitbucket tag"
-	export TAG="$BITBUCKET_TAG"
-elif [ ! -z ${TRAVIS_TAG} ]
-then
-	echo "assigning travis tag"
-	export TAG="$TRAVIS_TAG"
-elif [ ! -z ${GITHUB_TAG} ]
-then
-	echo "assigning github tag"
-	export TAG="$GITHUB_TAG"
-else
-	echo No Tag is set!
-	exit 1
-fi
+from dlt.common.typing import TDataItem
+from dlt.sources import DltResource
 
-echo "Tag is '${TAG}'"
+from .helpers.credentials import TZendeskCredentials
+from .helpers.api_client import ZendeskAPIClient, PaginationType
 
-#check if deployment is triggered only in master
-if [ ${BITBUCKET_BRANCH} != "master" ]; then
-               echo Deploy on tagged commit can be only executed in master!
-               exit 1
-fi
+from .zendesk_objects import (Tags, Tickets, TicketComments, TicketAudits, Users, Groups, GroupMembership,
+                              Organizations,
+                              TicketsFields)
 
-# Obtain the component repository and log in
-echo "Obtain the component repository and log in"
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
 
-echo "Set credentials"
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+@dlt.source(max_table_nesting=0)
+def zendesk_support(start_date_iso: int, credentials: TZendeskCredentials = dlt.secrets.value) \
+        -> Iterable[DltResource]:
+    supported_endpoints = [
+        ("groups", "/api/v2/groups.json", Groups),
+        ("group_memberships", "/api/v2/group_memberships.json", GroupMembership),
+        ("tags", "/api/v2/tags.json", Tags),
+        ("ticket_fields", "/api/v2/ticket_fields.json", TicketsFields),
+    ]
 
-# Push to the repository
-echo "Push to the repository"
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${TAG}
-docker push ${REPOSITORY}:latest
+    @dlt.resource(name="organizations_raw", parallelized=True, columns=Organizations, write_disposition="replace")
+    def organizations() -> Iterator[TDataItem]:
+        dt = pendulum.from_timestamp(start_date_iso)
+        from_date = dt.format('YYYY-MM-DD')
 
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
-fi
+        logging.info("Loading Organizations")
+        user_pages = zendesk_client.get_pages(
+            "/api/v2/search.json",
+            "results",
+            PaginationType.OFFSET,
+            params={"query": f"type:organization updated>{from_date}"},
+        )
+        yield from user_pages
+
+    @dlt.resource(name="users_raw", parallelized=True, columns=Users, write_disposition="replace")
+    def users() -> Iterator[TDataItem]:
+        dt = pendulum.from_timestamp(start_date_iso)
+        from_date = dt.format('YYYY-MM-DD')
+
+        logging.info("Loading users")
+        user_pages = zendesk_client.get_pages(
+            "/api/v2/users/search.json",
+            "users",
+            PaginationType.OFFSET,
+            params={"query": f"type:user updated>{from_date}"},
+        )
+        yield from user_pages
+
+    @dlt.resource(name="tickets_raw", parallelized=True, columns=Tickets, write_disposition="replace")
+    def ticket_table() -> Iterator[TDataItem]:
+        logging.info("Loading tickets")
+        ticket_pages = zendesk_client.get_pages(
+            "/api/v2/incremental/tickets.json",
+            "tickets",
+            PaginationType.STREAM,
+            params={"include": "metric_sets,comment_count",
+                    "start_time": start_date_iso},
+        )
+        yield from ticket_pages
+
+    @dlt.transformer(name="ticket_comments_raw", parallelized=True, columns=TicketComments)
+    def ticket_comments(tickets: Iterator[TDataItem]):
+        logging.info("Loading ticket comments")
+        for ticket in tickets:
+            # try if page not found write to log
+            try:
+                comment_pages = zendesk_client.get_pages(
+                    f"/api/v2/tickets/{ticket['id']}/comments.json",
+                    "comments",
+                    PaginationType.CURSOR,
+                )
+                for comments in comment_pages:
+                    yield [dict(ticket_id=ticket['id'], **i) for i in comments]
+            except Exception as e:
+                logging.warning(f"Ticket {ticket['id']} comments not found {e}")
+
+    @dlt.transformer(name="ticket_audits_raw", parallelized=True, columns=TicketAudits)
+    def ticket_audits(tickets: Iterator[TDataItem]):
+        logging.info("Loading ticket audits")
+        for ticket in tickets:
+            try:
+                audit_pages = zendesk_client.get_pages(
+                    f"/api/v2/tickets/{ticket['id']}/audits.json",
+                    "audits",
+                    PaginationType.CURSOR,
+                )
+                for audits in audit_pages:
+                    yield audits
+            except Exception as e:
+                logging.warning(f"Ticket {ticket['id']} audits not found {e}")
+
+    # Authenticate
+    zendesk_client = ZendeskAPIClient(credentials)
+
+    # loading base tables
+    resource_list = [
+        organizations,
+        users,
+        ticket_table,
+        ticket_table | ticket_comments,
+        ticket_table | ticket_audits
+    ]
+    # other tables to be loaded
+    for resource, endpoint_url, columns in list(supported_endpoints):
+        resource_list.append(
+            dlt.resource(_basic_resource(zendesk_client, endpoint_url, resource), name=f"{resource}_raw",
+                         columns=columns,
+                         parallelized=True, )
+        )
+    return resource_list
+
+
+def _basic_resource(zendesk_client: ZendeskAPIClient, endpoint_url: str, data_key: str) -> \
+        Iterator[TDataItem]:
+    logging.info(f"Loading {data_key}")
+    pages = zendesk_client.get_pages(
+        endpoint_url,
+        data_key,
+        PaginationType.CURSOR,
+    )
+    yield from pages
 
 
 ================================================
-File: /docker-compose.yml
+File: /src/dlt_zendesk/helpers/api_client.py
 ================================================
-version: "2"
-services:
-  # for development purposes
-  dev:
-    build: .
-    volumes:
-        - ./:/code
-        - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-  test:
-    # Use to run flake8 and unittests checks
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-    command:
-      - /bin/sh
-      - /code/scripts/build_n_test.sh
+from enum import Enum
+from typing import Dict, Iterator, Optional, Tuple, Any
+from dlt.common.typing import DictStrStr, TDataItems, TSecretValue
+from dlt.sources.helpers.requests import client
+
+from .credentials import (
+    ZendeskCredentialsEmailPass,
+    ZendeskCredentialsOAuth,
+    ZendeskCredentialsToken,
+    TZendeskCredentials,
+)
+
+PAGE_SIZE = 100
+INCREMENTAL_PAGE_SIZE = 1000
+
+
+class PaginationType(Enum):
+    OFFSET = 0
+    CURSOR = 1
+    STREAM = 2
+    START_TIME = 3
+
+
+class ZendeskAPIClient:
+    """
+    API client used to make requests to Zendesk talk, support and chat API
+    """
+
+    subdomain: str = ""
+    url: str = ""
+    headers: Optional[DictStrStr]
+    auth: Optional[Tuple[str, TSecretValue]]
+
+    def __init__(
+            self, credentials: TZendeskCredentials, url_prefix: Optional[str] = None
+    ) -> None:
+        """
+        Initializer for the API client which is then used to make API calls to the ZendeskAPI
+
+        Args:
+            credentials: ZendeskCredentials object
+            which contains the necessary credentials to authenticate to ZendeskAPI
+        """
+        # oauth token is the preferred way to authenticate, followed by api token and then email + password combo
+        # fill headers and auth for every possibility of credentials given,
+        # raise error if credentials are of incorrect type
+        if isinstance(credentials, ZendeskCredentialsOAuth):
+            self.headers = {"Authorization": f"Bearer {credentials.oauth_token}"}
+            self.auth = None
+        elif isinstance(credentials, ZendeskCredentialsToken):
+            self.headers = None
+            self.auth = (f"{credentials.email}/token", credentials.token)
+        elif isinstance(credentials, ZendeskCredentialsEmailPass):
+            self.auth = (credentials.email, credentials.password)
+            self.headers = None
+        else:
+            raise TypeError(
+                "Wrong credentials type provided to ZendeskAPIClient. The credentials need to be of type:"
+                " ZendeskCredentialsOAuth, ZendeskCredentialsToken or ZendeskCredentialsEmailPass"
+            )
+
+        # If url_prefix is set it overrides the default API URL (e.g. chat api uses zopim.com domain)
+        if url_prefix:
+            self.url = url_prefix
+        else:
+            self.subdomain = credentials.subdomain
+            self.url = f"https://{self.subdomain}.zendesk.com"
+
+    def get_pages(
+            self,
+            endpoint: str,
+            data_point_name: str,
+            pagination: PaginationType,
+            params: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[TDataItems]:
+        """
+        Makes a request to a paginated endpoint and returns a generator of data items per page.
+
+        Args:
+            endpoint: The url to the endpoint, e.g. /api/v2/calls
+            data_point_name: The key which data items are nested under in the response object (e.g. calls)
+            params: Optional dict of query params to include in the request
+            pagination: Type of pagination type used by endpoint
+
+        Returns:
+            Generator of pages, each page is a list of dict data items
+        """
+        # update the page size to enable cursor pagination
+        params = params or {}
+        if pagination == PaginationType.CURSOR:
+            params["page[size]"] = PAGE_SIZE
+        elif pagination == PaginationType.STREAM:
+            params["per_page"] = INCREMENTAL_PAGE_SIZE
+        elif pagination == PaginationType.START_TIME:
+            params["limit"] = INCREMENTAL_PAGE_SIZE
+
+        # make request and keep looping until there is no next page
+        get_url = f"{self.url}{endpoint}"
+        while get_url:
+            response = client.get(
+                url=get_url, headers=self.headers, auth=self.auth, params=params,
+            )
+            response.raise_for_status()
+            response_json = response.json()
+            result = response_json[data_point_name]
+            yield result
+
+            get_url = None
+            if pagination == PaginationType.CURSOR:
+                if response_json["meta"]["has_more"]:
+                    get_url = response_json["links"]["next"]
+            elif pagination == PaginationType.OFFSET:
+                get_url = response_json.get("next_page", None)
+            elif pagination == PaginationType.STREAM:
+                # See
+                # https://developer.zendesk.com/api-reference/ticketing/ticket-management/incremental_exports/#json-format
+                if not response_json["end_of_stream"]:
+                    get_url = response_json["next_page"]
+            elif pagination == PaginationType.START_TIME:
+                if response_json["count"] > 0:
+                    get_url = response_json["next_page"]
+
+            params = {}
+
+
+================================================
+File: /src/dlt_zendesk/helpers/credentials.py
+================================================
+"""
+This module handles how credentials are read in dlt sources
+"""
+import dlt
+from typing import ClassVar, List, Union
+from dlt.common.configuration import configspec
+from dlt.common.configuration.specs import CredentialsConfiguration
+from dlt.common.typing import TSecretValue
+
+
+@configspec
+class ZendeskCredentialsBase(CredentialsConfiguration):
+    """
+    The Base version of all the ZendeskCredential classes.
+    """
+
+    subdomain: str = dlt.config.value
+    __config_gen_annotations__: ClassVar[List[str]] = []
+
+
+@configspec
+class ZendeskCredentialsEmailPass(ZendeskCredentialsBase):
+    """
+    This class is used to store credentials for Email + Password Authentication
+    """
+
+    email: str = dlt.config.value
+    password: TSecretValue = dlt.secrets.value
+
+
+@configspec
+class ZendeskCredentialsOAuth(ZendeskCredentialsBase):
+    """
+    This class is used to store credentials for OAuth Token Authentication
+    """
+
+    oauth_token: TSecretValue = dlt.secrets.value
+
+
+@configspec
+class ZendeskCredentialsToken(ZendeskCredentialsBase):
+    """
+    This class is used to store credentials for Token Authentication
+    """
+
+    email: str = dlt.config.value
+    token: TSecretValue = dlt.secrets.value
+
+
+TZendeskCredentials = Union[
+    ZendeskCredentialsEmailPass, ZendeskCredentialsToken, ZendeskCredentialsOAuth
+]
+
+
+================================================
+File: /src/dlt_zendesk/zendesk_objects.py
+================================================
+from typing import Optional
+
+from dlt.common.libs.pydantic import BaseModel
+from pydantic import Field
+
+
+class Tags(BaseModel):
+    name: Optional[str] = Field(default=None)
+    count: Optional[int] = Field(default=None)
+
+
+class TicketsFields(BaseModel):
+    id: Optional[int]
+    type: Optional[str] = Field(default=None)
+    title: Optional[str] = Field(default=None)
+    active: Optional[bool] = Field(default=None)
+    tag: Optional[str] = Field(default=None)
+
+
+class Users(BaseModel):
+    id: int
+    name: Optional[str] = Field(default=None)
+    email: Optional[str] = Field(default=None)
+    url: Optional[str] = Field(default=None)
+    deleted: Optional[bool] = Field(default=None)
+    created_at: Optional[str] = Field(default=None)
+    updated_at: Optional[str] = Field(default=None)
+    time_zone: Optional[str] = Field(default=None)
+    phone: Optional[str] = Field(default=None)
+    photo: Optional[object] = Field(default={})
+    locale_id: Optional[int] = Field(default=None)
+    locale: Optional[str] = Field(default=None)
+    organization_id: Optional[int] = Field(default=None)
+    role: Optional[str] = Field(default=None)
+    role_type: Optional[int] = Field(default=None)
+    verified: Optional[bool] = Field(default=None)
+    external_id: Optional[str] = Field(default=None)
+    alias: Optional[str] = Field(default=None)
+    active: Optional[bool] = Field(default=None)
+    shared: Optional[bool] = Field(default=None)
+    shared_agent: Optional[bool] = Field(default=None)
+    last_login_at: Optional[str] = Field(default=None)
+    two_factor_auth_enabled: Optional[bool] = Field(default=None)
+    signature: Optional[str] = Field(default=None)
+    details: Optional[str] = Field(default=None)
+    notes: Optional[str] = Field(default=None)
+    custom_role_id: Optional[int] = Field(default=None)
+    moderator: Optional[bool] = Field(default=None)
+    ticket_restriction: Optional[str] = Field(default=None)
+    only_private_comments: Optional[bool] = Field(default=None)
+    restricted_agent: Optional[bool] = Field(default=None)
+    suspended: Optional[bool] = Field(default=None)
+    chat_only: Optional[bool] = Field(default=None)
+    user_fields: Optional[object] = Field(default={})
+    tags: Optional[list] = Field(default=[])
+
+
+class GroupMembership(BaseModel):
+    id: int
+    default: Optional[bool]
+    group_id: Optional[int]
+    user_id: Optional[int]
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
+
+class Groups(BaseModel):
+    id: int
+    name: Optional[str]
+    url: Optional[str]
+    deleted: Optional[bool] = Field(default=None)
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
+
+class Organizations(BaseModel):
+    id: int
+    name: Optional[str]
+    url: Optional[str]
+    organization_fields: Optional[object]
+    shared_tickets: Optional[bool]
+    shared_comments: Optional[bool]
+    external_id: Optional[str]
+    created_at: Optional[str]
+    updated_at: Optional[str]
+    domain_names: Optional[list] = Field(default=[])
+    details: Optional[str]
+    notes: Optional[str]
+    group_id: Optional[int]
+    tags: Optional[list[str]]
+
+
+class Tickets(BaseModel):
+    id: int
+    url: Optional[str] = Field(default=None)
+    external_id: Optional[str] = Field(default=None)
+    type: Optional[str] = Field(default=None)
+    subject: Optional[str] = Field(default=None)
+    priority: Optional[str] = Field(default=None)
+    status: Optional[str] = Field(default=None)
+    recipient: Optional[str] = Field(default=None)
+    requester_id: Optional[int] = Field(default=None)
+    submitter_id: Optional[int] = Field(default=None)
+    assignee_id: Optional[int] = Field(default=None)
+    organization_id: Optional[int] = Field(default=None)
+    group_id: Optional[int] = Field(default=None)
+    forum_topic_id: Optional[int] = Field(default=None)
+    problem_id: Optional[int] = Field(default=None)
+    has_incidents: Optional[bool] = Field(default=None)
+    due_at: Optional[str] = Field(default=None)
+    via: Optional[object] = Field(default={})
+    custom_fields: Optional[list[object]] = Field(default=[])
+    satisfaction_rating: Optional[object] = Field(default={})
+    ticket_form_id: Optional[int] = Field(default=None)
+    brand_id: Optional[int] = Field(default=None)
+    created_at: Optional[str] = Field(default=None)
+    updated_at: Optional[str] = Field(default=None)
+    tags: Optional[list] = Field(default=[])
+    metric_set: Optional[object] = Field(default={})
+
+
+class TicketAudits(BaseModel):
+    id: int
+    ticket_id: int
+    events: Optional[list[object]]
+    author_id: Optional[int] = Field(default=None)
+    created_at: Optional[str] = Field(default=None)
+    metadata: Optional[object]
+    via: Optional[object]
+
+
+class TicketComments(BaseModel):
+    id: int
+    ticket_id: int
+    audit_id: Optional[int] = Field(default=None)
+    type: Optional[str] = Field(default=None)
+    author_id: Optional[int] = Field(default=None)
+    body: Optional[str] = Field(default=None)
+    html_body: Optional[str] = Field(default=None)
+    plain_body: Optional[str] = Field(default=None)
+    public: Optional[bool] = Field(default=None)
+    attachments: Optional[list[object]] = Field(default=None)
+    via: Optional[object] = Field(default=None)
+    created_at: Optional[str] = Field(default=None)
+    uploads: Optional[list[object]] = Field(default=None)
+    metadata: Optional[object] = Field(default=None)
+
 
 ================================================
 File: /src/dlt_zendesk/zendesk_mapping.py
@@ -481,475 +920,6 @@ views = {
             ticket_audits_raw;
     """, ["ticket_audits_raw"], ["id"])
 }
-
-
-================================================
-File: /src/dlt_zendesk/zendesk_objects.py
-================================================
-from typing import Optional
-
-from dlt.common.libs.pydantic import BaseModel
-from pydantic import Field
-
-
-class Tags(BaseModel):
-    name: Optional[str] = Field(default=None)
-    count: Optional[int] = Field(default=None)
-
-
-class TicketsFields(BaseModel):
-    id: Optional[int]
-    type: Optional[str] = Field(default=None)
-    title: Optional[str] = Field(default=None)
-    active: Optional[bool] = Field(default=None)
-    tag: Optional[str] = Field(default=None)
-
-
-class Users(BaseModel):
-    id: int
-    name: Optional[str] = Field(default=None)
-    email: Optional[str] = Field(default=None)
-    url: Optional[str] = Field(default=None)
-    deleted: Optional[bool] = Field(default=None)
-    created_at: Optional[str] = Field(default=None)
-    updated_at: Optional[str] = Field(default=None)
-    time_zone: Optional[str] = Field(default=None)
-    phone: Optional[str] = Field(default=None)
-    photo: Optional[object] = Field(default={})
-    locale_id: Optional[int] = Field(default=None)
-    locale: Optional[str] = Field(default=None)
-    organization_id: Optional[int] = Field(default=None)
-    role: Optional[str] = Field(default=None)
-    role_type: Optional[int] = Field(default=None)
-    verified: Optional[bool] = Field(default=None)
-    external_id: Optional[str] = Field(default=None)
-    alias: Optional[str] = Field(default=None)
-    active: Optional[bool] = Field(default=None)
-    shared: Optional[bool] = Field(default=None)
-    shared_agent: Optional[bool] = Field(default=None)
-    last_login_at: Optional[str] = Field(default=None)
-    two_factor_auth_enabled: Optional[bool] = Field(default=None)
-    signature: Optional[str] = Field(default=None)
-    details: Optional[str] = Field(default=None)
-    notes: Optional[str] = Field(default=None)
-    custom_role_id: Optional[int] = Field(default=None)
-    moderator: Optional[bool] = Field(default=None)
-    ticket_restriction: Optional[str] = Field(default=None)
-    only_private_comments: Optional[bool] = Field(default=None)
-    restricted_agent: Optional[bool] = Field(default=None)
-    suspended: Optional[bool] = Field(default=None)
-    chat_only: Optional[bool] = Field(default=None)
-    user_fields: Optional[object] = Field(default={})
-    tags: Optional[list] = Field(default=[])
-
-
-class GroupMembership(BaseModel):
-    id: int
-    default: Optional[bool]
-    group_id: Optional[int]
-    user_id: Optional[int]
-    created_at: Optional[str]
-    updated_at: Optional[str]
-
-
-class Groups(BaseModel):
-    id: int
-    name: Optional[str]
-    url: Optional[str]
-    deleted: Optional[bool] = Field(default=None)
-    created_at: Optional[str]
-    updated_at: Optional[str]
-
-
-class Organizations(BaseModel):
-    id: int
-    name: Optional[str]
-    url: Optional[str]
-    organization_fields: Optional[object]
-    shared_tickets: Optional[bool]
-    shared_comments: Optional[bool]
-    external_id: Optional[str]
-    created_at: Optional[str]
-    updated_at: Optional[str]
-    domain_names: Optional[list] = Field(default=[])
-    details: Optional[str]
-    notes: Optional[str]
-    group_id: Optional[int]
-    tags: Optional[list[str]]
-
-
-class Tickets(BaseModel):
-    id: int
-    url: Optional[str] = Field(default=None)
-    external_id: Optional[str] = Field(default=None)
-    type: Optional[str] = Field(default=None)
-    subject: Optional[str] = Field(default=None)
-    priority: Optional[str] = Field(default=None)
-    status: Optional[str] = Field(default=None)
-    recipient: Optional[str] = Field(default=None)
-    requester_id: Optional[int] = Field(default=None)
-    submitter_id: Optional[int] = Field(default=None)
-    assignee_id: Optional[int] = Field(default=None)
-    organization_id: Optional[int] = Field(default=None)
-    group_id: Optional[int] = Field(default=None)
-    forum_topic_id: Optional[int] = Field(default=None)
-    problem_id: Optional[int] = Field(default=None)
-    has_incidents: Optional[bool] = Field(default=None)
-    due_at: Optional[str] = Field(default=None)
-    via: Optional[object] = Field(default={})
-    custom_fields: Optional[list[object]] = Field(default=[])
-    satisfaction_rating: Optional[object] = Field(default={})
-    ticket_form_id: Optional[int] = Field(default=None)
-    brand_id: Optional[int] = Field(default=None)
-    created_at: Optional[str] = Field(default=None)
-    updated_at: Optional[str] = Field(default=None)
-    tags: Optional[list] = Field(default=[])
-    metric_set: Optional[object] = Field(default={})
-
-
-class TicketAudits(BaseModel):
-    id: int
-    ticket_id: int
-    events: Optional[list[object]]
-    author_id: Optional[int] = Field(default=None)
-    created_at: Optional[str] = Field(default=None)
-    metadata: Optional[object]
-    via: Optional[object]
-
-
-class TicketComments(BaseModel):
-    id: int
-    ticket_id: int
-    audit_id: Optional[int] = Field(default=None)
-    type: Optional[str] = Field(default=None)
-    author_id: Optional[int] = Field(default=None)
-    body: Optional[str] = Field(default=None)
-    html_body: Optional[str] = Field(default=None)
-    plain_body: Optional[str] = Field(default=None)
-    public: Optional[bool] = Field(default=None)
-    attachments: Optional[list[object]] = Field(default=None)
-    via: Optional[object] = Field(default=None)
-    created_at: Optional[str] = Field(default=None)
-    uploads: Optional[list[object]] = Field(default=None)
-    metadata: Optional[object] = Field(default=None)
-
-
-================================================
-File: /src/dlt_zendesk/helpers/api_client.py
-================================================
-from enum import Enum
-from typing import Dict, Iterator, Optional, Tuple, Any
-from dlt.common.typing import DictStrStr, TDataItems, TSecretValue
-from dlt.sources.helpers.requests import client
-
-from .credentials import (
-    ZendeskCredentialsEmailPass,
-    ZendeskCredentialsOAuth,
-    ZendeskCredentialsToken,
-    TZendeskCredentials,
-)
-
-PAGE_SIZE = 100
-INCREMENTAL_PAGE_SIZE = 1000
-
-
-class PaginationType(Enum):
-    OFFSET = 0
-    CURSOR = 1
-    STREAM = 2
-    START_TIME = 3
-
-
-class ZendeskAPIClient:
-    """
-    API client used to make requests to Zendesk talk, support and chat API
-    """
-
-    subdomain: str = ""
-    url: str = ""
-    headers: Optional[DictStrStr]
-    auth: Optional[Tuple[str, TSecretValue]]
-
-    def __init__(
-            self, credentials: TZendeskCredentials, url_prefix: Optional[str] = None
-    ) -> None:
-        """
-        Initializer for the API client which is then used to make API calls to the ZendeskAPI
-
-        Args:
-            credentials: ZendeskCredentials object
-            which contains the necessary credentials to authenticate to ZendeskAPI
-        """
-        # oauth token is the preferred way to authenticate, followed by api token and then email + password combo
-        # fill headers and auth for every possibility of credentials given,
-        # raise error if credentials are of incorrect type
-        if isinstance(credentials, ZendeskCredentialsOAuth):
-            self.headers = {"Authorization": f"Bearer {credentials.oauth_token}"}
-            self.auth = None
-        elif isinstance(credentials, ZendeskCredentialsToken):
-            self.headers = None
-            self.auth = (f"{credentials.email}/token", credentials.token)
-        elif isinstance(credentials, ZendeskCredentialsEmailPass):
-            self.auth = (credentials.email, credentials.password)
-            self.headers = None
-        else:
-            raise TypeError(
-                "Wrong credentials type provided to ZendeskAPIClient. The credentials need to be of type:"
-                " ZendeskCredentialsOAuth, ZendeskCredentialsToken or ZendeskCredentialsEmailPass"
-            )
-
-        # If url_prefix is set it overrides the default API URL (e.g. chat api uses zopim.com domain)
-        if url_prefix:
-            self.url = url_prefix
-        else:
-            self.subdomain = credentials.subdomain
-            self.url = f"https://{self.subdomain}.zendesk.com"
-
-    def get_pages(
-            self,
-            endpoint: str,
-            data_point_name: str,
-            pagination: PaginationType,
-            params: Optional[Dict[str, Any]] = None,
-    ) -> Iterator[TDataItems]:
-        """
-        Makes a request to a paginated endpoint and returns a generator of data items per page.
-
-        Args:
-            endpoint: The url to the endpoint, e.g. /api/v2/calls
-            data_point_name: The key which data items are nested under in the response object (e.g. calls)
-            params: Optional dict of query params to include in the request
-            pagination: Type of pagination type used by endpoint
-
-        Returns:
-            Generator of pages, each page is a list of dict data items
-        """
-        # update the page size to enable cursor pagination
-        params = params or {}
-        if pagination == PaginationType.CURSOR:
-            params["page[size]"] = PAGE_SIZE
-        elif pagination == PaginationType.STREAM:
-            params["per_page"] = INCREMENTAL_PAGE_SIZE
-        elif pagination == PaginationType.START_TIME:
-            params["limit"] = INCREMENTAL_PAGE_SIZE
-
-        # make request and keep looping until there is no next page
-        get_url = f"{self.url}{endpoint}"
-        while get_url:
-            response = client.get(
-                url=get_url, headers=self.headers, auth=self.auth, params=params,
-            )
-            response.raise_for_status()
-            response_json = response.json()
-            result = response_json[data_point_name]
-            yield result
-
-            get_url = None
-            if pagination == PaginationType.CURSOR:
-                if response_json["meta"]["has_more"]:
-                    get_url = response_json["links"]["next"]
-            elif pagination == PaginationType.OFFSET:
-                get_url = response_json.get("next_page", None)
-            elif pagination == PaginationType.STREAM:
-                # See
-                # https://developer.zendesk.com/api-reference/ticketing/ticket-management/incremental_exports/#json-format
-                if not response_json["end_of_stream"]:
-                    get_url = response_json["next_page"]
-            elif pagination == PaginationType.START_TIME:
-                if response_json["count"] > 0:
-                    get_url = response_json["next_page"]
-
-            params = {}
-
-
-================================================
-File: /src/dlt_zendesk/helpers/credentials.py
-================================================
-"""
-This module handles how credentials are read in dlt sources
-"""
-import dlt
-from typing import ClassVar, List, Union
-from dlt.common.configuration import configspec
-from dlt.common.configuration.specs import CredentialsConfiguration
-from dlt.common.typing import TSecretValue
-
-
-@configspec
-class ZendeskCredentialsBase(CredentialsConfiguration):
-    """
-    The Base version of all the ZendeskCredential classes.
-    """
-
-    subdomain: str = dlt.config.value
-    __config_gen_annotations__: ClassVar[List[str]] = []
-
-
-@configspec
-class ZendeskCredentialsEmailPass(ZendeskCredentialsBase):
-    """
-    This class is used to store credentials for Email + Password Authentication
-    """
-
-    email: str = dlt.config.value
-    password: TSecretValue = dlt.secrets.value
-
-
-@configspec
-class ZendeskCredentialsOAuth(ZendeskCredentialsBase):
-    """
-    This class is used to store credentials for OAuth Token Authentication
-    """
-
-    oauth_token: TSecretValue = dlt.secrets.value
-
-
-@configspec
-class ZendeskCredentialsToken(ZendeskCredentialsBase):
-    """
-    This class is used to store credentials for Token Authentication
-    """
-
-    email: str = dlt.config.value
-    token: TSecretValue = dlt.secrets.value
-
-
-TZendeskCredentials = Union[
-    ZendeskCredentialsEmailPass, ZendeskCredentialsToken, ZendeskCredentialsOAuth
-]
-
-
-================================================
-File: /src/dlt_zendesk/__init__.py
-================================================
-import logging
-from typing import Iterable, Iterator
-
-import dlt
-import pendulum
-
-from dlt.common.typing import TDataItem
-from dlt.sources import DltResource
-
-from .helpers.credentials import TZendeskCredentials
-from .helpers.api_client import ZendeskAPIClient, PaginationType
-
-from .zendesk_objects import (Tags, Tickets, TicketComments, TicketAudits, Users, Groups, GroupMembership,
-                              Organizations,
-                              TicketsFields)
-
-
-@dlt.source(max_table_nesting=0)
-def zendesk_support(start_date_iso: int, credentials: TZendeskCredentials = dlt.secrets.value) \
-        -> Iterable[DltResource]:
-    supported_endpoints = [
-        ("groups", "/api/v2/groups.json", Groups),
-        ("group_memberships", "/api/v2/group_memberships.json", GroupMembership),
-        ("tags", "/api/v2/tags.json", Tags),
-        ("ticket_fields", "/api/v2/ticket_fields.json", TicketsFields),
-    ]
-
-    @dlt.resource(name="organizations_raw", parallelized=True, columns=Organizations, write_disposition="replace")
-    def organizations() -> Iterator[TDataItem]:
-        dt = pendulum.from_timestamp(start_date_iso)
-        from_date = dt.format('YYYY-MM-DD')
-
-        logging.info("Loading Organizations")
-        user_pages = zendesk_client.get_pages(
-            "/api/v2/search.json",
-            "results",
-            PaginationType.OFFSET,
-            params={"query": f"type:organization updated>{from_date}"},
-        )
-        yield from user_pages
-
-    @dlt.resource(name="users_raw", parallelized=True, columns=Users, write_disposition="replace")
-    def users() -> Iterator[TDataItem]:
-        dt = pendulum.from_timestamp(start_date_iso)
-        from_date = dt.format('YYYY-MM-DD')
-
-        logging.info("Loading users")
-        user_pages = zendesk_client.get_pages(
-            "/api/v2/users/search.json",
-            "users",
-            PaginationType.OFFSET,
-            params={"query": f"type:user updated>{from_date}"},
-        )
-        yield from user_pages
-
-    @dlt.resource(name="tickets_raw", parallelized=True, columns=Tickets, write_disposition="replace")
-    def ticket_table() -> Iterator[TDataItem]:
-        logging.info("Loading tickets")
-        ticket_pages = zendesk_client.get_pages(
-            "/api/v2/incremental/tickets.json",
-            "tickets",
-            PaginationType.STREAM,
-            params={"include": "metric_sets,comment_count",
-                    "start_time": start_date_iso},
-        )
-        yield from ticket_pages
-
-    @dlt.transformer(name="ticket_comments_raw", parallelized=True, columns=TicketComments)
-    def ticket_comments(tickets: Iterator[TDataItem]):
-        logging.info("Loading ticket comments")
-        for ticket in tickets:
-            # try if page not found write to log
-            try:
-                comment_pages = zendesk_client.get_pages(
-                    f"/api/v2/tickets/{ticket['id']}/comments.json",
-                    "comments",
-                    PaginationType.CURSOR,
-                )
-                for comments in comment_pages:
-                    yield [dict(ticket_id=ticket['id'], **i) for i in comments]
-            except Exception as e:
-                logging.warning(f"Ticket {ticket['id']} comments not found {e}")
-
-    @dlt.transformer(name="ticket_audits_raw", parallelized=True, columns=TicketAudits)
-    def ticket_audits(tickets: Iterator[TDataItem]):
-        logging.info("Loading ticket audits")
-        for ticket in tickets:
-            try:
-                audit_pages = zendesk_client.get_pages(
-                    f"/api/v2/tickets/{ticket['id']}/audits.json",
-                    "audits",
-                    PaginationType.CURSOR,
-                )
-                for audits in audit_pages:
-                    yield audits
-            except Exception as e:
-                logging.warning(f"Ticket {ticket['id']} audits not found {e}")
-
-    # Authenticate
-    zendesk_client = ZendeskAPIClient(credentials)
-
-    # loading base tables
-    resource_list = [
-        organizations,
-        users,
-        ticket_table,
-        ticket_table | ticket_comments,
-        ticket_table | ticket_audits
-    ]
-    # other tables to be loaded
-    for resource, endpoint_url, columns in list(supported_endpoints):
-        resource_list.append(
-            dlt.resource(_basic_resource(zendesk_client, endpoint_url, resource), name=f"{resource}_raw",
-                         columns=columns,
-                         parallelized=True, )
-        )
-    return resource_list
-
-
-def _basic_resource(zendesk_client: ZendeskAPIClient, endpoint_url: str, data_key: str) -> \
-        Iterator[TDataItem]:
-    logging.info(f"Loading {data_key}")
-    pages = zendesk_client.get_pages(
-        endpoint_url,
-        data_key,
-        PaginationType.CURSOR,
-    )
-    yield from pages
 
 
 ================================================
@@ -1277,91 +1247,48 @@ class Configuration(BaseModel):
 
 
 ================================================
-File: /tests/test_component.py
+File: /LICENSE.md
 ================================================
-'''
-Created on 12. 11. 2018
+The MIT License (MIT)
 
-@author: esner
-'''
-import unittest
-import mock
-import os
-from freezegun import freeze_time
+Copyright (c) 2018 Keboola DS, http://keboola.com
 
-from component import Component
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
 
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-class TestComponent(unittest.TestCase):
-
-    # set global time to 2010-10-10 - affects functions like datetime.now()
-    @freeze_time("2010-10-10")
-    # set KBC_DATADIR env to non-existing dir
-    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
-    def test_run_no_cfg_fails(self):
-        with self.assertRaises(ValueError):
-            comp = Component()
-            comp.run()
-
-
-if __name__ == "__main__":
-    # import sys;sys.argv = ['', 'Test.testName']
-    unittest.main()
-
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 ================================================
-File: /tests/__init__.py
+File: /requirements.txt
 ================================================
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
-
-================================================
-File: /component_config/logger
-================================================
-gelf
-
-================================================
-File: /component_config/component_long_description.md
-================================================
-keboola.ex-zendesk long description
-
-================================================
-File: /component_config/licenseUrl.md
-================================================
-https://github.com/keboola/component-zendesk/blob/master/LICENSE.md
-
-================================================
-File: /component_config/sourceCodeUrl.md
-================================================
-https://github.com/keboola/component-zendesk
-
-================================================
-File: /component_config/configuration_description.md
-================================================
-Configuration description.
+keboola.component==1.6.6
+keboola.utils==1.1.0
+freezegun~=1.5.1
+mock~=5.1.0
+pydantic~=2.8.2
+psutil~=5.8.0
+dlt~=0.5.2
+dlt[duckdb]
+duckdb~=0.10.3
+kbcstorage~=0.9.1
 
 ================================================
 File: /component_config/component_short_description.md
 ================================================
 New version of a Zendesk extractor built on a DLT
-
-================================================
-File: /component_config/loggerConfiguration.json
-================================================
-{
-  "verbosity": {
-    "100": "normal",
-    "200": "normal",
-    "250": "normal",
-    "300": "verbose",
-    "400": "verbose",
-    "500": "camouflage",
-    "550": "camouflage",
-    "600": "camouflage"
-  },
-  "gelf_server_type": "tcp"
-}
 
 ================================================
 File: /component_config/configSchema.json
@@ -1532,72 +1459,29 @@ File: /component_config/configSchema.json
 
 
 ================================================
+File: /component_config/licenseUrl.md
+================================================
+https://github.com/keboola/component-zendesk/blob/master/LICENSE.md
+
+================================================
+File: /component_config/documentationUrl.md
+================================================
+https://github.com/keboola/component-zendesk/blob/master/README.md
+
+================================================
+File: /component_config/configuration_description.md
+================================================
+Configuration description.
+
+================================================
 File: /component_config/configRowSchema.json
 ================================================
 {}
 
 ================================================
-File: /component_config/sample-config/config.json
+File: /component_config/component_long_description.md
 ================================================
-{
-  "storage": {
-    "input": {
-      "files": [],
-      "tables": [
-        {
-          "source": "in.c-test.test",
-          "destination": "test.csv",
-          "limit": 50,
-          "columns": [],
-          "where_values": [],
-          "where_operator": "eq"
-        }
-      ]
-    },
-    "output": {
-      "files": [],
-      "tables": []
-    }
-  },
-  "parameters": {
-    "#api_token": "demo",
-    "period_from": "yesterday",
-    "endpoints": [
-      "deals",
-      "companies"
-    ],
-    "company_properties": "",
-    "deal_properties": "",
-    "debug": true
-  },
-  "image_parameters": {
-    "syrup_url": "https://syrup.keboola.com/"
-  },
-  "authorization": {
-    "oauth_api": {
-      "id": "OAUTH_API_ID",
-      "credentials": {
-        "id": "main",
-        "authorizedFor": "Myself",
-        "creator": {
-          "id": "1234",
-          "description": "me@keboola.com"
-        },
-        "created": "2016-01-31 00:13:30",
-        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
-        "oauthVersion": "2.0",
-        "appKey": "000000004C184A49",
-        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
-      }
-    }
-  }
-}
-
-
-================================================
-File: /component_config/sample-config/in/state.json
-================================================
-{"data_delta": "10222018"}
+keboola.ex-zendesk long description
 
 ================================================
 File: /component_config/sample-config/in/tables/test.csv
@@ -1707,6 +1591,11 @@ File: /component_config/sample-config/in/tables/test.csv.manifest
 }
 
 ================================================
+File: /component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
 File: /component_config/sample-config/in/files/order1.xml
 ================================================
 <?xml version='1.0' ?>
@@ -1778,9 +1667,225 @@ File: /component_config/sample-config/out/files/order1.xml
 </root_el>
 
 ================================================
-File: /component_config/documentationUrl.md
+File: /component_config/sample-config/config.json
 ================================================
-https://github.com/keboola/component-zendesk/blob/master/README.md
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: /component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: /component_config/logger
+================================================
+gelf
+
+================================================
+File: /component_config/sourceCodeUrl.md
+================================================
+https://github.com/keboola/component-zendesk
+
+================================================
+File: /deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: /docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: /scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: /scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
 
 ================================================
 File: /scripts/run_kbc_tests.ps1
@@ -1818,6 +1923,44 @@ docker push $REPOSITORY`:test
 echo 'running test config in KBC'
 docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
 
+
+================================================
+File: /scripts/developer_portal/fn_actions_md_update.sh
+================================================
+#!/bin/bash
+
+# Set the path to the Python script file
+PYTHON_FILE="src/component.py"
+# Set the path to the Markdown file containing actions
+MD_FILE="component_config/actions.md"
+
+# Check if the file exists before creating it
+if [ ! -e "$MD_FILE" ]; then
+    touch "$MD_FILE"
+else
+    echo "File already exists: $MD_FILE"
+    exit 1
+fi
+
+# Get all occurrences of lines containing @sync_action('XXX') from the .py file
+SYNC_ACTIONS=$(grep -o -E "@sync_action\(['\"][^'\"]*['\"]\)" "$PYTHON_FILE" | sed "s/@sync_action(\(['\"]\)\([^'\"]*\)\(['\"]\))/\2/" | sort | uniq)
+
+# Check if any sync actions were found
+if [ -n "$SYNC_ACTIONS" ]; then
+    # Iterate over each occurrence of @sync_action('XXX')
+    for sync_action in $SYNC_ACTIONS; do
+        EXISTING_ACTIONS+=("$sync_action")
+    done
+
+    # Convert the array to JSON format
+    JSON_ACTIONS=$(printf '"%s",' "${EXISTING_ACTIONS[@]}")
+    JSON_ACTIONS="[${JSON_ACTIONS%,}]"
+
+    # Update the content of the actions.md file
+    echo "$JSON_ACTIONS" > "$MD_FILE"
+else
+    echo "No sync actions found. Not creating the file."
+fi
 
 ================================================
 File: /scripts/developer_portal/update_properties.sh
@@ -1885,97 +2028,97 @@ source "$(dirname "$0")/fn_actions_md_update.sh"
 update_property "$app_id" "actions" "component_config/actions.md"
 
 ================================================
-File: /scripts/developer_portal/fn_actions_md_update.sh
+File: /README.md
 ================================================
-#!/bin/bash
+keboola.ex-zendesk-v2
+=============
 
-# Set the path to the Python script file
-PYTHON_FILE="src/component.py"
-# Set the path to the Markdown file containing actions
-MD_FILE="component_config/actions.md"
+Prerequisites
+=============
 
-# Check if the file exists before creating it
-if [ ! -e "$MD_FILE" ]; then
-    touch "$MD_FILE"
-else
-    echo "File already exists: $MD_FILE"
-    exit 1
-fi
+[How to obtain API token](https://support.zendesk.com/hc/en-us/articles/4408889192858-Generating-a-new-API-token)
 
-# Get all occurrences of lines containing @sync_action('XXX') from the .py file
-SYNC_ACTIONS=$(grep -o -E "@sync_action\(['\"][^'\"]*['\"]\)" "$PYTHON_FILE" | sed "s/@sync_action(\(['\"]\)\([^'\"]*\)\(['\"]\))/\2/" | sort | uniq)
+Supported endpoints
+===================
 
-# Check if any sync actions were found
-if [ -n "$SYNC_ACTIONS" ]; then
-    # Iterate over each occurrence of @sync_action('XXX')
-    for sync_action in $SYNC_ACTIONS; do
-        EXISTING_ACTIONS+=("$sync_action")
-    done
+    - /api/v2/users.json
+    - /api/v2/groups.json
+    - /api/v2/group_memberships.json
+    - /api/v2/organizations.json
+    - /api/v2/tags.json", Tags
+    - /api/v2/ticket_fields.json
+    - /api/v2/incremental/tickets.json
+    - /api/v2/tickets/{ticket['id']}/comments.json
+    - /api/v2/tickets/{ticket['id']}/audits.json
 
-    # Convert the array to JSON format
-    JSON_ACTIONS=$(printf '"%s",' "${EXISTING_ACTIONS[@]}")
-    JSON_ACTIONS="[${JSON_ACTIONS%,}]"
+If you need more endpoints, please submit your request to
+[ideas.keboola.com](https://ideas.keboola.com/)
 
-    # Update the content of the actions.md file
-    echo "$JSON_ACTIONS" > "$MD_FILE"
-else
-    echo "No sync actions found. Not creating the file."
-fi
+Configuration
+=============
 
-================================================
-File: /scripts/build_n_run.ps1
-================================================
-echo Building component...
-$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
-docker build -rm -t $COMP_TAG ../
+### authentication
+- email
+- #api_token
+- sub_domain
 
-echo Running component...
-Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
-    $Readhost = Read-Host " ( y / n ) " 
-    Switch ($ReadHost) 
-     { 
-       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
-       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
-       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
-     } 
+### sync options
+- Full Sync downloads all data from the source every run
+- Incremental Sync downloads data (tickets, ticket_comments and ticket_audits) by parameter start_time described <a href='https://developer.zendesk.com/api-reference/ticketing/ticket-management/incremental_exports/#per_page'>here</a>. The start time is taken from the last successful run. 
 
-Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
-    $Readhost = Read-Host " ( y / n ) " 
-    Switch ($ReadHost) 
-     { 
-       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
-       N {Write-Host "No, execute the app normally"; 
-		    echo $DATA_PATH
-			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
-	   } 
-       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
-     } 
+### destination
+#### load type
+- Full load is used, the destination table will be overwritten every run
+- incremental load is used, data will be upserted into the destination table. Tables with a primary key will have rows updated, tables without a primary key will have rows appended.
 
+### available details
+#### Details of tickets which will be loaded also. Details are loaded per ticket. It has an impact on performance.
+- Comments
+- Audits
 
+### debug
+#### If checked, the component will output more detailed information about the run.
 
+Output
+======
 
-================================================
-File: /scripts/build_n_test.sh
-================================================
-#!/bin/sh
-set -e
+List of output tables is described [here](https://help.keboola.com/components/extractors/communication/zendesk/)
 
-flake8 --config=flake8.cfg
-python -m unittest discover
+Development
+-----------
 
-================================================
-File: /requirements.txt
-================================================
-keboola.component==1.6.6
-keboola.utils==1.1.0
-freezegun~=1.5.1
-mock~=5.1.0
-pydantic~=2.8.2
-psutil~=5.8.0
-dlt~=0.5.2
-dlt[duckdb]
-duckdb~=0.10.3
-kbcstorage~=0.9.1
+If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to
+your custom path in the `docker-compose.yml` file:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    volumes:
+      - ./:/code
+      - ./CUSTOM_FOLDER:/data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clone this repository, init the workspace and run the component with following
+command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+git clone git@github.com:keboola/component-zendesk.git keboola.ex-zendesk-v2
+cd keboola.ex-zendesk-v2
+docker-compose build
+docker-compose run --rm dev
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run the test suite and lint check using this command:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+docker-compose run --rm test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Integration
+===========
+
+For information about deployment and integration with KBC, please refer to the
+[deployment section of developers
+documentation](https://developers.keboola.com/extend/component/deployment/)
+
 
 ================================================
 File: /.github/workflows/push.yml
@@ -2205,147 +2348,4 @@ jobs:
         run: |
           chmod +x scripts/developer_portal/*.sh
           scripts/developer_portal/update_properties.sh
-
-================================================
-File: /Dockerfile
-================================================
-FROM python:3.12-slim
-ENV PYTHONIOENCODING utf-8
-
-COPY /src /code/src/
-COPY /tests /code/tests/
-COPY /scripts /code/scripts/
-COPY requirements.txt /code/requirements.txt
-COPY flake8.cfg /code/flake8.cfg
-COPY deploy.sh /code/deploy.sh
-
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
-
-RUN pip install flake8
-
-RUN pip install -r /code/requirements.txt
-
-WORKDIR /code/
-
-CMD ["python", "-u", "/code/src/component.py"]
-
-
-================================================
-File: /LICENSE.md
-================================================
-The MIT License (MIT)
-
-Copyright (c) 2018 Keboola DS, http://keboola.com
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files, to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished
-to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
-================================================
-File: /README.md
-================================================
-keboola.ex-zendesk-v2
-=============
-
-Prerequisites
-=============
-
-[How to obtain API token](https://support.zendesk.com/hc/en-us/articles/4408889192858-Generating-a-new-API-token)
-
-Supported endpoints
-===================
-
-    - /api/v2/users.json
-    - /api/v2/groups.json
-    - /api/v2/group_memberships.json
-    - /api/v2/organizations.json
-    - /api/v2/tags.json", Tags
-    - /api/v2/ticket_fields.json
-    - /api/v2/incremental/tickets.json
-    - /api/v2/tickets/{ticket['id']}/comments.json
-    - /api/v2/tickets/{ticket['id']}/audits.json
-
-If you need more endpoints, please submit your request to
-[ideas.keboola.com](https://ideas.keboola.com/)
-
-Configuration
-=============
-
-### authentication
-- email
-- #api_token
-- sub_domain
-
-### sync options
-- Full Sync downloads all data from the source every run
-- Incremental Sync downloads data (tickets, ticket_comments and ticket_audits) by parameter start_time described <a href='https://developer.zendesk.com/api-reference/ticketing/ticket-management/incremental_exports/#per_page'>here</a>. The start time is taken from the last successful run. 
-
-### destination
-#### load type
-- Full load is used, the destination table will be overwritten every run
-- incremental load is used, data will be upserted into the destination table. Tables with a primary key will have rows updated, tables without a primary key will have rows appended.
-
-### available details
-#### Details of tickets which will be loaded also. Details are loaded per ticket. It has an impact on performance.
-- Comments
-- Audits
-
-### debug
-#### If checked, the component will output more detailed information about the run.
-
-Output
-======
-
-List of output tables is described [here](https://help.keboola.com/components/extractors/communication/zendesk/)
-
-Development
------------
-
-If required, change local data folder (the `CUSTOM_FOLDER` placeholder) path to
-your custom path in the `docker-compose.yml` file:
-
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    volumes:
-      - ./:/code
-      - ./CUSTOM_FOLDER:/data
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Clone this repository, init the workspace and run the component with following
-command:
-
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-git clone git@github.com:keboola/component-zendesk.git keboola.ex-zendesk-v2
-cd keboola.ex-zendesk-v2
-docker-compose build
-docker-compose run --rm dev
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Run the test suite and lint check using this command:
-
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-docker-compose run --rm test
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Integration
-===========
-
-For information about deployment and integration with KBC, please refer to the
-[deployment section of developers
-documentation](https://developers.keboola.com/extend/component/deployment/)
-
 
