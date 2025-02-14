@@ -1,25 +1,462 @@
 Directory structure:
 └── kds_consulting_team-esnerda.ex-gusto-export/
+    ├── README.md
+    ├── Dockerfile
+    ├── bitbucket-pipelines.yml
+    ├── component.py
+    ├── configSchema.json
+    ├── deploy.sh
     ├── generic-mapping/
     │   └── mappings.json
-    ├── configSchema.json
-    ├── Dockerfile
     ├── gusto/
     │   ├── __init__.py
     │   ├── client.py
     │   └── client_service.py
-    ├── bitbucket-pipelines.yml
-    ├── component.py
-    ├── kbc/
-    │   ├── client_base.py
-    │   ├── __init__.py
-    │   ├── env_handler.py
-    │   └── mapping.py
-    ├── deploy.sh
-    └── README.md
+    └── kbc/
+        ├── __init__.py
+        ├── client_base.py
+        ├── env_handler.py
+        └── mapping.py
 
 ================================================
-File: /generic-mapping/mappings.json
+File: README.md
+================================================
+## Gusto Export extractor
+Extractor component for Keboola Connection allowing to retrieve daily checks from Gusto Export API
+
+### Configuration
+- **Gusto user name** – (REQ) Your Gusto account user name
+- **Gusto password** - (REQ) Password
+- **Gusto customer id** - (REQ) Customer ID
+- **Master location id** - (REQ) Master Location ID
+- **Gusto vendor id** - (REQ) Gusto vendor id
+- **Period from date [including]** – Start date from which to retrieve data (Inclusive)  
+- **Period to date [excluding]** – End of the retrieved period (exclusive) 
+- **Relative period from now (utc)** – Relative period in format: '5 hours ago', 'yesterday','3 days ago', '4 months ago', '2 years ago', 'today'. Overrides `from` and `to` parameters. NOTE: Either `Relative period` parameter or pair of `Period From` and `To` parameters are required.
+- **Continue since last start** - If set to `Yes` every consecutive run starts where the last one ended.
+- **Backfill mode** – This switch is to help backloading historical data. Depending on your filter setup, the extract for couple of days period may take quite a lot time. Component `run-time limit is 4 hours`. To backload data for few years back this helps to setup a regular orcehstration and load all historical data in appropriate chunks (<4hrs run). If backfill mode is enabled, each consecutive run of the component will continue from the end of the last run period, until current date is reached. The `From` and `To` date parameters are used to define Start date of the back-fill and also relative window of each run. Once the current date is reached, everything since last run date is downloaded on the next run.
+
+
+
+================================================
+File: Dockerfile
+================================================
+FROM quay.io/keboola/docker-custom-python:latest
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+WORKDIR /data/
+
+
+CMD ["python", "-u", "/code/component.py"]
+
+
+================================================
+File: bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+
+  tags:
+    '*':
+      - step:
+          script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - ./deploy.sh
+
+================================================
+File: component.py
+================================================
+'''
+
+@author: esner
+'''
+from kbc.env_handler import KBCEnvHandler
+from gusto.client_service import GustoService
+import logging
+import math
+import pytz
+
+from datetime import datetime
+from datetime import timedelta
+
+KEY_USER = 'user'
+KEY_PASS = '#pass'
+KEY_CUSTOMER_ID = 'customer_id'
+KEY_MASTER_LOCATION_ID = 'master_location_id'
+KEY_VENDOR_ID = '#vendor_id'
+
+
+KEY_PERIOD_FROM = 'period_from'
+KEY_PERIOD_TO = 'period_to'
+KEY_RELATIVE_PERIOD = 'relative_period'
+KEY_BACKFILL_MODE = 'backfill_mode'
+KEY_MAND_PERIOD_GROUP = [KEY_PERIOD_FROM, KEY_PERIOD_TO]
+KEY_MAND_DATE_GROUP = [KEY_RELATIVE_PERIOD, KEY_MAND_PERIOD_GROUP]
+
+MAX_PERIOD_SIZE = 10
+
+MANDATORY_PARS = [KEY_USER, KEY_PASS, KEY_CUSTOMER_ID,
+                  KEY_MASTER_LOCATION_ID, KEY_VENDOR_ID, KEY_MAND_DATE_GROUP]
+
+APP_VERSION = '0.1.6'
+
+
+class Component(KBCEnvHandler):
+
+    def __init__(self, data_path = None):
+        KBCEnvHandler.__init__(self, MANDATORY_PARS, data_path = data_path)
+
+    def run(self, debug=False):
+        '''
+        Main execution code
+        '''
+        # setup
+        self.set_default_logger('DEBUG' if debug else 'INFO')
+        logging.info('Running version %s', APP_VERSION)
+        logging.info('Loading configuration...')
+        self.validateConfig()
+        params = self.cfg_params
+        backfill_mode = params.get(KEY_BACKFILL_MODE)
+        if backfill_mode and not (params.get(KEY_PERIOD_FROM) and params.get(KEY_PERIOD_TO)):
+            logging.error(
+                'Period from and Period To paremeters must be defined when backfill mode is on!')
+            exit(1)
+
+        gservice = GustoService(params[KEY_CUSTOMER_ID], params[KEY_MASTER_LOCATION_ID],
+                                params[KEY_VENDOR_ID], params[KEY_USER], params[KEY_PASS])
+
+        extract_time = datetime.utcnow()
+        start_date, end_date, periods = self._get_date_periods()
+
+        last_delta = None
+        last_state = self.get_state_file()
+        if last_state and params['since_last'] and last_state['data_delta'] and last_state['data_delta'] != 'None':
+            start_date = datetime.strptime(last_state['data_delta'], '%m%d%Y')
+            end_date = datetime.utcnow()            
+            last_delta = last_state['data_delta']
+        elif self.cfg_params.get(KEY_RELATIVE_PERIOD):
+            from_date = super().get_past_date(self.cfg_params.get(KEY_RELATIVE_PERIOD))
+            last_delta = from_date.strftime("%m%d%Y")
+
+        # get locations
+        logging.info('Getting locations..')
+        res_files, loc_ids = gservice.get_n_save_location(
+            self.tables_out_path, None, extract_time)
+        # create manifests
+        self._create_manifests(res_files)
+
+        
+        # get locations
+        logging.info('Getting categories..')
+        res_files = gservice.get_n_save_category(
+            self.tables_out_path, None, extract_time)
+        # create manifests
+        self._create_manifests(res_files)
+
+        
+        # get locations
+        logging.info('Getting order types..')
+        res_files = gservice.get_n_save_order_type(
+            self.tables_out_path, None, extract_time)
+        # create manifests
+        self._create_manifests(res_files)
+
+        logging.info('Fetching checks data for period %s - %s', start_date.date(), end_date.date())
+        index = 0
+        res_files = []
+        for loc_id in loc_ids['location']['id']:
+            # skip master locations
+            if str(loc_id) == params[KEY_MASTER_LOCATION_ID]:
+                continue
+
+            logging.info('Downloading checks for location id:%s', loc_id)
+
+            index += 1
+            if last_delta and (params['since_last'] or params[KEY_RELATIVE_PERIOD]):
+                res_files_local, cl, delta = gservice.get_n_save_checks(self.tables_out_path, loc_id, loc_id,
+                                                                        None, None, time_delta=last_delta, store_as_sliced=True)
+            else:
+                res_files_local, delta = self._get_checks_in_periods(
+                    loc_id, periods, gservice)
+
+            res_files += res_files_local
+
+        # create manifests
+        logging.info('Preparing checks sliced tables')
+        self._create_manifests_sliced(res_files)
+        # write statefile
+        self.write_state_file({'data_delta': str(delta),
+                               'last_period': {'start_date': str(start_date.date()),
+                                                   'end_date': str(end_date.date())}})
+
+        
+        logging.info('Extraction finshed sucessfully')
+
+    def _get_checks_in_periods(self, loc_id, periods, gservice):
+        res_in_period = []
+        last_delta = ''
+        res_files = []
+        for period in periods:
+            uid = str(loc_id) + '_' + \
+                period['start_date'] + '_' + period['end_date']
+            res_files, cols, delta = gservice.get_n_save_checks(self.tables_out_path, uid, loc_id,
+                                                                period['start_date'], period['end_date'], store_as_sliced=True)
+            last_delta = delta
+            res_in_period += res_files
+        return res_in_period, last_delta
+
+    def _get_date_periods(self):
+        periods = []
+        if self.cfg_params.get(KEY_BACKFILL_MODE):
+            start_date, end_date = self._get_backfill_period()
+            periods = list(self._split_dates_to_chunks(
+                start_date, end_date, MAX_PERIOD_SIZE))
+
+        elif self.cfg_params.get(KEY_RELATIVE_PERIOD):
+            start_date = super().get_past_date(self.cfg_params.get(KEY_RELATIVE_PERIOD))
+            end_date = datetime.now()
+            periods = list(self._split_dates_to_chunks(
+                start_date.date(), end_date.date(), MAX_PERIOD_SIZE))
+
+        elif self.cfg_params.get(KEY_PERIOD_FROM) and self.cfg_params.get(KEY_PERIOD_TO):
+            start_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
+            end_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
+            periods = list(self._split_dates_to_chunks(
+                start_date, end_date, MAX_PERIOD_SIZE))
+            
+
+        elif self.cfg_params.get(KEY_PERIOD_FROM) and self.cfg_params.get(KEY_PERIOD_TO):
+            start_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
+            end_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
+            periods = list(self._split_dates_to_chunks(
+                start_date, end_date, MAX_PERIOD_SIZE))
+
+        else:
+            end_date = datetime.utcnow()
+            start_date = self.get_past_date(
+                '14 days ago', end_date)
+            periods = [{'start_date': start_date.strftime("%m%d%Y"),
+                        'end_date': end_date.strftime("%m%d%Y")}]
+        return start_date, end_date, periods
+
+    def _split_dates_to_chunks(self, start_date, end_date, intv, strformat="%m%d%Y"):
+        nr_days = (end_date - start_date).days
+        if nr_days < intv:
+            yield {'start_date': start_date.strftime(strformat),
+                   'end_date': end_date.strftime(strformat)}
+        else:            
+            diff = (end_date - start_date) / (math.ceil(nr_days/intv))
+            for i in range(math.ceil(nr_days/intv)):
+                yield {'start_date': (start_date + diff * i).strftime(strformat),
+                       'end_date': (start_date + diff * (i + 1)).strftime(strformat)}
+
+    def _create_manifests(self, res_files):
+        for file in res_files:
+            self.configuration.write_table_manifest(
+                file_name=file['file_path'],
+                destination=file['prefix'],
+                primary_key=file['ids'])
+
+    def _create_manifests_sliced(self, res_files):
+
+        res_sliced_folders = {}
+        for file in res_files:
+            res_sliced_folders.update({file['prefix']: (file['ids'])})
+
+        for folder in res_sliced_folders:
+            self.create_sliced_tables(folder, res_sliced_folders[folder], True)
+    
+    def _get_backfill_period(self):
+        state = self.get_state_file()
+        
+        if state and state.get('last_period'):
+            last_start_date = datetime.strptime(
+                state['last_period']['start_date'], '%Y-%m-%d')
+            last_end_date = datetime.strptime(
+                state['last_period']['end_date'], '%Y-%m-%d')
+            
+            diff = last_end_date - last_start_date
+            # if period is a single day
+            if diff.days == 0:
+                diff = timedelta(days=1)
+
+            start_date = last_end_date
+            if (last_end_date.date() + diff) >= datetime.now(pytz.utc).date() + timedelta(days=1):
+                end_date = datetime.now(pytz.utc) + timedelta(days=1)
+            else:
+                end_date = last_end_date + diff
+        else:
+            start_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
+            end_date = datetime.strptime(
+                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
+        return start_date, end_date
+
+
+"""
+        Main entrypoint
+"""
+if __name__ == "__main__":
+    comp = Component()
+    comp.run()
+
+
+================================================
+File: configSchema.json
+================================================
+{
+	"type": "object",
+	"title": "Gusto Export API extractor configuration",
+	"required": [
+		"user",
+		"#pass",
+		"customer_id",
+		"master_location_id",
+		"#vendor_id",
+		"period_from",
+		"period_to",
+		"since_last",
+		"relative_period"
+	],
+	"properties": {
+		"user": {
+			"type": "string",
+			"title": "Gusto user name",
+			"propertyOrder": 100
+		},
+		"#pass": {
+			"type": "string",
+			"title": "Gusto password",
+			"format": "password",
+			"propertyOrder": 200
+		},
+		"customer_id": {
+			"type": "string",
+			"title": "Gusto customer id",
+			"propertyOrder": 300
+		},
+		"master_location_id": {
+			"type": "string",
+			"title": "Master location id",
+			"propertyOrder": 400
+		},
+		"#vendor_id": {
+			"type": "string",
+			"format": "password",
+			"title": "Gusto vendor id",
+			"propertyOrder": 500
+		},
+		"period_from": {
+			"type": "string",
+			"format": "date",
+			"title": "Period from date",
+			"propertyOrder": 600
+		},
+		"period_to": {
+			"type": "string",
+			"format": "date",
+			"title": "Period to date",
+			"propertyOrder": 700
+		},
+		"relative_period": {
+			"type": "string",
+			"title": "Relative period from now (utc)",
+			"description": "Relative period in format: '5 hours ago', 'yesterday','3 days ago', '4 months ago', '2 years ago', 'today'. Overrides `from` and `to` parameters.",
+			"propertyOrder": 710
+		},
+		"backfill_mode": {
+			"type": "number",
+			"title": "Backfill mode",
+			"description": "If backfill mode is enabled, each consecutive run of the component will continue from the end of the last run period, until current date is reached. The From and To date parameters are used to define Start date of the back-fill and also relative window of each run.",
+			"propertyOrder": 720,
+			"enum": [
+				0,
+				1
+			],
+			"default": 0,
+			"options": {
+				"enum_titles": [
+					"No",
+					"Yes"
+				]
+			}
+		},
+		"since_last": {
+			"type": "number",
+			"title": "Continue since last start",
+			"description": "Flag whether to continue since last extraction date (must be within 14 days)",
+			"propertyOrder": 800,
+			"enum": [
+				0,
+				1
+			],
+			"default": 0,
+			"options": {
+				"enum_titles": [
+					"No",
+					"Yes"
+				]
+			}
+		}
+	}
+}
+
+
+================================================
+File: deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+================================================
+File: generic-mapping/mappings.json
 ================================================
 {
 	"location": {
@@ -768,121 +1205,7 @@ File: /generic-mapping/mappings.json
 
 
 ================================================
-File: /configSchema.json
-================================================
-{
-	"type": "object",
-	"title": "Gusto Export API extractor configuration",
-	"required": [
-		"user",
-		"#pass",
-		"customer_id",
-		"master_location_id",
-		"#vendor_id",
-		"period_from",
-		"period_to",
-		"since_last",
-		"relative_period"
-	],
-	"properties": {
-		"user": {
-			"type": "string",
-			"title": "Gusto user name",
-			"propertyOrder": 100
-		},
-		"#pass": {
-			"type": "string",
-			"title": "Gusto password",
-			"format": "password",
-			"propertyOrder": 200
-		},
-		"customer_id": {
-			"type": "string",
-			"title": "Gusto customer id",
-			"propertyOrder": 300
-		},
-		"master_location_id": {
-			"type": "string",
-			"title": "Master location id",
-			"propertyOrder": 400
-		},
-		"#vendor_id": {
-			"type": "string",
-			"format": "password",
-			"title": "Gusto vendor id",
-			"propertyOrder": 500
-		},
-		"period_from": {
-			"type": "string",
-			"format": "date",
-			"title": "Period from date",
-			"propertyOrder": 600
-		},
-		"period_to": {
-			"type": "string",
-			"format": "date",
-			"title": "Period to date",
-			"propertyOrder": 700
-		},
-		"relative_period": {
-			"type": "string",
-			"title": "Relative period from now (utc)",
-			"description": "Relative period in format: '5 hours ago', 'yesterday','3 days ago', '4 months ago', '2 years ago', 'today'. Overrides `from` and `to` parameters.",
-			"propertyOrder": 710
-		},
-		"backfill_mode": {
-			"type": "number",
-			"title": "Backfill mode",
-			"description": "If backfill mode is enabled, each consecutive run of the component will continue from the end of the last run period, until current date is reached. The From and To date parameters are used to define Start date of the back-fill and also relative window of each run.",
-			"propertyOrder": 720,
-			"enum": [
-				0,
-				1
-			],
-			"default": 0,
-			"options": {
-				"enum_titles": [
-					"No",
-					"Yes"
-				]
-			}
-		},
-		"since_last": {
-			"type": "number",
-			"title": "Continue since last start",
-			"description": "Flag whether to continue since last extraction date (must be within 14 days)",
-			"propertyOrder": 800,
-			"enum": [
-				0,
-				1
-			],
-			"default": 0,
-			"options": {
-				"enum_titles": [
-					"No",
-					"Yes"
-				]
-			}
-		}
-	}
-}
-
-
-================================================
-File: /Dockerfile
-================================================
-FROM quay.io/keboola/docker-custom-python:latest
-ENV PYTHONIOENCODING utf-8
-
-COPY . /code/
-WORKDIR /data/
-
-
-CMD ["python", "-u", "/code/component.py"]
-
-
-================================================
-File: /gusto/client.py
+File: gusto/client.py
 ================================================
 '''
 Created on 15. 10. 2018
@@ -974,7 +1297,7 @@ class Client(HttpClientBase):
 
 
 ================================================
-File: /gusto/client_service.py
+File: gusto/client_service.py
 ================================================
 from gusto.client import Client
 from kbc.mapping import GenericMapping
@@ -1111,272 +1434,7 @@ class GustoService:
         
 
 ================================================
-File: /bitbucket-pipelines.yml
-================================================
-options:
-  docker: true
-
-pipelines:
-  default:
-    - step:
-        script:
-          - export APP_IMAGE=keboola-component
-          - docker build . --tag=$APP_IMAGE
-          - docker images
-
-  tags:
-    '*':
-      - step:
-          script:
-          - export APP_IMAGE=keboola-component
-          - docker build . --tag=$APP_IMAGE
-          - docker images
-          - ./deploy.sh
-
-================================================
-File: /component.py
-================================================
-'''
-
-@author: esner
-'''
-from kbc.env_handler import KBCEnvHandler
-from gusto.client_service import GustoService
-import logging
-import math
-import pytz
-
-from datetime import datetime
-from datetime import timedelta
-
-KEY_USER = 'user'
-KEY_PASS = '#pass'
-KEY_CUSTOMER_ID = 'customer_id'
-KEY_MASTER_LOCATION_ID = 'master_location_id'
-KEY_VENDOR_ID = '#vendor_id'
-
-
-KEY_PERIOD_FROM = 'period_from'
-KEY_PERIOD_TO = 'period_to'
-KEY_RELATIVE_PERIOD = 'relative_period'
-KEY_BACKFILL_MODE = 'backfill_mode'
-KEY_MAND_PERIOD_GROUP = [KEY_PERIOD_FROM, KEY_PERIOD_TO]
-KEY_MAND_DATE_GROUP = [KEY_RELATIVE_PERIOD, KEY_MAND_PERIOD_GROUP]
-
-MAX_PERIOD_SIZE = 10
-
-MANDATORY_PARS = [KEY_USER, KEY_PASS, KEY_CUSTOMER_ID,
-                  KEY_MASTER_LOCATION_ID, KEY_VENDOR_ID, KEY_MAND_DATE_GROUP]
-
-APP_VERSION = '0.1.6'
-
-
-class Component(KBCEnvHandler):
-
-    def __init__(self, data_path = None):
-        KBCEnvHandler.__init__(self, MANDATORY_PARS, data_path = data_path)
-
-    def run(self, debug=False):
-        '''
-        Main execution code
-        '''
-        # setup
-        self.set_default_logger('DEBUG' if debug else 'INFO')
-        logging.info('Running version %s', APP_VERSION)
-        logging.info('Loading configuration...')
-        self.validateConfig()
-        params = self.cfg_params
-        backfill_mode = params.get(KEY_BACKFILL_MODE)
-        if backfill_mode and not (params.get(KEY_PERIOD_FROM) and params.get(KEY_PERIOD_TO)):
-            logging.error(
-                'Period from and Period To paremeters must be defined when backfill mode is on!')
-            exit(1)
-
-        gservice = GustoService(params[KEY_CUSTOMER_ID], params[KEY_MASTER_LOCATION_ID],
-                                params[KEY_VENDOR_ID], params[KEY_USER], params[KEY_PASS])
-
-        extract_time = datetime.utcnow()
-        start_date, end_date, periods = self._get_date_periods()
-
-        last_delta = None
-        last_state = self.get_state_file()
-        if last_state and params['since_last'] and last_state['data_delta'] and last_state['data_delta'] != 'None':
-            start_date = datetime.strptime(last_state['data_delta'], '%m%d%Y')
-            end_date = datetime.utcnow()            
-            last_delta = last_state['data_delta']
-        elif self.cfg_params.get(KEY_RELATIVE_PERIOD):
-            from_date = super().get_past_date(self.cfg_params.get(KEY_RELATIVE_PERIOD))
-            last_delta = from_date.strftime("%m%d%Y")
-
-        # get locations
-        logging.info('Getting locations..')
-        res_files, loc_ids = gservice.get_n_save_location(
-            self.tables_out_path, None, extract_time)
-        # create manifests
-        self._create_manifests(res_files)
-
-        
-        # get locations
-        logging.info('Getting categories..')
-        res_files = gservice.get_n_save_category(
-            self.tables_out_path, None, extract_time)
-        # create manifests
-        self._create_manifests(res_files)
-
-        
-        # get locations
-        logging.info('Getting order types..')
-        res_files = gservice.get_n_save_order_type(
-            self.tables_out_path, None, extract_time)
-        # create manifests
-        self._create_manifests(res_files)
-
-        logging.info('Fetching checks data for period %s - %s', start_date.date(), end_date.date())
-        index = 0
-        res_files = []
-        for loc_id in loc_ids['location']['id']:
-            # skip master locations
-            if str(loc_id) == params[KEY_MASTER_LOCATION_ID]:
-                continue
-
-            logging.info('Downloading checks for location id:%s', loc_id)
-
-            index += 1
-            if last_delta and (params['since_last'] or params[KEY_RELATIVE_PERIOD]):
-                res_files_local, cl, delta = gservice.get_n_save_checks(self.tables_out_path, loc_id, loc_id,
-                                                                        None, None, time_delta=last_delta, store_as_sliced=True)
-            else:
-                res_files_local, delta = self._get_checks_in_periods(
-                    loc_id, periods, gservice)
-
-            res_files += res_files_local
-
-        # create manifests
-        logging.info('Preparing checks sliced tables')
-        self._create_manifests_sliced(res_files)
-        # write statefile
-        self.write_state_file({'data_delta': str(delta),
-                               'last_period': {'start_date': str(start_date.date()),
-                                                   'end_date': str(end_date.date())}})
-
-        
-        logging.info('Extraction finshed sucessfully')
-
-    def _get_checks_in_periods(self, loc_id, periods, gservice):
-        res_in_period = []
-        last_delta = ''
-        res_files = []
-        for period in periods:
-            uid = str(loc_id) + '_' + \
-                period['start_date'] + '_' + period['end_date']
-            res_files, cols, delta = gservice.get_n_save_checks(self.tables_out_path, uid, loc_id,
-                                                                period['start_date'], period['end_date'], store_as_sliced=True)
-            last_delta = delta
-            res_in_period += res_files
-        return res_in_period, last_delta
-
-    def _get_date_periods(self):
-        periods = []
-        if self.cfg_params.get(KEY_BACKFILL_MODE):
-            start_date, end_date = self._get_backfill_period()
-            periods = list(self._split_dates_to_chunks(
-                start_date, end_date, MAX_PERIOD_SIZE))
-
-        elif self.cfg_params.get(KEY_RELATIVE_PERIOD):
-            start_date = super().get_past_date(self.cfg_params.get(KEY_RELATIVE_PERIOD))
-            end_date = datetime.now()
-            periods = list(self._split_dates_to_chunks(
-                start_date.date(), end_date.date(), MAX_PERIOD_SIZE))
-
-        elif self.cfg_params.get(KEY_PERIOD_FROM) and self.cfg_params.get(KEY_PERIOD_TO):
-            start_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
-            end_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
-            periods = list(self._split_dates_to_chunks(
-                start_date, end_date, MAX_PERIOD_SIZE))
-            
-
-        elif self.cfg_params.get(KEY_PERIOD_FROM) and self.cfg_params.get(KEY_PERIOD_TO):
-            start_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
-            end_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
-            periods = list(self._split_dates_to_chunks(
-                start_date, end_date, MAX_PERIOD_SIZE))
-
-        else:
-            end_date = datetime.utcnow()
-            start_date = self.get_past_date(
-                '14 days ago', end_date)
-            periods = [{'start_date': start_date.strftime("%m%d%Y"),
-                        'end_date': end_date.strftime("%m%d%Y")}]
-        return start_date, end_date, periods
-
-    def _split_dates_to_chunks(self, start_date, end_date, intv, strformat="%m%d%Y"):
-        nr_days = (end_date - start_date).days
-        if nr_days < intv:
-            yield {'start_date': start_date.strftime(strformat),
-                   'end_date': end_date.strftime(strformat)}
-        else:            
-            diff = (end_date - start_date) / (math.ceil(nr_days/intv))
-            for i in range(math.ceil(nr_days/intv)):
-                yield {'start_date': (start_date + diff * i).strftime(strformat),
-                       'end_date': (start_date + diff * (i + 1)).strftime(strformat)}
-
-    def _create_manifests(self, res_files):
-        for file in res_files:
-            self.configuration.write_table_manifest(
-                file_name=file['file_path'],
-                destination=file['prefix'],
-                primary_key=file['ids'])
-
-    def _create_manifests_sliced(self, res_files):
-
-        res_sliced_folders = {}
-        for file in res_files:
-            res_sliced_folders.update({file['prefix']: (file['ids'])})
-
-        for folder in res_sliced_folders:
-            self.create_sliced_tables(folder, res_sliced_folders[folder], True)
-    
-    def _get_backfill_period(self):
-        state = self.get_state_file()
-        
-        if state and state.get('last_period'):
-            last_start_date = datetime.strptime(
-                state['last_period']['start_date'], '%Y-%m-%d')
-            last_end_date = datetime.strptime(
-                state['last_period']['end_date'], '%Y-%m-%d')
-            
-            diff = last_end_date - last_start_date
-            # if period is a single day
-            if diff.days == 0:
-                diff = timedelta(days=1)
-
-            start_date = last_end_date
-            if (last_end_date.date() + diff) >= datetime.now(pytz.utc).date() + timedelta(days=1):
-                end_date = datetime.now(pytz.utc) + timedelta(days=1)
-            else:
-                end_date = last_end_date + diff
-        else:
-            start_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_FROM), '%Y-%m-%d')
-            end_date = datetime.strptime(
-                self.cfg_params.get(KEY_PERIOD_TO), '%Y-%m-%d')
-        return start_date, end_date
-
-
-"""
-        Main entrypoint
-"""
-if __name__ == "__main__":
-    comp = Component()
-    comp.run()
-
-
-================================================
-File: /kbc/client_base.py
+File: kbc/client_base.py
 ================================================
 '''
 Created on 5. 10. 2018
@@ -1566,7 +1624,7 @@ class HttpClientBase:
 
 
 ================================================
-File: /kbc/env_handler.py
+File: kbc/env_handler.py
 ================================================
 #==============================================================================
 # KBC Env handler
@@ -1822,7 +1880,7 @@ class KBCEnvHandler:
 
 
 ================================================
-File: /kbc/mapping.py
+File: kbc/mapping.py
 ================================================
 "__author__ = 'Leo Chan'"
 from _collections import OrderedDict
@@ -2209,63 +2267,5 @@ class GenericMapping():
 
 
         return result_files, return_res_cols
-
-
-================================================
-File: /deploy.sh
-================================================
-#!/bin/sh
-set -e
-
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
-
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
-
-# Push to the repository
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${BITBUCKET_TAG}
-docker push ${REPOSITORY}:latest
-
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
-fi
-
-================================================
-File: /README.md
-================================================
-## Gusto Export extractor
-Extractor component for Keboola Connection allowing to retrieve daily checks from Gusto Export API
-
-### Configuration
-- **Gusto user name** – (REQ) Your Gusto account user name
-- **Gusto password** - (REQ) Password
-- **Gusto customer id** - (REQ) Customer ID
-- **Master location id** - (REQ) Master Location ID
-- **Gusto vendor id** - (REQ) Gusto vendor id
-- **Period from date [including]** – Start date from which to retrieve data (Inclusive)  
-- **Period to date [excluding]** – End of the retrieved period (exclusive) 
-- **Relative period from now (utc)** – Relative period in format: '5 hours ago', 'yesterday','3 days ago', '4 months ago', '2 years ago', 'today'. Overrides `from` and `to` parameters. NOTE: Either `Relative period` parameter or pair of `Period From` and `To` parameters are required.
-- **Continue since last start** - If set to `Yes` every consecutive run starts where the last one ended.
-- **Backfill mode** – This switch is to help backloading historical data. Depending on your filter setup, the extract for couple of days period may take quite a lot time. Component `run-time limit is 4 hours`. To backload data for few years back this helps to setup a regular orcehstration and load all historical data in appropriate chunks (<4hrs run). If backfill mode is enabled, each consecutive run of the component will continue from the end of the last run period, until current date is reached. The `From` and `To` date parameters are used to define Start date of the back-fill and also relative window of each run. Once the current date is reached, everything since last run date is downloaded on the next run.
-
 
 

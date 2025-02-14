@@ -1,12 +1,28 @@
 Directory structure:
 └── kds_consulting_team-kds-team.ex-liveagent/
-    ├── tests/
-    │   ├── __init__.py
-    │   └── test_component.py
-    ├── .travis.yml
-    ├── change_log.md
+    ├── README.md
     ├── Dockerfile
+    ├── LICENSE.md
+    ├── bitbucket-pipelines.yml
+    ├── change_log.md
+    ├── deploy.sh
+    ├── docker-compose.yml
     ├── flake8.cfg
+    ├── requirements.txt
+    ├── .travis.yml
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── component_short_description.md
+    │   ├── configSchema.json
+    │   ├── configuration_description.md
+    │   ├── stack_parameters.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       └── in/
+    │           └── state.json
+    ├── scripts/
+    │   ├── build_n_test.sh
+    │   └── update_dev_portal_properties.sh
     ├── src/
     │   ├── main.py
     │   └── liveagent/
@@ -14,28 +30,233 @@ Directory structure:
     │       ├── component.py
     │       ├── result.py
     │       └── utils.py
-    ├── LICENSE.md
-    ├── requirements.txt
-    ├── bitbucket-pipelines.yml
-    ├── component_config/
-    │   ├── component_short_description.md
-    │   ├── configSchema.json
-    │   ├── stack_parameters.json
-    │   ├── configuration_description.md
-    │   ├── component_long_description.md
-    │   └── sample-config/
-    │       ├── in/
-    │       │   └── state.json
-    │       └── config.json
-    ├── deploy.sh
-    ├── docker-compose.yml
-    ├── scripts/
-    │   ├── build_n_test.sh
-    │   └── update_dev_portal_properties.sh
-    └── README.md
+    └── tests/
+        ├── __init__.py
+        └── test_component.py
 
 ================================================
-File: /.travis.yml
+File: Dockerfile
+================================================
+FROM python:3.8.6-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/main.py"]
+
+
+================================================
+File: LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        caches:
+          - docker
+        script:
+          - export APP_IMAGE=keboola-component
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
+          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:$TEST_TAG
+
+
+  branches:
+    master:
+      - step:
+          caches:
+            - docker
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+            - echo 'Pushing test image to repo. [tag=test]'
+            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            - docker push $REPOSITORY:test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=keboola-component
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - chmod +x ./scripts/update_dev_portal_properties.sh
+            - chmod +x ./deploy.sh
+            - ./scripts/update_dev_portal_properties.sh
+            - ./deploy.sh
+
+================================================
+File: deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    venv,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.9.zip#egg=kbc
+keboola.http-client
+retry
+
+================================================
+File: .travis.yml
 ================================================
 sudo: false
 
@@ -74,52 +295,278 @@ after_success:
 
 
 ================================================
-File: /Dockerfile
+File: component_config/component_long_description.md
 ================================================
-FROM python:3.8.6-slim
-ENV PYTHONIOENCODING utf-8
+# LiveAgent (Ladesk) extractor
 
-COPY . /code/
-
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
-
-RUN pip install flake8
-
-RUN pip install -r /code/requirements.txt
-
-WORKDIR /code/
-
-
-CMD ["python", "-u", "/code/src/main.py"]
-
+This extractor allows to download data from LiveAgent.
 
 ================================================
-File: /flake8.cfg
+File: component_config/component_short_description.md
 ================================================
-[flake8]
-exclude =
-    .git,
-    __pycache__,
-    venv,
-    tests
-max-line-length = 120
-
-# F812: list comprehension redefines ...
-# H101: Use TODO(NAME)
-# H202: assertRaises Exception too broad
-# H233: Python 3.x incompatible use of print operator
-# H301: one import per line
-# H306: imports not in alphabetical order (time, os)
-# H401: docstring should not start with a space
-# H403: multi line docstrings should end on a new line
-# H404: multi line docstring should start without a leading new line
-# H405: multi line docstring summary not separated with an empty line
-# H501: Do not use self.__dict__ for string formatting
-
+LiveAgent is a multi-channel customer service software that offers 175+ help desk and live chat features.
 
 ================================================
-File: /src/main.py
+File: component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Parameters",
+  "required": [
+    "#token",
+    "#token_v1",
+    "organization",
+    "objects",
+    "date",
+    "incremental_load"
+  ],
+  "properties": {
+    "#token": {
+      "type": "string",
+      "format": "password",
+      "title": "API Token (for API v3)",
+      "propertyOrder": 100,
+      "description": "An API token which will be used in authentication for API v3. You can generate an API key by navigating to Configuration > System > API."
+    },
+    "#token_v1": {
+      "type": "string",
+      "format": "password",
+      "title": "API Token (for API v1)",
+      "propertyOrder": 150,
+      "description": "An API token which will be used in authentication for API v1. You can obtain an API key by navigating to Configuration > System > API."
+    },
+    "organization": {
+      "type": "string",
+      "title": "Organization Name",
+      "description": "Organization name, which is located in the URL. Usually, the URL is in format https://<ORGANIZATION>.ladesk.com, and only the organization name needs to be provided.",
+      "propertyOrder": 200
+    },
+    "objects": {
+      "title": "Objects to download",
+      "description": "A list of objects for which statistics will be downloaded. One or multiple objects can be specified.",
+      "type": "array",
+      "format": "select",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "agents",
+          "calls",
+          "companies",
+          "contacts",
+          "departments",
+          "tags",
+          "tickets",
+          "tickets_messages",
+          "tickets_history",
+          "agent_report",
+          "ranking_agents_report",
+          "agent_availability",
+          "agent_availability_chats",
+          "calls_availability",
+          "conversations"
+        ],
+        "type": "string",
+        "options": {
+          "enum_titles": [
+            "Agents (v3)",
+            "Calls (v3)",
+            "Companies (v3)",
+            "Contacts (v3)",
+            "Departments (v3)",
+            "Tags (v3)",
+            "Tickets (v3)",
+            "Tickets Messages (v3)",
+            "Tickets History (v3)",
+            "Agent Report (v1)",
+            "Ranking Agents Report (v1)",
+            "Agent Availability for Tickets (v1)",
+            "Agent Availability for Chats (v1)",
+            "Calls Availability (v1)",
+            "Conversations (v1)"
+          ]
+        }
+      },
+      "default": [
+        "agents",
+        "calls",
+        "contacts",
+        "tickets"
+      ],
+      "propertyOrder": 300
+    },
+    "date": {
+      "type": "object",
+      "title": "Date settings",
+      "description": "Setting date range for which the statistics will be downloaded.",
+      "format": "grid",
+      "required": [
+        "from",
+        "until"
+      ],
+      "properties": {
+        "from": {
+          "type": "string",
+          "title": "Start Date",
+          "default": "30 days ago",
+          "propertyOrder": 100,
+          "description": "Start date, from which the extractor will download data. Can be specified absolutely in format YYYY-MM-DD or relatively like 4 hours ago, 10 days ago, 3 months ago, etc."
+        },
+        "until": {
+          "type": "string",
+          "title": "End Date",
+          "default": "today",
+          "propertyOrder": 200,
+          "description": "End date, to which the extractor will download data. Can be specified absolutely in format YYYY-MM-DD or relatively like 4 hours ago, 10 days ago, 3 months ago, etc."
+        }
+      },
+      "propertyOrder": 400
+    },
+    "incremental_load": {
+      "type": "number",
+      "format": "text",
+      "enum": [
+        1,
+        0
+      ],
+      "uniqueItems": true,
+      "title": "Load Type",
+      "default": 1,
+      "options": {
+        "enum_titles": [
+          "Incremental Load",
+          "Full Load"
+        ]
+      },
+      "propertyOrder": 500
+    },
+      "fail_on_error": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Fail on error",
+      "default": true,
+      "propertyOrder": 600,
+        "description": "If set to false, entities that cannot be processed will not result in error, but will be skipped instead."
+    }
+  }
+}
+
+================================================
+File: component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "#token": "<TOKEN>",
+    "organization": "keboola",
+    "objects": [
+      "agents",
+      "calls",
+      "tickets",
+      "departments",
+      "tags"
+    ],
+    "date": {
+      "from": "30 days ago",
+      "until": "today"
+    },
+    "incremental_load": 1
+  },
+  "image_parameters": {}
+}
+
+================================================
+File: component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: src/main.py
 ================================================
 from liveagent.component import Component, UserException
 import logging
@@ -137,7 +584,7 @@ if __name__ == "__main__":
 
 
 ================================================
-File: /src/liveagent/client.py
+File: src/liveagent/client.py
 ================================================
 import logging
 import re
@@ -492,7 +939,7 @@ class LiveAgentClient(HttpClient):
 
 
 ================================================
-File: /src/liveagent/component.py
+File: src/liveagent/component.py
 ================================================
 import dateparser
 import logging
@@ -737,7 +1184,7 @@ class Component(KBCEnvHandler):
 
 
 ================================================
-File: /src/liveagent/result.py
+File: src/liveagent/result.py
 ================================================
 import os
 import csv
@@ -955,7 +1402,7 @@ class LiveAgentWriter:
 
 
 ================================================
-File: /src/liveagent/utils.py
+File: src/liveagent/utils.py
 ================================================
 class Parameters:
     pass
@@ -964,451 +1411,4 @@ class Parameters:
 class Writers:
     pass
 
-
-================================================
-File: /LICENSE.md
-================================================
-The MIT License (MIT)
-
-Copyright (c) 2018 Keboola DS, http://keboola.com
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files, to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished
-to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
-================================================
-File: /requirements.txt
-================================================
-https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.9.zip#egg=kbc
-keboola.http-client
-retry
-
-================================================
-File: /bitbucket-pipelines.yml
-================================================
-options:
-  docker: true
-
-pipelines:
-  default:
-    - step:
-        caches:
-          - docker
-        script:
-          - export APP_IMAGE=keboola-component
-          - docker build . --tag=$APP_IMAGE
-          - docker images
-          - docker -v
-          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
-          - echo "Running unit-tests..."
-          - docker run $APP_IMAGE python -m unittest discover
-          # push test image to ecr - uncomment for testing before deployment
-          - export TEST_TAG=${BITBUCKET_BRANCH//\//-}
-          - echo "Pushing test image to repo. [tag=${TEST_TAG}]"
-          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
-          - docker tag $APP_IMAGE:latest $REPOSITORY:$TEST_TAG
-          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-          - docker push $REPOSITORY:$TEST_TAG
-
-
-  branches:
-    master:
-      - step:
-          caches:
-            - docker
-          script:
-            - export APP_IMAGE=keboola-component
-            - docker build . --tag=$APP_IMAGE
-            - docker images
-            - docker -v
-            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
-            - echo "Running unit-tests..."
-            - docker run $APP_IMAGE python -m unittest discover
-            # push test image to ecr - uncomment for testing before deployment
-            - echo 'Pushing test image to repo. [tag=test]'
-            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
-            - docker tag $APP_IMAGE:latest $REPOSITORY:test
-            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-            - docker push $REPOSITORY:test
-            - chmod +x ./scripts/update_dev_portal_properties.sh
-            - ./scripts/update_dev_portal_properties.sh
-  tags:
-    '*':
-      - step:
-          deployment: production
-          script:
-            - export APP_IMAGE=keboola-component
-            - docker build . --tag=$APP_IMAGE
-            - docker images
-            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
-            - echo "Running unit-tests..."
-            - docker run $APP_IMAGE python -m unittest discover
-            - echo "Preparing KBC test image"
-            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
-            # push test image to ECR - uncomment when initialised
-            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
-            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
-            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-            # - docker push $REPOSITORY:test
-            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
-            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
-            - chmod +x ./scripts/update_dev_portal_properties.sh
-            - chmod +x ./deploy.sh
-            - ./scripts/update_dev_portal_properties.sh
-            - ./deploy.sh
-
-================================================
-File: /component_config/component_short_description.md
-================================================
-LiveAgent is a multi-channel customer service software that offers 175+ help desk and live chat features.
-
-================================================
-File: /component_config/configSchema.json
-================================================
-{
-  "type": "object",
-  "title": "Parameters",
-  "required": [
-    "#token",
-    "#token_v1",
-    "organization",
-    "objects",
-    "date",
-    "incremental_load"
-  ],
-  "properties": {
-    "#token": {
-      "type": "string",
-      "format": "password",
-      "title": "API Token (for API v3)",
-      "propertyOrder": 100,
-      "description": "An API token which will be used in authentication for API v3. You can generate an API key by navigating to Configuration > System > API."
-    },
-    "#token_v1": {
-      "type": "string",
-      "format": "password",
-      "title": "API Token (for API v1)",
-      "propertyOrder": 150,
-      "description": "An API token which will be used in authentication for API v1. You can obtain an API key by navigating to Configuration > System > API."
-    },
-    "organization": {
-      "type": "string",
-      "title": "Organization Name",
-      "description": "Organization name, which is located in the URL. Usually, the URL is in format https://<ORGANIZATION>.ladesk.com, and only the organization name needs to be provided.",
-      "propertyOrder": 200
-    },
-    "objects": {
-      "title": "Objects to download",
-      "description": "A list of objects for which statistics will be downloaded. One or multiple objects can be specified.",
-      "type": "array",
-      "format": "select",
-      "uniqueItems": true,
-      "items": {
-        "enum": [
-          "agents",
-          "calls",
-          "companies",
-          "contacts",
-          "departments",
-          "tags",
-          "tickets",
-          "tickets_messages",
-          "tickets_history",
-          "agent_report",
-          "ranking_agents_report",
-          "agent_availability",
-          "agent_availability_chats",
-          "calls_availability",
-          "conversations"
-        ],
-        "type": "string",
-        "options": {
-          "enum_titles": [
-            "Agents (v3)",
-            "Calls (v3)",
-            "Companies (v3)",
-            "Contacts (v3)",
-            "Departments (v3)",
-            "Tags (v3)",
-            "Tickets (v3)",
-            "Tickets Messages (v3)",
-            "Tickets History (v3)",
-            "Agent Report (v1)",
-            "Ranking Agents Report (v1)",
-            "Agent Availability for Tickets (v1)",
-            "Agent Availability for Chats (v1)",
-            "Calls Availability (v1)",
-            "Conversations (v1)"
-          ]
-        }
-      },
-      "default": [
-        "agents",
-        "calls",
-        "contacts",
-        "tickets"
-      ],
-      "propertyOrder": 300
-    },
-    "date": {
-      "type": "object",
-      "title": "Date settings",
-      "description": "Setting date range for which the statistics will be downloaded.",
-      "format": "grid",
-      "required": [
-        "from",
-        "until"
-      ],
-      "properties": {
-        "from": {
-          "type": "string",
-          "title": "Start Date",
-          "default": "30 days ago",
-          "propertyOrder": 100,
-          "description": "Start date, from which the extractor will download data. Can be specified absolutely in format YYYY-MM-DD or relatively like 4 hours ago, 10 days ago, 3 months ago, etc."
-        },
-        "until": {
-          "type": "string",
-          "title": "End Date",
-          "default": "today",
-          "propertyOrder": 200,
-          "description": "End date, to which the extractor will download data. Can be specified absolutely in format YYYY-MM-DD or relatively like 4 hours ago, 10 days ago, 3 months ago, etc."
-        }
-      },
-      "propertyOrder": 400
-    },
-    "incremental_load": {
-      "type": "number",
-      "format": "text",
-      "enum": [
-        1,
-        0
-      ],
-      "uniqueItems": true,
-      "title": "Load Type",
-      "default": 1,
-      "options": {
-        "enum_titles": [
-          "Incremental Load",
-          "Full Load"
-        ]
-      },
-      "propertyOrder": 500
-    },
-      "fail_on_error": {
-      "type": "boolean",
-      "format": "checkbox",
-      "title": "Fail on error",
-      "default": true,
-      "propertyOrder": 600,
-        "description": "If set to false, entities that cannot be processed will not result in error, but will be skipped instead."
-    }
-  }
-}
-
-================================================
-File: /component_config/stack_parameters.json
-================================================
-{}
-
-================================================
-File: /component_config/component_long_description.md
-================================================
-# LiveAgent (Ladesk) extractor
-
-This extractor allows to download data from LiveAgent.
-
-================================================
-File: /component_config/sample-config/in/state.json
-================================================
-{"data_delta": "10222018"}
-
-================================================
-File: /component_config/sample-config/config.json
-================================================
-{
-  "parameters": {
-    "#token": "<TOKEN>",
-    "organization": "keboola",
-    "objects": [
-      "agents",
-      "calls",
-      "tickets",
-      "departments",
-      "tags"
-    ],
-    "date": {
-      "from": "30 days ago",
-      "until": "today"
-    },
-    "incremental_load": 1
-  },
-  "image_parameters": {}
-}
-
-================================================
-File: /deploy.sh
-================================================
-#!/bin/sh
-set -e
-
-#check if deployment is triggered only in master
-if [ $BITBUCKET_BRANCH != "master" ]; then
-               echo Deploy on tagged commit can be only executed in master!
-               exit 1
-fi
-
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
-
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
-
-# Push to the repository
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${BITBUCKET_TAG}
-docker push ${REPOSITORY}:latest
-
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
-fi
-
-
-================================================
-File: /docker-compose.yml
-================================================
-version: "2"
-services:
-  # for development purposes
-  dev:
-    build: .
-    volumes:
-        - ./:/code
-        - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-  test:
-    # Use to run flake8 and unittests checks
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-    command:
-      - /bin/sh
-      - /code/scripts/build_n_test.sh
-
-================================================
-File: /scripts/build_n_test.sh
-================================================
-#!/bin/sh
-set -e
-
-flake8 --config=flake8.cfg
-python -m unittest discover
-
-================================================
-File: /scripts/update_dev_portal_properties.sh
-================================================
-#!/usr/bin/env bash
-
-set -e
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-
-
-# Update properties in Keboola Developer Portal
-echo "Updating long description"
-value=`cat component_config/component_long_description.md`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
-else
-    echo "longDescription is empty!"
-    exit 1
-fi
-
-echo "Updating config schema"
-value=`cat component_config/configSchema.json`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
-else
-    echo "configurationSchema is empty!"
-fi
-
-
-echo "Updating config description"
-
-value=`cat component_config/configuration_description.md`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
-else
-    echo "configurationDescription is empty!"
-fi
-
-
-echo "Updating short description"
-
-value=`cat component_config/component_short_description.md`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
-else
-    echo "shortDescription is empty!"
-    exit 1
-fi
 

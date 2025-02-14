@@ -1,46 +1,534 @@
 Directory structure:
 └── kds_consulting_team-kds-team.app-gd-user-management/
-    ├── tests/
-    │   ├── __init__.py
-    │   └── test_component.py
-    ├── change_log.md
+    ├── README.md
     ├── Dockerfile
-    ├── flake8.cfg
-    ├── src/
-    │   ├── lib/
-    │   │   ├── GD_KB_client.py
-    │   │   ├── component.py
-    │   │   ├── user.py
-    │   │   └── logger.py
-    │   └── main.py
     ├── LICENSE.md
-    ├── requirements.txt
     ├── bitbucket-pipelines.yml
+    ├── change_log.md
+    ├── docker-compose.yml
+    ├── flake8.cfg
+    ├── requirements.txt
     ├── component_config/
+    │   ├── component_long_description.md
     │   ├── component_short_description.md
     │   ├── configSchema.json
-    │   ├── stack_parameters.json
     │   ├── configuration_description.md
-    │   ├── component_long_description.md
+    │   ├── stack_parameters.json
     │   └── sample-config/
+    │       ├── config.json
     │       ├── in/
-    │       │   ├── tables/
-    │       │   │   ├── test.csv
-    │       │   │   └── test.csv.manifest
-    │       │   └── state.json
-    │       ├── out/
+    │       │   ├── state.json
     │       │   └── tables/
-    │       │       └── test.csv
-    │       └── config.json
-    ├── docker-compose.yml
+    │       │       ├── test.csv
+    │       │       └── test.csv.manifest
+    │       └── out/
+    │           └── tables/
+    │               └── test.csv
     ├── scripts/
     │   ├── build_n_test.sh
-    │   ├── update_dev_portal_properties.sh
-    │   └── deploy.sh
-    └── README.md
+    │   ├── deploy.sh
+    │   └── update_dev_portal_properties.sh
+    ├── src/
+    │   ├── main.py
+    │   └── lib/
+    │       ├── GD_KB_client.py
+    │       ├── component.py
+    │       ├── logger.py
+    │       └── user.py
+    └── tests/
+        ├── __init__.py
+        └── test_component.py
 
 ================================================
-File: /change_log.md
+File: README.md
+================================================
+# GoodData User Management Application
+
+This application allows user of the component to manage users in the GoodData project, invite new users to the project, change roles and assign data permissions for each user.
+
+## 1 Overview
+
+The application, as aforementioned, allows users to maintain access to a GoodData project and or manage users' access to certain data. The application uses GoodData API to assign [Data Permissions](https://help.gooddata.com/display/doc/Data+Permissions) to desired users, that automatically pre-filter available data to end-user.
+
+### 1.1 Prerequisities
+
+**The following requirements are needed for successful conifguration of the application:**
+
+* a GoodData project
+* an admin account to the GoodData project
+
+### 1.2 Status file
+
+All actions performed by the application are automatically recorded to a status file. The file is incrementally auto-saved to `out.c-GDUserManagement.status` table. All actions contain information on whether said action was successful and any additional information, which are the result of taking the action.
+
+### 1.3 Process overview
+
+The application automatically determines what actions need to be taken for each user based on the table of users (see *input mapping* section). The process is ran row-by-row, i.e. all users are processed sequentially, to avoid any confusion in the process. For each user, the application determines whether the user is already in the organization and/or project and acts accordingly on that, i.e. creates the user if necessary. To prevent any possible failure, all users are first disabled in the project, before assigning data permissions and re-enabling them again. If it's necessary, the application generates an invitation, which is delivered to the user on the provided e-mail address.
+
+### 1.4 Process detail
+
+Below is a more detailed description of the process.
+
+1. User and all their data is read from the table.
+2. User's login is compared to the list of users in GD project and list of users provisioned by Keboola.
+    1. If the user is in both organization and project, they are disabled or removed.
+    2. If the user is in the organization but not in the project, nothing is done.
+    3. If the user is not in the organization but is in the project, they are disabled.
+    4. If the user is not in the organization nor the project, an attempt is made to create them in Keboola organization. If the       attemp fails, the user is already part of another organization and will not be maintained in Keboola domain.
+3. For each user, their `Mandatory User Filter (MUF)` expression is read and parsed into URI format. The URI format is a format, where all attribute names, labels and values are transformed to their URI counterparts. If the attribute, label or value does not exist, the URI expression is not created and an error is recorded in the status file.
+4. The URI expression is posted to GoodData and the user filter is created. Each user filter is assigned unique ID, which is then passed on to users as an attribute.
+5. The following action occurs once the user filter was created (follow-up to point 2):
+    1. User is assigned the user filter and is re-enabled in the project.
+    2. User is assigned the user filter and is added to the project.
+    3. User is assigned the user fitler and is re-enabled in the project.
+    4. User is assigned the user filter and is enabled/invited to the project.
+6. Process ends.
+
+## 2 Input mapping
+
+The application accepts 4 parameters and a table of users. In addition to the 4 parameters, the component automatically uses [Storage API Token](https://help.keboola.com/management/project/tokens/) to access available GoodData projects within the project and provision users. A sample configuration can be found [in the repository](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/).
+
+### 2.1 Parameters
+
+Following 4 parameters are accepted: `GD Login`, `GD Password`, `GD Project ID` and `GD Custom Domain`. More detailed description of all parameters is provided in the upcoming subsections.
+Recently, there were two additional parameters added: `Re-invite users` and `Fail on Error`. The Re-invite users options enables sending invite emails to already invited users and fail on error makes the component end with error AFTER processing all objects if it encounters any errors during the run.
+The `Fail on Error` feature only works on queue v2.
+
+A sample of the configuration file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/config.json).
+
+#### 2.1.1 GD Login
+
+The login email to the GoodData portal. Requirements for the used login are:
+
+* must have access to the project
+* must be admin of the project
+* must not have any data permissions assigned to them.
+
+Failure to comply with any of the above requirements will raise an error.
+
+You can either use an already existing login (e.g. a personal account with admin privileges) or you can use Keboola's GoodData Provisioning API to [create a new login](https://keboolagooddataprovisioning.docs.apiary.io/#reference/0/kbc-access/get-user-credentials-to-project) and use those credentials.
+
+#### 2.1.2 GD Password
+
+The password to `GD Login` used to log in to GoodData portal.
+
+#### 2.1.3 GD Project ID
+
+The ID of a project, for which the changes are to be made. The ID is compared to a list of available project IDs in the Keboola project. If the GD PID is not in the list of available PIDs, i.e. the writer is not located in the same project as the application, an error is raised. This behavior is enforced by the application to prevent changing users across projects without having knowledge about it.
+
+Follow [the link](https://help.gooddata.com/display/doc/Find+the+Project+ID) to get more information on how to find your project ID.
+
+#### 2.1.4 GD Custom Domain
+
+In case, the destination GoodData project is white labelled, it is required to provide the white label domain in the following format: `https://subdomain.domain.com` or whatever the equivalent is. This domain will be used for all GoodData related API calls,
+hence the incorrect format or domain will result in application failure.
+If the GoodData project is not white labeled, the field should be left blank and the component will use the base URL based on project location (`https://keboola.eu.gooddata.com` for EU location, `https://secure.gooddata.com` for US location).
+
+### 2.2 User table
+
+The user table **must** contain following columns: `login`, `action`, `role`, `muf`, `first_name` and `last_name`. If any of the columns is missing, the application will fail. Sample of the table can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/in/tables/test.csv).
+
+Below is the detailed description of each column.
+
+#### 2.2.1 login
+
+The email of the user, for whom the action is to be executed. If the user does not exist in the organization, an attempt will be made to register the user under Keboola organization with this email.
+
+#### 2.2.2 action
+
+The action, which is to be done for the user. Must be one of the following: `DISABLE`, `ENABLE`, `INVITE` or `REMOVE`.
+
+##### 2.2.2.a `DISABLE`
+
+**Disables the user** in the project. This process skips all data permission processes and automatically disables the user. If the user is not in the project or is already disabled, the user is skipped.
+
+##### 2.2.2.b `ENABLE`
+
+If the **user** is **already in the project**, they will be disabled. Data permissions processes follow, after which the user **will be re-enabled**.
+
+If the **user** is **not in the project**, they will be automatically enabled, provided that data permission processes execute successfully.
+
+In the special case, that **user** is **not part of the project nor Keboola organization**, there are not enough privileges for the user to be automatically added to the project. This action will be demoted to `INVITE`.
+
+##### 2.2.2.c `INVITE`
+
+If the **user** is **already in the project**, no invite is generated. Standard `DISABLE - MUF - ENABLE` process is followed instead.
+
+If the **user** is **not in the project**, an invite is generated for the user. The invite is sent to user's `login` mail and the user is assigned data permissions prior to invite being sent out.
+
+##### 2.2.2.d `REMOVE`
+
+If the **user** is in the project, in disabled or enabled state, and their email address is not identical to `GD login` parameter, the user is removed using process `GD_REMOVE`. If the **user** is in the project and their login is identical to `GD login` parameter, or they are not present in the project, `SKIP_NO_REMOVE` or `SKIP` process is used, respectively.
+
+#### 2.2.3 role
+
+Role of the user to be had in the project. Must be one of `admin`, `dashboardOnly`, `editor`, `editorInvite`, `editorUserAdmin`, `explorer`, `explorerOnly`, `keboolaEditorPlus`, `readOnlyUser` or `readOnlyNoExport`. If a role is not assigned properly, the error is recorded in the status file.
+
+#### 2.2.4 muf
+
+A list of json-like objects, from which data permissions are created. An example list might have the following form:
+
+```
+[
+    {
+        "attribute": "attr.inctestsales.city",
+        "value": ["NYC", "VAN", "PRG"],
+        "operator": "IN"
+    },
+    {
+        "attribute": "attr.inctestsales.sales_person",
+        "value": ["Sales_1"],
+        "operator": "="
+    }
+]
+```
+
+In the above example, two data permission filters are provided. Each JSON object must contain keys `attribute`, `value` and `operator`. 
+
+If the user should be able to acccess all the data, the `muf` expression should be provided as an empty list, i.e.
+
+```
+[]
+```
+
+##### 2.2.4.a `attribute`
+
+The attribute must be a string expression, identifying the attribute within the project. In general, attributes sourcing from Keboola writers are quite easy to determine. For example, column `city` from table `in.c-test.sales` would become `attr.inctestsales.city` in GoodData. Note the `attr` in the beginning of the identifier and missing punctuation from table name, i.e. all dots and dashes from Keboola table path were replaced.
+If unsure what is the correct attribute identifier, it is possible to obtain the full list of attributes within the project [in the following guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
+
+##### 2.2.4.b `value`
+
+The key value must be a list of values for which the expression must be determined. The application always assumes primary label for the attribute, i.e. any custom labels for the attribute are ignored. You can obtain a list of available values for attribute by following [this guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
+
+##### 2.2.4.c `operator`
+
+Operator must be one of `=`, `<>`, `IN` or `NOT IN`. At the moment, the only unsupported operator is `AND`. See more about operators [here](https://help.gooddata.com/display/doc/Data+Permissions#DataPermissions-CreateanExpressionStatementforaDataPermission).
+
+##### 2.2.4.d Note on .csv files
+
+Note that json-files have keys enclosed in double quotes, which, conincidentally, is a commonly used character in quoting CSV files as well. This may lead to bad parsing of the `muf` expression, if it's not quoted properly. It is therefore recommended to follow standard CSV file procedures, specifically double all double quotes. As an example, below is the correct way the `muf` expression should be inputted in the CSV file
+
+```
+"[{""attribute"":""attr.inctestsales.city"",""value"":[""NYC"",""VAN"",""PRG""],""operator"":""NOT IN""}]"
+```
+
+and
+
+```
+"[]"
+```
+
+which will then be parsed as
+
+```
+[
+    {
+        "attribute": "attr.inctestsales.city",
+        "value": ["NYC","VAN","PRG"],
+        "operator": "NOT IN"
+    }
+]
+```
+
+and 
+
+```
+[]
+```
+
+#### 2.2.5 first_name
+
+First name of the user. The name will be used if the user must be created in the Keboola domain.
+
+#### 2.2.6 last_name
+
+Last name of the user. The usage is same as `first_name`.
+
+## 3 Output mapping
+
+The output of the application is the status file, which is loaded incrementally to `out.c-GDUserManagement.status` table automatically. Sample of the status file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/out/tables/test.csv).
+
+The file contains following columns:
+
+* `user` - user, for which the action was executed. `admin` records are required calls by application at initialization.
+* `action` - describes action type
+* `status` - marks, whether the action was a success
+* `timestamp` - UTC timestamp of the event
+* `role` - user role
+* `details` - any additional details related to the action
+* `muf` - muf assigned to the user from the table
+
+### 3.1 user
+
+The user column contains the information about the login, for which the action was performed. For each login, there's a set of actions that are executed in order to make sure that each user is safely added to a project and in case of fail does not have access to information they should not have access to.
+
+### 3.2 action
+
+The column represents the action that is executed. Detailed information about all of the actions can be found in the `details` column. There are currently 4 admin actions, executed at the very beginning of the process and 8 user actions, executed on the user level. In the following subsections, each of the actions will be briefly discussed in order of their usual execution.
+
+#### 3.2.1 `GET_ATTRIBUTES`
+
+An admin action that obtains the list of all attributes in the GoodData project, which is then used to create MUF expressions and MUFs. When a user specified attribute is missing in the list of attributes returned by this action, the MUF fails and user is not enabled in the project.
+
+#### 3.2.2 `GET_GD_USERS` and `GET_KBC_USERS`
+
+Both of these admin actions download a list of users from the GoodData project or its assigned Keboola domain respectively. The list of users is then used when assigning necessary actions to each user (see seciont 3.2.4 `ASSIGN_ACTION`).
+
+#### 3.2.3 `MAP_ROLES`
+
+The admin action creates a map of roles beteen GoodData and Keboola. As the roles can have slightly different names, this action is necessary to assign correct role to users.
+
+#### 3.2.4 `ASSIGN_ACTION`
+
+A user action, which determines the required steps needed for each user. The backbone of the action is comparing a user against the list of users obtained in 3.2.2. Arbitrary actions, such as disabling a user that is not part of the project, are skipped. See section for 4 for detailed execution plan and description of each assigned action.
+
+#### 3.2.5 `USER_CREATE`
+
+A user action performed, when user is not in the GoodData project nor part of the user list in Keboola domain. The action creates a user in the Keboola domain and allows them to be provisioned and managed further using Keboola GoodData Provisioning API.
+
+#### 3.2.6 `DISABLE_IN_PRJ`
+
+A user action that disables a user in the project. The action is only executed, if a user is already present in the project, either in disabled or enabled state.
+
+#### 3.2.7 `CREATE_MUF_EXPR`
+
+An action performed on user level, that converts each of the json MUF objects to be represented by their unique URI identifiers. The action uses output of `GET_ATTRIBUTES` action, obtains the values for attributes used in the json structure and maps accordingly. If the action is successful, the resulting URI representation can be seen in `details` column. If the action fails, the reason is recorded in the `details` column.
+
+#### 3.2.8 `CREATE_MUF`
+
+A user level action, that registers the MUF expression obtained in step 3.2.7, pushes it to GoodData and returns unique URI for the filter. If filter is a list with lenght more than 1 (multiple filters) a list of URIs is returned.
+
+#### 3.2.9 `ASSIGN_MUF`
+
+A user action, which assigns the filters obtained in step 3.2.8 to user. The filters are tied to user's profile in the project.
+
+#### 3.2.10 `INVITE_TO_PRJ`
+
+A user action that invites user to the project and assigns MUF at the same time. The filter is sent together with the invitation and the filter becomes active once the user accepts the invitation. The action is executed only if all the preceeding steps were completed successfully to make sure users do not have access to data, they're not supposed to have.
+
+#### 3.2.11 `ENABLE_IN_PRJ`
+
+A user action, that enables user in the project. The action is executed only if all the preceeding steps were completed successfully to prevent access to data, user should not see.
+
+#### 3.2.12 `REMOVE_FROM_PRJ`
+
+A user action, that removes a user from the project. The action is executed straight away with no preceeding steps.
+
+### 3.3 status
+
+One of `SUCCESS` or `ERROR`. Marks whether the respective action was successful.
+
+### 3.4 timestamp
+
+A time when the action was perfomed. The time is provided in `YYYY-MM-DD HH:MI:SS.F` format and UTC timezone.
+
+### 3.5 role
+
+A role assigned to the user.
+
+### 3.6 details
+
+Additional details available to each action. The value in the column varies from the action performed.
+
+### 3.7 muf
+
+Original MUF expression assigned to the user in the input mapping.
+
+## 4 Execution plan
+
+As was mentioned in section 3.2.4, each user has a unique list of actions which are performed based on his membership in the project or organization. In this section, each of the execution plans from `ASSIGN_ACTION` step will be discussed in detail to provide more clarity.
+
+### 4.1 `GD_DISABLE`
+
+This action performs only one step:
+
+```
+DISABLE_IN_PRJ
+```
+
+and is performed only on users, that should be disabled and are already present in the project. Other users, who are assigned this action but are not members of the project are skipped.
+
+### 4.2 `GD_REMOVE`
+
+This action only performs one step:
+
+```
+REMOVE_FROM_PRJ
+```
+
+and removes user completely from the project. No data filters or role changes are applied.
+
+### 4.3 `GD_DISABLE MUF GD_ENABLE`
+
+This action is performed on all of the users, that are already in the project (enabled or disabled state) and should be enabled after the result is finished. The execution plan is following:
+
+```
+DISABLE_IN_PRJ > CREATE_MUF_EXPR > CREATE_MUG > ASSIGN_MUG > ENABLE_IN_PRJ
+```
+
+If any of the steps before the `ENABLE_IN_PRJ` action fails, the user stays in disabled state.
+
+### 4.4 `MUF GD_INVITE`
+
+The action is performed, when users should be invited to the project instead of adding them directly to the project. In this case, an email invitation will be sent and user will have the MUF assigned once he activates his account automatically. There's no need to re-run the component to activate the filter once the user accepts the invitation. The execution plan for the process is following:
+
+```
+CREATE_MUF_EXPR > CREATE_MUF > INVITE_TO_PRJ
+```
+
+and as was mentioned, the invitation contains the MUF so the `ASSIGN_MUF` step is omitted. If any of the intermediary step fail, the invitation is not sent out. It's also important to mention, that invitation is not sent to users, that are already in the project in enabled state.
+
+### 4.5 `MUF KB_ENABLE`
+
+The action happens when user is present in Keboola organization but not a member of the GoodData project. The action uses Keboola endpoint to add user directly to the project. The execution plan is following:
+
+```
+CREATE_MUF_EXPR > CREATE_MUF > ASSIGN_MUF > ENABLE_IN_PRJ
+```
+
+and as is the case with previous action steps, the user is not enabled in the project if any of the preceeding actions fail.
+
+### 4.6 `TRY_KB_CREATE MUF ENABLE_OR_INVITE`
+
+If a user is not a member of the project nor the organization, the component will try to create the user in Keboola organization. However, it might happen that some users are already part of different organization. In that case, the user can't be created in the organization and his unique identifier is not known since he's not part of a project. The only remaining thing is to invite user to the project, which component does automatically with added MUF. If the user is created successfully in Keboola organization, the user will then follow the same process as `MUF KB_ENABLE` action. Therefore, there are two possible execution steps based on whether `USER_CREATE` action succeds or not.
+
+If `USER_CREATE` succeeds, the following execution plan is executed:
+
+```
+USER_CREATE > CREATE_MUF_EXPR > CREATE_MUF > ASSIGN_MUF > ENABLE_IN_PRJ
+```
+
+else the plan below is executed:
+
+```
+USER_CREATE > CREATE_MUF_EXPR > CREATE_MUF > INVITE_TO_PRJ
+```
+
+## 5 Development
+
+To run the image locally, use `docker-compose.yml` to define environment, mainly `KBC_TOKEN`, which is used as storage API token for Keboola Provisioning API. Then run following commands:
+
+```
+docker-compose build
+docker-compose run --rm dev
+```
+
+## 6 See also
+
+The following two API references might be handy when working with the application:
+
+* [Keboola GoodData Provisioning API](https://keboolagooddataprovisioning.docs.apiary.io/)
+* [GoodData API Reference](https://help.gooddata.com/display/API/API+Reference)
+
+================================================
+File: Dockerfile
+================================================
+FROM python:3.8.6-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+RUN pip install --ignore-installed -r /code/requirements.txt
+
+WORKDIR /code/
+
+# RUN THE MAIN PYTHON SCRIPT
+CMD ["python3", "-u", "/code/src/main.py"]
+
+================================================
+File: LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2019 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: bitbucket-pipelines.yml
+================================================
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        script:
+          - export APP_IMAGE=$APP_IMAGE
+          - docker build . --tag=$APP_IMAGE
+          - docker images
+          - docker -v
+          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+          - echo "Running unit-tests..."
+          - docker run $APP_IMAGE python -m unittest discover
+          # push test image to ecr - uncomment for testing before deployment
+          - echo 'Pushing test image to repo. [tag=test]'
+          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+          - docker tag $APP_IMAGE:latest $REPOSITORY:test
+          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+          - docker push $REPOSITORY:test
+
+  branches:
+    master:
+      - step:
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker -v
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            # push test image to ecr - uncomment for testing before deployment
+#            - echo 'Pushing test image to repo. [tag=test]'
+#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
+#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+#            - docker push $REPOSITORY:test
+            - ./scripts/update_dev_portal_properties.sh
+  tags:
+    '*':
+      - step:
+          deployment: production
+          script:
+            - export APP_IMAGE=$APP_IMAGE
+            - docker build . --tag=$APP_IMAGE
+            - docker images
+            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
+            - echo "Running unit-tests..."
+            - docker run $APP_IMAGE python -m unittest discover
+            - echo "Preparing KBC test image"
+            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
+            # push test image to ECR - uncomment when initialised
+            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
+            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
+            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+            # - docker push $REPOSITORY:test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
+            - ./scripts/update_dev_portal_properties.sh
+            - ./scripts/deploy.sh
+
+================================================
+File: change_log.md
 ================================================
 **0.2.6**
 Added ability to completely disable project check.
@@ -73,24 +561,35 @@ Added docstrings for clarity.
 Added Storage Token fetching from environment.
 
 ================================================
-File: /Dockerfile
+File: docker-compose.yml
 ================================================
-FROM python:3.8.6-slim
-ENV PYTHONIOENCODING utf-8
-
-COPY . /code/
-
-RUN apt-get update && apt-get install -y build-essential
-RUN pip install flake8
-RUN pip install --ignore-installed -r /code/requirements.txt
-
-WORKDIR /code/
-
-# RUN THE MAIN PYTHON SCRIPT
-CMD ["python3", "-u", "/code/src/main.py"]
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+      - KBC_TOKEN=XXXX-[REDACTED]
+      - KBC_RUNID=12345.134
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+      - KBC_TOKEN=XXXX-[REDACTED]
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
 
 ================================================
-File: /flake8.cfg
+File: flake8.cfg
 ================================================
 [flake8]
 exclude =
@@ -114,7 +613,596 @@ max-line-length = 120
 
 
 ================================================
-File: /src/lib/GD_KB_client.py
+File: requirements.txt
+================================================
+logging_gelf==0.0.18
+# https://github.com/keboola/python-docker-application/zipball/2.1.1#egg=keboola-2.1.1
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.5.0.zip#egg=kbc
+
+================================================
+File: component_config/component_long_description.md
+================================================
+# GoodData User Management Application
+
+This application allows user of the component to manage users in the GoodData project, invite new users to the project, change roles and assign data permissions for each user.
+
+## Overview
+
+The application, as aforementioned, allows users to maintain access to a GoodData project and or manage users' access to certain data. The application uses GoodData API to assign [Data Permissions](https://help.gooddata.com/display/doc/Data+Permissions) to desired users, that automatically pre-filter available data to end-user.
+
+### Prerequisities
+
+**The following requirements are needed for successful conifguration of the application:**
+
+* a GoodData project
+* an admin account to the GoodData project
+
+### Process overview
+
+The application automatically determines what actions need to be taken for each user based on the table of users (see *input mapping* section). The process is ran row-by-row, i.e. all users are process sequentially, to avoid any confusion in the process. For each user, the application determines whether the user is already in the organization and/or project and acts accordingly on that, i.e. creates the user if necessary. To prevent any possible failure, all users are first disabled in the project, before assigning data permissions and re-enabling them again. If it's necessary, the application generates an invitation, which is delivered to the user.
+
+### Process detail
+
+Below is the more detailed description of the process.
+
+1. User and all their data is read from the table.
+2. User's login is compared to the list of users in GD project and list of users provisioned by Keboola.
+   1. If the user is in both organization and project, they are disabled or removed.
+   2. If the user is in the organization but not in the project, nothing is done.
+   3. If the user is not in the organization but is in the project, they are disabled.
+   4. If the user is not in the organization nor the project, an attempt is made to create them in Keboola organization is made. If the attemp fails, the user is already part of another organization and will not be maintained in Keboola domain.
+3. For each user, their `Mandatory User Filter (MUF)` expression is read and parsed into URI format. The URI format is a format, where all attribute names, labels and values are transformed to their URI counterparts. If the attribute, label or value does not exist, the URI expression is not created and an error is recorded in the status file.
+4. The URI expression is posted to GoodData and the user filter is created. Each user filter is assigned unique ID, which is then passed on to users as an attribute.
+5. The following action occurs once the user filter was created (follow-up to point 2):
+   1. User is assigned the user filter and is re-enabled in the project.
+   2. User is assigned the user filter and is added to the project.
+   3. User is assigned the user fitler and is re-enabled in the project.
+   4. User is assigned the user filter and is enabled/invited to the project.
+6. Process ends.
+
+See section **4 Execution plan** in [documentation](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/README.md).
+
+## See also
+
+The following two API references might be handy when working with the application:
+
+* [Keboola GoodData Provisioning API](https://keboolagooddataprovisioning.docs.apiary.io/)
+* [GoodData API Reference](https://help.gooddata.com/display/API/API+Reference)
+
+================================================
+File: component_config/component_short_description.md
+================================================
+A GoodData User Management application for managing users and data permissions.
+
+================================================
+File: component_config/configSchema.json
+================================================
+{
+  "title": "Parameters",
+  "type": "object",
+  "required": [
+    "username",
+    "#password",
+    "pid",
+    "domain_custom"
+  ],
+  "properties": {
+    "username": {
+      "type": "string",
+      "title": "GD Login",
+      "default": "",
+      "description": "Admin login to GoodData portal.",
+      "propertyOrder": 100
+    },
+    "#password": {
+      "type": "string",
+      "format": "password",
+      "title": "GD Password",
+      "description": "Password to admin login to GoodData portal.",
+      "propertyOrder": 200
+    },
+    "pid": {
+      "type": "string",
+      "title": "GD Project ID",
+      "description": "GoodData project ID. See description for more info.",
+      "propertyOrder": 300
+    },
+    "domain_custom": {
+      "type": "string",
+      "title": "GD Custom Domain",
+      "description": "If the GoodData project is white labeled, provide the domain. Format: \"https://subdomain.domain.com\".",
+      "default": "",
+      "propertyOrder": 600
+    },
+    "re_invite_users": {
+      "type": "boolean",
+      "title": "Re-invite users",
+      "format": "checkbox",
+      "description": "Send invites to users that have already been invited",
+      "default": true,
+      "propertyOrder": 700
+    },
+    "fail_on_error": {
+      "type": "boolean",
+      "title": "Fail on Error",
+      "format": "checkbox",
+      "description": "If set to true, the component will end with error after processing all requests and saving output if it encounters any problems during run.",
+      "default": false,
+      "propertyOrder": 800
+    }
+  }
+}
+
+================================================
+File: component_config/configuration_description.md
+================================================
+##### Note
+
+A more detailed documentation is available in [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/README.md).
+
+## Input mapping
+
+The application accepts 4 parameters and a table of users. In addition to the 4 parameters, the component automatically uses [Storage API Token](https://help.keboola.com/management/project/tokens/) to access available GoodData projects within the project and provision users. A sample configuration can be found [in the repository](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/).
+
+### 1 Parameters
+
+Following 4 parameters are accepted: `GD Login`, `GD Password`, `GD Project ID` and `GD Custom Domain`. More detailed description of all parameters is provided in the upcoming subsections.
+
+A sample of the configuration file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/config.json).
+
+#### 1.1 GD Login
+
+The login email to the GoodData portal. Requirements for the used login are:
+
+* must have access to the project
+* must be admin of the project
+* must not have any data permissions assigned to them.
+
+Failure to comply with any of the above requirements will raise an error.
+
+#### 1.2 GD Password
+
+The password to `GD Login` used to log in to GoodData portal.
+
+#### 1.3 GD Project ID
+
+The ID of a project, for which the changes are to be made. The ID is compared to a list of available project IDs in the Keboola project. If the GD PID is not in the list of available PIDs, i.e. the writer is not located in the same project as the application, an error is raised. This behavior is enforced by the application to prevent changing users across projects without having knowledge about it.
+
+Follow [the link](https://help.gooddata.com/display/doc/Find+the+Project+ID) to get more information on how to find your project ID.
+
+#### 1.4 GD Custom Domain
+
+In case, the destination GoodData project is white labelled, it is required to provide the white label domain in the following format: `https://subdomain.domain.com` or whatever the equivalent is. This domain will be used for all GoodData related API calls,
+hence the incorrect format or domain will result in application failure.
+If the GoodData project is not white labeled, the field should be left blank and the component will use the base URL based on project location (`keboola.eu.gooddata.com` for EU location, `secure.gooddata.com` for US location).
+
+### 2 User table
+
+The user table **must** contain following columns: `login`, `action`, `role`, `muf`, `first_name` and `last_name`. If any of the columns is missing, the application will fail. Sample of the table can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/in/tables/test.csv).
+
+Below is the detailed description of each column.
+
+#### 2.1 login
+
+The email of the user, for whom the action is to be executed. If the user does not exist in the organization, an attempt will be made to register the user under Keboola organization with this email.
+
+#### 2.2 action
+
+The action, which is to be done for the user. Must be one of the following: `DISABLE`, `ENABLE`, `INVITE` or `REMOVE`.
+
+##### 2.2.a `DISABLE`
+
+**Disables the user** in the project. This process skips all data permission processes and automatically disables the user. If the user is not in the project or is already disabled, the user is skipped.
+
+##### 2.2.b `ENABLE`
+
+If the **user** is **already in the project**, they will be disabled. Data permissions processes follow, after which the user **will be re-enabled**.
+
+If the **user** is **not in the project**, they will be automatically enabled, provided that data permission processes execute successfully.
+
+In the special case, that **user** is **not part of the project nor Keboola organization**, there are not enough privileges for the user to be automatically added to the project. This action will be demoted to `INVITE`.
+
+##### 2.2.c `INVITE`
+
+If the **user** is **already in the project**, no invite is generated. Standard `DISABLE - MUF - ENABLE` process is followed instead.
+
+If the **user** is **not in the project**, an invite is generated for the user. The invite is sent to user's `login` mail and the user is assigned data permissions prior to invite being sent out.
+
+##### 2.2.2.d `REMOVE`
+
+If the **user** is in the project, in disabled or enabled state, and their email address is not identical to `GD login` parameter, the user is removed using process `GD_REMOVE`. If the **user** is in the project and their login is identical to `GD login` parameter, or they are not present in the project, `SKIP_NO_REMOVE` or `SKIP` process is used, respectively.
+
+#### 2.3 role
+
+Role of the user to be had in the project. Must be one of `admin`, `dashboardOnly`, `editor`, `editorInvite`, `editorUserAdmin`, `explorer`, `explorerOnly`, `keboolaEditorPlus`, `readOnlyUser` or `readOnlyNoExport`. If a role is not assigned properly, the error is recorded in the status file.
+
+#### 2.4 muf
+
+A list of json-like objects, from which data permissions are created. An example list might have the following form:
+
+```
+[
+    {
+        "attribute": "attr.inctestsales.city",
+        "value": ["NYC", "VAN", "PRG"],
+        "operator": "IN"
+    },
+    {
+        "attribute": "attr.inctestsales.sales_person",
+        "value": ["Sales_1"],
+        "operator": "="
+    }
+]
+```
+
+In the above example, two data permission filters are provided. Each JSON object must contain keys `attribute`, `value` and `operator`. 
+
+If the user should be able to acccess all the data, the `muf` expression should be provided as an empty list, i.e.
+
+```
+[]
+```
+
+##### 2.4.a `attribute`
+
+The attribute must be a string expression, identifying the attribute within the project. In general, attributes sourcing from Keboola writers are quite easy to determine. For example, column `city` from table `in.c-test.sales` would become `attr.inctestsales.city` in GoodData. Note the `attr` in the beginning of the identifier and missing punctuation from table name, i.e. all dots and dashes from Keboola table path were replaced.
+If unsure what is the correct attribute identifier, it is possible to obtain the full list of attributes within the project [in the following guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
+
+##### 2.4.b `value`
+
+The key value must be a list of values for which the expression must be determined. The application always assumes primary label for the attribute, i.e. any custom labels for the attribute are ignored. You can obtain a list of available values for attribute by following [this guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
+
+##### 2.4.c `operator`
+
+Operator must be one of `=`, `<>`, `IN` or `NOT IN`. At the moment, the only unsupported operator is `AND`. See more about operators [here](https://help.gooddata.com/display/doc/Data+Permissions#DataPermissions-CreateanExpressionStatementforaDataPermission).
+
+##### 2.4.d Note on .csv files
+
+Note that json-files have keys enclosed in double quotes, which, conincidentally, is a commonly used character in quoting CSV files as well. This may lead to bad parsing of the `muf` expression, if it's not quoted properly. It is therefore recommended to follow standard CSV file procedures, specifically double all double quotes. As an example, below is the correct way the `muf` expression should be inputted in the CSV file
+
+```
+"[{""attribute"":""attr.inctestsales.city"",""value"":[""NYC"",""VAN"",""PRG""],""operator"":""NOT IN""}]"
+```
+
+and
+
+```
+"[]"
+```
+
+which will then be parsed as
+
+```
+[
+    {
+        "attribute": "attr.inctestsales.city",
+        "value": ["NYC","VAN","PRG"],
+        "operator": "NOT IN"
+    }
+]
+```
+
+and 
+
+```
+[]
+```
+
+#### 2.5 first_name
+
+First name of the user. The name will be used if the user must be created in the Keboola domain.
+
+#### 2.6 last_name
+
+Last name of the user. The usage is same as `first_name`.
+
+## 3 Output mapping
+
+The output of the application is the status file, which is loaded incrementally to `out.c-GDUserManagement.status` table automatically. Sample of the status file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/out/tables/test.csv).
+
+The file contains following columns:
+
+* `user` - user, for which the action was executed. `admin` records are required calls by application at initialization.
+* `action` - describes action type
+* `status` - marks, whether the action was a success
+* `timestamp` - UTC timestamp of the event
+* `role` - user role
+* `details` - any additional details related to the action
+* `muf` - muf assigned to the user from the table
+
+See [documentaion](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/README.md) for more detailed information about execution plans and output mapping.
+
+## 4 See also
+
+The following two API references might be handy when working with the application:
+
+* [Keboola GoodData Provisioning API](https://keboolagooddataprovisioning.docs.apiary.io/)
+* [GoodData API Reference](https://help.gooddata.com/display/API/API+Reference)
+
+================================================
+File: component_config/stack_parameters.json
+================================================
+{
+    "connection.keboola.com": {
+      "provisioning_url": "https://gooddata-provisioning.keboola.com",
+      "gd_url": "https://secure.gooddata.com"
+    },
+    "connection.eu-central-1.keboola.com": {
+      "provisioning_url": "https://gooddata-provisioning.eu-central-1.keboola.com",
+      "gd_url": "https://keboola.eu.gooddata.com"
+    },
+    "connection.ap-southeast-2.keboola.com": {
+        "provisioning_url": "https://gooddata-provisioning.ap-southeast-2.keboola.com",
+        "gd_url": "https://secure.gooddata.com"
+    }
+  }
+
+================================================
+File: component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "username": "admin_user@domain.com",
+    "#password": "notPSWD1234",
+    "pid": "gdprojectid12345678",
+    "domain_custom": "",
+    "re_invite_users": false,
+    "fail_on_error": true
+  },
+  "image_parameters": {
+    "provisioning_url": "https://gooddata-provisioning.keboola.com",
+    "gd_url": "https://secure.gooddata.com"
+  }
+}
+
+================================================
+File: component_config/sample-config/in/state.json
+================================================
+{}
+
+================================================
+File: component_config/sample-config/in/tables/test.csv
+================================================
+"login","action","role","muf","first_name","last_name"
+"user1@domain.com","ENABLE","admin","[{""attribute"":""attr.inctestsales.sales"",""value"":[""sales_2""],""operator"":""NOT IN""}]","USER","1"
+"user2@domain.com","INVITE","admin","[]","USER","2"
+"user3@domain.com","DISABLE","admin","[]","USER","3"
+
+
+================================================
+File: component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "login",
+        "action",
+        "role",
+        "muf",
+        "first_name",
+        "last_name"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "login": [],
+        "action": [],
+        "role": [],
+        "muf": [],
+        "first_name": [],
+        "last_name": []
+    }
+}
+
+================================================
+File: component_config/sample-config/out/tables/test.csv
+================================================
+"login","action","status","timestamp","role","details","muf"
+"user1@domain.com","DISABLE_IN_PRJ","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
+"user1@domain.com","CREATE_MUF_EXPR","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
+"user1@domain.com","CREATE_MUF","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
+"user1@domain.com","ASSIGN_MUF","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
+"user1@domain.com","ENABLE_IN_PRJ","ERROR","2011-01-01 00:00:00 UTC","admin","Not enough permissions","[]"
+
+
+================================================
+File: scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: scripts/deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: src/main.py
+================================================
+import logging
+from lib.component import Component
+
+# Key definition
+
+if __name__ == '__main__':
+
+    mngr = Component()
+    mngr.run()
+
+    logging.info("User management finished!")
+
+
+================================================
+File: src/lib/GD_KB_client.py
 ================================================
 import json
 import re
@@ -1021,7 +2109,7 @@ class clientGoodDataKeboola:
 
 
 ================================================
-File: /src/lib/component.py
+File: src/lib/component.py
 ================================================
 import csv
 import json
@@ -2214,44 +3302,7 @@ class Component(KBCEnvHandler):
 
 
 ================================================
-File: /src/lib/user.py
-================================================
-class User:
-    """
-    A class representing user in the whole MUF process.
-    """
-    def __init__(self, login, role, muf, action, first_name, last_name, sso_provider=None):
-
-        """
-        Init function.
-
-        Parameters
-        ----------
-        login : str
-            A login of the user.
-        role : str
-            A role of the user in the project.
-        muf : str
-            A data permission for the user.
-        action : str
-            A type of action to be performed with the user.
-        first_name : str
-            A first name of the user.
-        last_name : str
-            A last name of the user.
-        """
-
-        self.login = login
-        self.role = role
-        self.muf = muf
-        self.action = action
-        self.first_name = first_name
-        self.last_name = last_name
-        self.sso_provider = sso_provider
-
-
-================================================
-File: /src/lib/logger.py
+File: src/lib/logger.py
 ================================================
 import csv
 import json
@@ -2382,1090 +3433,39 @@ class Logger:
 
 
 ================================================
-File: /src/main.py
+File: src/lib/user.py
 ================================================
-import logging
-from lib.component import Component
+class User:
+    """
+    A class representing user in the whole MUF process.
+    """
+    def __init__(self, login, role, muf, action, first_name, last_name, sso_provider=None):
+
+        """
+        Init function.
+
+        Parameters
+        ----------
+        login : str
+            A login of the user.
+        role : str
+            A role of the user in the project.
+        muf : str
+            A data permission for the user.
+        action : str
+            A type of action to be performed with the user.
+        first_name : str
+            A first name of the user.
+        last_name : str
+            A last name of the user.
+        """
+
+        self.login = login
+        self.role = role
+        self.muf = muf
+        self.action = action
+        self.first_name = first_name
+        self.last_name = last_name
+        self.sso_provider = sso_provider
 
-# Key definition
-
-if __name__ == '__main__':
-
-    mngr = Component()
-    mngr.run()
-
-    logging.info("User management finished!")
-
-
-================================================
-File: /LICENSE.md
-================================================
-The MIT License (MIT)
-
-Copyright (c) 2019 Keboola DS, http://keboola.com
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files, to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished
-to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
-================================================
-File: /requirements.txt
-================================================
-logging_gelf==0.0.18
-# https://github.com/keboola/python-docker-application/zipball/2.1.1#egg=keboola-2.1.1
-https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.5.0.zip#egg=kbc
-
-================================================
-File: /bitbucket-pipelines.yml
-================================================
-options:
-  docker: true
-
-pipelines:
-  default:
-    - step:
-        script:
-          - export APP_IMAGE=$APP_IMAGE
-          - docker build . --tag=$APP_IMAGE
-          - docker images
-          - docker -v
-          - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
-          - echo "Running unit-tests..."
-          - docker run $APP_IMAGE python -m unittest discover
-          # push test image to ecr - uncomment for testing before deployment
-          - echo 'Pushing test image to repo. [tag=test]'
-          - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
-          - docker tag $APP_IMAGE:latest $REPOSITORY:test
-          - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-          - docker push $REPOSITORY:test
-
-  branches:
-    master:
-      - step:
-          script:
-            - export APP_IMAGE=$APP_IMAGE
-            - docker build . --tag=$APP_IMAGE
-            - docker images
-            - docker -v
-            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
-            - echo "Running unit-tests..."
-            - docker run $APP_IMAGE python -m unittest discover
-            # push test image to ecr - uncomment for testing before deployment
-#            - echo 'Pushing test image to repo. [tag=test]'
-#            - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
-#            - docker tag $APP_IMAGE:latest $REPOSITORY:test
-#            - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-#            - docker push $REPOSITORY:test
-            - ./scripts/update_dev_portal_properties.sh
-  tags:
-    '*':
-      - step:
-          deployment: production
-          script:
-            - export APP_IMAGE=$APP_IMAGE
-            - docker build . --tag=$APP_IMAGE
-            - docker images
-            - docker run $APP_IMAGE flake8 /code/ --config=/code/flake8.cfg
-            - echo "Running unit-tests..."
-            - docker run $APP_IMAGE python -m unittest discover
-            - echo "Preparing KBC test image"
-            - docker pull quay.io/keboola/developer-portal-cli-v2:latest
-            # push test image to ECR - uncomment when initialised
-            # - export REPOSITORY=`docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP`
-            # - docker tag $APP_IMAGE:latest $REPOSITORY:test
-            # - eval $(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-            # - docker push $REPOSITORY:test
-            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
-            # - docker run --rm -e KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $KBC_CONFIG_1 test
-            - ./scripts/update_dev_portal_properties.sh
-            - ./scripts/deploy.sh
-
-================================================
-File: /component_config/component_short_description.md
-================================================
-A GoodData User Management application for managing users and data permissions.
-
-================================================
-File: /component_config/configSchema.json
-================================================
-{
-  "title": "Parameters",
-  "type": "object",
-  "required": [
-    "username",
-    "#password",
-    "pid",
-    "domain_custom"
-  ],
-  "properties": {
-    "username": {
-      "type": "string",
-      "title": "GD Login",
-      "default": "",
-      "description": "Admin login to GoodData portal.",
-      "propertyOrder": 100
-    },
-    "#password": {
-      "type": "string",
-      "format": "password",
-      "title": "GD Password",
-      "description": "Password to admin login to GoodData portal.",
-      "propertyOrder": 200
-    },
-    "pid": {
-      "type": "string",
-      "title": "GD Project ID",
-      "description": "GoodData project ID. See description for more info.",
-      "propertyOrder": 300
-    },
-    "domain_custom": {
-      "type": "string",
-      "title": "GD Custom Domain",
-      "description": "If the GoodData project is white labeled, provide the domain. Format: \"https://subdomain.domain.com\".",
-      "default": "",
-      "propertyOrder": 600
-    },
-    "re_invite_users": {
-      "type": "boolean",
-      "title": "Re-invite users",
-      "format": "checkbox",
-      "description": "Send invites to users that have already been invited",
-      "default": true,
-      "propertyOrder": 700
-    },
-    "fail_on_error": {
-      "type": "boolean",
-      "title": "Fail on Error",
-      "format": "checkbox",
-      "description": "If set to true, the component will end with error after processing all requests and saving output if it encounters any problems during run.",
-      "default": false,
-      "propertyOrder": 800
-    }
-  }
-}
-
-================================================
-File: /component_config/stack_parameters.json
-================================================
-{
-    "connection.keboola.com": {
-      "provisioning_url": "https://gooddata-provisioning.keboola.com",
-      "gd_url": "https://secure.gooddata.com"
-    },
-    "connection.eu-central-1.keboola.com": {
-      "provisioning_url": "https://gooddata-provisioning.eu-central-1.keboola.com",
-      "gd_url": "https://keboola.eu.gooddata.com"
-    },
-    "connection.ap-southeast-2.keboola.com": {
-        "provisioning_url": "https://gooddata-provisioning.ap-southeast-2.keboola.com",
-        "gd_url": "https://secure.gooddata.com"
-    }
-  }
-
-================================================
-File: /component_config/configuration_description.md
-================================================
-##### Note
-
-A more detailed documentation is available in [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/README.md).
-
-## Input mapping
-
-The application accepts 4 parameters and a table of users. In addition to the 4 parameters, the component automatically uses [Storage API Token](https://help.keboola.com/management/project/tokens/) to access available GoodData projects within the project and provision users. A sample configuration can be found [in the repository](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/).
-
-### 1 Parameters
-
-Following 4 parameters are accepted: `GD Login`, `GD Password`, `GD Project ID` and `GD Custom Domain`. More detailed description of all parameters is provided in the upcoming subsections.
-
-A sample of the configuration file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/config.json).
-
-#### 1.1 GD Login
-
-The login email to the GoodData portal. Requirements for the used login are:
-
-* must have access to the project
-* must be admin of the project
-* must not have any data permissions assigned to them.
-
-Failure to comply with any of the above requirements will raise an error.
-
-#### 1.2 GD Password
-
-The password to `GD Login` used to log in to GoodData portal.
-
-#### 1.3 GD Project ID
-
-The ID of a project, for which the changes are to be made. The ID is compared to a list of available project IDs in the Keboola project. If the GD PID is not in the list of available PIDs, i.e. the writer is not located in the same project as the application, an error is raised. This behavior is enforced by the application to prevent changing users across projects without having knowledge about it.
-
-Follow [the link](https://help.gooddata.com/display/doc/Find+the+Project+ID) to get more information on how to find your project ID.
-
-#### 1.4 GD Custom Domain
-
-In case, the destination GoodData project is white labelled, it is required to provide the white label domain in the following format: `https://subdomain.domain.com` or whatever the equivalent is. This domain will be used for all GoodData related API calls,
-hence the incorrect format or domain will result in application failure.
-If the GoodData project is not white labeled, the field should be left blank and the component will use the base URL based on project location (`keboola.eu.gooddata.com` for EU location, `secure.gooddata.com` for US location).
-
-### 2 User table
-
-The user table **must** contain following columns: `login`, `action`, `role`, `muf`, `first_name` and `last_name`. If any of the columns is missing, the application will fail. Sample of the table can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/in/tables/test.csv).
-
-Below is the detailed description of each column.
-
-#### 2.1 login
-
-The email of the user, for whom the action is to be executed. If the user does not exist in the organization, an attempt will be made to register the user under Keboola organization with this email.
-
-#### 2.2 action
-
-The action, which is to be done for the user. Must be one of the following: `DISABLE`, `ENABLE`, `INVITE` or `REMOVE`.
-
-##### 2.2.a `DISABLE`
-
-**Disables the user** in the project. This process skips all data permission processes and automatically disables the user. If the user is not in the project or is already disabled, the user is skipped.
-
-##### 2.2.b `ENABLE`
-
-If the **user** is **already in the project**, they will be disabled. Data permissions processes follow, after which the user **will be re-enabled**.
-
-If the **user** is **not in the project**, they will be automatically enabled, provided that data permission processes execute successfully.
-
-In the special case, that **user** is **not part of the project nor Keboola organization**, there are not enough privileges for the user to be automatically added to the project. This action will be demoted to `INVITE`.
-
-##### 2.2.c `INVITE`
-
-If the **user** is **already in the project**, no invite is generated. Standard `DISABLE - MUF - ENABLE` process is followed instead.
-
-If the **user** is **not in the project**, an invite is generated for the user. The invite is sent to user's `login` mail and the user is assigned data permissions prior to invite being sent out.
-
-##### 2.2.2.d `REMOVE`
-
-If the **user** is in the project, in disabled or enabled state, and their email address is not identical to `GD login` parameter, the user is removed using process `GD_REMOVE`. If the **user** is in the project and their login is identical to `GD login` parameter, or they are not present in the project, `SKIP_NO_REMOVE` or `SKIP` process is used, respectively.
-
-#### 2.3 role
-
-Role of the user to be had in the project. Must be one of `admin`, `dashboardOnly`, `editor`, `editorInvite`, `editorUserAdmin`, `explorer`, `explorerOnly`, `keboolaEditorPlus`, `readOnlyUser` or `readOnlyNoExport`. If a role is not assigned properly, the error is recorded in the status file.
-
-#### 2.4 muf
-
-A list of json-like objects, from which data permissions are created. An example list might have the following form:
-
-```
-[
-    {
-        "attribute": "attr.inctestsales.city",
-        "value": ["NYC", "VAN", "PRG"],
-        "operator": "IN"
-    },
-    {
-        "attribute": "attr.inctestsales.sales_person",
-        "value": ["Sales_1"],
-        "operator": "="
-    }
-]
-```
-
-In the above example, two data permission filters are provided. Each JSON object must contain keys `attribute`, `value` and `operator`. 
-
-If the user should be able to acccess all the data, the `muf` expression should be provided as an empty list, i.e.
-
-```
-[]
-```
-
-##### 2.4.a `attribute`
-
-The attribute must be a string expression, identifying the attribute within the project. In general, attributes sourcing from Keboola writers are quite easy to determine. For example, column `city` from table `in.c-test.sales` would become `attr.inctestsales.city` in GoodData. Note the `attr` in the beginning of the identifier and missing punctuation from table name, i.e. all dots and dashes from Keboola table path were replaced.
-If unsure what is the correct attribute identifier, it is possible to obtain the full list of attributes within the project [in the following guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
-
-##### 2.4.b `value`
-
-The key value must be a list of values for which the expression must be determined. The application always assumes primary label for the attribute, i.e. any custom labels for the attribute are ignored. You can obtain a list of available values for attribute by following [this guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
-
-##### 2.4.c `operator`
-
-Operator must be one of `=`, `<>`, `IN` or `NOT IN`. At the moment, the only unsupported operator is `AND`. See more about operators [here](https://help.gooddata.com/display/doc/Data+Permissions#DataPermissions-CreateanExpressionStatementforaDataPermission).
-
-##### 2.4.d Note on .csv files
-
-Note that json-files have keys enclosed in double quotes, which, conincidentally, is a commonly used character in quoting CSV files as well. This may lead to bad parsing of the `muf` expression, if it's not quoted properly. It is therefore recommended to follow standard CSV file procedures, specifically double all double quotes. As an example, below is the correct way the `muf` expression should be inputted in the CSV file
-
-```
-"[{""attribute"":""attr.inctestsales.city"",""value"":[""NYC"",""VAN"",""PRG""],""operator"":""NOT IN""}]"
-```
-
-and
-
-```
-"[]"
-```
-
-which will then be parsed as
-
-```
-[
-    {
-        "attribute": "attr.inctestsales.city",
-        "value": ["NYC","VAN","PRG"],
-        "operator": "NOT IN"
-    }
-]
-```
-
-and 
-
-```
-[]
-```
-
-#### 2.5 first_name
-
-First name of the user. The name will be used if the user must be created in the Keboola domain.
-
-#### 2.6 last_name
-
-Last name of the user. The usage is same as `first_name`.
-
-## 3 Output mapping
-
-The output of the application is the status file, which is loaded incrementally to `out.c-GDUserManagement.status` table automatically. Sample of the status file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/out/tables/test.csv).
-
-The file contains following columns:
-
-* `user` - user, for which the action was executed. `admin` records are required calls by application at initialization.
-* `action` - describes action type
-* `status` - marks, whether the action was a success
-* `timestamp` - UTC timestamp of the event
-* `role` - user role
-* `details` - any additional details related to the action
-* `muf` - muf assigned to the user from the table
-
-See [documentaion](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/README.md) for more detailed information about execution plans and output mapping.
-
-## 4 See also
-
-The following two API references might be handy when working with the application:
-
-* [Keboola GoodData Provisioning API](https://keboolagooddataprovisioning.docs.apiary.io/)
-* [GoodData API Reference](https://help.gooddata.com/display/API/API+Reference)
-
-================================================
-File: /component_config/component_long_description.md
-================================================
-# GoodData User Management Application
-
-This application allows user of the component to manage users in the GoodData project, invite new users to the project, change roles and assign data permissions for each user.
-
-## Overview
-
-The application, as aforementioned, allows users to maintain access to a GoodData project and or manage users' access to certain data. The application uses GoodData API to assign [Data Permissions](https://help.gooddata.com/display/doc/Data+Permissions) to desired users, that automatically pre-filter available data to end-user.
-
-### Prerequisities
-
-**The following requirements are needed for successful conifguration of the application:**
-
-* a GoodData project
-* an admin account to the GoodData project
-
-### Process overview
-
-The application automatically determines what actions need to be taken for each user based on the table of users (see *input mapping* section). The process is ran row-by-row, i.e. all users are process sequentially, to avoid any confusion in the process. For each user, the application determines whether the user is already in the organization and/or project and acts accordingly on that, i.e. creates the user if necessary. To prevent any possible failure, all users are first disabled in the project, before assigning data permissions and re-enabling them again. If it's necessary, the application generates an invitation, which is delivered to the user.
-
-### Process detail
-
-Below is the more detailed description of the process.
-
-1. User and all their data is read from the table.
-2. User's login is compared to the list of users in GD project and list of users provisioned by Keboola.
-   1. If the user is in both organization and project, they are disabled or removed.
-   2. If the user is in the organization but not in the project, nothing is done.
-   3. If the user is not in the organization but is in the project, they are disabled.
-   4. If the user is not in the organization nor the project, an attempt is made to create them in Keboola organization is made. If the attemp fails, the user is already part of another organization and will not be maintained in Keboola domain.
-3. For each user, their `Mandatory User Filter (MUF)` expression is read and parsed into URI format. The URI format is a format, where all attribute names, labels and values are transformed to their URI counterparts. If the attribute, label or value does not exist, the URI expression is not created and an error is recorded in the status file.
-4. The URI expression is posted to GoodData and the user filter is created. Each user filter is assigned unique ID, which is then passed on to users as an attribute.
-5. The following action occurs once the user filter was created (follow-up to point 2):
-   1. User is assigned the user filter and is re-enabled in the project.
-   2. User is assigned the user filter and is added to the project.
-   3. User is assigned the user fitler and is re-enabled in the project.
-   4. User is assigned the user filter and is enabled/invited to the project.
-6. Process ends.
-
-See section **4 Execution plan** in [documentation](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/README.md).
-
-## See also
-
-The following two API references might be handy when working with the application:
-
-* [Keboola GoodData Provisioning API](https://keboolagooddataprovisioning.docs.apiary.io/)
-* [GoodData API Reference](https://help.gooddata.com/display/API/API+Reference)
-
-================================================
-File: /component_config/sample-config/in/tables/test.csv
-================================================
-"login","action","role","muf","first_name","last_name"
-"user1@domain.com","ENABLE","admin","[{""attribute"":""attr.inctestsales.sales"",""value"":[""sales_2""],""operator"":""NOT IN""}]","USER","1"
-"user2@domain.com","INVITE","admin","[]","USER","2"
-"user3@domain.com","DISABLE","admin","[]","USER","3"
-
-
-================================================
-File: /component_config/sample-config/in/tables/test.csv.manifest
-================================================
-{
-    "id": "in.c-test.test",
-    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
-    "name": "test",
-    "primary_key": [],
-    "indexed_columns": [],
-    "created": "2018-03-02T15:36:50+0100",
-    "last_change_date": "2018-03-02T15:36:54+0100",
-    "last_import_date": "2018-03-02T15:36:54+0100",
-    "rows_count": 0,
-    "data_size_bytes": 0,
-    "is_alias": false,
-    "attributes": [],
-    "columns": [
-        "login",
-        "action",
-        "role",
-        "muf",
-        "first_name",
-        "last_name"
-    ],
-    "metadata": [
-        {
-            "id": "18271581",
-            "key": "KBC.createdBy.component.id",
-            "value": "transformation",
-            "provider": "system",
-            "timestamp": "2018-03-02T15:37:02+0100"
-        },
-        {
-            "id": "18271582",
-            "key": "KBC.createdBy.configuration.id",
-            "value": "361585608",
-            "provider": "system",
-            "timestamp": "2018-03-02T15:37:02+0100"
-        },
-        {
-            "id": "18271583",
-            "key": "KBC.createdBy.configurationRow.id",
-            "value": "361585762",
-            "provider": "system",
-            "timestamp": "2018-03-02T15:37:02+0100"
-        },
-        {
-            "id": "18271584",
-            "key": "KBC.lastUpdatedBy.component.id",
-            "value": "transformation",
-            "provider": "system",
-            "timestamp": "2018-03-02T15:37:02+0100"
-        },
-        {
-            "id": "18271585",
-            "key": "KBC.lastUpdatedBy.configuration.id",
-            "value": "361585608",
-            "provider": "system",
-            "timestamp": "2018-03-02T15:37:02+0100"
-        },
-        {
-            "id": "18271586",
-            "key": "KBC.lastUpdatedBy.configurationRow.id",
-            "value": "361585762",
-            "provider": "system",
-            "timestamp": "2018-03-02T15:37:02+0100"
-        }
-    ],
-    "column_metadata": {
-        "login": [],
-        "action": [],
-        "role": [],
-        "muf": [],
-        "first_name": [],
-        "last_name": []
-    }
-}
-
-================================================
-File: /component_config/sample-config/in/state.json
-================================================
-{}
-
-================================================
-File: /component_config/sample-config/out/tables/test.csv
-================================================
-"login","action","status","timestamp","role","details","muf"
-"user1@domain.com","DISABLE_IN_PRJ","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
-"user1@domain.com","CREATE_MUF_EXPR","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
-"user1@domain.com","CREATE_MUF","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
-"user1@domain.com","ASSIGN_MUF","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
-"user1@domain.com","ENABLE_IN_PRJ","ERROR","2011-01-01 00:00:00 UTC","admin","Not enough permissions","[]"
-
-
-================================================
-File: /component_config/sample-config/config.json
-================================================
-{
-  "parameters": {
-    "username": "admin_user@domain.com",
-    "#password": "notPSWD1234",
-    "pid": "gdprojectid12345678",
-    "domain_custom": "",
-    "re_invite_users": false,
-    "fail_on_error": true
-  },
-  "image_parameters": {
-    "provisioning_url": "https://gooddata-provisioning.keboola.com",
-    "gd_url": "https://secure.gooddata.com"
-  }
-}
-
-================================================
-File: /docker-compose.yml
-================================================
-version: "2"
-services:
-  # for development purposes
-  dev:
-    build: .
-    volumes:
-        - ./:/code
-        - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-      - KBC_TOKEN=XXXX-[REDACTED]
-      - KBC_RUNID=12345.134
-  test:
-    # Use to run flake8 and unittests checks
-    build: .
-    volumes:
-      - ./:/code
-      - ./data:/data
-    environment:
-      - KBC_DATADIR=./data
-      - KBC_TOKEN=XXXX-[REDACTED]
-    command:
-      - /bin/sh
-      - /code/scripts/build_n_test.sh
-
-================================================
-File: /scripts/build_n_test.sh
-================================================
-#!/bin/sh
-set -e
-
-flake8 --config=flake8.cfg
-python -m unittest discover
-
-================================================
-File: /scripts/update_dev_portal_properties.sh
-================================================
-#!/usr/bin/env bash
-
-set -e
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-
-
-# Update properties in Keboola Developer Portal
-echo "Updating long description"
-value=`cat component_config/component_long_description.md`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
-else
-    echo "longDescription is empty!"
-    exit 1
-fi
-
-echo "Updating config schema"
-value=`cat component_config/configSchema.json`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
-else
-    echo "configurationSchema is empty!"
-fi
-
-
-echo "Updating config description"
-
-value=`cat component_config/configuration_description.md`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
-else
-    echo "configurationDescription is empty!"
-fi
-
-
-echo "Updating short description"
-
-value=`cat component_config/component_short_description.md`
-echo "$value"
-if [ ! -z "$value" ]
-then
-    docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
-else
-    echo "shortDescription is empty!"
-    exit 1
-fi
-
-================================================
-File: /scripts/deploy.sh
-================================================
-#!/bin/sh
-set -e
-
-#check if deployment is triggered only in master
-if [ $BITBUCKET_BRANCH != "master" ]; then
-               echo Deploy on tagged commit can be only executed in master!
-               exit 1
-fi
-
-# Obtain the component repository and log in
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-export REPOSITORY=`docker run --rm  \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
-
-eval $(docker run --rm \
-    -e KBC_DEVELOPERPORTAL_USERNAME \
-    -e KBC_DEVELOPERPORTAL_PASSWORD \
-    quay.io/keboola/developer-portal-cli-v2:latest \
-    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
-
-# Push to the repository
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
-docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
-docker push ${REPOSITORY}:${BITBUCKET_TAG}
-docker push ${REPOSITORY}:latest
-
-# Update the tag in Keboola Developer Portal -> Deploy to KBC
-if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
-then
-    docker run --rm \
-        -e KBC_DEVELOPERPORTAL_USERNAME \
-        -e KBC_DEVELOPERPORTAL_PASSWORD \
-        quay.io/keboola/developer-portal-cli-v2:latest \
-        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
-else
-    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
-fi
-
-
-================================================
-File: /README.md
-================================================
-# GoodData User Management Application
-
-This application allows user of the component to manage users in the GoodData project, invite new users to the project, change roles and assign data permissions for each user.
-
-## 1 Overview
-
-The application, as aforementioned, allows users to maintain access to a GoodData project and or manage users' access to certain data. The application uses GoodData API to assign [Data Permissions](https://help.gooddata.com/display/doc/Data+Permissions) to desired users, that automatically pre-filter available data to end-user.
-
-### 1.1 Prerequisities
-
-**The following requirements are needed for successful conifguration of the application:**
-
-* a GoodData project
-* an admin account to the GoodData project
-
-### 1.2 Status file
-
-All actions performed by the application are automatically recorded to a status file. The file is incrementally auto-saved to `out.c-GDUserManagement.status` table. All actions contain information on whether said action was successful and any additional information, which are the result of taking the action.
-
-### 1.3 Process overview
-
-The application automatically determines what actions need to be taken for each user based on the table of users (see *input mapping* section). The process is ran row-by-row, i.e. all users are processed sequentially, to avoid any confusion in the process. For each user, the application determines whether the user is already in the organization and/or project and acts accordingly on that, i.e. creates the user if necessary. To prevent any possible failure, all users are first disabled in the project, before assigning data permissions and re-enabling them again. If it's necessary, the application generates an invitation, which is delivered to the user on the provided e-mail address.
-
-### 1.4 Process detail
-
-Below is a more detailed description of the process.
-
-1. User and all their data is read from the table.
-2. User's login is compared to the list of users in GD project and list of users provisioned by Keboola.
-    1. If the user is in both organization and project, they are disabled or removed.
-    2. If the user is in the organization but not in the project, nothing is done.
-    3. If the user is not in the organization but is in the project, they are disabled.
-    4. If the user is not in the organization nor the project, an attempt is made to create them in Keboola organization. If the       attemp fails, the user is already part of another organization and will not be maintained in Keboola domain.
-3. For each user, their `Mandatory User Filter (MUF)` expression is read and parsed into URI format. The URI format is a format, where all attribute names, labels and values are transformed to their URI counterparts. If the attribute, label or value does not exist, the URI expression is not created and an error is recorded in the status file.
-4. The URI expression is posted to GoodData and the user filter is created. Each user filter is assigned unique ID, which is then passed on to users as an attribute.
-5. The following action occurs once the user filter was created (follow-up to point 2):
-    1. User is assigned the user filter and is re-enabled in the project.
-    2. User is assigned the user filter and is added to the project.
-    3. User is assigned the user fitler and is re-enabled in the project.
-    4. User is assigned the user filter and is enabled/invited to the project.
-6. Process ends.
-
-## 2 Input mapping
-
-The application accepts 4 parameters and a table of users. In addition to the 4 parameters, the component automatically uses [Storage API Token](https://help.keboola.com/management/project/tokens/) to access available GoodData projects within the project and provision users. A sample configuration can be found [in the repository](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/).
-
-### 2.1 Parameters
-
-Following 4 parameters are accepted: `GD Login`, `GD Password`, `GD Project ID` and `GD Custom Domain`. More detailed description of all parameters is provided in the upcoming subsections.
-Recently, there were two additional parameters added: `Re-invite users` and `Fail on Error`. The Re-invite users options enables sending invite emails to already invited users and fail on error makes the component end with error AFTER processing all objects if it encounters any errors during the run.
-The `Fail on Error` feature only works on queue v2.
-
-A sample of the configuration file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/config.json).
-
-#### 2.1.1 GD Login
-
-The login email to the GoodData portal. Requirements for the used login are:
-
-* must have access to the project
-* must be admin of the project
-* must not have any data permissions assigned to them.
-
-Failure to comply with any of the above requirements will raise an error.
-
-You can either use an already existing login (e.g. a personal account with admin privileges) or you can use Keboola's GoodData Provisioning API to [create a new login](https://keboolagooddataprovisioning.docs.apiary.io/#reference/0/kbc-access/get-user-credentials-to-project) and use those credentials.
-
-#### 2.1.2 GD Password
-
-The password to `GD Login` used to log in to GoodData portal.
-
-#### 2.1.3 GD Project ID
-
-The ID of a project, for which the changes are to be made. The ID is compared to a list of available project IDs in the Keboola project. If the GD PID is not in the list of available PIDs, i.e. the writer is not located in the same project as the application, an error is raised. This behavior is enforced by the application to prevent changing users across projects without having knowledge about it.
-
-Follow [the link](https://help.gooddata.com/display/doc/Find+the+Project+ID) to get more information on how to find your project ID.
-
-#### 2.1.4 GD Custom Domain
-
-In case, the destination GoodData project is white labelled, it is required to provide the white label domain in the following format: `https://subdomain.domain.com` or whatever the equivalent is. This domain will be used for all GoodData related API calls,
-hence the incorrect format or domain will result in application failure.
-If the GoodData project is not white labeled, the field should be left blank and the component will use the base URL based on project location (`https://keboola.eu.gooddata.com` for EU location, `https://secure.gooddata.com` for US location).
-
-### 2.2 User table
-
-The user table **must** contain following columns: `login`, `action`, `role`, `muf`, `first_name` and `last_name`. If any of the columns is missing, the application will fail. Sample of the table can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/in/tables/test.csv).
-
-Below is the detailed description of each column.
-
-#### 2.2.1 login
-
-The email of the user, for whom the action is to be executed. If the user does not exist in the organization, an attempt will be made to register the user under Keboola organization with this email.
-
-#### 2.2.2 action
-
-The action, which is to be done for the user. Must be one of the following: `DISABLE`, `ENABLE`, `INVITE` or `REMOVE`.
-
-##### 2.2.2.a `DISABLE`
-
-**Disables the user** in the project. This process skips all data permission processes and automatically disables the user. If the user is not in the project or is already disabled, the user is skipped.
-
-##### 2.2.2.b `ENABLE`
-
-If the **user** is **already in the project**, they will be disabled. Data permissions processes follow, after which the user **will be re-enabled**.
-
-If the **user** is **not in the project**, they will be automatically enabled, provided that data permission processes execute successfully.
-
-In the special case, that **user** is **not part of the project nor Keboola organization**, there are not enough privileges for the user to be automatically added to the project. This action will be demoted to `INVITE`.
-
-##### 2.2.2.c `INVITE`
-
-If the **user** is **already in the project**, no invite is generated. Standard `DISABLE - MUF - ENABLE` process is followed instead.
-
-If the **user** is **not in the project**, an invite is generated for the user. The invite is sent to user's `login` mail and the user is assigned data permissions prior to invite being sent out.
-
-##### 2.2.2.d `REMOVE`
-
-If the **user** is in the project, in disabled or enabled state, and their email address is not identical to `GD login` parameter, the user is removed using process `GD_REMOVE`. If the **user** is in the project and their login is identical to `GD login` parameter, or they are not present in the project, `SKIP_NO_REMOVE` or `SKIP` process is used, respectively.
-
-#### 2.2.3 role
-
-Role of the user to be had in the project. Must be one of `admin`, `dashboardOnly`, `editor`, `editorInvite`, `editorUserAdmin`, `explorer`, `explorerOnly`, `keboolaEditorPlus`, `readOnlyUser` or `readOnlyNoExport`. If a role is not assigned properly, the error is recorded in the status file.
-
-#### 2.2.4 muf
-
-A list of json-like objects, from which data permissions are created. An example list might have the following form:
-
-```
-[
-    {
-        "attribute": "attr.inctestsales.city",
-        "value": ["NYC", "VAN", "PRG"],
-        "operator": "IN"
-    },
-    {
-        "attribute": "attr.inctestsales.sales_person",
-        "value": ["Sales_1"],
-        "operator": "="
-    }
-]
-```
-
-In the above example, two data permission filters are provided. Each JSON object must contain keys `attribute`, `value` and `operator`. 
-
-If the user should be able to acccess all the data, the `muf` expression should be provided as an empty list, i.e.
-
-```
-[]
-```
-
-##### 2.2.4.a `attribute`
-
-The attribute must be a string expression, identifying the attribute within the project. In general, attributes sourcing from Keboola writers are quite easy to determine. For example, column `city` from table `in.c-test.sales` would become `attr.inctestsales.city` in GoodData. Note the `attr` in the beginning of the identifier and missing punctuation from table name, i.e. all dots and dashes from Keboola table path were replaced.
-If unsure what is the correct attribute identifier, it is possible to obtain the full list of attributes within the project [in the following guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
-
-##### 2.2.4.b `value`
-
-The key value must be a list of values for which the expression must be determined. The application always assumes primary label for the attribute, i.e. any custom labels for the attribute are ignored. You can obtain a list of available values for attribute by following [this guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
-
-##### 2.2.4.c `operator`
-
-Operator must be one of `=`, `<>`, `IN` or `NOT IN`. At the moment, the only unsupported operator is `AND`. See more about operators [here](https://help.gooddata.com/display/doc/Data+Permissions#DataPermissions-CreateanExpressionStatementforaDataPermission).
-
-##### 2.2.4.d Note on .csv files
-
-Note that json-files have keys enclosed in double quotes, which, conincidentally, is a commonly used character in quoting CSV files as well. This may lead to bad parsing of the `muf` expression, if it's not quoted properly. It is therefore recommended to follow standard CSV file procedures, specifically double all double quotes. As an example, below is the correct way the `muf` expression should be inputted in the CSV file
-
-```
-"[{""attribute"":""attr.inctestsales.city"",""value"":[""NYC"",""VAN"",""PRG""],""operator"":""NOT IN""}]"
-```
-
-and
-
-```
-"[]"
-```
-
-which will then be parsed as
-
-```
-[
-    {
-        "attribute": "attr.inctestsales.city",
-        "value": ["NYC","VAN","PRG"],
-        "operator": "NOT IN"
-    }
-]
-```
-
-and 
-
-```
-[]
-```
-
-#### 2.2.5 first_name
-
-First name of the user. The name will be used if the user must be created in the Keboola domain.
-
-#### 2.2.6 last_name
-
-Last name of the user. The usage is same as `first_name`.
-
-## 3 Output mapping
-
-The output of the application is the status file, which is loaded incrementally to `out.c-GDUserManagement.status` table automatically. Sample of the status file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/out/tables/test.csv).
-
-The file contains following columns:
-
-* `user` - user, for which the action was executed. `admin` records are required calls by application at initialization.
-* `action` - describes action type
-* `status` - marks, whether the action was a success
-* `timestamp` - UTC timestamp of the event
-* `role` - user role
-* `details` - any additional details related to the action
-* `muf` - muf assigned to the user from the table
-
-### 3.1 user
-
-The user column contains the information about the login, for which the action was performed. For each login, there's a set of actions that are executed in order to make sure that each user is safely added to a project and in case of fail does not have access to information they should not have access to.
-
-### 3.2 action
-
-The column represents the action that is executed. Detailed information about all of the actions can be found in the `details` column. There are currently 4 admin actions, executed at the very beginning of the process and 8 user actions, executed on the user level. In the following subsections, each of the actions will be briefly discussed in order of their usual execution.
-
-#### 3.2.1 `GET_ATTRIBUTES`
-
-An admin action that obtains the list of all attributes in the GoodData project, which is then used to create MUF expressions and MUFs. When a user specified attribute is missing in the list of attributes returned by this action, the MUF fails and user is not enabled in the project.
-
-#### 3.2.2 `GET_GD_USERS` and `GET_KBC_USERS`
-
-Both of these admin actions download a list of users from the GoodData project or its assigned Keboola domain respectively. The list of users is then used when assigning necessary actions to each user (see seciont 3.2.4 `ASSIGN_ACTION`).
-
-#### 3.2.3 `MAP_ROLES`
-
-The admin action creates a map of roles beteen GoodData and Keboola. As the roles can have slightly different names, this action is necessary to assign correct role to users.
-
-#### 3.2.4 `ASSIGN_ACTION`
-
-A user action, which determines the required steps needed for each user. The backbone of the action is comparing a user against the list of users obtained in 3.2.2. Arbitrary actions, such as disabling a user that is not part of the project, are skipped. See section for 4 for detailed execution plan and description of each assigned action.
-
-#### 3.2.5 `USER_CREATE`
-
-A user action performed, when user is not in the GoodData project nor part of the user list in Keboola domain. The action creates a user in the Keboola domain and allows them to be provisioned and managed further using Keboola GoodData Provisioning API.
-
-#### 3.2.6 `DISABLE_IN_PRJ`
-
-A user action that disables a user in the project. The action is only executed, if a user is already present in the project, either in disabled or enabled state.
-
-#### 3.2.7 `CREATE_MUF_EXPR`
-
-An action performed on user level, that converts each of the json MUF objects to be represented by their unique URI identifiers. The action uses output of `GET_ATTRIBUTES` action, obtains the values for attributes used in the json structure and maps accordingly. If the action is successful, the resulting URI representation can be seen in `details` column. If the action fails, the reason is recorded in the `details` column.
-
-#### 3.2.8 `CREATE_MUF`
-
-A user level action, that registers the MUF expression obtained in step 3.2.7, pushes it to GoodData and returns unique URI for the filter. If filter is a list with lenght more than 1 (multiple filters) a list of URIs is returned.
-
-#### 3.2.9 `ASSIGN_MUF`
-
-A user action, which assigns the filters obtained in step 3.2.8 to user. The filters are tied to user's profile in the project.
-
-#### 3.2.10 `INVITE_TO_PRJ`
-
-A user action that invites user to the project and assigns MUF at the same time. The filter is sent together with the invitation and the filter becomes active once the user accepts the invitation. The action is executed only if all the preceeding steps were completed successfully to make sure users do not have access to data, they're not supposed to have.
-
-#### 3.2.11 `ENABLE_IN_PRJ`
-
-A user action, that enables user in the project. The action is executed only if all the preceeding steps were completed successfully to prevent access to data, user should not see.
-
-#### 3.2.12 `REMOVE_FROM_PRJ`
-
-A user action, that removes a user from the project. The action is executed straight away with no preceeding steps.
-
-### 3.3 status
-
-One of `SUCCESS` or `ERROR`. Marks whether the respective action was successful.
-
-### 3.4 timestamp
-
-A time when the action was perfomed. The time is provided in `YYYY-MM-DD HH:MI:SS.F` format and UTC timezone.
-
-### 3.5 role
-
-A role assigned to the user.
-
-### 3.6 details
-
-Additional details available to each action. The value in the column varies from the action performed.
-
-### 3.7 muf
-
-Original MUF expression assigned to the user in the input mapping.
-
-## 4 Execution plan
-
-As was mentioned in section 3.2.4, each user has a unique list of actions which are performed based on his membership in the project or organization. In this section, each of the execution plans from `ASSIGN_ACTION` step will be discussed in detail to provide more clarity.
-
-### 4.1 `GD_DISABLE`
-
-This action performs only one step:
-
-```
-DISABLE_IN_PRJ
-```
-
-and is performed only on users, that should be disabled and are already present in the project. Other users, who are assigned this action but are not members of the project are skipped.
-
-### 4.2 `GD_REMOVE`
-
-This action only performs one step:
-
-```
-REMOVE_FROM_PRJ
-```
-
-and removes user completely from the project. No data filters or role changes are applied.
-
-### 4.3 `GD_DISABLE MUF GD_ENABLE`
-
-This action is performed on all of the users, that are already in the project (enabled or disabled state) and should be enabled after the result is finished. The execution plan is following:
-
-```
-DISABLE_IN_PRJ > CREATE_MUF_EXPR > CREATE_MUG > ASSIGN_MUG > ENABLE_IN_PRJ
-```
-
-If any of the steps before the `ENABLE_IN_PRJ` action fails, the user stays in disabled state.
-
-### 4.4 `MUF GD_INVITE`
-
-The action is performed, when users should be invited to the project instead of adding them directly to the project. In this case, an email invitation will be sent and user will have the MUF assigned once he activates his account automatically. There's no need to re-run the component to activate the filter once the user accepts the invitation. The execution plan for the process is following:
-
-```
-CREATE_MUF_EXPR > CREATE_MUF > INVITE_TO_PRJ
-```
-
-and as was mentioned, the invitation contains the MUF so the `ASSIGN_MUF` step is omitted. If any of the intermediary step fail, the invitation is not sent out. It's also important to mention, that invitation is not sent to users, that are already in the project in enabled state.
-
-### 4.5 `MUF KB_ENABLE`
-
-The action happens when user is present in Keboola organization but not a member of the GoodData project. The action uses Keboola endpoint to add user directly to the project. The execution plan is following:
-
-```
-CREATE_MUF_EXPR > CREATE_MUF > ASSIGN_MUF > ENABLE_IN_PRJ
-```
-
-and as is the case with previous action steps, the user is not enabled in the project if any of the preceeding actions fail.
-
-### 4.6 `TRY_KB_CREATE MUF ENABLE_OR_INVITE`
-
-If a user is not a member of the project nor the organization, the component will try to create the user in Keboola organization. However, it might happen that some users are already part of different organization. In that case, the user can't be created in the organization and his unique identifier is not known since he's not part of a project. The only remaining thing is to invite user to the project, which component does automatically with added MUF. If the user is created successfully in Keboola organization, the user will then follow the same process as `MUF KB_ENABLE` action. Therefore, there are two possible execution steps based on whether `USER_CREATE` action succeds or not.
-
-If `USER_CREATE` succeeds, the following execution plan is executed:
-
-```
-USER_CREATE > CREATE_MUF_EXPR > CREATE_MUF > ASSIGN_MUF > ENABLE_IN_PRJ
-```
-
-else the plan below is executed:
-
-```
-USER_CREATE > CREATE_MUF_EXPR > CREATE_MUF > INVITE_TO_PRJ
-```
-
-## 5 Development
-
-To run the image locally, use `docker-compose.yml` to define environment, mainly `KBC_TOKEN`, which is used as storage API token for Keboola Provisioning API. Then run following commands:
-
-```
-docker-compose build
-docker-compose run --rm dev
-```
-
-## 6 See also
-
-The following two API references might be handy when working with the application:
-
-* [Keboola GoodData Provisioning API](https://keboolagooddataprovisioning.docs.apiary.io/)
-* [GoodData API Reference](https://help.gooddata.com/display/API/API+Reference)
 
