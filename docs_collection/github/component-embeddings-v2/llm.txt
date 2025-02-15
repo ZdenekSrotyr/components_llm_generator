@@ -3091,6 +3091,7 @@ class Component(ComponentBase):
                 self.config,
                 self.embedding_manager.embedding_model
             )
+            self._test_vector_store_connection(self.vector_store_manager)
             logging.info("Vector store connection successful")
 
         logging.info("Services initialized")
@@ -3137,8 +3138,8 @@ class Component(ComponentBase):
         output_schema["embedding"] = ColumnDefinition(
             data_types={
                 "base": DataType(dtype="STRING"),
-                "snowflake": DataType(dtype="VECTOR(FLOAT,256)"),
-                "bigquery": DataType(dtype="ARRAY<FLOAT64>")
+                "snowflake": DataType(dtype="VECTOR", length="FLOAT,256"),
+                "bigquery": DataType(dtype="STRING")
             },
             nullable=True,
             primary_key=False,
@@ -3960,7 +3961,7 @@ from pinecone import Pinecone
 from pymilvus import connections
 from qdrant_client import QdrantClient
 from redis.asyncio import Redis as AsyncRedis
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -3992,108 +3993,113 @@ class VectorStoreManager:
     def _initialize_vector_store(self):
         """Initialize the vector store based on configuration."""
         db_config = self.config.vector_db
+        try:
+            match db_config.db_type:
+                case "pgvector":
+                    settings = db_config.pgvector_settings
+                    connection_string = (
+                        f"postgresql+psycopg://{settings.username}:{settings.password}"
+                        f"@{settings.host}:{settings.port}/{settings.database}"
+                    )
+                    return PGVector(
+                        connection=connection_string,
+                        embeddings=self.embedding_model,
+                        collection_name=settings.collection_name,
+                        async_mode=True
+                    )
 
-        match db_config.db_type:
-            case "pgvector":
-                settings = db_config.pgvector_settings
-                connection_string = (
-                    f"postgresql+psycopg://{settings.username}:{settings.password}"
-                    f"@{settings.host}:{settings.port}/{settings.database}"
-                )
-                return PGVector(
-                    connection=connection_string,
-                    embeddings=self.embedding_model,
-                    collection_name=settings.collection_name,
-                    async_mode=True
-                )
+                case "pinecone":
+                    settings = db_config.pinecone_settings
 
-            case "pinecone":
-                settings = db_config.pinecone_settings
+                    pc = Pinecone(api_key=settings.api_key)
+                    index_name = settings.index_name
 
-                pc = Pinecone(api_key=settings.api_key)
-                index_name = settings.index_name
+                    if index_name not in [index_info["name"] for index_info in pc.list_indexes()]:
+                        raise UserException(f"Index '{index_name}' not found in Pinecone.")
 
-                if index_name not in [index_info["name"] for index_info in pc.list_indexes()]:
-                    raise UserException(f"Index '{index_name}' not found in Pinecone.")
+                    index = pc.Index(index_name)
+                    return PineconeVectorStore(index=index, embedding=self.embedding_model)
 
-                index = pc.Index(index_name)
-                return PineconeVectorStore(index=index, embedding=self.embedding_model)
+                case "qdrant":
+                    settings = db_config.qdrant_settings
+                    client = QdrantClient(
+                        url=settings.url,
+                        api_key=settings.api_key,
+                        prefer_grpc=True,
+                        timeout=30  # Increase timeout for batch operations
+                    )
+                    return QdrantVectorStore(
+                        client=client,
+                        collection_name=settings.collection_name,
+                        embedding=self.embedding_model
+                    )
 
-            case "qdrant":
-                settings = db_config.qdrant_settings
-                client = QdrantClient(
-                    url=settings.url,
-                    api_key=settings.api_key,
-                    prefer_grpc=True,
-                    timeout=30  # Increase timeout for batch operations
-                )
-                return QdrantVectorStore(
-                    client=client,
-                    collection_name=settings.collection_name,
-                    embedding=self.embedding_model
-                )
+                case "milvus":
+                    settings = db_config.milvus_settings
 
-            case "milvus":
-                settings = db_config.milvus_settings
+                    connections.connect(
+                        alias="default",
+                        host=settings.host,
+                        port=settings.port,
+                        user=settings.username,
+                        password=settings.password
+                    )
+                    return Milvus(
+                        collection_name="embeddings",
+                        embedding_function=self.embedding_model,
+                        connection_args={
+                            "host": settings.host,
+                            "port": settings.port,
+                            "user": settings.username,
+                            "password": settings.password,
+                            "secure": True
+                        }
+                    )
 
-                connections.connect(
-                    alias="default",
-                    host=settings.host,
-                    port=settings.port,
-                    user=settings.username,
-                    password=settings.password
-                )
-                return Milvus(
-                    collection_name="embeddings",
-                    embedding_function=self.embedding_model,
-                    connection_args={
-                        "host": settings.host,
-                        "port": settings.port,
-                        "user": settings.username,
-                        "password": settings.password,
-                        "secure": True
-                    }
-                )
+                case "redis":
+                    settings = db_config.redis_settings
 
-            case "redis":
-                settings = db_config.redis_settings
+                    client = AsyncRedis(
+                        host=settings.host,
+                        port=settings.port,
+                        password=settings.password,
+                        ssl=True
+                    )
+                    return RedisVectorStore(
+                        redis_client=client,
+                        index_name="embeddings",
+                        embeddings=self.embedding_model
+                    )
 
-                client = AsyncRedis(
-                    host=settings.host,
-                    port=settings.port,
-                    password=settings.password,
-                    ssl=True
-                )
-                return RedisVectorStore(
-                    redis_client=client,
-                    index_name="embeddings",
-                    embeddings=self.embedding_model
-                )
+                case "opensearch":
+                    settings = db_config.opensearch_settings
 
-            case "opensearch":
-                settings = db_config.opensearch_settings
-
-                client = AsyncOpenSearch(
-                    hosts=[{"host": settings.host, "port": settings.port}],
-                    http_auth=(settings.username, settings.password),
-                    use_ssl=True,
-                    timeout=30,
-                    max_retries=MAX_RETRIES,
-                    retry_on_timeout=True,
-                    verify_certs=True
-                )
-                return OpenSearchVectorSearch(
-                    client=client,
-                    index_name=settings.index_name,
-                    embedding_function=self.embedding_model,
-                    engine="nmslib",
-                    space_type="cosinesimil",
-                    ef_construction=512,
-                    m=16,
-                    opensearch_url="TODO"
-                )
-            case _:
-                raise UserException(f"Unsupported vector store type: {db_config.db_type}")
+                    client = AsyncOpenSearch(
+                        hosts=[{"host": settings.host, "port": settings.port}],
+                        http_auth=(settings.username, settings.password),
+                        use_ssl=True,
+                        timeout=30,
+                        max_retries=MAX_RETRIES,
+                        retry_on_timeout=True,
+                        verify_certs=True
+                    )
+                    return OpenSearchVectorSearch(
+                        client=client,
+                        index_name=settings.index_name,
+                        embedding_function=self.embedding_model,
+                        engine="nmslib",
+                        space_type="cosinesimil",
+                        ef_construction=512,
+                        m=16,
+                        opensearch_url="TODO"
+                    )
+                case _:
+                    raise UserException(f"Unsupported vector store type: {db_config.db_type}")
+        except Exception as e:
+            if "details =" in str(e):
+                detail = str(e).split("details =")[1].strip().strip('"')
+                raise UserException(detail)
+            raise UserException(f"Failed to initialize vector client: {str(e)}")
 
     @staticmethod
     def _create_documents(
@@ -4125,7 +4131,9 @@ class VectorStoreManager:
 
     @retry(
         stop=stop_after_attempt(MAX_RETRIES),
-        wait=wait_exponential(multiplier=1, min=MIN_BACKOFF, max=MAX_BACKOFF)
+        wait=wait_exponential(multiplier=1, min=MIN_BACKOFF, max=MAX_BACKOFF),
+        retry=retry_if_not_exception_type(UserException),
+        reraise=True
     )
     async def store_vectors(
             self,
@@ -4137,37 +4145,35 @@ class VectorStoreManager:
         if not self.vector_store:
             return
 
-        try:
-            # Create LangChain documents with embeddings
-            documents = self._create_documents(texts, embeddings, metadata)
+        # Create LangChain documents with embeddings
+        documents = self._create_documents(texts, embeddings, metadata)
 
-            # Process in batches using configured batch size
-            batch_size = self.config.advanced_options.batch_size
-            for i in range(0, len(documents), batch_size):
-                batch = documents[i:i + batch_size]
+        # Process in batches using configured batch size
+        batch_size = self.config.advanced_options.batch_size
+        for i in range(0, len(documents), batch_size):
+            batch = documents[i:i + batch_size]
 
-                match type(self.vector_store).__name__:
-                    case "PGVector" | "RedisVectorStore" | "OpenSearchVectorSearch":
-                        # These support and benefit from async operations
-                        async with self.semaphore:
-                            ids = await self.vector_store.aadd_documents(batch)
-                            logging.debug(f"Async Stored {len(ids)} vectors")
-                            self.stored_ids.extend(ids)
-                    case _:
-                        # Others are better with synchronous batch operations
-                        ids = await asyncio.to_thread(
-                            self.vector_store.add_documents,
-                            batch
-                        )
-                        logging.debug(f"Stored {len(ids)} vectors")
+            match type(self.vector_store).__name__:
+                case "PGVector" | "RedisVectorStore" | "OpenSearchVectorSearch":
+                    # These support and benefit from async operations
+                    async with self.semaphore:
+                        ids = await self.vector_store.aadd_documents(batch)
+                        logging.debug(f"Async Stored {len(ids)} vectors")
                         self.stored_ids.extend(ids)
-
-        except Exception as e:
-            raise UserException(f"Failed to store vectors: {str(e)}")
+                case _:
+                    # Others are better with synchronous batch operations
+                    ids = await asyncio.to_thread(
+                        self.vector_store.add_documents,
+                        batch
+                    )
+                    logging.debug(f"Stored {len(ids)} vectors")
+                    self.stored_ids.extend(ids)
 
     @retry(
         stop=stop_after_attempt(MAX_RETRIES),
-        wait=wait_exponential(multiplier=1, min=MIN_BACKOFF, max=MAX_BACKOFF)
+        wait=wait_exponential(multiplier=1, min=MIN_BACKOFF, max=MAX_BACKOFF),
+        retry=retry_if_not_exception_type(UserException),
+        reraise=True
     )
     async def upsert_vectors(
             self,
@@ -4176,18 +4182,11 @@ class VectorStoreManager:
             metadata: Sequence[dict],
             ids: Sequence[str]
     ) -> None:
-        """Upsert vectors in the vector store (update if exists, insert if not).
-
-        Args:
-            texts: Sequence of text content to embed
-            embeddings: Sequence of pre-computed embedding vectors
-            metadata: Sequence of metadata dictionaries for each text
-            ids: Sequence of IDs for the vectors to upsert
-        """
-        if not self.vector_store:
-            return
-
+        """Upsert vectors in the vector store (update if exists, insert if not)."""
         try:
+            if not self.vector_store:
+                return
+
             documents = self._create_documents(texts, embeddings, metadata)
             batch_size = self.config.advanced_options.batch_size
 
@@ -4205,8 +4204,10 @@ class VectorStoreManager:
                         await self.vector_store.aadd_documents(batch, ids=batch_ids)
                         logging.debug(f"Upserted {len(batch)} vectors with IDs: {batch_ids}")
                         self.stored_ids.extend(batch_ids)
-
         except Exception as e:
+            if "details =" in str(e):
+                detail = str(e).split("details =")[1].strip().strip('"')
+                raise UserException(detail)
             raise UserException(f"Failed to upsert vectors: {str(e)}")
 
 
@@ -4690,7 +4691,8 @@ CMD ["python", "-u", "/code/src/component.py"]
 ================================================
 File: components/app-embeddings-v2/VERSION
 ================================================
-0.0.5
+0.0.10
+
 
 ================================================
 File: components/app-embeddings-v2/docker-compose.yml
@@ -4928,8 +4930,7 @@ File: components/app-embeddings-v2/component_config/configRowSchema.json
                         },
                         "username": {
                             "type": "string",
-                            "title": "Username",
-                            "format": "password"
+                            "title": "Username"
                         },
                         "#password": {
                             "type": "string",
@@ -5030,8 +5031,7 @@ File: components/app-embeddings-v2/component_config/configRowSchema.json
                         },
                         "username": {
                             "type": "string",
-                            "title": "Username",
-                            "format": "password"
+                            "title": "Username"
                         },
                         "#password": {
                             "type": "string",
@@ -5099,8 +5099,7 @@ File: components/app-embeddings-v2/component_config/configRowSchema.json
                         },
                         "username": {
                             "type": "string",
-                            "title": "Username",
-                            "format": "password"
+                            "title": "Username"
                         },
                         "#password": {
                             "type": "string",
@@ -6248,7 +6247,7 @@ CMD ["python", "-u", "/code/src/component.py"]
 ================================================
 File: components/wr-pgvector-embeddings/VERSION
 ================================================
-0.0.4
+0.0.8
 
 ================================================
 File: components/wr-pgvector-embeddings/docker-compose.yml
@@ -6413,8 +6412,7 @@ File: components/wr-pgvector-embeddings/component_config/configRowSchema.json
                         },
                         "username": {
                             "type": "string",
-                            "title": "Username",
-                            "format": "password"
+                            "title": "Username"
                         },
                         "#password": {
                             "type": "string",
@@ -6494,8 +6492,7 @@ File: components/wr-pgvector-embeddings/component_config/configRowSchema.json
                         },
                         "username": {
                             "type": "string",
-                            "title": "Username",
-                            "format": "password"
+                            "title": "Username"
                         },
                         "#password": {
                             "type": "string",
@@ -6567,8 +6564,7 @@ File: components/wr-pgvector-embeddings/component_config/configRowSchema.json
                         },
                         "username": {
                             "type": "string",
-                            "title": "Username",
-                            "format": "password"
+                            "title": "Username"
                         },
                         "#password": {
                             "type": "string",
@@ -7006,8 +7002,7 @@ File: components/wr-pgvector-embeddings/component_config/configSchema.json
                     "properties": {
                         "#aws_access_key": {
                             "type": "string",
-                            "title": "AWS Access Key",
-                            "format": "password"
+                            "title": "AWS Access Key"
                         },
                         "#aws_secret_key": {
                             "type": "string",
@@ -7658,7 +7653,7 @@ CMD ["python", "-u", "/code/src/component.py"]
 ================================================
 File: components/wr-qdrant-embeddings/VERSION
 ================================================
-0.0.1
+0.0.6
 
 
 ================================================
@@ -7824,8 +7819,7 @@ File: components/wr-qdrant-embeddings/component_config/configRowSchema.json
                         },
                         "username": {
                             "type": "string",
-                            "title": "Username",
-                            "format": "password"
+                            "title": "Username"
                         },
                         "#password": {
                             "type": "string",
@@ -7910,8 +7904,7 @@ File: components/wr-qdrant-embeddings/component_config/configRowSchema.json
                         },
                         "username": {
                             "type": "string",
-                            "title": "Username",
-                            "format": "password"
+                            "title": "Username"
                         },
                         "#password": {
                             "type": "string",
@@ -7983,8 +7976,7 @@ File: components/wr-qdrant-embeddings/component_config/configRowSchema.json
                         },
                         "username": {
                             "type": "string",
-                            "title": "Username",
-                            "format": "password"
+                            "title": "Username"
                         },
                         "#password": {
                             "type": "string",
@@ -9081,6 +9073,8 @@ name: app-embeddings-v2
 
 on:
   push:
+    tags:
+      - '*' # Skip the workflow on the main branch without tag
     paths:
       - 'components/app-embeddings-v2/**'
       - 'components/_common/**'
@@ -9315,6 +9309,8 @@ name: wr-pgvector-embeddings
 
 on:
   push:
+    tags:
+      - '*' # Skip the workflow on the main branch without tag
     paths:
       - 'components/wr-pgvector-embeddings/**'
       - 'components/_common/**'
@@ -9345,6 +9341,8 @@ name: wr-qdrant-embeddings
 
 on:
   push:
+    tags:
+      - '*' # Skip the workflow on the main branch without tag
     paths:
       - 'components/wr-qdrant-embeddings/**'
       - 'components/_common/**'
