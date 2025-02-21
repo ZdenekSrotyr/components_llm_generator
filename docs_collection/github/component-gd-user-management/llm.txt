@@ -1,0 +1,3825 @@
+Directory structure:
+└── keboola-component-gd-user-management/
+    ├── README.md
+    ├── Dockerfile
+    ├── LICENSE.md
+    ├── change_log.md
+    ├── docker-compose.yml
+    ├── flake8.cfg
+    ├── requirements.txt
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── component_short_description.md
+    │   ├── configSchema.json
+    │   ├── configuration_description.md
+    │   ├── documentationUrl.md
+    │   ├── licenseUrl.md
+    │   ├── logger
+    │   ├── loggerConfiguration.json
+    │   ├── sourceCodeUrl.md
+    │   ├── stack_parameters.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── files/
+    │       │   │   └── order1.xml
+    │       │   └── tables/
+    │       │       ├── test.csv
+    │       │       └── test.csv.manifest
+    │       └── out/
+    │           ├── files/
+    │           │   └── order1.xml
+    │           └── tables/
+    │               └── test.csv
+    ├── scripts/
+    │   ├── build_n_test.sh
+    │   ├── deploy.sh
+    │   ├── update_dev_portal_properties.sh
+    │   └── developer_portal/
+    │       ├── fn_actions_md_update.sh
+    │       └── update_properties.sh
+    ├── src/
+    │   ├── main.py
+    │   └── lib/
+    │       ├── GD_KB_client.py
+    │       ├── component.py
+    │       ├── logger.py
+    │       └── user.py
+    ├── tests/
+    │   ├── __init__.py
+    │   └── test_component.py
+    └── .github/
+        └── workflows/
+            └── push.yml
+
+================================================
+File: README.md
+================================================
+# GoodData User Management Application
+
+This application allows user of the component to manage users in the GoodData project, invite new users to the project, change roles and assign data permissions for each user.
+
+## 1 Overview
+
+The application, as aforementioned, allows users to maintain access to a GoodData project and or manage users' access to certain data. The application uses GoodData API to assign [Data Permissions](https://help.gooddata.com/display/doc/Data+Permissions) to desired users, that automatically pre-filter available data to end-user.
+
+### 1.1 Prerequisities
+
+**The following requirements are needed for successful conifguration of the application:**
+
+* a GoodData project
+* an admin account to the GoodData project
+
+### 1.2 Status file
+
+All actions performed by the application are automatically recorded to a status file. The file is incrementally auto-saved to `out.c-GDUserManagement.status` table. All actions contain information on whether said action was successful and any additional information, which are the result of taking the action.
+
+### 1.3 Process overview
+
+The application automatically determines what actions need to be taken for each user based on the table of users (see *input mapping* section). The process is ran row-by-row, i.e. all users are processed sequentially, to avoid any confusion in the process. For each user, the application determines whether the user is already in the organization and/or project and acts accordingly on that, i.e. creates the user if necessary. To prevent any possible failure, all users are first disabled in the project, before assigning data permissions and re-enabling them again. If it's necessary, the application generates an invitation, which is delivered to the user on the provided e-mail address.
+
+### 1.4 Process detail
+
+Below is a more detailed description of the process.
+
+1. User and all their data is read from the table.
+2. User's login is compared to the list of users in GD project and list of users provisioned by Keboola.
+    1. If the user is in both organization and project, they are disabled or removed.
+    2. If the user is in the organization but not in the project, nothing is done.
+    3. If the user is not in the organization but is in the project, they are disabled.
+    4. If the user is not in the organization nor the project, an attempt is made to create them in Keboola organization. If the       attemp fails, the user is already part of another organization and will not be maintained in Keboola domain.
+3. For each user, their `Mandatory User Filter (MUF)` expression is read and parsed into URI format. The URI format is a format, where all attribute names, labels and values are transformed to their URI counterparts. If the attribute, label or value does not exist, the URI expression is not created and an error is recorded in the status file.
+4. The URI expression is posted to GoodData and the user filter is created. Each user filter is assigned unique ID, which is then passed on to users as an attribute.
+5. The following action occurs once the user filter was created (follow-up to point 2):
+    1. User is assigned the user filter and is re-enabled in the project.
+    2. User is assigned the user filter and is added to the project.
+    3. User is assigned the user fitler and is re-enabled in the project.
+    4. User is assigned the user filter and is enabled/invited to the project.
+6. Process ends.
+
+## 2 Input mapping
+
+The application accepts 4 parameters and a table of users. In addition to the 4 parameters, the component automatically uses [Storage API Token](https://help.keboola.com/management/project/tokens/) to access available GoodData projects within the project and provision users. A sample configuration can be found [in the repository](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/).
+
+### 2.1 Parameters
+
+Following 4 parameters are accepted: `GD Login`, `GD Password`, `GD Project ID` and `GD Custom Domain`. More detailed description of all parameters is provided in the upcoming subsections.
+Recently, there were two additional parameters added: `Re-invite users` and `Fail on Error`. The Re-invite users options enables sending invite emails to already invited users and fail on error makes the component end with error AFTER processing all objects if it encounters any errors during the run.
+The `Fail on Error` feature only works on queue v2.
+
+A sample of the configuration file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/config.json).
+
+#### 2.1.1 GD Login
+
+The login email to the GoodData portal. Requirements for the used login are:
+
+* must have access to the project
+* must be admin of the project
+* must not have any data permissions assigned to them.
+
+Failure to comply with any of the above requirements will raise an error.
+
+You can either use an already existing login (e.g. a personal account with admin privileges) or you can use Keboola's GoodData Provisioning API to [create a new login](https://keboolagooddataprovisioning.docs.apiary.io/#reference/0/kbc-access/get-user-credentials-to-project) and use those credentials.
+
+#### 2.1.2 GD Password
+
+The password to `GD Login` used to log in to GoodData portal.
+
+#### 2.1.3 GD Project ID
+
+The ID of a project, for which the changes are to be made. The ID is compared to a list of available project IDs in the Keboola project. If the GD PID is not in the list of available PIDs, i.e. the writer is not located in the same project as the application, an error is raised. This behavior is enforced by the application to prevent changing users across projects without having knowledge about it.
+
+Follow [the link](https://help.gooddata.com/display/doc/Find+the+Project+ID) to get more information on how to find your project ID.
+
+#### 2.1.4 GD Custom Domain
+
+In case, the destination GoodData project is white labelled, it is required to provide the white label domain in the following format: `https://subdomain.domain.com` or whatever the equivalent is. This domain will be used for all GoodData related API calls,
+hence the incorrect format or domain will result in application failure.
+If the GoodData project is not white labeled, the field should be left blank and the component will use the base URL based on project location (`https://keboola.eu.gooddata.com` for EU location, `https://secure.gooddata.com` for US location).
+
+### 2.2 User table
+
+The user table **must** contain following columns: `login`, `action`, `role`, `muf`, `first_name` and `last_name`. If any of the columns is missing, the application will fail. Sample of the table can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/in/tables/test.csv).
+
+Below is the detailed description of each column.
+
+#### 2.2.1 login
+
+The email of the user, for whom the action is to be executed. If the user does not exist in the organization, an attempt will be made to register the user under Keboola organization with this email.
+
+#### 2.2.2 action
+
+The action, which is to be done for the user. Must be one of the following: `DISABLE`, `ENABLE`, `INVITE` or `REMOVE`.
+
+##### 2.2.2.a `DISABLE`
+
+**Disables the user** in the project. This process skips all data permission processes and automatically disables the user. If the user is not in the project or is already disabled, the user is skipped.
+
+##### 2.2.2.b `ENABLE`
+
+If the **user** is **already in the project**, they will be disabled. Data permissions processes follow, after which the user **will be re-enabled**.
+
+If the **user** is **not in the project**, they will be automatically enabled, provided that data permission processes execute successfully.
+
+In the special case, that **user** is **not part of the project nor Keboola organization**, there are not enough privileges for the user to be automatically added to the project. This action will be demoted to `INVITE`.
+
+##### 2.2.2.c `INVITE`
+
+If the **user** is **already in the project**, no invite is generated. Standard `DISABLE - MUF - ENABLE` process is followed instead.
+
+If the **user** is **not in the project**, an invite is generated for the user. The invite is sent to user's `login` mail and the user is assigned data permissions prior to invite being sent out.
+
+##### 2.2.2.d `REMOVE`
+
+If the **user** is in the project, in disabled or enabled state, and their email address is not identical to `GD login` parameter, the user is removed using process `GD_REMOVE`. If the **user** is in the project and their login is identical to `GD login` parameter, or they are not present in the project, `SKIP_NO_REMOVE` or `SKIP` process is used, respectively.
+
+#### 2.2.3 role
+
+Role of the user to be had in the project. Must be one of `admin`, `dashboardOnly`, `editor`, `editorInvite`, `editorUserAdmin`, `explorer`, `explorerOnly`, `keboolaEditorPlus`, `readOnlyUser` or `readOnlyNoExport`. If a role is not assigned properly, the error is recorded in the status file.
+
+#### 2.2.4 muf
+
+A list of json-like objects, from which data permissions are created. An example list might have the following form:
+
+```
+[
+    {
+        "attribute": "attr.inctestsales.city",
+        "value": ["NYC", "VAN", "PRG"],
+        "operator": "IN"
+    },
+    {
+        "attribute": "attr.inctestsales.sales_person",
+        "value": ["Sales_1"],
+        "operator": "="
+    }
+]
+```
+
+In the above example, two data permission filters are provided. Each JSON object must contain keys `attribute`, `value` and `operator`. 
+
+If the user should be able to acccess all the data, the `muf` expression should be provided as an empty list, i.e.
+
+```
+[]
+```
+
+##### 2.2.4.a `attribute`
+
+The attribute must be a string expression, identifying the attribute within the project. In general, attributes sourcing from Keboola writers are quite easy to determine. For example, column `city` from table `in.c-test.sales` would become `attr.inctestsales.city` in GoodData. Note the `attr` in the beginning of the identifier and missing punctuation from table name, i.e. all dots and dashes from Keboola table path were replaced.
+If unsure what is the correct attribute identifier, it is possible to obtain the full list of attributes within the project [in the following guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
+
+##### 2.2.4.b `value`
+
+The key value must be a list of values for which the expression must be determined. The application always assumes primary label for the attribute, i.e. any custom labels for the attribute are ignored. You can obtain a list of available values for attribute by following [this guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
+
+##### 2.2.4.c `operator`
+
+Operator must be one of `=`, `<>`, `IN` or `NOT IN`. At the moment, the only unsupported operator is `AND`. See more about operators [here](https://help.gooddata.com/display/doc/Data+Permissions#DataPermissions-CreateanExpressionStatementforaDataPermission).
+
+##### 2.2.4.d Note on .csv files
+
+Note that json-files have keys enclosed in double quotes, which, conincidentally, is a commonly used character in quoting CSV files as well. This may lead to bad parsing of the `muf` expression, if it's not quoted properly. It is therefore recommended to follow standard CSV file procedures, specifically double all double quotes. As an example, below is the correct way the `muf` expression should be inputted in the CSV file
+
+```
+"[{""attribute"":""attr.inctestsales.city"",""value"":[""NYC"",""VAN"",""PRG""],""operator"":""NOT IN""}]"
+```
+
+and
+
+```
+"[]"
+```
+
+which will then be parsed as
+
+```
+[
+    {
+        "attribute": "attr.inctestsales.city",
+        "value": ["NYC","VAN","PRG"],
+        "operator": "NOT IN"
+    }
+]
+```
+
+and 
+
+```
+[]
+```
+
+#### 2.2.5 first_name
+
+First name of the user. The name will be used if the user must be created in the Keboola domain.
+
+#### 2.2.6 last_name
+
+Last name of the user. The usage is same as `first_name`.
+
+## 3 Output mapping
+
+The output of the application is the status file, which is loaded incrementally to `out.c-GDUserManagement.status` table automatically. Sample of the status file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/out/tables/test.csv).
+
+The file contains following columns:
+
+* `user` - user, for which the action was executed. `admin` records are required calls by application at initialization.
+* `action` - describes action type
+* `status` - marks, whether the action was a success
+* `timestamp` - UTC timestamp of the event
+* `role` - user role
+* `details` - any additional details related to the action
+* `muf` - muf assigned to the user from the table
+
+### 3.1 user
+
+The user column contains the information about the login, for which the action was performed. For each login, there's a set of actions that are executed in order to make sure that each user is safely added to a project and in case of fail does not have access to information they should not have access to.
+
+### 3.2 action
+
+The column represents the action that is executed. Detailed information about all of the actions can be found in the `details` column. There are currently 4 admin actions, executed at the very beginning of the process and 8 user actions, executed on the user level. In the following subsections, each of the actions will be briefly discussed in order of their usual execution.
+
+#### 3.2.1 `GET_ATTRIBUTES`
+
+An admin action that obtains the list of all attributes in the GoodData project, which is then used to create MUF expressions and MUFs. When a user specified attribute is missing in the list of attributes returned by this action, the MUF fails and user is not enabled in the project.
+
+#### 3.2.2 `GET_GD_USERS` and `GET_KBC_USERS`
+
+Both of these admin actions download a list of users from the GoodData project or its assigned Keboola domain respectively. The list of users is then used when assigning necessary actions to each user (see seciont 3.2.4 `ASSIGN_ACTION`).
+
+#### 3.2.3 `MAP_ROLES`
+
+The admin action creates a map of roles beteen GoodData and Keboola. As the roles can have slightly different names, this action is necessary to assign correct role to users.
+
+#### 3.2.4 `ASSIGN_ACTION`
+
+A user action, which determines the required steps needed for each user. The backbone of the action is comparing a user against the list of users obtained in 3.2.2. Arbitrary actions, such as disabling a user that is not part of the project, are skipped. See section for 4 for detailed execution plan and description of each assigned action.
+
+#### 3.2.5 `USER_CREATE`
+
+A user action performed, when user is not in the GoodData project nor part of the user list in Keboola domain. The action creates a user in the Keboola domain and allows them to be provisioned and managed further using Keboola GoodData Provisioning API.
+
+#### 3.2.6 `DISABLE_IN_PRJ`
+
+A user action that disables a user in the project. The action is only executed, if a user is already present in the project, either in disabled or enabled state.
+
+#### 3.2.7 `CREATE_MUF_EXPR`
+
+An action performed on user level, that converts each of the json MUF objects to be represented by their unique URI identifiers. The action uses output of `GET_ATTRIBUTES` action, obtains the values for attributes used in the json structure and maps accordingly. If the action is successful, the resulting URI representation can be seen in `details` column. If the action fails, the reason is recorded in the `details` column.
+
+#### 3.2.8 `CREATE_MUF`
+
+A user level action, that registers the MUF expression obtained in step 3.2.7, pushes it to GoodData and returns unique URI for the filter. If filter is a list with lenght more than 1 (multiple filters) a list of URIs is returned.
+
+#### 3.2.9 `ASSIGN_MUF`
+
+A user action, which assigns the filters obtained in step 3.2.8 to user. The filters are tied to user's profile in the project.
+
+#### 3.2.10 `INVITE_TO_PRJ`
+
+A user action that invites user to the project and assigns MUF at the same time. The filter is sent together with the invitation and the filter becomes active once the user accepts the invitation. The action is executed only if all the preceeding steps were completed successfully to make sure users do not have access to data, they're not supposed to have.
+
+#### 3.2.11 `ENABLE_IN_PRJ`
+
+A user action, that enables user in the project. The action is executed only if all the preceeding steps were completed successfully to prevent access to data, user should not see.
+
+#### 3.2.12 `REMOVE_FROM_PRJ`
+
+A user action, that removes a user from the project. The action is executed straight away with no preceeding steps.
+
+### 3.3 status
+
+One of `SUCCESS` or `ERROR`. Marks whether the respective action was successful.
+
+### 3.4 timestamp
+
+A time when the action was perfomed. The time is provided in `YYYY-MM-DD HH:MI:SS.F` format and UTC timezone.
+
+### 3.5 role
+
+A role assigned to the user.
+
+### 3.6 details
+
+Additional details available to each action. The value in the column varies from the action performed.
+
+### 3.7 muf
+
+Original MUF expression assigned to the user in the input mapping.
+
+## 4 Execution plan
+
+As was mentioned in section 3.2.4, each user has a unique list of actions which are performed based on his membership in the project or organization. In this section, each of the execution plans from `ASSIGN_ACTION` step will be discussed in detail to provide more clarity.
+
+### 4.1 `GD_DISABLE`
+
+This action performs only one step:
+
+```
+DISABLE_IN_PRJ
+```
+
+and is performed only on users, that should be disabled and are already present in the project. Other users, who are assigned this action but are not members of the project are skipped.
+
+### 4.2 `GD_REMOVE`
+
+This action only performs one step:
+
+```
+REMOVE_FROM_PRJ
+```
+
+and removes user completely from the project. No data filters or role changes are applied.
+
+### 4.3 `GD_DISABLE MUF GD_ENABLE`
+
+This action is performed on all of the users, that are already in the project (enabled or disabled state) and should be enabled after the result is finished. The execution plan is following:
+
+```
+DISABLE_IN_PRJ > CREATE_MUF_EXPR > CREATE_MUG > ASSIGN_MUG > ENABLE_IN_PRJ
+```
+
+If any of the steps before the `ENABLE_IN_PRJ` action fails, the user stays in disabled state.
+
+### 4.4 `MUF GD_INVITE`
+
+The action is performed, when users should be invited to the project instead of adding them directly to the project. In this case, an email invitation will be sent and user will have the MUF assigned once he activates his account automatically. There's no need to re-run the component to activate the filter once the user accepts the invitation. The execution plan for the process is following:
+
+```
+CREATE_MUF_EXPR > CREATE_MUF > INVITE_TO_PRJ
+```
+
+and as was mentioned, the invitation contains the MUF so the `ASSIGN_MUF` step is omitted. If any of the intermediary step fail, the invitation is not sent out. It's also important to mention, that invitation is not sent to users, that are already in the project in enabled state.
+
+### 4.5 `MUF KB_ENABLE`
+
+The action happens when user is present in Keboola organization but not a member of the GoodData project. The action uses Keboola endpoint to add user directly to the project. The execution plan is following:
+
+```
+CREATE_MUF_EXPR > CREATE_MUF > ASSIGN_MUF > ENABLE_IN_PRJ
+```
+
+and as is the case with previous action steps, the user is not enabled in the project if any of the preceeding actions fail.
+
+### 4.6 `TRY_KB_CREATE MUF ENABLE_OR_INVITE`
+
+If a user is not a member of the project nor the organization, the component will try to create the user in Keboola organization. However, it might happen that some users are already part of different organization. In that case, the user can't be created in the organization and his unique identifier is not known since he's not part of a project. The only remaining thing is to invite user to the project, which component does automatically with added MUF. If the user is created successfully in Keboola organization, the user will then follow the same process as `MUF KB_ENABLE` action. Therefore, there are two possible execution steps based on whether `USER_CREATE` action succeds or not.
+
+If `USER_CREATE` succeeds, the following execution plan is executed:
+
+```
+USER_CREATE > CREATE_MUF_EXPR > CREATE_MUF > ASSIGN_MUF > ENABLE_IN_PRJ
+```
+
+else the plan below is executed:
+
+```
+USER_CREATE > CREATE_MUF_EXPR > CREATE_MUF > INVITE_TO_PRJ
+```
+
+## 5 Development
+
+To run the image locally, use `docker-compose.yml` to define environment, mainly `KBC_TOKEN`, which is used as storage API token for Keboola Provisioning API. Then run following commands:
+
+```
+docker-compose build
+docker-compose run --rm dev
+```
+
+## 6 See also
+
+The following two API references might be handy when working with the application:
+
+* [Keboola GoodData Provisioning API](https://keboolagooddataprovisioning.docs.apiary.io/)
+* [GoodData API Reference](https://help.gooddata.com/display/API/API+Reference)
+
+================================================
+File: Dockerfile
+================================================
+FROM python:3.8.6-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+RUN pip install --ignore-installed -r /code/requirements.txt
+
+WORKDIR /code/
+
+# RUN THE MAIN PYTHON SCRIPT
+CMD ["python3", "-u", "/code/src/main.py"]
+
+================================================
+File: LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2019 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: change_log.md
+================================================
+**0.2.6**
+Added ability to completely disable project check.
+
+**0.2.5**
+Added ability to provision the GD project from other Keboola project than the source Keboola project.
+Managed by using two additional parameters `external_project` and `#external_project_token`. Only configurable via API.
+Fixed JSON schema for hidden fields.
+
+**0.2.4**
+Fixed bug, which resulted in application fail when invitations were not created.
+
+**0.2.1**
+Fixed bug, that recorded errors when enabling users as successful
+
+**0.2.0**
+Added functionality to remove the user from the project completely
+
+**0.1.6**
+Fixed error, that was caused when non- latin-1 characters were used.
+Switched strings to be encoded in utf-8
+
+**0.1.0**
+First public version of the application.
+Added README.md
+Added configuration descriptions, sample configurations and configuration schema.
+Added docstrings for clarity.
+
+**0.0.11**
+Added Storage Token fetching from environment.
+
+================================================
+File: docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+      - KBC_TOKEN=XXXX-[REDACTED]
+      - KBC_RUNID=12345.134
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+      - KBC_TOKEN=XXXX-[REDACTED]
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: requirements.txt
+================================================
+logging_gelf==0.0.18
+# https://github.com/keboola/python-docker-application/zipball/2.1.1#egg=keboola-2.1.1
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.5.0.zip#egg=kbc
+
+================================================
+File: component_config/component_long_description.md
+================================================
+# GoodData User Management Application
+
+This application allows user of the component to manage users in the GoodData project, invite new users to the project, change roles and assign data permissions for each user.
+
+## Overview
+
+The application, as aforementioned, allows users to maintain access to a GoodData project and or manage users' access to certain data. The application uses GoodData API to assign [Data Permissions](https://help.gooddata.com/display/doc/Data+Permissions) to desired users, that automatically pre-filter available data to end-user.
+
+### Prerequisities
+
+**The following requirements are needed for successful conifguration of the application:**
+
+* a GoodData project
+* an admin account to the GoodData project
+
+### Process overview
+
+The application automatically determines what actions need to be taken for each user based on the table of users (see *input mapping* section). The process is ran row-by-row, i.e. all users are process sequentially, to avoid any confusion in the process. For each user, the application determines whether the user is already in the organization and/or project and acts accordingly on that, i.e. creates the user if necessary. To prevent any possible failure, all users are first disabled in the project, before assigning data permissions and re-enabling them again. If it's necessary, the application generates an invitation, which is delivered to the user.
+
+### Process detail
+
+Below is the more detailed description of the process.
+
+1. User and all their data is read from the table.
+2. User's login is compared to the list of users in GD project and list of users provisioned by Keboola.
+   1. If the user is in both organization and project, they are disabled or removed.
+   2. If the user is in the organization but not in the project, nothing is done.
+   3. If the user is not in the organization but is in the project, they are disabled.
+   4. If the user is not in the organization nor the project, an attempt is made to create them in Keboola organization is made. If the attemp fails, the user is already part of another organization and will not be maintained in Keboola domain.
+3. For each user, their `Mandatory User Filter (MUF)` expression is read and parsed into URI format. The URI format is a format, where all attribute names, labels and values are transformed to their URI counterparts. If the attribute, label or value does not exist, the URI expression is not created and an error is recorded in the status file.
+4. The URI expression is posted to GoodData and the user filter is created. Each user filter is assigned unique ID, which is then passed on to users as an attribute.
+5. The following action occurs once the user filter was created (follow-up to point 2):
+   1. User is assigned the user filter and is re-enabled in the project.
+   2. User is assigned the user filter and is added to the project.
+   3. User is assigned the user fitler and is re-enabled in the project.
+   4. User is assigned the user filter and is enabled/invited to the project.
+6. Process ends.
+
+See section **4 Execution plan** in [documentation](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/README.md).
+
+## See also
+
+The following two API references might be handy when working with the application:
+
+* [Keboola GoodData Provisioning API](https://keboolagooddataprovisioning.docs.apiary.io/)
+* [GoodData API Reference](https://help.gooddata.com/display/API/API+Reference)
+
+================================================
+File: component_config/component_short_description.md
+================================================
+A GoodData User Management application for managing users and data permissions.
+
+================================================
+File: component_config/configSchema.json
+================================================
+{
+  "title": "Parameters",
+  "type": "object",
+  "required": [
+    "username",
+    "#password",
+    "pid",
+    "domain_custom"
+  ],
+  "properties": {
+    "username": {
+      "type": "string",
+      "title": "GD Login",
+      "default": "",
+      "description": "Admin login to GoodData portal.",
+      "propertyOrder": 100
+    },
+    "#password": {
+      "type": "string",
+      "format": "password",
+      "title": "GD Password",
+      "description": "Password to admin login to GoodData portal.",
+      "propertyOrder": 200
+    },
+    "pid": {
+      "type": "string",
+      "title": "GD Project ID",
+      "description": "GoodData project ID. See description for more info.",
+      "propertyOrder": 300
+    },
+    "domain_custom": {
+      "type": "string",
+      "title": "GD Custom Domain",
+      "description": "If the GoodData project is white labeled, provide the domain. Format: \"https://subdomain.domain.com\".",
+      "default": "",
+      "propertyOrder": 600
+    },
+    "re_invite_users": {
+      "type": "boolean",
+      "title": "Re-invite users",
+      "format": "checkbox",
+      "description": "Send invites to users that have already been invited",
+      "default": true,
+      "propertyOrder": 700
+    },
+    "fail_on_error": {
+      "type": "boolean",
+      "title": "Fail on Error",
+      "format": "checkbox",
+      "description": "If set to true, the component will end with error after processing all requests and saving output if it encounters any problems during run.",
+      "default": false,
+      "propertyOrder": 800
+    }
+  }
+}
+
+================================================
+File: component_config/configuration_description.md
+================================================
+##### Note
+
+A more detailed documentation is available in [component's repository](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/README.md).
+
+## Input mapping
+
+The application accepts 4 parameters and a table of users. In addition to the 4 parameters, the component automatically uses [Storage API Token](https://help.keboola.com/management/project/tokens/) to access available GoodData projects within the project and provision users. A sample configuration can be found [in the repository](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/).
+
+### 1 Parameters
+
+Following 4 parameters are accepted: `GD Login`, `GD Password`, `GD Project ID` and `GD Custom Domain`. More detailed description of all parameters is provided in the upcoming subsections.
+
+A sample of the configuration file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/config.json).
+
+#### 1.1 GD Login
+
+The login email to the GoodData portal. Requirements for the used login are:
+
+* must have access to the project
+* must be admin of the project
+* must not have any data permissions assigned to them.
+
+Failure to comply with any of the above requirements will raise an error.
+
+#### 1.2 GD Password
+
+The password to `GD Login` used to log in to GoodData portal.
+
+#### 1.3 GD Project ID
+
+The ID of a project, for which the changes are to be made. The ID is compared to a list of available project IDs in the Keboola project. If the GD PID is not in the list of available PIDs, i.e. the writer is not located in the same project as the application, an error is raised. This behavior is enforced by the application to prevent changing users across projects without having knowledge about it.
+
+Follow [the link](https://help.gooddata.com/display/doc/Find+the+Project+ID) to get more information on how to find your project ID.
+
+#### 1.4 GD Custom Domain
+
+In case, the destination GoodData project is white labelled, it is required to provide the white label domain in the following format: `https://subdomain.domain.com` or whatever the equivalent is. This domain will be used for all GoodData related API calls,
+hence the incorrect format or domain will result in application failure.
+If the GoodData project is not white labeled, the field should be left blank and the component will use the base URL based on project location (`keboola.eu.gooddata.com` for EU location, `secure.gooddata.com` for US location).
+
+### 2 User table
+
+The user table **must** contain following columns: `login`, `action`, `role`, `muf`, `first_name` and `last_name`. If any of the columns is missing, the application will fail. Sample of the table can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/in/tables/test.csv).
+
+Below is the detailed description of each column.
+
+#### 2.1 login
+
+The email of the user, for whom the action is to be executed. If the user does not exist in the organization, an attempt will be made to register the user under Keboola organization with this email.
+
+#### 2.2 action
+
+The action, which is to be done for the user. Must be one of the following: `DISABLE`, `ENABLE`, `INVITE` or `REMOVE`.
+
+##### 2.2.a `DISABLE`
+
+**Disables the user** in the project. This process skips all data permission processes and automatically disables the user. If the user is not in the project or is already disabled, the user is skipped.
+
+##### 2.2.b `ENABLE`
+
+If the **user** is **already in the project**, they will be disabled. Data permissions processes follow, after which the user **will be re-enabled**.
+
+If the **user** is **not in the project**, they will be automatically enabled, provided that data permission processes execute successfully.
+
+In the special case, that **user** is **not part of the project nor Keboola organization**, there are not enough privileges for the user to be automatically added to the project. This action will be demoted to `INVITE`.
+
+##### 2.2.c `INVITE`
+
+If the **user** is **already in the project**, no invite is generated. Standard `DISABLE - MUF - ENABLE` process is followed instead.
+
+If the **user** is **not in the project**, an invite is generated for the user. The invite is sent to user's `login` mail and the user is assigned data permissions prior to invite being sent out.
+
+##### 2.2.2.d `REMOVE`
+
+If the **user** is in the project, in disabled or enabled state, and their email address is not identical to `GD login` parameter, the user is removed using process `GD_REMOVE`. If the **user** is in the project and their login is identical to `GD login` parameter, or they are not present in the project, `SKIP_NO_REMOVE` or `SKIP` process is used, respectively.
+
+#### 2.3 role
+
+Role of the user to be had in the project. Must be one of `admin`, `dashboardOnly`, `editor`, `editorInvite`, `editorUserAdmin`, `explorer`, `explorerOnly`, `keboolaEditorPlus`, `readOnlyUser` or `readOnlyNoExport`. If a role is not assigned properly, the error is recorded in the status file.
+
+#### 2.4 muf
+
+A list of json-like objects, from which data permissions are created. An example list might have the following form:
+
+```
+[
+    {
+        "attribute": "attr.inctestsales.city",
+        "value": ["NYC", "VAN", "PRG"],
+        "operator": "IN"
+    },
+    {
+        "attribute": "attr.inctestsales.sales_person",
+        "value": ["Sales_1"],
+        "operator": "="
+    }
+]
+```
+
+In the above example, two data permission filters are provided. Each JSON object must contain keys `attribute`, `value` and `operator`. 
+
+If the user should be able to acccess all the data, the `muf` expression should be provided as an empty list, i.e.
+
+```
+[]
+```
+
+##### 2.4.a `attribute`
+
+The attribute must be a string expression, identifying the attribute within the project. In general, attributes sourcing from Keboola writers are quite easy to determine. For example, column `city` from table `in.c-test.sales` would become `attr.inctestsales.city` in GoodData. Note the `attr` in the beginning of the identifier and missing punctuation from table name, i.e. all dots and dashes from Keboola table path were replaced.
+If unsure what is the correct attribute identifier, it is possible to obtain the full list of attributes within the project [in the following guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
+
+##### 2.4.b `value`
+
+The key value must be a list of values for which the expression must be determined. The application always assumes primary label for the attribute, i.e. any custom labels for the attribute are ignored. You can obtain a list of available values for attribute by following [this guide](https://help.gooddata.com/display/doc/Determine+the+Attribute+Value+ID).
+
+##### 2.4.c `operator`
+
+Operator must be one of `=`, `<>`, `IN` or `NOT IN`. At the moment, the only unsupported operator is `AND`. See more about operators [here](https://help.gooddata.com/display/doc/Data+Permissions#DataPermissions-CreateanExpressionStatementforaDataPermission).
+
+##### 2.4.d Note on .csv files
+
+Note that json-files have keys enclosed in double quotes, which, conincidentally, is a commonly used character in quoting CSV files as well. This may lead to bad parsing of the `muf` expression, if it's not quoted properly. It is therefore recommended to follow standard CSV file procedures, specifically double all double quotes. As an example, below is the correct way the `muf` expression should be inputted in the CSV file
+
+```
+"[{""attribute"":""attr.inctestsales.city"",""value"":[""NYC"",""VAN"",""PRG""],""operator"":""NOT IN""}]"
+```
+
+and
+
+```
+"[]"
+```
+
+which will then be parsed as
+
+```
+[
+    {
+        "attribute": "attr.inctestsales.city",
+        "value": ["NYC","VAN","PRG"],
+        "operator": "NOT IN"
+    }
+]
+```
+
+and 
+
+```
+[]
+```
+
+#### 2.5 first_name
+
+First name of the user. The name will be used if the user must be created in the Keboola domain.
+
+#### 2.6 last_name
+
+Last name of the user. The usage is same as `first_name`.
+
+## 3 Output mapping
+
+The output of the application is the status file, which is loaded incrementally to `out.c-GDUserManagement.status` table automatically. Sample of the status file can be [found here](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/component_config/sample-config/out/tables/test.csv).
+
+The file contains following columns:
+
+* `user` - user, for which the action was executed. `admin` records are required calls by application at initialization.
+* `action` - describes action type
+* `status` - marks, whether the action was a success
+* `timestamp` - UTC timestamp of the event
+* `role` - user role
+* `details` - any additional details related to the action
+* `muf` - muf assigned to the user from the table
+
+See [documentaion](https://bitbucket.org/kds_consulting_team/kds-team.app-gd-user-management/src/master/README.md) for more detailed information about execution plans and output mapping.
+
+## 4 See also
+
+The following two API references might be handy when working with the application:
+
+* [Keboola GoodData Provisioning API](https://keboolagooddataprovisioning.docs.apiary.io/)
+* [GoodData API Reference](https://help.gooddata.com/display/API/API+Reference)
+
+================================================
+File: component_config/logger
+================================================
+gelf
+
+================================================
+File: component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: component_config/stack_parameters.json
+================================================
+{
+    "connection.keboola.com": {
+      "provisioning_url": "https://gooddata-provisioning.keboola.com",
+      "gd_url": "https://secure.gooddata.com"
+    },
+    "connection.eu-central-1.keboola.com": {
+      "provisioning_url": "https://gooddata-provisioning.eu-central-1.keboola.com",
+      "gd_url": "https://keboola.eu.gooddata.com"
+    },
+    "connection.ap-southeast-2.keboola.com": {
+        "provisioning_url": "https://gooddata-provisioning.ap-southeast-2.keboola.com",
+        "gd_url": "https://secure.gooddata.com"
+    }
+  }
+
+================================================
+File: component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "username": "admin_user@domain.com",
+    "#password": "notPSWD1234",
+    "pid": "gdprojectid12345678",
+    "domain_custom": "",
+    "re_invite_users": false,
+    "fail_on_error": true
+  },
+  "image_parameters": {
+    "provisioning_url": "https://gooddata-provisioning.keboola.com",
+    "gd_url": "https://secure.gooddata.com"
+  }
+}
+
+================================================
+File: component_config/sample-config/in/state.json
+================================================
+{}
+
+================================================
+File: component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: component_config/sample-config/in/tables/test.csv
+================================================
+"login","action","role","muf","first_name","last_name"
+"user1@domain.com","ENABLE","admin","[{""attribute"":""attr.inctestsales.sales"",""value"":[""sales_2""],""operator"":""NOT IN""}]","USER","1"
+"user2@domain.com","INVITE","admin","[]","USER","2"
+"user3@domain.com","DISABLE","admin","[]","USER","3"
+
+
+================================================
+File: component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "login",
+        "action",
+        "role",
+        "muf",
+        "first_name",
+        "last_name"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "login": [],
+        "action": [],
+        "role": [],
+        "muf": [],
+        "first_name": [],
+        "last_name": []
+    }
+}
+
+================================================
+File: component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: component_config/sample-config/out/tables/test.csv
+================================================
+"login","action","status","timestamp","role","details","muf"
+"user1@domain.com","DISABLE_IN_PRJ","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
+"user1@domain.com","CREATE_MUF_EXPR","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
+"user1@domain.com","CREATE_MUF","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
+"user1@domain.com","ASSIGN_MUF","SUCCESS","2011-01-01 00:00:00 UTC","admin","","[]"
+"user1@domain.com","ENABLE_IN_PRJ","ERROR","2011-01-01 00:00:00 UTC","admin","Not enough permissions","[]"
+
+
+================================================
+File: scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: scripts/deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: scripts/developer_portal/fn_actions_md_update.sh
+================================================
+#!/bin/bash
+
+# Set the path to the Python script file
+PYTHON_FILE="src/component.py"
+# Set the path to the Markdown file containing actions
+MD_FILE="component_config/actions.md"
+
+# Check if the file exists before creating it
+if [ ! -e "$MD_FILE" ]; then
+    touch "$MD_FILE"
+else
+    echo "File already exists: $MD_FILE"
+    exit 1
+fi
+
+# Get all occurrences of lines containing @sync_action('XXX') from the .py file
+SYNC_ACTIONS=$(grep -o -E "@sync_action\(['\"][^'\"]*['\"]\)" "$PYTHON_FILE" | sed "s/@sync_action(\(['\"]\)\([^'\"]*\)\(['\"]\))/\2/" | sort | uniq)
+
+# Check if any sync actions were found
+if [ -n "$SYNC_ACTIONS" ]; then
+    # Iterate over each occurrence of @sync_action('XXX')
+    for sync_action in $SYNC_ACTIONS; do
+        EXISTING_ACTIONS+=("$sync_action")
+    done
+
+    # Convert the array to JSON format
+    JSON_ACTIONS=$(printf '"%s",' "${EXISTING_ACTIONS[@]}")
+    JSON_ACTIONS="[${JSON_ACTIONS%,}]"
+
+    # Update the content of the actions.md file
+    echo "$JSON_ACTIONS" > "$MD_FILE"
+else
+    echo "No sync actions found. Not creating the file."
+fi
+
+================================================
+File: scripts/developer_portal/update_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+
+# Check if the KBC_DEVELOPERPORTAL_APP environment variable is set
+if [ -z "$KBC_DEVELOPERPORTAL_APP" ]; then
+    echo "Error: KBC_DEVELOPERPORTAL_APP environment variable is not set."
+    exit 1
+fi
+
+# Pull the latest version of the developer portal CLI Docker image
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+# Function to update a property for the given app ID
+update_property() {
+    local app_id="$1"
+    local prop_name="$2"
+    local file_path="$3"
+
+    if [ ! -f "$file_path" ]; then
+        echo "File '$file_path' not found. Skipping update for property '$prop_name' of application '$app_id'."
+        return
+    fi
+
+    # shellcheck disable=SC2155
+    local value=$(<"$file_path")
+
+    echo "Updating $prop_name for $app_id"
+    echo "$value"
+
+    if [ -n "$value" ]; then
+        docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property "$KBC_DEVELOPERPORTAL_VENDOR" "$app_id" "$prop_name" --value="$value"
+        echo "Property $prop_name updated successfully for $app_id"
+    else
+        echo "$prop_name is empty for $app_id, skipping..."
+    fi
+}
+
+app_id="$KBC_DEVELOPERPORTAL_APP"
+
+update_property "$app_id" "isDeployReady" "component_config/isDeployReady.md"
+update_property "$app_id" "longDescription" "component_config/component_long_description.md"
+update_property "$app_id" "configurationSchema" "component_config/configSchema.json"
+update_property "$app_id" "configurationRowSchema" "component_config/configRowSchema.json"
+update_property "$app_id" "configurationDescription" "component_config/configuration_description.md"
+update_property "$app_id" "shortDescription" "component_config/component_short_description.md"
+update_property "$app_id" "logger" "component_config/logger"
+update_property "$app_id" "loggerConfiguration" "component_config/loggerConfiguration.json"
+update_property "$app_id" "licenseUrl" "component_config/licenseUrl.md"
+update_property "$app_id" "documentationUrl" "component_config/documentationUrl.md"
+update_property "$app_id" "sourceCodeUrl" "component_config/sourceCodeUrl.md"
+update_property "$app_id" "uiOptions" "component_config/uiOptions.md"
+
+# Update the actions.md file
+source "$(dirname "$0")/fn_actions_md_update.sh"
+# update_property actions
+update_property "$app_id" "actions" "component_config/actions.md"
+
+================================================
+File: src/main.py
+================================================
+import logging
+from lib.component import Component
+
+# Key definition
+
+if __name__ == '__main__':
+
+    mngr = Component()
+    mngr.run()
+
+    logging.info("User management finished!")
+
+
+================================================
+File: src/lib/GD_KB_client.py
+================================================
+import json
+import re
+import requests
+import logging
+import sys
+import secrets
+
+
+class clientGoodDataKeboola:
+    """
+    Main class for REST requests to GD API.
+
+    See API reference for both services; links below:
+    GoodData API Reference: https://help.gooddata.com/display/API/API+Reference
+    Keboola GoodData Provisioning API: https://keboolagooddataprovisioning.docs.apiary.io/
+    """
+
+    def __init__(self, username, password, pid, domain, gd_url, kbc_url, sapi_token):
+        """
+        Client class initialization.
+
+        Parameters
+        ----------
+        username : str
+            Login to GoodData portal. A login for admin account with no data permissions must be provided.
+        password : str
+            Password to GD login provided in the first argument.
+        pid : str
+            GoodData project ID.
+        domain : str
+            Custom domain for GD, if the project is whitelabeled.
+        gd_url : str
+            Stack parameter, default GD URL.
+        kbc_url : str
+            Stack parameter, default KBC Provisioning API URL.
+        sapi_token : str
+            Environment variabel, storage API token to Keboola.
+        """
+
+        self.username = username
+        self.password = password
+        self.pid = pid
+        self.sapi_token = sapi_token
+        self.kbc_url = kbc_url
+        self._KBC_header = {'X-StorageApi-Token': self.sapi_token}
+
+        if domain.strip() != '':
+            self.gd_url = domain.strip()
+        else:
+            self.gd_url = gd_url
+
+        logging.info("GD domain set to %s." % self.gd_url)
+        logging.info("KBC domain set to %s." % self.kbc_url)
+
+        self._GD_get_SST_token()
+
+    def _GD_get_SST_token(self):
+        """
+        A function for obtaining super token to GD API.
+
+        Parameters
+        ----------
+        self : class
+
+        Returns
+        -------
+        SST token : str
+            Super token used for obtaining TT token.
+
+        Raises
+        ------
+        KeyError
+            If login is successful, but token is not in the response.
+        SystemExit
+            If login is not successful.
+        """
+
+        _data = f'''{{
+            "postUserLogin":{{
+                "login":"{self.username}",
+                "password":"{self.password}",
+                "remember": 1,
+                "verify_level": 2
+            }}
+        }}
+        '''
+
+        headers = {"Content-Type": "application/json",
+                   "Accept": "application/json"}
+
+        url = self.gd_url + '/gdc/account/login'
+
+        auth_response = requests.post(url, headers=headers, data=_data)
+        auth_sc, auth_json = self.rsp_splitter(auth_response)
+
+        if auth_sc in (200, 201, 202):
+
+            # SST token is needed for further authorization, mainly
+            # obtaining the TT token
+            try:
+                self.SST_token = auth_json['userLogin']['token']
+                logging.info(
+                    "Login to GoodData was successful. SST token obtained.")
+                # logging.debug("SST Token: %s" % self.SST_token)
+
+            except KeyError:
+                logging.error(
+                    "Could not obtain the SST token. Please contact support.")
+                sys.exit(1)
+        else:
+
+            logging.error(
+                "Could not log in to GoodData, status code received was: %s." % str(auth_sc))
+            logging.error("Response received: %s" % json.dumps(auth_json))
+            sys.exit(1)
+
+    def _GD_get_TT_token(self):
+        """
+        Function for obtaining TT token.
+
+        Parameters
+        ----------
+        self : class
+
+        Returns
+        -------
+        TT token : str
+            TT token used in every request made to GD API.
+
+        Raises
+        ------
+        KeyError
+            If login using SST is successful, but TT token was not in response.
+        SystemExit
+            If TT token could not be obtained using SST token.
+        """
+
+        headers = {"Content-Type": "application/json",
+                   "Accept": "application/json",
+                   "X-GDC-AuthSST": self.SST_token}
+
+        url = self.gd_url + '/gdc/account/token'
+
+        TT_response = requests.get(url, headers=headers)
+        TT_sc, TT_json = self.rsp_splitter(TT_response)
+
+        if TT_sc in (200, 201, 202):
+
+            try:
+                self.TT_token = TT_json['userToken']['token']
+                # logging.info("Successfully obtained the TT token.")
+                # logging.debug("TT Token: %s" % self.TT_token)
+
+            except KeyError:
+                logging.error("Log in successful, however TT token " +
+                              "could not be obtained. Please contact support.")
+                sys.exit(1)
+        else:
+
+            logging.error(
+                "Could not log in to GoodData using SST, status code received was: %s." % str(TT_sc))
+            logging.error("Response received: %s" % json.dumps(TT_json))
+            sys.exit(1)
+
+    def _GD_build_header(self):
+        """
+        Function for building header for GD request. TT token needs to be refreshed after almost every request.
+
+        Parameters
+        ----------
+        self : class
+
+        Returns:
+        _GD_header : dict
+            A header used for requests to GoodData.
+        """
+
+        self._GD_get_TT_token()
+
+        _header = {"Content-Type": "application/json",
+                   "Accept": "application/json",
+                   "X-GDC-AuthTT": self.TT_token}
+
+        self._GD_header = _header
+
+        logging.debug("Request header: %s" % _header)
+
+    def _GD_get_users(self):
+        """
+        Function for getting all users (active and disabled), currently in the project.
+
+        Parameters
+        ----------
+        self : class
+
+        Returns
+        -------
+
+        """
+
+        self._GD_build_header()
+
+        url = self.gd_url + f'/gdc/projects/{self.pid}/users'
+
+        users_request = requests.get(url, headers=self._GD_header)
+        ur_sc = users_request.status_code
+        ur_json = users_request.json()
+
+        if ur_sc in (200, 201, 202):
+            logging.info("Users were extracted successfully.")
+            return ur_json
+        else:
+            logging.error("There was an issue extracting users from GD. " +
+                          "Code received is %s." % str(ur_sc))
+            logging.error("Response: %s" % json.dumps(ur_json))
+            sys.exit(1)
+
+    def _GD_get_project_invitations(self):
+        """
+        Function for getting project details
+
+        Parameters
+        ----------
+        self : class
+
+        Returns
+        -------
+
+        """
+
+        self._GD_build_header()
+
+        url = self.gd_url + f'/gdc/projects/{self.pid}/invitations'
+
+        project_request = requests.get(url, headers=self._GD_header)
+        ur_sc = project_request.status_code
+        ur_json = project_request.json()
+
+        if ur_sc in (200, 201, 202):
+            return ur_json
+        else:
+            logging.error("There was an issue extracting invitation data from GD. " +
+                          "Code received is %s." % str(ur_sc))
+            logging.error("Response: %s" % json.dumps(ur_json))
+            sys.exit(1)
+
+    def _GD_get_attributes(self):
+        """
+        Function for getting all attributes in the project.
+
+        Parameters
+        ----------
+        self : class
+
+        Returns
+        -------
+        att_json : dict
+            A dictionary of users and their attributes.
+
+        Raises
+        ------
+        SystemExit
+            If a list of users could not be obtained.
+        """
+
+        self._GD_build_header()
+
+        url = self.gd_url + f'/gdc/md/{self.pid}/query/attributes'
+
+        attr_response = requests.get(url, headers=self._GD_header)
+
+        att_sc = attr_response.status_code
+        att_json = attr_response.json()
+
+        if att_sc == 200:
+
+            logging.info("Attributes were fetched successfully.")
+            return att_json
+
+        else:
+
+            logging.info(
+                "Could not fetch attributes. Response received status code %s." % att_sc)
+            logging.debug('Response: %s' % json.dumps(att_json))
+            sys.exit(1)
+
+    def rsp_splitter(self, rsp):
+        """
+        A function for splitting requests.response class.
+
+        Parameters
+        ----------
+        self : class
+        rsp : request.Response class
+            A response received from a request.
+
+        Returns
+        -------
+        status_code : int
+            A status code of the response.
+        json : dict
+            A json response.
+        """
+
+        try:
+            _rtrn_json = rsp.json()
+        except ValueError:
+            _rtrn_json = {}
+
+        return rsp.status_code, _rtrn_json
+
+    def _GD_get_attribute_values(self, attribute_uri):
+        """
+        A function for obtaining attribute values for given attribute.
+
+        Parameters
+        ----------
+        self : class
+        attribute_uri : str
+            A URI for an attribute, for which values shall be obtained.
+
+        Returns
+        -------
+        tuple
+            A tuple of lenght 2. First element indicates success of the operation. In case the operation is successful
+            the second element is a list of dictionaries with attribute values and their URI. If unsuccessful, the
+            second element is an error message.
+        """
+
+        self._GD_build_header()
+
+        url = self.gd_url + attribute_uri
+
+        attr_response = requests.get(url, headers=self._GD_header)
+        att_sc = attr_response.status_code
+
+        if att_sc != 200:
+            logging.error(
+                "Could not obtain attribute values for attribute %s." % attribute_uri)
+
+            return False, "Could not obtain attribute values for attribute %s." % attribute_uri
+
+        _elmts = attr_response.json(
+        )['attribute']['content']['displayForms'][0]['links']['elements']
+
+        _paging = _elmts + '?limit=10000'
+        self._GD_build_header()
+
+        hasMore = True
+        _out_elements = []
+        while hasMore:
+
+            el_url = self.gd_url + _paging
+
+            el_response = requests.get(el_url, headers=self._GD_header)
+            el_sc, el_json = self.rsp_splitter(el_response)
+
+            _out_elements += el_json['attributeElements']['elements']
+
+            _offset_url = el_json['attributeElements']['paging']['next']
+
+            if _offset_url:
+                _paging = _offset_url
+            else:
+                hasMore = False
+
+        return True, _out_elements
+
+    def _KBC_get_projects(self):
+        """
+        A function to obtain all projects within a KBC project.
+
+        Parameters
+        ----------
+        self : class
+
+        Returns
+        -------
+        prj_json : list
+            A list of dictionaries containing project information for all projects.
+
+        Raises
+        ------
+        SystemExit
+            If the list could not be obtained.
+        """
+
+        url = self.kbc_url + '/projects'
+
+        prj_response = requests.get(url, headers=self._KBC_header)
+
+        prj_sc, prj_json = self.rsp_splitter(prj_response)
+
+        if prj_sc in (200, 201, 202):
+
+            return prj_json
+
+        else:
+
+            logging.error(
+                "Could not obtain projects.")
+            logging.error("Status code received %s." % prj_sc)
+            logging.error("Response: %s" % json.dumps(prj_json))
+            sys.exit(1)
+
+    def _KBC_get_users(self):
+        """
+        A function for obtaining all users provisioned within the project.
+
+        Parameters
+        ----------
+        self : class
+
+        Returns
+        -------
+        usr_json : list
+            A list of dictionaries; each dictionary represents one user provisioned by Keboola.
+
+        Raises
+        ------
+        SystemExit
+            If a list of users could not be obtained.
+        """
+
+        url = self.kbc_url + '/users'
+        params = {}
+        complete = False
+        paginationToken = None
+        allUsers = []
+
+        while complete is not True:
+
+            if paginationToken is not None:
+                params['nextPageToken'] = paginationToken
+
+            usr_response = requests.get(url, headers=self._KBC_header, params=params)
+            paginationUrl = usr_response.headers['Link']
+
+            if paginationUrl == '':
+
+                complete = True
+
+            else:
+
+                paginationToken = re.findall(r'nextPageToken=.*;', paginationUrl)[0].replace('nextPageToken=', '')
+
+            usr_sc, usr_json = self.rsp_splitter(usr_response)
+
+            if usr_sc in (200, 201, 202):
+
+                allUsers += usr_json
+
+            else:
+
+                logging.error(
+                    "Could not obtain provisioned users for the project.")
+                logging.error("Status code received %s." % usr_sc)
+                logging.error("Response: %s" % json.dumps(usr_json))
+                sys.exit(1)
+
+        return allUsers
+
+    def _KBC_create_user(self, login, first_name, last_name, sso_provider=None):
+        """
+        A function for creating user within Keboola domain.
+
+        Parameters
+        ----------
+        self : class
+        login : str
+            A login to be used by the user.
+        first_name : str
+            A first name of the user. Cannot be empty.
+        last_name : str
+            A last name of the user. Cannot be empty.
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+        """
+
+        url = self.kbc_url + '/users'
+        _pswd = secrets.token_hex(16)
+
+        _data = {
+            "login": login,
+            "password": _pswd,
+            "firstName": first_name,
+            "lastName": last_name
+        }
+
+        if sso_provider is not None:
+            _data['ssoProvider'] = sso_provider
+
+        logging.debug(_data)
+
+        cu_response = requests.post(url, headers=self._KBC_header, json=_data)
+
+        return self.rsp_splitter(cu_response)
+
+    def _KBC_remove_user_from_project(self, login):
+        """
+        A function for removing user from the project using Keboola API.
+
+        Parameters
+        ----------
+        self : class
+        login : str
+            Login to be removed from the project.
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+        """
+
+        url = self.kbc_url + f'/projects/{self.pid}/users/{login}'
+
+        du_response = requests.delete(url, headers=self._KBC_header)
+
+        return self.rsp_splitter(du_response)
+
+    def _KBC_add_user_to_project(self, login, role):
+        """
+        A function for adding users to a project using Keboola API.
+
+        Parameters
+        ----------
+        self : class
+        login : str
+            Login to be added to a project.
+        role : str
+            Role of a newly added member. Must be one of admin, editor, readOnly, dashboardOnly, keboolaEditorPlus.
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+        """
+
+        url = self.kbc_url + f'/projects/{self.pid}/users/{login}'
+
+        _data = f'''{{
+            "role": "{role}"
+        }}
+        '''
+
+        au_response = requests.post(url, headers=self._KBC_header, data=_data)
+
+        return self.rsp_splitter(au_response)
+
+    def _GD_get_role_details(self, role_uri):
+        """
+        A function for getting details about roles in GoodData.
+
+        Parameters
+        ----------
+        self : class
+        role_uri : str
+            URI of a GD role.
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+        """
+
+        url = self.gd_url + role_uri
+        self._GD_build_header()
+
+        role_detail_request = requests.get(url, headers=self._GD_header)
+        return self.rsp_splitter(role_detail_request)
+
+    def _GD_get_roles(self):
+        """
+        A function for getting all roles and their details.
+
+        Parameters
+        ----------
+        self : class
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+
+        Raises
+        ------
+        SystemExit
+            If a list of roles could not be obtained.
+        """
+
+        url = self.gd_url + f'/gdc/projects/{self.pid}/roles'
+
+        self._GD_build_header()
+
+        roles_response = requests.get(url, headers=self._GD_header)
+        roles_sc, roles_json = self.rsp_splitter(roles_response)
+
+        if roles_sc != 200:
+            logging.error("Could not fetch project roles. Received code %s" % roles_sc)
+            logging.error("Response: %s" % json.dumps(roles_json))
+            sys.exit(1)
+
+        _roles = roles_json.get('projectRoles', {}).get('roles', [])
+        if _roles == []:
+            logging.error("Could not download roles from GoodData.")
+            logging.error(f"Received: {roles_sc} - {roles_json}.")
+            sys.exit(1)
+
+        _GD_roles = {}
+
+        for r in _roles:
+            _, _details = self._GD_get_role_details(r)
+
+            # logging.debug(_details)
+
+            _role_title = _details['projectRole']['meta']['identifier']
+            _GD_roles[_role_title] = r
+
+        return _GD_roles
+
+    def _GD_add_user_to_project(self, user_uri, role_uri):
+        """
+        A function for adding user to a project using GD API.
+
+        Parameters
+        ----------
+        self : class
+        user_uri : str
+            URI of an account to be added to the project.
+        role_uri : str
+            An URI of a role to be assigned to the person.
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+        """
+
+        url = self.gd_url + f'/gdc/projects/{self.pid}/users'
+
+        self._GD_build_header()
+
+        _data = f'''{{
+            "user": {{
+                "content": {{
+                    "status": "ENABLED",
+                    "userRoles": [
+                        "{role_uri}"
+                    ]
+                }},
+                "links": {{
+                    "self": "{user_uri}"
+                }}
+            }}
+        }}
+        '''
+
+        au_response = requests.post(url, headers=self._GD_header, data=_data)
+
+        return self.rsp_splitter(au_response)
+
+    def _GD_disable_user_in_project(self, user_uri):
+        """
+        A function to disable users in a project using GD API.
+
+        Parameters
+        ----------
+        self : class
+        user_uri : str
+            A URI of an account to be disabled in the project.
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+        """
+
+        url = self.gd_url + f'/gdc/projects/{self.pid}/users'
+
+        self._GD_build_header()
+
+        _data = f'''{{
+            "user": {{
+                "content": {{
+                    "status": "DISABLED"
+                }},
+                "links": {{
+                    "self": "{user_uri}"
+                }}
+            }}
+        }}
+        '''
+
+        ru_response = requests.post(url, headers=self._GD_header, data=_data)
+
+        return self.rsp_splitter(ru_response)
+
+    def _GD_invite_users_to_project(self, invitation_dict):
+        """
+        A function to create invitations to the GD project.
+
+        Parameters
+        ----------
+        self : class
+        invitation_dict : dict
+            A dictionary containing information about login, role and data filters to be applied.
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+        """
+
+        url = self.gd_url + f'/gdc/projects/{self.pid}/invitations'
+
+        self._GD_build_header()
+
+        _email = invitation_dict['_email']
+        _role = invitation_dict['_role']
+        _usrFilter = invitation_dict['_usrFilter']
+        _usrFilter_str = self.list_to_str(_usrFilter)
+
+        _data = f'''{{
+            "invitations": [
+              {{
+                "invitation": {{
+                  "content": {{
+                    "email": "{_email}",
+                    "userFilters": {_usrFilter_str},
+                    "role": "{_role}",
+                    "firstname": "",
+                    "lastname": "",
+                    "action": {{}}
+                  }}
+                }}
+                }}
+              ]
+            }}
+        '''
+
+        logging.debug(_data)
+
+        inv_response = requests.post(url, headers=self._GD_header, data=_data)
+
+        return self.rsp_splitter(inv_response)
+
+    @staticmethod
+    def list_to_str(listToStr):
+        """
+        A function to convert list to list-like string.
+
+        Parameters
+        ----------
+        l : list
+
+        Returns
+        -------
+        str
+            A string that represents inputted list..
+        """
+
+        return '[' + ','.join('"{0}"'.format(x) for x in listToStr) + ']'
+
+    def _GD_create_MUF(self, expression, name):
+        """
+        A function to create MUF expressions in the project.
+
+        Parameters
+        ----------
+        self : class
+        expression : str
+            A string expressions of data permissions to be applied.
+        name : str
+            A name of the expression.
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+        """
+
+        url = self.gd_url + f'/gdc/md/{self.pid}/obj'
+
+        self._GD_build_header()
+
+        _data = f'''{{
+            "userFilter": {{
+              "content": {{
+                "expression": "{expression}"
+              }},
+              "meta": {{
+                "category": "userFilter",
+                "title": "{name}"
+              }}
+            }}
+          }}
+        '''
+
+        logging.debug(_data)
+
+        dp_rsp = requests.post(url, headers=self._GD_header, data=_data)
+
+        return self.rsp_splitter(dp_rsp)
+
+    def _GD_assign_MUF(self, user, userFilters):
+        """
+        A function to assign MUFs to a user.
+
+        Parameters
+        ----------
+        self : class
+        user : str
+            A login, to which the filter should be applied.
+        userFilters : list
+            A list of filter to be applied.
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+        """
+
+        url = self.gd_url + f'/gdc/md/{self.pid}/userfilters'
+
+        self._GD_build_header()
+
+        userFilters_str = self.list_to_str(userFilters)
+
+        _data = f'''{{
+            "userFilters": {{
+                "items": [
+                    {{
+                        "user": "{user}",
+                        "userFilters": {userFilters_str}
+                    }}
+                ]
+            }}
+        }}
+        '''
+
+        logging.debug(_data)
+
+        af_rsp = requests.post(url, headers=self._GD_header, data=_data)
+
+        return self.rsp_splitter(af_rsp)
+
+    def _GD_get_data_permissions_for_user(self, user_uri):
+        """
+        A function for getting data permissions for a user.
+
+        Parameters
+        ----------
+        self : class
+        user_uri : str
+            An URI of the admin user.
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+        """
+
+        url = self.gd_url + f'/gdc/md/{self.pid}/userfilters'
+
+        self._GD_build_header()
+
+        _params = {"users": f'{user_uri}'}
+
+        logging.debug(_params)
+
+        uf_rsp = requests.get(url, headers=self._GD_header, params=_params)
+
+        return self.rsp_splitter(uf_rsp)
+
+    def _GD_remove_user_from_project(self, user_uri):
+        """
+        A function removes a user completely from the project. The user has to
+        be invited back to the project, in order to regain access.
+
+        Parameters
+        ----------
+        self : class
+        user_uri : str
+            An URI of the user, which should be deleted.
+
+        Returns
+        -------
+        tuple
+            See rsp_splitter.
+        """
+
+        _user_uid = user_uri.split('/')[-1]
+
+        url = self.gd_url + f'/gdc/projects/{self.pid}/users/{_user_uid}'
+        self._GD_build_header()
+
+        du_rsp = requests.delete(url, headers=self._GD_header)
+
+        return self.rsp_splitter(du_rsp)
+
+
+================================================
+File: src/lib/component.py
+================================================
+import csv
+import json
+import logging
+import os
+import sys
+from lib.GD_KB_client import clientGoodDataKeboola
+from lib.logger import Logger
+from lib.user import User
+from kbc.env_handler import KBCEnvHandler
+
+sys.tracebacklimit = 0
+
+APP_VERSION = '0.3.3'
+
+KEY_GDUSERNAME = 'username'
+KEY_GDPASSWORD = '#password'
+KEY_GDPID = 'pid'
+KEY_GDCUSTOMDOMAIN = 'domain_custom'
+KEY_GDURL = 'gd_url'
+KEY_KBCURL = 'provisioning_url'
+KEY_EXTERNAL_PROJECT = 'external_project'
+KEY_EXTERNAL_PROJECT_TOKEN = '#external_project_token'
+KEY_SKIPPROJECTCHECK = 'skip_project_check'
+KEY_RUN_ID = 'KBC_RUNID'
+KEY_DEBUG = 'debug'
+KEY_RE_INVITE_USERS = "re_invite_users"
+KEY_FAIL_ON_ERROR = "fail_on_error"
+
+KEY_PBP = 'pbp'
+KEY_CUSTOM_PID = '#pid'
+KEY_CUSTOM_GDAPI_TOKEN = '#sapi_token'
+KEY_CUSTOM_GDAPI_URL = 'api_url'
+
+MANDATORY_PARS = [KEY_GDUSERNAME, KEY_GDPASSWORD, KEY_GDPID]
+
+
+class Component(KBCEnvHandler):
+    """
+    The main component class, a children class of KBCEnvHandler.
+
+    See keboola-python-util-lib package: https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/src/master/
+    """
+
+    def __init__(self):
+        """
+        Init function.
+        In addition to initialization of the class, the function checks whether provided PID is in the list
+        of PIDs provisioned by the Keboola GD Writer, obtains attributes of the whole GD project, extracts users
+        from both Keboola and GD environments, maps Keboola roles to GD roles, checks admin privileges and ensures
+        the admin user has no data permissions assigned to themselves.
+
+        Parameters
+        ----------
+        username_key : str
+            A key in dictionary for username parameter.
+        password_key : str
+            A key in dictionary for password parameter.
+        pid_key : str
+            A key in dictionary for PID parameter.
+        domain_key : str
+            A key in dictionary for domain parameter.
+        gd_url_key : str
+            A key in dictionary for GD URL stack parameter.
+        kbc_prov_key : str
+            A key in dictionary for Keboola Provisioning API stack parameter.
+        MANDATORY_PARAMS : list
+            A list of mandatory parameters.
+        """
+
+        KBCEnvHandler.__init__(self, MANDATORY_PARS)
+        logging.info("Running app version %s..." % APP_VERSION)
+
+        if self.cfg_params.get(KEY_DEBUG) is True:
+            logger = logging.getLogger()
+            logger.setLevel(level='DEBUG')
+
+            sys.tracebacklimit = 3
+
+        try:
+            self.validate_config(MANDATORY_PARS)
+        except KeyError as e:
+            logging.exception(e)
+            raise
+
+        sapi_token = self.get_storage_token()
+        username = self.cfg_params[KEY_GDUSERNAME]
+        password = self.cfg_params[KEY_GDPASSWORD]
+        pid = self.cfg_params[KEY_GDPID]
+        domain = self.cfg_params[KEY_GDCUSTOMDOMAIN]
+        gd_url = self.image_params[KEY_GDURL]
+        kbc_prov_url = self.image_params[KEY_KBCURL]
+        self.run_id = os.environ.get(KEY_RUN_ID, '')
+        self.re_invite_users = self.cfg_params.get(KEY_RE_INVITE_USERS, True)
+
+        fail_on_error = self.cfg_params.get(KEY_FAIL_ON_ERROR, False)
+        if fail_on_error and 'queuev2' not in os.environ.get('KBC_PROJECT_FEATURE_GATES', ''):
+            logging.error("Fail on error option is only available on Queue V2.")
+            sys.exit(1)
+
+        external_project = self.cfg_params.get(KEY_EXTERNAL_PROJECT, False)
+        external_project_token = self.cfg_params.get(KEY_EXTERNAL_PROJECT_TOKEN)
+
+        if external_project is True:
+            sapi_token = external_project_token
+
+        pbp = self.image_params.get(KEY_PBP, {})
+        pbp_gd_pid = pbp.get(KEY_CUSTOM_PID, None)
+        pbp_gd_api_token = pbp.get(KEY_CUSTOM_GDAPI_TOKEN)
+        pbp_gd_api_url = pbp.get(KEY_CUSTOM_GDAPI_URL, '')
+
+        self.is_pbp_project = False
+
+        if pbp_gd_pid == pid:
+            kbc_prov_url = pbp_gd_api_url
+            sapi_token = pbp_gd_api_token
+            self.is_pbp_project = True
+
+        self.client = clientGoodDataKeboola(username, password, pid, domain,
+                                            gd_url, kbc_prov_url, sapi_token)
+
+        self.input_files = self.configuration.get_input_tables()
+        self.log = Logger(self.data_path, run_id=self.run_id, write_always=fail_on_error)
+        self._get_all_attributes()
+        self._get_all_users()
+        self._map_roles()
+        self._GD_check_user_admin()
+        self._GD_check_admin_permissions()
+        if not self.re_invite_users:
+            self._get_all_invitations()
+        else:
+            self.invitations = []
+
+        self.encountered_errors = False
+
+    def run(self):
+        """
+        The main run function
+
+        Parameters
+        ----------
+        self : class
+        """
+
+        for f in self.input_files:
+
+            _path = os.path.join(self.data_path, 'in',
+                                 'tables', f['destination'])
+
+            with open(_path) as file:
+
+                _rdr = csv.DictReader(file)
+
+                for row in _rdr:
+
+                    try:
+
+                        _login = row['login'].lower()
+                        _action = row['action']
+                        _role = row['role']
+                        _muf = row['muf']
+                        _fn = row['first_name']
+                        _ln = row['last_name']
+                        _sso = row.get('sso_provider', '')
+
+                        if _sso.strip() == '':
+                            _sso = None
+
+                        user = User(_login, _role, _muf, _action, _fn, _ln, _sso)
+                        muf_name = f'muf_{_login}_{self.run_id}'
+
+                    except KeyError as e:
+
+                        logging.error(
+                            "Column %s is missing from the .csv file." % e)
+                        sys.exit(1)
+
+                    if _login.strip() == self.client.username.lower().strip():
+                        logging.error("Cannot operate on user, who is used for authentication.")
+                        self.log.make_log(user.login, 'PERMISSION_ERROR', False,
+                                          user.role, "Cannot assign filters to user used for authentication.",
+                                          user.muf)
+                        continue
+
+                    logging.info("Starting process for user %s." % _login)
+
+                    _av_roles = list(self._roles_map.keys())
+
+                    if _role not in _av_roles:
+                        self.log.make_log(user.login, "ROLE_ERROR", False,
+                                          user.role, "Role must be one of %s" % str(_av_roles), user.muf)
+
+                        logging.warn(
+                            "There were some errors for user %s." % _login)
+                        self.encountered_errors = True
+                        continue
+
+                    self.check_membership(user)
+
+                    logging.info("User %s was assigned the following action: %s" % (
+                        user.login, user._app_action))
+
+                    self.log.make_log(user.login, "ASSIGN_ACTION", True,
+                                      user.role, user._app_action, user.muf)
+
+                    self.map_role_to_uri(user)
+
+                    if user._app_action == 'SKIP':
+
+                        self.log.make_log(user.login, "NO_ACTION", True,
+                                          user.role, "No action needed.", user.muf)
+
+                        logging.debug("Skipping user %s" % user.login)
+
+                        continue
+
+                    elif user._app_action == 'SKIP_NO_REMOVE':
+
+                        logging.warn(
+                            "Can't remove the user specified in the login section. The user %s will be skipped!"
+                            % _login)
+                        self.log.make_log(user.login, "REMOVE_FROM_PRJ", False,
+                                          user.role, "Cannot remove the user used to login. Please, "
+                                          + "change the username in parameters.", '')
+
+                    elif user._app_action == 'GD_REMOVE':
+
+                        logging.debug(
+                            "Attempting to remove user %s." % user.login)
+
+                        _sc, _js = self.client._GD_remove_user_from_project(
+                            user.uri)
+
+                        if _sc == 200:
+
+                            self.log.make_log(user.login, "REMOVE_FROM_PRJ", True,
+                                              user.role, '', user.muf)
+
+                        else:
+
+                            self.log.make_log(user.login, "REMOVE_FROM_PRJ", False,
+                                              user.role, '', user.muf)
+
+                    elif user._app_action == 'GD_DISABLE':
+
+                        logging.debug(
+                            "Attemmpting to disable user %s" % user.login)
+
+                        _sc, _js = self.client._GD_disable_user_in_project(
+                            user.uri)
+
+                        if _sc == 200:
+
+                            self.log.make_log(user.login, "DISABLE_IN_PRJ", True,
+                                              user.role, '', user.muf)
+
+                        else:
+
+                            self.log.make_log(user.login, "DISABLE_IN_PRJ", False,
+                                              user.role, _js, user.muf)
+
+                    elif user._app_action == 'GD_DISABLE MUF GD_ENABLE':
+
+                        logging.debug(
+                            "User %s will be disabled, assigned MUFs and re-enabled." % user.login)
+                        logging.debug("Disabling...")
+
+                        _sc, _js = self.client._GD_disable_user_in_project(
+                            user.uri)
+
+                        if _sc == 200:
+
+                            self.log.make_log(user.login, "DISABLE_IN_PRJ", True,
+                                              user.role, '', user.muf)
+
+                        else:
+
+                            self.log.make_log(user.login, "DISABLE_IN_PRJ", False,
+                                              user.role, _js, user.muf)
+
+                            logging.warn(
+                                "There were some errors for user %s." % _login)
+                            self.encountered_errors = True
+                            continue
+
+                        logging.debug("Creating MUFs...")
+                        _status, _muf = self.create_muf_uri(user, muf_name)
+
+                        logging.debug(_muf)
+
+                        if _status is False:
+                            logging.warn(
+                                "There were some errors for user %s when creating URIs for MUFs." % _login)
+                            self.encountered_errors = True
+                            continue
+
+                        logging.debug("Assigning MUFs...")
+                        _sc, _js = self.client._GD_assign_MUF(user.uri, _muf)
+
+                        if _sc == 200:
+
+                            self.log.make_log(user.login, "ASSIGN_MUF", True,
+                                              user.role, '', user.muf)
+
+                        else:
+
+                            self.log.make_log(user.login, "ASSIGN_MUF", False,
+                                              user.role, _js, user.muf)
+
+                            logging.debug(_js)
+
+                            logging.warn(
+                                "There were some errors for user %s when assigning MUFs." % _login)
+                            self.encountered_errors = True
+                            continue
+
+                        logging.debug("Re-enabling user...")
+                        _sc, _js = self.client._GD_add_user_to_project(user.uri, user.role_uri)
+
+                        if _sc == 200:
+
+                            _failed = _js['projectUsersUpdateResult']['failed']
+
+                            if len(_failed) == 0:
+                                self.log.make_log(user.login, "ENABLE_IN_PRJ", True, user.role, '', user.muf)
+
+                            else:
+                                self.log.make_log(user.login, "ENABLE_IN_PRJ", False, user.role,
+                                                  _failed[0]['message'], user.muf)
+                                logging.warn("There were some errors for user %s." % _login)
+                                self.encountered_errors = True
+
+                        else:
+                            logging.warn(f"Could not enable user {_login} in the project. Returned: {_sc} - {_js}.")
+                            self.log.make_log(user.login, "ENABLE_IN_PRJ", False, user.role,
+                                              f"Could not enable user {_login} in the project. " +
+                                              f"Returned: {_sc} - {_js}.", user.muf)
+
+                            continue
+
+                    elif user._app_action in ('MUF GD_INVITE', 'TRY_KB_CREATE MUF ENABLE_OR_INVITE'):
+
+                        if user._app_action == 'TRY_KB_CREATE MUF ENABLE_OR_INVITE':
+
+                            logging.info(
+                                "Attempting to create user %s in organization." % user.login)
+
+                            _sc, _js = self.client._KBC_create_user(
+                                user.login, user.first_name, user.last_name, user.sso_provider)
+
+                            if _sc == 201:
+
+                                user.uri = '/gdc/account/profile/' + _js['uid']
+                                self.log.make_log(
+                                    user.login, "USER_CREATE", True, user.role, user.uri, user.muf)
+
+                                logging.debug(
+                                    "User created successfully. URI: %s" % user.uri)
+
+                            elif _sc == 422:
+
+                                self.log.make_log(
+                                    user.login, "USER_CREATE", False, user.role, _js['errorMessage'], user.muf)
+
+                                logging.warn(
+                                    "There were some errors for user %s." % _login)
+                                self.encountered_errors = True
+                                continue
+
+                            else:
+
+                                logging.warn(
+                                    "User %s already exists in a different organization." % user.login)
+
+                        logging.debug("Creating MUFs...")
+                        _status, _muf = self.create_muf_uri(user, muf_name)
+
+                        if _status is False:
+                            logging.warn(
+                                "Could not create MUF for user %s." % _login)
+                            continue
+
+                        if user.uri is None or (user.uri is not None and user.action == 'INVITE'):
+
+                            logging.debug("Inviting user...")
+
+                            _dict = {'_email': user.login,
+                                     '_role': user.role_uri,
+                                     '_usrFilter': _muf}
+
+                            _sc, _js = self.client._GD_invite_users_to_project(
+                                _dict)
+
+                            if _sc == 200:
+
+                                _d_mismatch = _js['createdInvitations']['loginsDomainMismatch']
+                                _d_inproject = _js['createdInvitations']['loginsAlreadyInProject']
+
+                                if len(_d_mismatch) == 0 and len(_d_inproject) == 0:
+
+                                    self.log.make_log(user.login, "INVITE_TO_PRJ", True,
+                                                      user.role, '', user.muf)
+
+                                else:
+
+                                    logging.warn(
+                                        "There were some errors when inviting user %s." % _login)
+                                    self.encountered_errors = True
+                                    self.log.make_log(user.login, "INVITE_TO_PRJ", False,
+                                                      user.role, _js, user.muf)
+
+                            else:
+
+                                logging.warning(
+                                    "There were some errors when inviting user %s." % _login)
+                                self.encountered_errors = True
+                                self.log.make_log(
+                                    user.login, "INVITE_TO_PRJ", False, user.role,
+                                    "Error when creating invitations, please check the email address. Response: " +
+                                    str(_js),
+                                    user.muf)
+
+                        else:
+
+                            logging.debug("Assigning MUFs...")
+
+                            _sc, _js = self.client._GD_assign_MUF(
+                                user.uri, _muf)
+
+                            if _sc == 200:
+
+                                self.log.make_log(user.login, "ASSIGN_MUF", True,
+                                                  user.role, '', user.muf)
+
+                            else:
+
+                                self.log.make_log(user.login, "ASSIGN_MUF", False,
+                                                  user.role, _js, user.muf)
+
+                                logging.debug(_js)
+
+                                logging.warn(
+                                    "There were some errors for user %s when assigning MUFs." % _login)
+                                self.encountered_errors = True
+                                continue
+
+                            logging.debug("Enabling user in the project...")
+                            _sc, _js = self.client._KBC_add_user_to_project(
+                                user.login, user.role)
+
+                            if _sc == 204:
+
+                                self.log.make_log(user.login, "ENABLE_IN_PRJ", True,
+                                                  user.role, '', user.muf)
+
+                            else:
+
+                                self.log.make_log(user.login, "ENABLE_IN_PRJ", False,
+                                                  user.role, _js, user.muf)
+
+                                logging.warn(
+                                    "There were some errors for user %s." % _login)
+                                self.encountered_errors = True
+
+                    elif user._app_action == 'MUF KB_ENABLE':
+
+                        logging.debug(
+                            "User will be assigned MUFs and enabled.")
+                        logging.debug("Creating MUFs...")
+
+                        _status, _muf = self.create_muf_uri(user, muf_name)
+
+                        if _status is False:
+                            logging.warn(
+                                "Could not create MUF for user %s." % user.login)
+                            continue
+
+                        logging.debug("Assigning MUFs...")
+
+                        _sc, _js = self.client._GD_assign_MUF(user.uri, _muf)
+
+                        if _sc == 200:
+
+                            self.log.make_log(user.login, "ASSIGN_MUF", True,
+                                              user.role, '', user.muf)
+
+                        else:
+
+                            self.log.make_log(user.login, "ASSIGN_MUF", False,
+                                              user.role, _js, user.muf)
+
+                            logging.debug(_js)
+
+                            logging.warn(
+                                "There were some errors for user %s when assigning MUFs." % _login)
+                            self.encountered_errors = True
+                            continue
+
+                        logging.debug("Enabling user in the project...")
+                        _sc, _js = self.client._KBC_add_user_to_project(
+                            user.login, user.role)
+
+                        if _sc == 204:
+
+                            self.log.make_log(user.login, "ENABLE_IN_PRJ", True,
+                                              user.role, '', user.muf)
+
+                        else:
+
+                            self.log.make_log(user.login, "ENABLE_IN_PRJ", False,
+                                              user.role, _js, user.muf)
+
+                    logging.info("Process for user %s has ended." % user.login)
+
+        if self.encountered_errors:
+            logging.error("The component has encountered errors during the component run. "
+                          "Please check the status table for more info.")
+            sys.exit(1)
+
+    def _compare_projects(self):
+        """
+        A function, that compares provided PID with those provisioned by GD Writer.
+
+        Parameters
+        ----------
+        self : class
+
+        Raises
+        ------
+        SystemExit
+            If the provided PID is not in the list of projects provosioned by Keboola.
+        """
+
+        _projects = self.client._KBC_get_projects()
+        _projects_ids = [p['pid'] for p in _projects]
+
+        if self.client.pid not in _projects_ids:
+            logging.error(
+                "GoodData Project ID %s is not located in this project." % self.client.pid)
+            logging.error(
+                "You can't provision users from a different project than the origin project.")
+            sys.exit(1)
+
+    def _get_all_attributes(self):
+        """
+        A function for obtaining all attributes from the GD project.
+
+        Parameters
+        ----------
+        self : class
+        """
+
+        logging.info("Obtaining all attributes for the project.")
+        _att_out = {}
+
+        _attributes = self.client._GD_get_attributes()['query']['entries']
+
+        for a in _attributes:
+            _identifier = a['identifier']
+            _link = a['link']
+
+            _att_out[_identifier] = {'identifier': _identifier,
+                                     'uri': _link}
+
+        self.attributes = _att_out
+        self.log.make_log('admin', 'GET_ATTRIBUTES', True, '', '', '')
+
+    def _get_all_users(self):
+        """
+        A function to obtain all users provisioned by Keboola and within GD project.
+
+        Parameters
+        ----------
+        self : class
+        """
+
+        _GD_users = self.client._GD_get_users()['users']
+        _GD_users_out = {}
+
+        for u in _GD_users:
+
+            # logging.debug(u)
+
+            _email = u['user']['content']['email']
+            _email_identifier = _email.lower()
+            _user_uri = u['user']['links']['self']
+            _role = u['user']['content']['userRoles']
+
+            if _role != []:
+
+                _role_uri = _role[0]
+
+            else:
+
+                _role_uri = ''
+
+            _status = u['user']['content']['status']
+
+            _GD_users_out[_email_identifier] = {'email': _email,
+                                                'uri': _user_uri,
+                                                'role': _role_uri,
+                                                'status': _status}
+
+        self.log.make_log('admin', 'GET_GD_USERS', True, '', '', '')
+        self.users_GD = _GD_users_out
+
+        logging.debug("GoodData users:")
+        logging.debug(_GD_users_out)
+
+        # with open('/data/out/files/users.json', 'w') as file:
+
+        #    json.dump(self.users_GD, file)
+
+        if self.is_pbp_project is True:
+
+            _KB_users = self.client._KBC_get_users()
+
+            logging.debug("Keboola users:")
+            logging.debug(_KB_users)
+
+        else:
+
+            _KB_users = []
+
+        _KB_users_out = {}
+
+        for u in _KB_users:
+            _email = u['login']
+            _email_identifier = _email.lower()
+            _user_uri = '/gdc/account/profile/' + u['uid']
+
+            _KB_users_out[_email_identifier] = {'email': _email,
+                                                'uri': _user_uri}
+
+        self.log.make_log('admin', 'GET_KBC_USERS', True, '', '', '')
+        self.users_KB = _KB_users_out
+
+    def _get_all_invitations(self):
+        logging.info("Fetching invited users")
+        invitations = self.client._GD_get_project_invitations().get("invitations")
+        self.invitations = []
+        for invitation in invitations:
+            try:
+                invite_email = invitation.get("invitation").get("content").get("email")
+                self.invitations.append(invite_email)
+            except AttributeError:
+                logging.info(f"Error processing invite info: {invitation} ")
+
+    def _map_roles(self):
+        """
+        A function mapping GD roles to KBC ones.
+
+        Parameters
+        ----------
+        self : class
+
+        Returns
+        -------
+
+        Raises
+        ------
+        """
+
+        logging.info("Mapping GD roles to KBC equivalents.")
+        _GD_roles = self.client._GD_get_roles()
+
+        _KB_roles = ['admin',
+                     'dashboardOnly',
+                     'editor',
+                     'editorInvite',
+                     'editorUserAdmin',
+                     'explorer',
+                     'explorerOnly',
+                     'keboolaEditorPlus',
+                     'readOnlyUser',
+                     'readOnlyNoExport']
+
+        _role_map = {'admin': 'adminRole',
+                     'dashboardOnly': 'dashboardOnlyRole',
+                     'editor': 'editorRole',
+                     'editorInvite': 'editorInviteRole',
+                     'editorUserAdmin': 'editorUserAdminRole',
+                     'explorer': 'explorerRole',
+                     'explorerOnly': 'explorerOnlyRole',
+                     'keboolaEditorPlus': 'keboolaEditorPlusRole',
+                     'readOnlyUser': 'readOnlyUserRole',
+                     'readOnlyNoExport': 'readOnlyNoExportRole'}
+
+        _role_matrix = {}
+
+        for r in _KB_roles:
+            _gd_map = _role_map.get(r)
+            _gd_uri = _GD_roles.get(_gd_map)
+
+            _role_matrix[r] = {'KBC': r,
+                               'GD': _gd_map,
+                               'GD_URI': _gd_uri}
+
+        self._roles_map = _role_matrix
+        self.log.make_log('admin', 'MAP_ROLES', True, '',
+                          json.dumps(_role_matrix), '')
+
+    def _GD_check_admin_permissions(self):
+        """
+        A function checking, whether admin user has any data permissions assigned to them.
+
+        Parameters
+        ----------
+        self : class
+
+        Raises
+        ------
+        SystemExit
+            If the admin user has admin permissions assigned.
+        """
+
+        _login = self.client.username
+        _login_uri = self.users_GD[_login]['uri']
+
+        _sc, _js = self.client._GD_get_data_permissions_for_user(_login_uri)
+
+        _usr_filters = _js["userFilters"]["items"]
+
+        if len(_usr_filters) != 0:
+            logging.error("Admin account cannot have any data permissions assigned to them. Please, use" +
+                          " a different user or remove data permissions.")
+
+            sys.exit(1)
+
+    def _GD_check_user_admin(self):
+        """
+        A function checking whether provided user is admin within GD project.
+
+        Parameters
+        ----------
+        self : class
+
+        Raises
+        ------
+        SystemExit
+            If provided user is not admin.
+        """
+
+        _login = self.client.username
+
+        _usr_information = self.users_GD.get(_login)
+        logging.debug(_usr_information)
+
+        if _usr_information:
+
+            _usr_role_uri = _usr_information['role']
+            _usr_role_name = None
+
+            for r in self._roles_map:
+
+                _role_dict = self._roles_map[r]
+
+                if _role_dict['GD_URI'] == _usr_role_uri:
+                    _usr_role_name = r
+                    break
+
+            if _usr_role_name == 'admin':
+
+                logging.info("Verified admin privileges for user %s." % _login)
+
+            else:
+
+                logging.error(
+                    "User %s does not have admin privileges." % _login)
+                sys.exit(1)
+
+        else:
+
+            logging.error("User %s is not in the project." % _login)
+            sys.exit(1)
+
+    def create_muf_expression(self, muf_str):
+        """
+        A function for creating MUF expressions, i.e. attributes' and values' names are replaced by their URIs.
+
+        Parameters
+        ----------
+        self : class
+        muf_str : str
+            A string containing MUF expression.
+
+        Returns
+        -------
+        tuple
+            A tuple of length 2. The first element marks, whether the operation was successful. If the first element
+            is true, the second element is a list of user filters expressions. If the first element is false, the
+            second element is an error message.
+        """
+
+        try:
+
+            _muf_json = json.loads(muf_str)
+
+        except ValueError as e:
+
+            return False, e
+
+        _muf_expr = []
+
+        for mf in _muf_json:
+
+            try:
+                _attr = mf['attribute']
+                _val = mf['value']
+                _oper = mf['operator']
+
+            except KeyError as e:
+
+                return False, "Key %s is missing in MUF json." % e
+
+            logging.debug(_attr)
+            logging.debug(_val)
+            logging.debug(_oper)
+
+            if not isinstance(_val, list):
+
+                return False, "Attribute values must be a list."
+
+            elif len(_val) > 1 and _oper not in ('IN', 'NOT IN'):
+
+                return False, "Unique value must be provided for non-IN operators."
+
+            # Possible improvement for AND operator in the future.
+            if isinstance(_attr, str):
+
+                _attr_GD = self.attributes.get(_attr)
+
+                if not _attr_GD:
+
+                    return False, "Attribute %s is not in the project." % _attr
+
+                else:
+
+                    _attr_uri = _attr_GD.get('uri')
+
+                if not _attr_uri:
+                    return False, "Attribute %s has no URI." % _attr
+
+                _attr_vals = self.get_attribute_values(_attr_uri)
+
+                if _attr_vals is False:
+                    return False, "Could not obtain values for attribute %s" % _attr_uri
+
+                _attr_vals_uri = []
+
+                for v in _val:
+
+                    _v_uri = _attr_vals.get(v)
+
+                    if _v_uri:
+
+                        _attr_vals_uri += [_v_uri]
+
+                    else:
+
+                        return False, "Attribute %s has no value %s." % (_attr, v)
+
+                if _oper in ('IN', 'NOT IN'):
+
+                    _attr_vals_uri = self._expr_list_to_tuple(_attr_vals_uri)
+
+                else:
+
+                    _attr_vals_uri = self._expr_list_to_str(_attr_vals_uri)
+
+                _expr = ' '.join([self._expr_str_to_list(_attr_uri),
+                                  _oper,
+                                  _attr_vals_uri])
+
+                _muf_expr += [_expr]
+
+            else:
+
+                return False, "Attribute lists are not yet supported."
+
+        return True, _muf_expr
+
+    def get_attribute_values(self, attribute_uri):
+        """
+        A function, getting and parsing the attributes.
+
+        Parameters
+        ----------
+        _attribute_uri : str
+            A URI of an attribute, for which values are to be obtained.
+
+        Returns
+        -------
+        dict
+            A dictionary, with values' title as a key and respective URI as a value.
+        """
+
+        _sc, _values = self.client._GD_get_attribute_values(attribute_uri)
+
+        if _sc is False:
+            return False
+
+        _val_out = {}
+
+        for v in _values:
+            _title = v['title']
+            _uri = v['uri']
+
+            _val_out[_title] = _uri
+
+        return _val_out
+
+    @staticmethod
+    def _expr_list_to_tuple(_list):
+        """
+        A method converting a list of value into a tuple, with elements surrounded by square brackets.
+
+        Parameters
+        ----------
+        _list : list
+            A list to be converted.
+
+        Returns
+        -------
+        str
+            A string-like-tuple.
+        """
+
+        return '(' + ','.join('[{0}]'.format(x) for x in _list) + ')'
+
+    @staticmethod
+    def _expr_str_to_list(_str):
+        """
+        A method converting string to a string like list.
+
+        Parameters
+        ----------
+        _str : str
+            A string to be converted.
+
+        Returns
+        -------
+        str
+            A converted string, encapsulated by square brackets.
+        """
+
+        return '[' + _str + ']'
+
+    @staticmethod
+    def _expr_list_to_str(_list):
+        """
+        A method converting a list-like expression to string-like-list.
+
+        Parameters
+        ----------
+        _list : list
+            List of values to be converted.
+
+        Returns
+        -------
+        str
+            A string, encapsulated by square brackets. All contents of a list are concatenated.
+        """
+
+        return '[' + ''.join(_list) + ']'
+
+    def create_muf(self, muf_expr, muf_name: str = None):
+        """
+        Creates data permission from a list.
+
+        Parameters
+        ----------
+        muf_expr : list
+            A list of expressions, for which data permissions should be created.
+
+        Returns
+        -------
+        tuple
+            A tuple with 2 elements. First element captures, whether the an attempt to create MUFs for
+            all elements in the list was successful. If the first argument returns `SUCCESS`, a list
+            with URIs to filter is returned, otherwise an error message is returned.
+        """
+        _muf_ids = []
+
+        for mf in muf_expr:
+
+            mf_sc, mf_json = self.client._GD_create_MUF(mf, muf_name if muf_name is not None else 'muf')
+
+            if mf_sc == 200:
+
+                _muf_ids += [mf_json['uri']]
+
+            else:
+
+                # logging.debug("MUF:")
+                # logging.debug(mf)
+
+                logging.debug("Status response:")
+                logging.debug(mf_sc)
+
+                logging.debug("JSON response:")
+                logging.debug(mf_json)
+                return False, "Could not create MUF. Received: %s" % mf_json
+
+        return True, _muf_ids
+
+    def check_membership(self, user):
+        """
+        A function checking whether a user is in the Keboola organization or GD project.
+
+        Parameters
+        ----------
+        self : class
+        user : User class
+            A class representing user.
+
+        Raises
+        ------
+        SystemExit
+            If none of the conditions is met.
+        """
+
+        _login = user.login
+        _user_action = user.action
+
+        if _user_action not in ("ENABLE", "DISABLE", "INVITE", "REMOVE"):
+            self.log.make_log(_login, _user_action, False,
+                              user.role, "User action must be one of ENABLE, DISABLE, INVITE or REMOVE.", '')
+            user._app_action = 'SKIP'
+
+            return
+
+        _in_org = _login in self.users_KB
+        _in_prj = _login in self.users_GD
+
+        if user.login in self.invitations and user.action == "INVITE" and not self.re_invite_users:
+            logging.info(f"User {user.login} will not be invited as they have already received an invite.")
+            user._app_action = 'SKIP'
+
+        elif _in_prj is True:
+
+            _status = self.users_GD[_login]['status']
+            user.uri = self.users_GD[_login]['uri']
+
+            if _status == 'ENABLED' and _user_action == 'ENABLE':
+
+                user._app_action = 'GD_DISABLE MUF GD_ENABLE'
+
+            elif _status == 'ENABLED' and _user_action == 'DISABLE':
+
+                user._app_action = 'GD_DISABLE'
+
+            elif _status == 'DISABLED' and _user_action == 'ENABLE':
+
+                user._app_action = 'GD_DISABLE MUF GD_ENABLE'
+
+            elif _status == 'DISABLED' and _user_action == 'DISABLE':
+
+                user._app_action = 'SKIP'
+
+            elif _status == 'ENABLED' and _user_action == 'INVITE':
+
+                user._app_action = 'GD_DISABLE MUF GD_ENABLE'
+
+            elif _status == 'DISABLED' and _user_action == 'INVITE':
+
+                user._app_action = 'MUF GD_INVITE'
+
+            elif _user_action == 'REMOVE' and _login == self.client.username:
+
+                user._app_action = 'SKIP_NO_REMOVE'
+
+            elif _user_action == 'REMOVE' and _login != self.client.username:
+
+                user._app_action = 'GD_REMOVE'
+
+            else:
+
+                logging.error("Unknown error during membership check.")
+                sys.exit(2)
+
+        elif _in_prj is False and _in_org is True:
+
+            user.uri = self.users_KB[_login]['uri']
+
+            if _user_action == 'ENABLE':
+
+                user._app_action = 'MUF KB_ENABLE'
+
+            elif _user_action == 'DISABLE':
+
+                user._app_action = 'SKIP'
+
+            elif _user_action == 'INVITE':
+
+                user._app_action = 'MUF GD_INVITE'
+
+            elif _user_action == 'REMOVE':
+
+                user._app_action = 'SKIP'
+
+            else:
+
+                logging.error("Unknown error during membership check.")
+                sys.exit(2)
+
+        elif _in_prj is False and _in_org is False:
+
+            user.uri = None
+
+            if _user_action in ('DISABLE', 'REMOVE'):
+
+                user._app_action = 'SKIP'
+
+            else:
+
+                if self.is_pbp_project:
+                    user._app_action = 'TRY_KB_CREATE MUF ENABLE_OR_INVITE'
+
+                else:
+                    user._app_action = 'MUF GD_INVITE'
+
+        else:
+
+            logging.error("Unknown error while checking for membership.")
+            sys.exit(2)
+
+    def create_muf_uri(self, user, muf_name: str):
+        """
+        A function combining creating MUF expression function and creating MUFs.
+
+        Parameters
+        ----------
+        self : class
+        user : User class
+
+        Returns
+        -------
+        tuple
+            A tuple with 2 elements. First element captures, whether the an attempt to create MUFs for
+            all elements in the list was successful. If the first argument returns `SUCCESS`, a list
+            with URIs to filter is returned, otherwise an error message is returned.
+
+        Raises
+        ------
+        """
+
+        _muf_str = user.muf
+        logging.debug(_muf_str)
+
+        if _muf_str == '[]':
+            return True, []
+
+        _status, _muf_expr = self.create_muf_expression(_muf_str)
+
+        self.log.make_log(user.login, "CREATE_MUF_EXPR", _status,
+                          user.role, str(_muf_expr), user.muf)
+
+        logging.debug("Creating: %s" % str(_status))
+        logging.debug("MUF EXPR: %s" % _muf_expr)
+
+        if _status is False:
+            return False, []
+
+        _status, _muf_uri = self.create_muf(_muf_expr, muf_name)
+
+        self.log.make_log(user.login, "CREATE_MUF", _status,
+                          user.role, str(_muf_uri), user.muf)
+
+        if _status is False:
+
+            return False, []
+
+        else:
+
+            return True, _muf_uri
+
+    def map_role_to_uri(self, user):
+        """
+        A function mapping user role to its URI.
+
+        Parameters
+        ----------
+        self : class
+        user : User class
+        """
+
+        _role = user.role
+        user.role_uri = self._roles_map[_role]['GD_URI']
+
+
+================================================
+File: src/lib/logger.py
+================================================
+import csv
+import json
+import logging
+import os
+import datetime
+
+
+class Logger:
+
+    """
+    A class used for logging all necessary steps in the MUF process and their status.
+    """
+
+    def __init__(self, data_path, run_id=None, write_always: bool = False):
+
+        """
+        An initialization function.
+
+        Parameters
+        ----------
+        data_path : str
+            A data path, where the status file will be used.
+        """
+
+        self.data_path = data_path
+        self.output_path = os.path.join(data_path, 'out', 'tables', 'status.csv')
+        self.fields = ['user',
+                       'action',
+                       'status',
+                       'timestamp',
+                       'role',
+                       'details',
+                       'muf',
+                       'run_id']
+        self.run_id = run_id
+        self.write_always = write_always
+        if self.write_always:
+            logging.info("Parameter fail_on_error is set to true, the component will end with error if it encounters "
+                         "any problems during run.")
+
+        logging.info("Status file saved to %s." % self.output_path)
+
+        with open(self.output_path, 'w') as log_file:
+
+            writer = csv.DictWriter(log_file,
+                                    self.fields,
+                                    restval='',
+                                    extrasaction='ignore',
+                                    quotechar='"',
+                                    quoting=csv.QUOTE_ALL)
+
+            writer.writeheader()
+
+        self.create_manifest()
+
+    def make_log(self, user, action, success, role, details, muf):
+
+        """
+        A function, that writes a row to a status file.
+
+        Parameters
+        ----------
+        self : class
+        user : str
+            A user, for which the action was performed.
+        action : str
+            Name of the action performed.
+        success : bool
+            Boolean value whether the action was successful.
+        role : str
+            Role of the user.
+        details : str
+            Any additional details about the action.
+        muf : str
+            A muf expression used for the user.
+        """
+
+        _ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f UTC')
+        if success:
+            success_str = "SUCCESS"
+        else:
+            success_str = "ERROR"
+
+        _to_write = {'user': user,
+                     'action': action,
+                     'status': success_str,
+                     'timestamp': _ts,
+                     'role': role,
+                     'details': details,
+                     'muf': muf,
+                     'run_id': self.run_id}
+
+        with open(self.output_path, 'a') as log_file:
+
+            writer = csv.DictWriter(log_file,
+                                    self.fields,
+                                    restval='',
+                                    extrasaction='ignore',
+                                    quotechar='"',
+                                    quoting=csv.QUOTE_ALL)
+
+            writer.writerow(_to_write)
+
+    def create_manifest(self):
+
+        """
+        A function creating manifest for the status file.
+
+        Parameters
+        ----------
+        self : class
+        """
+
+        _out_path = self.output_path
+        _manifest_path = _out_path + '.manifest'
+
+        _man = {"destination": "out.c-GDUserManagement.status",
+                "incremental": True,
+                "delimiter": ","}
+
+        if self.write_always:
+            _man["write_always"] = True
+
+        with open(_manifest_path, 'w') as f:
+
+            json.dump(_man, f)
+
+
+================================================
+File: src/lib/user.py
+================================================
+class User:
+    """
+    A class representing user in the whole MUF process.
+    """
+    def __init__(self, login, role, muf, action, first_name, last_name, sso_provider=None):
+
+        """
+        Init function.
+
+        Parameters
+        ----------
+        login : str
+            A login of the user.
+        role : str
+            A role of the user in the project.
+        muf : str
+            A data permission for the user.
+        action : str
+            A type of action to be performed with the user.
+        first_name : str
+            A first name of the user.
+        last_name : str
+            A last name of the user.
+        """
+
+        self.login = login
+        self.role = role
+        self.muf = muf
+        self.action = action
+        self.first_name = first_name
+        self.last_name = last_name
+        self.sso_provider = sso_provider
+
+
+================================================
+File: .github/workflows/push.yml
+================================================
+name: Keboola Component Build & Deploy Pipeline
+on:
+  push:
+    branches:
+      - 'feature/*'
+      - 'bug/*'
+    tags:
+      - '*' # Skip the workflow on the main branch without tags
+
+concurrency: ci-${{ github.ref }} # to avoid tag collisions in the ECR
+env:
+  # repository variables:
+  KBC_DEVELOPERPORTAL_APP: "kds-team.app-gd-user-management" # replace with your component id
+  KBC_DEVELOPERPORTAL_VENDOR: "kds-team" # replace with your vendor
+  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+  KBC_DEVELOPERPORTAL_USERNAME: ${{ vars.KBC_DEVELOPERPORTAL_USERNAME }}
+
+  # repository secrets:
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }} # recommended for pushing to ECR
+  KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+
+  # (Optional) Test KBC project: https://connection.keboola.com/admin/projects/0000
+  KBC_TEST_PROJECT_CONFIGS: "" # space separated list of config ids
+  KBC_STORAGE_TOKEN: ${{ secrets.KBC_STORAGE_TOKEN }} # required for running KBC tests
+
+jobs:
+  push_event_info:
+    name: Push Event Info
+    runs-on: ubuntu-latest
+    outputs:
+      app_image_tag: ${{ steps.tag.outputs.app_image_tag }}
+      is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
+      is_default_branch: ${{ steps.default_branch.outputs.is_default_branch }}
+      is_deploy_ready: ${{ steps.deploy_ready.outputs.is_deploy_ready }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Fetch all branches from remote repository
+        run: git fetch --prune --unshallow --tags -f
+
+      - name: Get current branch name
+        id: current_branch
+        run: |
+          if [[ ${{ github.ref }} != "refs/tags/"* ]]; then
+            branch_name=${{ github.ref_name }}
+            echo "branch_name=$branch_name" | tee -a $GITHUB_OUTPUT
+          else
+            raw=$(git branch -r --contains ${{ github.ref }})
+            branch="$(echo ${raw//origin\//} | tr -d '\n')"
+            echo "branch_name=$branch" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Is current branch the default branch
+        id: default_branch
+        run: |
+          echo "default_branch='${{ github.event.repository.default_branch }}'"
+          if [ "${{ github.event.repository.default_branch }}" = "${{ steps.current_branch.outputs.branch_name }}" ]; then
+             echo "is_default_branch=true" | tee -a $GITHUB_OUTPUT
+          else
+             echo "is_default_branch=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Set image tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
+          echo "is_semantic_tag=$IS_SEMANTIC_TAG" | tee -a $GITHUB_OUTPUT
+          echo "app_image_tag=$TAG" | tee -a $GITHUB_OUTPUT
+
+      - name: Deploy-Ready check
+        id: deploy_ready
+        run: |
+          if [[ "${{ steps.default_branch.outputs.is_default_branch }}" == "true" \
+            && "${{ github.ref }}" == refs/tags/* \
+            && "${{ steps.tag.outputs.is_semantic_tag }}" == "true" ]]; then
+              echo "is_deploy_ready=true" | tee -a $GITHUB_OUTPUT
+          else
+              echo "is_deploy_ready=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Docker Image Build
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest
+          outputs: type=docker,dest=/tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - build
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Tests
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest flake8 . --config=flake8.cfg
+          echo "Running unit-tests..."
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest python -m unittest discover
+
+  tests-kbc:
+    name: Run KBC Tests
+    needs:
+      - push_event_info
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up environment variables
+        run: |
+          echo "KBC_TEST_PROJECT_CONFIGS=${KBC_TEST_PROJECT_CONFIGS}" >> $GITHUB_ENV
+          echo "KBC_STORAGE_TOKEN=${{ secrets.KBC_STORAGE_TOKEN }}" >> $GITHUB_ENV
+
+      - name: Run KBC test jobs
+        if: env.KBC_TEST_PROJECT_CONFIGS != '' && env.KBC_STORAGE_TOKEN != ''
+        uses: keboola/action-run-configs-parallel@master
+        with:
+          token: ${{ secrets.KBC_STORAGE_TOKEN }}
+          componentId: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          configs: ${{ env.KBC_TEST_PROJECT_CONFIGS }}
+
+  push:
+    name: Docker Image Push
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - tests
+      - tests-kbc
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Tests
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+
+      - name: Docker login
+        if: env.DOCKERHUB_TOKEN
+        run: docker login --username "${{ env.DOCKERHUB_USER }}" --password "${{ env.DOCKERHUB_TOKEN }}"
+
+      - name: Push image to ECR
+        uses: keboola/action-push-to-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          push_latest: ${{ needs.push_event_info.outputs.is_deploy_ready }}
+          source_image: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+
+  deploy:
+    name: Deploy to KBC
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Developer Portal Tag
+        uses: keboola/action-set-tag-developer-portal@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+
+  update_developer_portal_properties:
+    name: Developer Portal Properties Update
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    runs-on: ubuntu-latest
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Update developer portal properties
+        run: |
+          chmod +x scripts/developer_portal/*.sh
+          scripts/developer_portal/update_properties.sh
+

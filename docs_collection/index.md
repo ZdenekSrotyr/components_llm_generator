@@ -242,6 +242,581 @@
 - Repository: https://github.com/keboola/component-delta-lake
 - Description: None
 
+### component-csob-ceb
+- [Documentation](github/component-csob-ceb/llm.txt)
+- Repository: https://github.com/keboola/component-csob-ceb
+- Description: None
+
+### component-google-nlp
+- [Documentation](github/component-google-nlp/llm.txt)
+- Repository: https://github.com/keboola/component-google-nlp
+- Description: None
+
+### component-google-translation
+- [Documentation](github/component-google-translation/llm.txt)
+- Repository: https://github.com/keboola/component-google-translation
+- Description: None
+
+### component-reviewtrackers
+- [Documentation](github/component-reviewtrackers/llm.txt)
+- Repository: https://github.com/keboola/component-reviewtrackers
+- Description: None
+
+### component-marketo-bulk
+- [Documentation](github/component-marketo-bulk/llm.txt)
+- Repository: https://github.com/keboola/component-marketo-bulk
+- Description: None
+
+### component-marketo
+- [Documentation](github/component-marketo/llm.txt)
+- Repository: https://github.com/keboola/component-marketo
+- Description: None
+
+### component-appsflyer
+- [Documentation](github/component-appsflyer/llm.txt)
+- Repository: https://github.com/keboola/component-appsflyer
+- Description: None
+
+### component-web-content-crawler
+- [Documentation](github/component-web-content-crawler/llm.txt)
+- Repository: https://github.com/keboola/component-web-content-crawler
+- Description: None
+
+### component-gd-user-management
+- [Documentation](github/component-gd-user-management/llm.txt)
+- Repository: https://github.com/keboola/component-gd-user-management
+- Description: None
+
+### component-one-signal
+- [Documentation](github/component-one-signal/llm.txt)
+- Repository: https://github.com/keboola/component-one-signal
+- Description: None
+
+### component-dynamodb
+- [Documentation](github/component-dynamodb/llm.txt)
+- Repository: https://github.com/keboola/component-dynamodb
+- Description: None
+
+### component-powerbi
+- [Documentation](github/component-powerbi/llm.txt)
+- Repository: https://github.com/keboola/component-powerbi
+- Description: None
+
+### component-tableau-extract-refresh-trigger
+- [Documentation](github/component-tableau-extract-refresh-trigger/llm.txt)
+- Repository: https://github.com/keboola/component-tableau-extract-refresh-trigger
+- Description: None
+
+### component-sendinblue
+- [Documentation](github/component-sendinblue/llm.txt)
+- Repository: https://github.com/keboola/component-sendinblue
+- Description: None
+
+### component-http-extended
+- [Documentation](github/component-http-extended/llm.txt)
+- Repository: https://github.com/keboola/component-http-extended
+- Description: None
+
+### component-2performant
+- [Documentation](github/component-2performant/llm.txt)
+- Repository: https://github.com/keboola/component-2performant
+- Description: None
+
+### component-cj-affiliate
+- [Documentation](github/component-cj-affiliate/llm.txt)
+- Repository: https://github.com/keboola/component-cj-affiliate
+- Description: None
+
+### component-zuora
+- [Documentation](github/component-zuora/llm.txt)
+- Repository: https://github.com/keboola/component-zuora
+- Description: None
+
+### component-gd-maql-executioner
+- [Documentation](github/component-gd-maql-executioner/llm.txt)
+- Repository: https://github.com/keboola/component-gd-maql-executioner
+- Description: None
+
+### component-powerbi-refresh
+- [Documentation](github/component-powerbi-refresh/llm.txt)
+- Repository: https://github.com/keboola/component-powerbi-refresh
+- Description: None
+
+### component-hubspot-crm
+- [Documentation](github/component-hubspot-crm/llm.txt)
+- Repository: https://github.com/keboola/component-hubspot-crm
+- Description: None
+
+### component-mailgun-v2
+- [Documentation](github/component-mailgun-v2/llm.txt)
+- Repository: https://github.com/keboola/component-mailgun-v2
+- Description: None
+
+### component-share-a-sale
+- [Documentation](github/component-share-a-sale/llm.txt)
+- Repository: https://github.com/keboola/component-share-a-sale
+- Description: None
+
+### component-snapchat-marketing
+- [Documentation](github/component-snapchat-marketing/llm.txt)
+- Repository: https://github.com/keboola/component-snapchat-marketing
+- Description: None
+
+### component-gooddata-project
+- [Documentation](github/component-gooddata-project/llm.txt)
+- Repository: https://github.com/keboola/component-gooddata-project
+- Description: None
+
+### component-google-my-business
+- [Documentation](github/component-google-my-business/llm.txt)
+- Repository: https://github.com/keboola/component-google-my-business
+- Description: None
+
+### component-zoho
+- [Documentation](github/component-zoho/llm.txt)
+- Repository: https://github.com/keboola/component-zoho
+- Description: None
+
+### component-looker-schedule-runner
+- [Documentation](github/component-looker-schedule-runner/llm.txt)
+- Repository: https://github.com/keboola/component-looker-schedule-runner
+- Description: None
+
+### component-adform-reports
+- [Documentation](github/component-adform-reports/llm.txt)
+- Repository: https://github.com/keboola/component-adform-reports
+- Description: None
+
+### component-mysql-multi-schema
+- [Documentation](github/component-mysql-multi-schema/llm.txt)
+- Repository: https://github.com/keboola/component-mysql-multi-schema
+- Description: None
+
+### component-azure-blob
+- [Documentation](github/component-azure-blob/llm.txt)
+- Repository: https://github.com/keboola/component-azure-blob
+- Description: None
+
+### component-microsoft-dynamics
+- [Documentation](github/component-microsoft-dynamics/llm.txt)
+- Repository: https://github.com/keboola/component-microsoft-dynamics
+- Description: None
+
+### component-ms-sharepoint
+- [Documentation](github/component-ms-sharepoint/llm.txt)
+- Repository: https://github.com/keboola/component-ms-sharepoint
+- Description: None
+
+### component-ms-sharepoint-lists
+- [Documentation](github/component-ms-sharepoint-lists/llm.txt)
+- Repository: https://github.com/keboola/component-ms-sharepoint-lists
+- Description: None
+
+### component-magento
+- [Documentation](github/component-magento/llm.txt)
+- Repository: https://github.com/keboola/component-magento
+- Description: None
+
+### component-kbc-project-metadata-v2
+- [Documentation](github/component-kbc-project-metadata-v2/llm.txt)
+- Repository: https://github.com/keboola/component-kbc-project-metadata-v2
+- Description: None
+
+### component-bubble-io
+- [Documentation](github/component-bubble-io/llm.txt)
+- Repository: https://github.com/keboola/component-bubble-io
+- Description: None
+
+### component-jira
+- [Documentation](github/component-jira/llm.txt)
+- Repository: https://github.com/keboola/component-jira
+- Description: None
+
+### component-ares-opendata
+- [Documentation](github/component-ares-opendata/llm.txt)
+- Repository: https://github.com/keboola/component-ares-opendata
+- Description: None
+
+### component-liveagent
+- [Documentation](github/component-liveagent/llm.txt)
+- Repository: https://github.com/keboola/component-liveagent
+- Description: None
+
+### component-zendesk-wr
+- [Documentation](github/component-zendesk-wr/llm.txt)
+- Repository: https://github.com/keboola/component-zendesk-wr
+- Description: None
+
+### component-kbc-project-generator
+- [Documentation](github/component-kbc-project-generator/llm.txt)
+- Repository: https://github.com/keboola/component-kbc-project-generator
+- Description: None
+
+### component-kbc-configuration-exporter
+- [Documentation](github/component-kbc-configuration-exporter/llm.txt)
+- Repository: https://github.com/keboola/component-kbc-configuration-exporter
+- Description: None
+
+### component-generic
+- [Documentation](github/component-generic/llm.txt)
+- Repository: https://github.com/keboola/component-generic
+- Description: None
+
+### component-academy-bucket-linker
+- [Documentation](github/component-academy-bucket-linker/llm.txt)
+- Repository: https://github.com/keboola/component-academy-bucket-linker
+- Description: None
+
+### component-azure-blob-storage-v2
+- [Documentation](github/component-azure-blob-storage-v2/llm.txt)
+- Repository: https://github.com/keboola/component-azure-blob-storage-v2
+- Description: None
+
+### component-customer-io
+- [Documentation](github/component-customer-io/llm.txt)
+- Repository: https://github.com/keboola/component-customer-io
+- Description: None
+
+### component-asana-v2
+- [Documentation](github/component-asana-v2/llm.txt)
+- Repository: https://github.com/keboola/component-asana-v2
+- Description: None
+
+### component-aws-cost-and-usage-reports
+- [Documentation](github/component-aws-cost-and-usage-reports/llm.txt)
+- Repository: https://github.com/keboola/component-aws-cost-and-usage-reports
+- Description: None
+
+### component-mysql-next
+- [Documentation](github/component-mysql-next/llm.txt)
+- Repository: https://github.com/keboola/component-mysql-next
+- Description: None
+
+### component-elasticsearch
+- [Documentation](github/component-elasticsearch/llm.txt)
+- Repository: https://github.com/keboola/component-elasticsearch
+- Description: None
+
+### component-shopify
+- [Documentation](github/component-shopify/llm.txt)
+- Repository: https://github.com/keboola/component-shopify
+- Description: None
+
+### component-woocommerce
+- [Documentation](github/component-woocommerce/llm.txt)
+- Repository: https://github.com/keboola/component-woocommerce
+- Description: None
+
+### component-hubspot
+- [Documentation](github/component-hubspot/llm.txt)
+- Repository: https://github.com/keboola/component-hubspot
+- Description: None
+
+### component-sftp
+- [Documentation](github/component-sftp/llm.txt)
+- Repository: https://github.com/keboola/component-sftp
+- Description: None
+
+### component-airtable
+- [Documentation](github/component-airtable/llm.txt)
+- Repository: https://github.com/keboola/component-airtable
+- Description: None
+
+### component-marketo-bulk-v2
+- [Documentation](github/component-marketo-bulk-v2/llm.txt)
+- Repository: https://github.com/keboola/component-marketo-bulk-v2
+- Description: None
+
+### component-looker-deployer
+- [Documentation](github/component-looker-deployer/llm.txt)
+- Repository: https://github.com/keboola/component-looker-deployer
+- Description: None
+
+### component-google-cloud-storage
+- [Documentation](github/component-google-cloud-storage/llm.txt)
+- Repository: https://github.com/keboola/component-google-cloud-storage
+- Description: None
+
+### component-salesforce-v2
+- [Documentation](github/component-salesforce-v2/llm.txt)
+- Repository: https://github.com/keboola/component-salesforce-v2
+- Description: None
+
+### component-salesforce
+- [Documentation](github/component-salesforce/llm.txt)
+- Repository: https://github.com/keboola/component-salesforce
+- Description: None
+
+### component-teriyakimadness-revelup
+- [Documentation](github/component-teriyakimadness-revelup/llm.txt)
+- Repository: https://github.com/keboola/component-teriyakimadness-revelup
+- Description: None
+
+### component-twilio
+- [Documentation](github/component-twilio/llm.txt)
+- Repository: https://github.com/keboola/component-twilio
+- Description: None
+
+### component-dev-prod-sync
+- [Documentation](github/component-dev-prod-sync/llm.txt)
+- Repository: https://github.com/keboola/component-dev-prod-sync
+- Description: None
+
+### component-snowflake-query-runner
+- [Documentation](github/component-snowflake-query-runner/llm.txt)
+- Repository: https://github.com/keboola/component-snowflake-query-runner
+- Description: None
+
+### component-google-ad-manager
+- [Documentation](github/component-google-ad-manager/llm.txt)
+- Repository: https://github.com/keboola/component-google-ad-manager
+- Description: None
+
+### component-google-search-console
+- [Documentation](github/component-google-search-console/llm.txt)
+- Repository: https://github.com/keboola/component-google-search-console
+- Description: None
+
+### component-shoptet-permalink
+- [Documentation](github/component-shoptet-permalink/llm.txt)
+- Repository: https://github.com/keboola/component-shoptet-permalink
+- Description: None
+
+### component-criteo
+- [Documentation](github/component-criteo/llm.txt)
+- Repository: https://github.com/keboola/component-criteo
+- Description: None
+
+### component-azure-data-lake-gen2
+- [Documentation](github/component-azure-data-lake-gen2/llm.txt)
+- Repository: https://github.com/keboola/component-azure-data-lake-gen2
+- Description: None
+
+### component-email-content
+- [Documentation](github/component-email-content/llm.txt)
+- Repository: https://github.com/keboola/component-email-content
+- Description: None
+
+### component-ibm-watson-assistant
+- [Documentation](github/component-ibm-watson-assistant/llm.txt)
+- Repository: https://github.com/keboola/component-ibm-watson-assistant
+- Description: None
+
+### component-linkedin-pages
+- [Documentation](github/component-linkedin-pages/llm.txt)
+- Repository: https://github.com/keboola/component-linkedin-pages
+- Description: None
+
+### component-table-definition-generator
+- [Documentation](github/component-table-definition-generator/llm.txt)
+- Repository: https://github.com/keboola/component-table-definition-generator
+- Description: None
+
+### component-chartmogul
+- [Documentation](github/component-chartmogul/llm.txt)
+- Repository: https://github.com/keboola/component-chartmogul
+- Description: None
+
+### component-monday
+- [Documentation](github/component-monday/llm.txt)
+- Repository: https://github.com/keboola/component-monday
+- Description: None
+
+### component-snowflake-byodb-view-writer
+- [Documentation](github/component-snowflake-byodb-view-writer/llm.txt)
+- Repository: https://github.com/keboola/component-snowflake-byodb-view-writer
+- Description: None
+
+### component-ms-sql-2005
+- [Documentation](github/component-ms-sql-2005/llm.txt)
+- Repository: https://github.com/keboola/component-ms-sql-2005
+- Description: None
+
+### component-ceps
+- [Documentation](github/component-ceps/llm.txt)
+- Repository: https://github.com/keboola/component-ceps
+- Description: None
+
+### component-custom-python
+- [Documentation](github/component-custom-python/llm.txt)
+- Repository: https://github.com/keboola/component-custom-python
+- Description: None
+
+### component-orchestration-trigger-queue-v2
+- [Documentation](github/component-orchestration-trigger-queue-v2/llm.txt)
+- Repository: https://github.com/keboola/component-orchestration-trigger-queue-v2
+- Description: None
+
+### component-component-runner
+- [Documentation](github/component-component-runner/llm.txt)
+- Repository: https://github.com/keboola/component-component-runner
+- Description: None
+
+### component-filemaker
+- [Documentation](github/component-filemaker/llm.txt)
+- Repository: https://github.com/keboola/component-filemaker
+- Description: None
+
+### component-k2
+- [Documentation](github/component-k2/llm.txt)
+- Repository: https://github.com/keboola/component-k2
+- Description: None
+
+### component-databricks-job-runner
+- [Documentation](github/component-databricks-job-runner/llm.txt)
+- Repository: https://github.com/keboola/component-databricks-job-runner
+- Description: None
+
+### component-email-smtp-sender
+- [Documentation](github/component-email-smtp-sender/llm.txt)
+- Repository: https://github.com/keboola/component-email-smtp-sender
+- Description: None
+
+### component-hlidac-shopu-s3
+- [Documentation](github/component-hlidac-shopu-s3/llm.txt)
+- Repository: https://github.com/keboola/component-hlidac-shopu-s3
+- Description: None
+
+### component-jira-epic-creator
+- [Documentation](github/component-jira-epic-creator/llm.txt)
+- Repository: https://github.com/keboola/component-jira-epic-creator
+- Description: None
+
+### component-tiktok-ads
+- [Documentation](github/component-tiktok-ads/llm.txt)
+- Repository: https://github.com/keboola/component-tiktok-ads
+- Description: None
+
+### component-dbt-cloud-job-trigger
+- [Documentation](github/component-dbt-cloud-job-trigger/llm.txt)
+- Repository: https://github.com/keboola/component-dbt-cloud-job-trigger
+- Description: None
+
+### component-hubspot-v2
+- [Documentation](github/component-hubspot-v2/llm.txt)
+- Repository: https://github.com/keboola/component-hubspot-v2
+- Description: None
+
+### component-oracle-custom
+- [Documentation](github/component-oracle-custom/llm.txt)
+- Repository: https://github.com/keboola/component-oracle-custom
+- Description: None
+
+### component-deepnote-notebook-trigger
+- [Documentation](github/component-deepnote-notebook-trigger/llm.txt)
+- Repository: https://github.com/keboola/component-deepnote-notebook-trigger
+- Description: None
+
+### component-time-doctor-2
+- [Documentation](github/component-time-doctor-2/llm.txt)
+- Repository: https://github.com/keboola/component-time-doctor-2
+- Description: None
+
+### component-servicenow-tables
+- [Documentation](github/component-servicenow-tables/llm.txt)
+- Repository: https://github.com/keboola/component-servicenow-tables
+- Description: None
+
+### component-dv360
+- [Documentation](github/component-dv360/llm.txt)
+- Repository: https://github.com/keboola/component-dv360
+- Description: None
+
+### component-ehub-public
+- [Documentation](github/component-ehub-public/llm.txt)
+- Repository: https://github.com/keboola/component-ehub-public
+- Description: None
+
+### component-ehub-publisher
+- [Documentation](github/component-ehub-publisher/llm.txt)
+- Repository: https://github.com/keboola/component-ehub-publisher
+- Description: None
+
+### component-klaviyo-v2
+- [Documentation](github/component-klaviyo-v2/llm.txt)
+- Repository: https://github.com/keboola/component-klaviyo-v2
+- Description: None
+
+### component-chatbot-analytics-onedrive
+- [Documentation](github/component-chatbot-analytics-onedrive/llm.txt)
+- Repository: https://github.com/keboola/component-chatbot-analytics-onedrive
+- Description: None
+
+### component-google-cm-360
+- [Documentation](github/component-google-cm-360/llm.txt)
+- Repository: https://github.com/keboola/component-google-cm-360
+- Description: None
+
+### component-onedrive
+- [Documentation](github/component-onedrive/llm.txt)
+- Repository: https://github.com/keboola/component-onedrive
+- Description: None
+
+### component-quickbooks-online-fhs
+- [Documentation](github/component-quickbooks-online-fhs/llm.txt)
+- Repository: https://github.com/keboola/component-quickbooks-online-fhs
+- Description: None
+
+### component-weather-api
+- [Documentation](github/component-weather-api/llm.txt)
+- Repository: https://github.com/keboola/component-weather-api
+- Description: None
+
+### component-snowflake-procedure-trigger
+- [Documentation](github/component-snowflake-procedure-trigger/llm.txt)
+- Repository: https://github.com/keboola/component-snowflake-procedure-trigger
+- Description: None
+
+### component-pinterest
+- [Documentation](github/component-pinterest/llm.txt)
+- Repository: https://github.com/keboola/component-pinterest
+- Description: None
+
+### component-hibob
+- [Documentation](github/component-hibob/llm.txt)
+- Repository: https://github.com/keboola/component-hibob
+- Description: None
+
+### component-youtube-analytics
+- [Documentation](github/component-youtube-analytics/llm.txt)
+- Repository: https://github.com/keboola/component-youtube-analytics
+- Description: None
+
+### component-generative-ai
+- [Documentation](github/component-generative-ai/llm.txt)
+- Repository: https://github.com/keboola/component-generative-ai
+- Description: None
+
+### component-sap
+- [Documentation](github/component-sap/llm.txt)
+- Repository: https://github.com/keboola/component-sap
+- Description: None
+
+### component-quickbooks-online-wr
+- [Documentation](github/component-quickbooks-online-wr/llm.txt)
+- Repository: https://github.com/keboola/component-quickbooks-online-wr
+- Description: None
+
+### component-confluence
+- [Documentation](github/component-confluence/llm.txt)
+- Repository: https://github.com/keboola/component-confluence
+- Description: None
+
+### component-microsoft-dynamics-365-finance-operations
+- [Documentation](github/component-microsoft-dynamics-365-finance-operations/llm.txt)
+- Repository: https://github.com/keboola/component-microsoft-dynamics-365-finance-operations
+- Description: None
+
+### component-xero-reports
+- [Documentation](github/component-xero-reports/llm.txt)
+- Repository: https://github.com/keboola/component-xero-reports
+- Description: None
+
+### component-energis
+- [Documentation](github/component-energis/llm.txt)
+- Repository: https://github.com/keboola/component-energis
+- Description: A KBC extractor for Energis 
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors

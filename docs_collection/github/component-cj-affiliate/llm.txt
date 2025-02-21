@@ -1,0 +1,1840 @@
+Directory structure:
+└── keboola-component-cj-affiliate/
+    ├── README.md
+    ├── Dockerfile
+    ├── LICENSE.md
+    ├── change_log.md
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── flake8.cfg
+    ├── requirements.txt
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── component_short_description.md
+    │   ├── configSchema.json
+    │   ├── configuration_description.md
+    │   ├── documentationUrl.md
+    │   ├── licenseUrl.md
+    │   ├── logger
+    │   ├── loggerConfiguration.json
+    │   ├── sourceCodeUrl.md
+    │   ├── stack_parameters.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── files/
+    │       │   │   └── order1.xml
+    │       │   └── tables/
+    │       │       ├── test.csv
+    │       │       └── test.csv.manifest
+    │       └── out/
+    │           ├── files/
+    │           │   └── order1.xml
+    │           └── tables/
+    │               ├── commissions-items.csv
+    │               ├── commissions-items.csv.manifest
+    │               ├── commissions.csv
+    │               ├── commissions.csv.manifest
+    │               └── test.csv
+    ├── scripts/
+    │   ├── build_n_test.sh
+    │   ├── update_dev_portal_properties.sh
+    │   └── developer_portal/
+    │       ├── fn_actions_md_update.sh
+    │       └── update_properties.sh
+    ├── src/
+    │   ├── main.py
+    │   └── lib/
+    │       ├── client.py
+    │       ├── component.py
+    │       └── result.py
+    ├── tests/
+    │   ├── __init__.py
+    │   └── test_component.py
+    └── .github/
+        └── workflows/
+            └── push.yml
+
+================================================
+File: README.md
+================================================
+# CJ Affiliate Extractor
+
+CJ Affiliate is an online advertising company operating in the affiliate marketing industry, which operates worldwide. The extractor allows to connect to CJ's API and download commissions for specified advertisers or publishers.
+
+The extractor utilizes [Commission Detail API](https://developers.cj.com/graphql/reference/Commission%20Detail) to query and download all commissions within specified time window. Both `publisherCommissions` and `advertiserCommissions` endpoints are available in the extractor.
+
+#### Pre-requisities
+
+To successfully run the extractor and download commissions, the following is required:
+- personal access token,
+- access to either `publisherCommissions` or `advertiserCommissions` endpoint.
+
+The personal access token can be created in the [CJ's developer portal](https://developers.cj.com/account/personal-access-tokens).
+
+## Configuration
+
+The example of component's configuration can be foung in the [repository](https://bitbucket.org/kds_consulting_team/kds-team.ex-cj-affiliate/src/master/component_config/sample-config/).
+
+The API returns commissions that satisfy a query sent to the API. The **full** query sent to the API might have the following form
+
+```
+{ publisherCommissions(forPublishers: ["999"], sinceEventDate:"2018-08-08T00:00:00Z",beforeEventDate:"2018-08-09T00:00:00Z"){count payloadComplete records {actionTrackerName websiteName advertiserName postingDate pubCommissionAmountUsd items { quantity perItemSaleAmountPubCurrency totalCommissionPubCurrency }  }  } }
+```
+
+but for simplicity reasons, the user is not required to provide full query, but rather configure a set of parameters, while the component takes care of the rest and builds the required query.
+
+### Parameters
+
+In the following section, each parameter will be dissected one-by-one and its role in the query explained. A sample version of the configuration file can be found [here](https://bitbucket.org/kds_consulting_team/kds-team.ex-cj-affiliate/src/master/component_config/sample-config/config.json).
+
+##### Note on date ranges
+
+By design, the CJ's API only accepts date ranges with a maximum of 31 days difference. The extractor automatically splits the date into intervals of maximum 5 days and queries the data for each of the 5-day ranges. A 5 day interval was chosen as an optimal trade-off between number of requests and long query times for longer date ranges.
+
+##### Notes on pagination
+
+All of responses by CJ's API return at most 10000 responses on a single page. A pagination is automatically handled by the extractor using the `sinceCommissionId` cursor parameter. Additionally, meta parameters `payloadComplete` and `maxCommissionId` are automatically added to the query for pagination purposes.
+
+#### Personal Access Token (`#apiToken`)
+
+The personal access token can be created in the [CJ's developer portal](https://developers.cj.com/account/personal-access-tokens) and provides access to one of the endpoints in CJ's API. The token is used to authenticate all requests. Each request is authenticated by appending personal access token in the `Authorization` header.
+
+#### Advertiser or Publisher (`advOrPub`)
+
+A string marking, whether to use `publisherCommissions` or `advertiserCommissions` endpoint. The default value is `advertiserCommissions`.
+
+Depending on the value chosen, the first part of the query will differ. If `advertiser` is selected, the query will have a form of `{advertiserCommissions (forAdvertisers: ...) ...}`, otherwise it will take shape of `{publisherCommissions (forPublishers: ...) ...}`.
+
+#### Entity IDs (`entityId`)
+
+An array of entities for which the commissions should be downloaded. Only the authorized entities are downloaded (design of CJ's API). If the account used to authorize the request has no access to any of the entities specified, the component will fail.
+
+Irrespectful of the endpoint chosen, the array of entities is filled directly after endpoint specification. The query thus might look like this:
+
+```
+{advertiserCommissions( forAdvertisers: ["12345678","23456789"] ...) ...}
+```
+
+#### Start Date (`dateFrom`)
+
+A date, since when the commissions will be downloaded. The extractor is using the `sinceEventDate` field to query only the commissions satisfying the condition. Accepted values for the parameter are:
+
+- `yesterday`,
+- `X days ago` where `X` is a positive integer,
+- or, an absolute date in format `YYYY-MM-DD`.
+
+The parameter will be added to the query after the entities are specified, hence the query takes form of:
+
+```
+{advertiserCommissions( forAdvertisers: ["12345678","23456789"] sinceEventDate: "2019-01-01T00:00:00Z" ...) ...}
+```
+
+#### End Date (`dateTo`)
+
+Similar to parameter `dateFrom`, the `dateTo` parameter defines a window, for which the commissions are downloaded. The parameter uses field `beforeEventDate` to filter the commissions. Accepted values are:
+
+- `today` or `now`,
+- `yesterday`,
+- `X days ago` where `X` is a positive integer,
+- or, an absolute date in format `YYYY-MM-DD`.
+
+If left blank, the parameter defaults to `now`. Adding this parameter to the query completes the endpoint function specification. The query now has a form of:
+
+```
+{advertiserCommissions( forAdvertisers: ["12345678","23456789"] sinceEventDate: "2019-01-01T00:00:00Z" beforeEventDate: "2019-01-02T00:00:00Z") ...}
+```
+
+#### Incremental Load (`incremental`)
+
+A boolean marking, whether incremental load to storage should be utilized. The parameter value does not affect the query or its shape, but rather effects load type used when exporting tables to Keboola Storage.
+
+#### Query (`recordsQuery`)
+
+A query used to specify fields to be returned by the API. The full list of available fields for both endpoints can be found in [the API's documentation](https://developers.cj.com/graphql/reference/Commission%20Detail). The query can be space, comma, dot or new-line separated string of fields and should represent the query used in `records` query field, which defines the response.
+
+Queries can be split into 3 parts:
+
+- main part,
+- items part,
+- vertical attributes part.
+
+If specified, the items part of the query is outputted into a separate table called `commissions-items`. Main and vertical attributes parts are together bundled and provided in `commissions` table.
+
+In addittion, if field `commissionId` is not specified in the query, it will automatically be added as it's used as a primary key for the `commissions` table. Similarly, if not specified, field `commissionItemId` is added for table `commissions-items`.
+
+An example input can have the following form:
+
+```
+commissionId advertiserId saleAmountAdvCurrency items {sku} verticalAttributes{age, city, campaignId}
+```
+
+and fills in the last piece of puzzle into the query sent to the API:
+
+```
+{advertiserCommissions( forAdvertisers: ["12345678","23456789"] sinceEventDate: "2019-01-01T00:00:00Z" beforeEventDate: "2019-01-02T00:00:00Z") {payloadComplete maxCommissionId records {
+    commissionId advertiserId saleAmountAdvCurrency items { commissionItemId sku} verticalAttributes{age, city, campaignId}
+} } }
+```
+
+Notice the added `commissionItemId` field in the items query. The query inputted must not be encapsulated by curly braces (`{}`) as it's already inputted into `records {}`, which itself is bounded by these. The query will fail otherwise.
+
+**Correct**:
+
+```
+commissionId advertiserId saleAmountAdvCurrency items { commissionItemId sku} verticalAttributes{age, city, campaignId}
+```
+
+**Incorrect**:
+
+```
+{ commissionId advertiserId saleAmountAdvCurrency items { commissionItemId sku} verticalAttributes{age, city, campaignId} }
+```
+
+## Output
+
+The output of the extractor are either one or two tables. A sample of the output can be found [here](https://bitbucket.org/kds_consulting_team/kds-team.ex-cj-affiliate/src/master/component_config/sample-config/out/tables/).
+
+In all cases, `commissions` table is created and outputted. The table contains main information about the commissions specified in main and vertical attributes part of the query.
+
+If `items` are specified, the `commissions-items` table is outputted. The table refers to `commissions` with `commissionId` column.
+
+## Development
+
+For development purposed, run the following commands to build and run the image:
+
+```
+docker-compose build dev
+docker-compose run --rm dev
+```
+
+================================================
+File: Dockerfile
+================================================
+FROM python:3.8-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY . /code/
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install flake8
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+CMD ["python3", "-u", "/code/src/main.py"]
+
+
+================================================
+File: LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: change_log.md
+================================================
+**0.1.1**
+Fixed TypeError: not all arguments converted during string formatting, that appeared on startup of the application and made the application exit
+Changed maximum date interval to 5 days, instead of previously used 10.
+
+**0.1.0**
+Production ready version of the extractor
+Added documentation and description
+Specified UI schema
+
+**0.0.2**
+Fixed error with data path.
+
+**0.0.1**
+First working version of the extractor
+The extractor splits date range into chunks, to provide faster query times. Moreover, it automatically processes items and commissions and logs them into separate tables.
+
+================================================
+File: deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+#check if deployment is triggered only in master
+if [ $BITBUCKET_BRANCH != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${BITBUCKET_TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${BITBUCKET_TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${BITBUCKET_TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${BITBUCKET_TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${BITBUCKET_TAG} is not allowed."
+fi
+
+
+================================================
+File: docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: requirements.txt
+================================================
+https://bitbucket.org/kds_consulting_team/keboola-python-util-lib/get/0.2.4.zip#egg=kbc
+logging_gelf==0.0.31
+urllib3==1.26.16
+
+================================================
+File: component_config/component_long_description.md
+================================================
+# CJ Affiliate Extractor
+
+CJ Affiliate is an online advertising company operating in the affiliate marketing industry, which operates worldwide. The extractor allows to connect to CJ's API and download commissions for specified advertisers or publishers.
+
+The extractor utilizes [Commission Detail API](https://developers.cj.com/graphql/reference/Commission%20Detail) to query and download all commissions within specified time window. Both `publisherCommissions` and `advertiserCommissions` endpoints are available in the extractor.
+
+#### Pre-requisities
+
+To successfully run the extractor and download commissions, the following is required:
+- personal access token,
+- access to either `publisherCommissions` or `advertiserCommissions` endpoint.
+
+The personal access token can be created in the [CJ's developer portal](https://developers.cj.com/account/personal-access-tokens).
+
+================================================
+File: component_config/component_short_description.md
+================================================
+CJ Affiliate is an online advertising company operating in the affiliate marketing industry, connecting publishers with advertisers globally.
+
+================================================
+File: component_config/configSchema.json
+================================================
+{
+    "title": "Parameters",
+    "type": "object",
+    "required": [
+        "#apiToken",
+        "advOrPub",
+        "entityId",
+        "recordsQuery",
+        "dateFrom",
+        "dateTo",
+        "incremental"
+    ],
+    "properties": {
+        "#apiToken": {
+            "type": "string",
+            "format": "password",
+            "title": "Personal Access Token",
+            "description": "The personal access token authorizing requests to the API. A token can be created in <a href='https://developers.cj.com/account/personal-access-tokens'>CJ Developer Portal</a>.",
+            "propertyOrder": 100
+        },
+        "advOrPub": {
+            "type": "string",
+            "uniqueItems": true,
+            "enum": [
+                "advertiser",
+                "publisher"
+            ],
+            "default": "advertiser",
+            "propertyOrder": 200,
+            "title": "Advertiser or Publisher",
+            "description": "Choose whether to use \"advertiserCommissions\" endpoint or \"publisherCommissions\" endpoint."
+        },
+        "entityId": {
+            "type": "array",
+            "format": "table",
+            "title": "Entity IDs",
+            "description": "IDs of entities, for which to download commissions. Un-authorized entities are ignored.",
+            "items": {
+                "title": "ID",
+                "type": "string"
+            },
+            "propertyOrder": 300
+        },
+        "recordsQuery": {
+            "type": "string",
+            "format": "textarea",
+            "options": {
+                "input_height": "100px"
+            },
+            "default": "commissionId advertiserId advCommissionAmountAdvCurrency items { sku } verticalAttributes {age}",
+            "propertyOrder": 700,
+            "title": "Query",
+            "description": "A valid records query that will be sent to CJ's API. Refer to <a href='https://developers.cj.com/graphql/reference/Commission%20Detail'>CJ's Developer portal</a> for valid query fields and correct specification."
+        },
+        "dateFrom": {
+            "type": "string",
+            "title": "Start Date",
+            "description": "Lower boundary of the date window, for which the commissions should be downloaded.</br></br>Accepted values:<ul><li><font color='red'>yesterday</font> - sets parameter to yesterday's date,</li><li><font color='red'>X day(s) ago</font> - sets parameter to relative date from today,</li><li>absolute date in format <font color='red'>YYYY-MM-DD</font>.",
+            "propertyOrder": 400,
+            "default": "7 days ago"
+        },
+        "dateTo": {
+            "type": "string",
+            "title": "End Date",
+            "description": "Upper boundary of the date window, for which the commissions should be downloaded.</br></br>Accepted values:<ul><li><font color='red'>now</font>, <font color='red'>today</font> or blank - sets parameter to today's date,</li><li><font color='red'>yesterday</font> - sets parameter to yesterday's date,</li><li><font color='red'>X day(s) ago</font> - sets parameter to relative date from today,</li><li>absolute date in format <font color='red'>YYYY-MM-DD</font>.",
+            "propertyOrder": 500,
+            "default": "now"
+        },
+        "dateField": {
+            "title": "Date window field",
+            "type": "string",
+            "enum": [
+                "EventDate",
+                "LockingDate",
+                "PostingDate"
+            ],
+            "default": "EventDate",
+            "propertyOrder": 550,
+            "description": "Select one of the available filtering arguments. Refer to <a href='https://developers.cj.com/graphql/reference/Commission%20Detail'>CJ's Developer portal</a>"
+        },
+        "incremental": {
+            "type": "boolean",
+            "title": "Incremental Load",
+            "description": "If set to <font color='red'>true</font>, incremental load will be utilized. Otherwise, full load to storage is performed.",
+            "default": true,
+            "propertyOrder": 600
+        }
+    }
+}
+
+================================================
+File: component_config/configuration_description.md
+================================================
+The API returns commissions that satisfy a query sent to the API. The **full** query sent to the API might have the following form:
+
+```
+{ publisherCommissions(forPublishers: ["999"], sinceEventDate:"2018-08-08T00:00:00Z",beforeEventDate:"2018-08-09T00:00:00Z"){count payloadComplete records {actionTrackerName websiteName advertiserName postingDate pubCommissionAmountUsd items { quantity perItemSaleAmountPubCurrency totalCommissionPubCurrency }  }  } }
+```
+
+but for simplicity reasons, the user is not required to provide full query, but rather configure a set of parameters, while the component takes care of the rest and builds the required query.
+
+### Parameters
+
+In the following section, each parameter will be dissected one-by-one and its role in the query explained. A sample version of the configuration file can be found [here](https://bitbucket.org/kds_consulting_team/kds-team.ex-cj-affiliate/src/master/component_config/sample-config/config.json).
+
+##### Note on date ranges
+
+By design, the CJ's API only accepts date ranges with a maximum of 31 days difference. The extractor automatically splits the date into intervals of maximum 10 days and queries the data for each of the 10-day ranges. A 10 day interval was chosen as an optimal trade-off between number of requests and long query times for longer date ranges.
+
+##### Notes on pagination
+
+All of responses by CJ's API return at most 10000 responses on a single page. A pagination is automatically handled by the extractor using the `sinceCommissionId` cursor parameter. Additionally, meta parameters `payloadComplete` and `maxCommissionId` are automatically added to the query for pagination purposes.
+
+#### Personal Access Token (`#apiToken`)
+
+The personal access token can be created in the [CJ's developer portal](https://developers.cj.com/account/personal-access-tokens) and provides access to one of the endpoints in CJ's API. The token is used to authenticate all requests. Each request is authenticated by appending personal access token in the `Authorization` header.
+
+#### Advertiser or Publisher (`advOrPub`)
+
+A string marking, whether to use `publisherCommissions` or `advertiserCommissions` endpoint. The default value is `advertiserCommissions`.
+
+Depending on the value chosen, the first part of the query will differ. If `advertiser` is selected, the query will have a form of `{advertiserCommissions (forAdvertisers: ...) ...}`, otherwise it will take shape of `{publisherCommissions (forPublishers: ...) ...}`.
+
+#### Entity IDs (`entityId`)
+
+An array of entities for which the commissions should be downloaded. Only the authorized entities are downloaded (design of CJ's API). If the account used to authorize the request has no access to any of the entities specified, the component will fail.
+
+Irrespectful of the endpoint chosen, the array of entities is filled directly after endpoint specification. The query thus might look like this:
+
+```
+{advertiserCommissions( forAdvertisers: ["12345678","23456789"] ...) ...}
+```
+
+#### Start Date (`dateFrom`)
+
+A date, since when the commissions will be downloaded. The extractor is using the `sinceEventDate` field to query only the commissions satisfying the condition. Accepted values for the parameter are:
+
+- `yesterday`,
+- `X days ago` where `X` is a positive integer,
+- or, an absolute date in format `YYYY-MM-DD`.
+
+The parameter will be added to the query after the entities are specified, hence the query takes form of:
+
+```
+{advertiserCommissions( forAdvertisers: ["12345678","23456789"] sinceEventDate: "2019-01-01T00:00:00Z" ...) ...}
+```
+
+#### End Date (`dateTo`)
+
+Similar to parameter `dateFrom`, the `dateTo` parameter defines a window, for which the commissions are downloaded. The parameter uses field `beforeEventDate` to filter the commissions. Accepted values are:
+
+- `today` or `now`,
+- `yesterday`,
+- `X days ago` where `X` is a positive integer,
+- or, an absolute date in format `YYYY-MM-DD`.
+
+If left blank, the parameter defaults to `now`. Adding this parameter to the query completes the endpoint function specification. The query now has a form of:
+
+```
+{advertiserCommissions( forAdvertisers: ["12345678","23456789"] sinceEventDate: "2019-01-01T00:00:00Z" beforeEventDate: "2019-01-02T00:00:00Z") ...}
+```
+
+#### Incremental Load (`incremental`)
+
+A boolean marking, whether incremental load to storage should be utilized. The parameter value does not affect the query or its shape, but rather effects load type used when exporting tables to Keboola Storage.
+
+#### Query (`recordsQuery`)
+
+A query used to specify fields to be returned by the API. The full list of available fields for both endpoints can be found in [the API's documentation](https://developers.cj.com/graphql/reference/Commission%20Detail). The query can be space, comma, dot or new-line separated string of fields and should represent the query used in `records` query field, which defines the response.
+
+Queries can be split into 3 parts:
+
+- main part,
+- items part,
+- vertical attributes part.
+
+If specified, the items part of the query is outputted into a separate table called `commissions-items`. Main and vertical attributes parts are together bundled and provided in `commissions` table.
+
+In addittion, if field `commissionId` is not specified in the query, it will automatically be added as it's used as a primary key for the `commissions` table. Similarly, if not specified, field `commissionItemId` is added for table `commissions-items`.
+
+An example input can have the following form:
+
+```
+commissionId advertiserId saleAmountAdvCurrency items {sku} verticalAttributes{age, city, campaignId}
+```
+
+and fills in the last piece of puzzle into the query sent to the API:
+
+```
+{advertiserCommissions( forAdvertisers: ["12345678","23456789"] sinceEventDate: "2019-01-01T00:00:00Z" beforeEventDate: "2019-01-02T00:00:00Z") {payloadComplete maxCommissionId records {
+    commissionId advertiserId saleAmountAdvCurrency items { commissionItemId sku} verticalAttributes{age, city, campaignId}
+} } }
+```
+
+Notice the added `commissionItemId` field in the items query. The query inputted must not be encapsulated by curly braces (`{}`) as it's already inputted into `records {}`, which itself is bounded by these. The query will fail otherwise.
+
+**Correct**:
+
+```
+commissionId advertiserId saleAmountAdvCurrency items { commissionItemId sku} verticalAttributes{age, city, campaignId}
+```
+
+**Incorrect**:
+
+```
+{ commissionId advertiserId saleAmountAdvCurrency items { commissionItemId sku} verticalAttributes{age, city, campaignId} }
+```
+
+================================================
+File: component_config/logger
+================================================
+gelf
+
+================================================
+File: component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: component_config/stack_parameters.json
+================================================
+{}
+
+================================================
+File: component_config/sample-config/config.json
+================================================
+{
+  "parameters":{
+    "#apiToken": "XXXXXXXXXXXXX",
+    "advOrPub": "advertiser",
+    "entityId": ["1234568","23456789","34567890"],
+    "recordsQuery": ",advertiserId publisherId eventDate actionStatus actionType commissionId eventDate lockingDate postingDate items {commissionItemId , sku, totalCommissionUsd} ,,,,verticalAttributes{age bookingDate,campaignId city,countryCode,itemId}",
+    "dateFrom": "2019-01-01",
+    "dateTo": "now",
+    "incremental": true
+  },
+  "image_parameters":{}
+}
+
+================================================
+File: component_config/sample-config/in/state.json
+================================================
+{}
+
+================================================
+File: component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: component_config/sample-config/out/tables/commissions-items.csv
+================================================
+"commissionItemId","sku","totalCommissionUsd","commissionId"
+"2562483977","DeboraK435","3.568","2412747306"
+
+
+================================================
+File: component_config/sample-config/out/tables/commissions-items.csv.manifest
+================================================
+{"primary_key": ["commissionItemId"], "incremental": true}
+
+================================================
+File: component_config/sample-config/out/tables/commissions.csv
+================================================
+"advertiserId","publisherId","eventDate","actionStatus","actionType","commissionId","eventDate","lockingDate","postingDate","verticalAttributes_age","verticalAttributes_bookingDate","verticalAttributes_campaignId","verticalAttributes_city","verticalAttributes_countryCode","verticalAttributes_itemId"
+"3304249","4541318","2019-01-01T00:57:07Z","closed","item_sale","2412747306","2019-01-01T00:57:07Z","2019-03-01T08:00:00Z","2019-01-01T02:00:14Z","","","","","",""
+
+
+================================================
+File: component_config/sample-config/out/tables/commissions.csv.manifest
+================================================
+{"primary_key": ["commissionId"], "incremental": true}
+
+================================================
+File: component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+    exit 1
+fi
+
+================================================
+File: scripts/developer_portal/fn_actions_md_update.sh
+================================================
+#!/bin/bash
+
+# Set the path to the Python script file
+PYTHON_FILE="src/component.py"
+# Set the path to the Markdown file containing actions
+MD_FILE="component_config/actions.md"
+
+# Check if the file exists before creating it
+if [ ! -e "$MD_FILE" ]; then
+    touch "$MD_FILE"
+else
+    echo "File already exists: $MD_FILE"
+    exit 1
+fi
+
+# Get all occurrences of lines containing @sync_action('XXX') from the .py file
+SYNC_ACTIONS=$(grep -o -E "@sync_action\(['\"][^'\"]*['\"]\)" "$PYTHON_FILE" | sed "s/@sync_action(\(['\"]\)\([^'\"]*\)\(['\"]\))/\2/" | sort | uniq)
+
+# Check if any sync actions were found
+if [ -n "$SYNC_ACTIONS" ]; then
+    # Iterate over each occurrence of @sync_action('XXX')
+    for sync_action in $SYNC_ACTIONS; do
+        EXISTING_ACTIONS+=("$sync_action")
+    done
+
+    # Convert the array to JSON format
+    JSON_ACTIONS=$(printf '"%s",' "${EXISTING_ACTIONS[@]}")
+    JSON_ACTIONS="[${JSON_ACTIONS%,}]"
+
+    # Update the content of the actions.md file
+    echo "$JSON_ACTIONS" > "$MD_FILE"
+else
+    echo "No sync actions found. Not creating the file."
+fi
+
+================================================
+File: scripts/developer_portal/update_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+
+# Check if the KBC_DEVELOPERPORTAL_APP environment variable is set
+if [ -z "$KBC_DEVELOPERPORTAL_APP" ]; then
+    echo "Error: KBC_DEVELOPERPORTAL_APP environment variable is not set."
+    exit 1
+fi
+
+# Pull the latest version of the developer portal CLI Docker image
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+# Function to update a property for the given app ID
+update_property() {
+    local app_id="$1"
+    local prop_name="$2"
+    local file_path="$3"
+
+    if [ ! -f "$file_path" ]; then
+        echo "File '$file_path' not found. Skipping update for property '$prop_name' of application '$app_id'."
+        return
+    fi
+
+    # shellcheck disable=SC2155
+    local value=$(<"$file_path")
+
+    echo "Updating $prop_name for $app_id"
+    echo "$value"
+
+    if [ -n "$value" ]; then
+        docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property "$KBC_DEVELOPERPORTAL_VENDOR" "$app_id" "$prop_name" --value="$value"
+        echo "Property $prop_name updated successfully for $app_id"
+    else
+        echo "$prop_name is empty for $app_id, skipping..."
+    fi
+}
+
+app_id="$KBC_DEVELOPERPORTAL_APP"
+
+update_property "$app_id" "isDeployReady" "component_config/isDeployReady.md"
+update_property "$app_id" "longDescription" "component_config/component_long_description.md"
+update_property "$app_id" "configurationSchema" "component_config/configSchema.json"
+update_property "$app_id" "configurationRowSchema" "component_config/configRowSchema.json"
+update_property "$app_id" "configurationDescription" "component_config/configuration_description.md"
+update_property "$app_id" "shortDescription" "component_config/component_short_description.md"
+update_property "$app_id" "logger" "component_config/logger"
+update_property "$app_id" "loggerConfiguration" "component_config/loggerConfiguration.json"
+update_property "$app_id" "licenseUrl" "component_config/licenseUrl.md"
+update_property "$app_id" "documentationUrl" "component_config/documentationUrl.md"
+update_property "$app_id" "sourceCodeUrl" "component_config/sourceCodeUrl.md"
+update_property "$app_id" "uiOptions" "component_config/uiOptions.md"
+
+# Update the actions.md file
+source "$(dirname "$0")/fn_actions_md_update.sh"
+# update_property actions
+update_property "$app_id" "actions" "component_config/actions.md"
+
+================================================
+File: src/main.py
+================================================
+import logging
+import os
+import sys
+import logging_gelf.handlers
+import logging_gelf.formatters
+from lib.component import cjRunner
+
+# Environment setup
+sys.tracebacklimit = 0
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)-8s : [line:%(lineno)3s] %(message)s',
+    datefmt="%Y-%m-%d %H:%M:%S")
+
+if 'KBC_LOGGER_ADDR' in os.environ and 'KBC_LOGGER_PORT' in os.environ:
+
+    logger = logging.getLogger()
+    logging_gelf_handler = logging_gelf.handlers.GELFTCPSocketHandler(
+        host=os.getenv('KBC_LOGGER_ADDR'), port=int(os.getenv('KBC_LOGGER_PORT')))
+    logging_gelf_handler.setFormatter(
+        logging_gelf.formatters.GELFFormatter(null_character=True))
+    logger.addHandler(logging_gelf_handler)
+
+    # remove default logging to stdout
+    logger.removeHandler(logger.handlers[0])
+
+APP_VERSION = '0.1.4'
+
+if __name__ == '__main__':
+
+    logging.info("Running component version %s..." % APP_VERSION)
+    c = cjRunner()
+    c.run()
+
+    logging.info("Extraction finished!")
+
+
+================================================
+File: src/lib/client.py
+================================================
+import logging
+import sys
+from kbc.client_base import HttpClientBase
+
+BASE_URL = 'https://commissions.api.cj.com/query'
+
+
+class cjClient(HttpClientBase):
+
+    def __init__(self, token):
+
+        self.paramToken = token
+
+        _defaultHeaders = {
+            'Authorization': ' '.join(["Bearer", self.paramToken])
+        }
+
+        HttpClientBase.__init__(self, base_url=BASE_URL, default_http_header=_defaultHeaders,
+                                status_forcelist=(502, 504), max_retries=5)
+
+        logging.debug("Client initialized.")
+
+    def _sendQuery(self, query):
+
+        rspQuery = self.post_raw(url=self.base_url, data=str(query), timeout=(60, 600))
+        querySc, queryJs = rspQuery.status_code, rspQuery.json()
+
+        if querySc == 200:
+
+            if queryJs['data'] is None:
+
+                logging.error(
+                    "Empty data received. API response: %s" % queryJs)
+                sys.exit(1)
+
+            else:
+
+                return queryJs['data']
+
+        else:
+
+            logging.error(
+                "There was an error downloading commissions. Received: %s - %s " % (querySc, queryJs))
+            sys.exit(1)
+
+    def _buildQuery(self, advOrPub, entities, startDate,
+                    endDate, dateField,  recordsQuery, sinceCommissionId=None):
+
+        query = '{'
+
+        if advOrPub == 'advertiser':
+
+            query += f'advertiserCommissions ( forAdvertisers: {entities}, '
+
+        else:
+
+            query += f'publisherCommissions ( forPublishers: {entities}, '
+
+        query += f'since{dateField}: "{startDate}", '
+        query += f'before{dateField}: "{endDate}"'
+
+        if sinceCommissionId is not None:
+
+            query += f', sinceCommissionId: "{sinceCommissionId}"'
+
+        query += ') { payloadComplete maxCommissionId records { '
+        query += recordsQuery
+        query += ' } } }'
+
+        return query
+
+    def getPagedCommissions(self, advOrPub, entities, startDate,
+                            endDate, dateField, recordsQuery):
+
+        dataKey = "advertiserCommissions" if advOrPub == 'advertiser' else "publisherCommissions"
+        payloadComplete = False
+        sinceCommissionId = None
+        allData = []
+
+        while payloadComplete is False:
+
+            query = self._buildQuery(advOrPub, entities, startDate,
+                                     endDate, dateField, recordsQuery, sinceCommissionId=sinceCommissionId)
+
+            logging.info("Sending query: %s." % query)
+
+            rspQuery = self._sendQuery(query)
+            data = rspQuery[dataKey]
+            payloadComplete = data['payloadComplete']
+            sinceCommissionId = data['maxCommissionId']
+            allData += data['records']
+
+        return allData
+
+
+================================================
+File: src/lib/component.py
+================================================
+import datetime
+import json
+import logging
+import re
+import sys
+from kbc.env_handler import KBCEnvHandler
+from lib.client import cjClient
+from lib.result import cjWriter
+
+API_TOKEN_KEY = '#apiToken'
+ADVERTISER_OR_PUBLISHER_KEY = 'advOrPub'
+ENTITY_KEY = 'entityId'
+QUERY_KEY = 'recordsQuery'
+INCREMENTAL_KEY = 'incremental'
+DATE_FROM_KEY = 'dateFrom'
+DATE_TO_KEY = 'dateTo'
+DATE_FIELD_KEY = 'dateField'
+
+MANDATORY_PARAMS = [API_TOKEN_KEY, ADVERTISER_OR_PUBLISHER_KEY,
+                    ENTITY_KEY, QUERY_KEY, DATE_FROM_KEY]
+
+
+class cjRunner(KBCEnvHandler):
+
+    def __init__(self):
+
+        KBCEnvHandler.__init__(self, mandatory_params=MANDATORY_PARAMS)
+        self.validate_config(MANDATORY_PARAMS)
+
+        self.paramApiToken = self.cfg_params[API_TOKEN_KEY]
+        self.paramAdvOrPub = self.cfg_params[ADVERTISER_OR_PUBLISHER_KEY]
+        self.paramEntityId = self.cfg_params[ENTITY_KEY]
+        self.paramQuery = self._sanitizeQuery(self.cfg_params[QUERY_KEY])
+        self.paramIncremental = self.cfg_params[INCREMENTAL_KEY]
+        self.paramDateTo = self.cfg_params[DATE_TO_KEY]
+        self.paramDateFrom = self.cfg_params[DATE_FROM_KEY]
+        self.paramDateField = self.cfg_params.get(DATE_FIELD_KEY, 'EventDate')
+
+        self.varDateTo = self.parseDates(self.paramDateTo, 'to')
+        self.varDateFrom = self.parseDates(self.paramDateFrom, 'from')
+        self.varDateRange = self.split_dates_to_chunks(self.varDateFrom, self.varDateTo,
+                                                       5, strformat='%Y-%m-%dT%H:%M:%SZ')
+
+        logging.info("Downloading commissions. Start date: %s, end date: %s." % (
+            self.varDateFrom, self.varDateTo))
+
+        self._validateParameters()
+        self.prepareColumnsAndQuery()
+
+        _tableDict = {
+            'commissions': {
+                'fields': self.varCommissionColumn,
+                'primaryKey': ['commissionId']
+            }
+        }
+
+        if self.varItemsColumns is not None:
+
+            _tableDict['commissions-items'] = {
+                'fields': self.varItemsColumns,
+                'primaryKey': ['commissionItemId', 'commissionId']
+            }
+
+        self.client = cjClient(self.paramApiToken)
+        self.writer = cjWriter(
+            dataPath=self.data_path, tableDict=_tableDict, incremental=self.paramIncremental)
+
+    def _sanitizeQuery(self, queryString):
+
+        queryString = re.sub(r"items\s*\{", " items{", queryString)
+        queryString = re.sub(
+            r"verticalAttributes\s*\{", " verticalAttributes{", queryString)
+        queryString = re.sub(r"\{\s+", '{', re.sub(r"\s+\}", '}', queryString))
+
+        return re.sub(r'\s+', ',', re.sub(r'[^\d\w\{\}]', ' ', queryString).strip())
+
+    def _getItems(self, queryString):
+
+        regexString = r"items\{([^}]+)\}"
+
+        itemsList = re.findall(regexString, queryString)
+        if itemsList == []:
+
+            itemsList = ['']
+
+        return itemsList[0], re.sub(r'\s+', '', re.sub(regexString, '', queryString))
+
+    def _getVerticalAttributes(self, queryString):
+
+        regexString = r"verticalAttributes\{([^}]+)\}"
+
+        vertAttrList = re.findall(regexString, queryString)
+        if vertAttrList == []:
+
+            vertAttrList = ['']
+
+        return vertAttrList[0], re.sub(r'\s+', '', re.sub(regexString, '', queryString))
+
+    @staticmethod
+    def removeEmptyValues(listObj):
+
+        outList = []
+
+        for elemement in listObj:
+
+            if elemement != '':
+
+                outList += [elemement]
+
+        return outList
+
+    def prepareColumnsAndQuery(self):
+
+        _items, queryNoItems = self._getItems(self.paramQuery)
+
+        if _items.strip() == '':
+
+            logging.info("No items detected in the input query.")
+            self.varItemsColumns = None
+
+        else:
+
+            if 'commissionItemId' not in _items:
+
+                _items = ','.join(['commissionItemId', _items])
+
+            _itemsColumns = [c.strip() for c in _items.split(',')]
+            _itemsColumns += ['commissionId']
+
+            _itemsColumns = self.removeEmptyValues(_itemsColumns)
+
+            self.varItemsColumns = _itemsColumns
+
+        _vAttr, queryNoVertAttr = self._getVerticalAttributes(queryNoItems)
+
+        if _vAttr.strip() == '':
+
+            logging.info("No vertical attributes detected.")
+            _vertAttrColumns = []
+
+        else:
+
+            _vertAttrColumns = ['verticalAttributes_' + v.strip()
+                                for v in _vAttr.split(',')]
+
+        sanitizedQuery = self._sanitizeQuery(queryNoVertAttr)
+
+        if sanitizedQuery == '':
+
+            logging.error("No query detected in root query. Process exiting!")
+            sys.exit(1)
+
+        if 'commissionId' not in sanitizedQuery:
+
+            sanitizedQuery = ','.join(['commissionId', sanitizedQuery])
+
+        _commissionsColumns = [c.strip() for c in sanitizedQuery.split(',')]
+        _commissionsColumnsAll = _commissionsColumns + _vertAttrColumns
+        _commissionsColumnsAll = self.removeEmptyValues(_commissionsColumnsAll)
+
+        self.varCommissionColumn = _commissionsColumnsAll
+
+        _vAttrQuery = self._sanitizeQuery(_vAttr)
+        _itemsQuery = self._sanitizeQuery(_items)
+        _queryAll = sanitizedQuery
+
+        if _vAttrQuery != '':
+
+            _queryAll += ',verticalAttributes{' + _vAttrQuery + '}'
+
+        if _itemsQuery != '':
+
+            _queryAll += ',items{' + _items + '}'
+
+        self.varRecordsQuery = _queryAll
+        logging.debug("Query:")
+        logging.debug(_queryAll)
+
+    def _validateParameters(self):
+
+        _correctTypes = {
+            'ApiToken': str,
+            'AdvOrPub': str,
+            'EntityId': list,
+            'Query': str,
+            'Incremental': bool
+        }
+
+        for key in _correctTypes:
+
+            param = eval("self.param" + key)
+            paramCorrectType = _correctTypes[key]
+            paramType = type(param)
+            paramTypeBool = isinstance(param, paramCorrectType)
+
+            if paramTypeBool is False:
+
+                logging.error(f"Wrong type for parameter \"{key}\". Expected: {str(paramCorrectType)}, "
+                              + f"got: {str(paramType)}")
+
+                sys.exit(1)
+
+        if self.paramAdvOrPub not in ('advertiser', 'publisher'):
+
+            logging.error(
+                "Parameter \"advOrPub\" must be one of \"advertiser\" or \"publisher\".")
+            sys.exit(1)
+
+        if self.varDateTo <= self.varDateFrom:
+
+            logging.error(
+                "The upper boundary of date must be greater than the lower boundary!")
+            sys.exit(1)
+
+        if len(self.paramEntityId) == 0:
+
+            logging.error("No entity IDs provided.")
+            sys.exit(1)
+
+    def parseDates(self, dateString, dateType):
+
+        if dateString == '':
+
+            if dateType == 'to':
+
+                parsedDate = datetime.datetime.utcnow()
+
+            else:
+
+                logging.error("Parameter \"dateFrom\" can't be empty!")
+                sys.exit(1)
+
+        elif dateString in ('now', 'today'):
+
+            if dateType == 'to':
+
+                parsedDate = datetime.datetime.utcnow().date()
+
+            else:
+
+                logging.error(
+                    "Parameter \"dateFrom\" can't be one of \"now, today\".")
+                sys.exit(1)
+
+        elif dateString == 'yesterday':
+
+            parsedDate = datetime.datetime.utcnow().date() + datetime.timedelta(days=-1)
+
+        elif 'days ago' in dateString or 'day ago' in dateString:
+
+            _dateRelative = re.sub(r'\s|days|ago|day', '', dateString)
+
+            try:
+
+                _dateRelative = int(_dateRelative)
+
+            except ValueError as e:
+
+                logging.error("Incorrect specification of date. %s" % e)
+                sys.exit(1)
+
+            parsedDate = datetime.datetime.utcnow().date(
+            ) - datetime.timedelta(days=_dateRelative)
+
+        else:
+
+            try:
+
+                parsedDate = datetime.datetime.strptime(dateString, '%Y-%m-%d')
+
+            except ValueError as e:
+
+                logging.error("Error when parsing date value.")
+                logging.error(e)
+                sys.exit(1)
+
+        if dateType == 'to':
+
+            parsedDate += datetime.timedelta(days=1)
+
+        return datetime.datetime.combine(parsedDate, datetime.datetime.min.time())
+
+    def run(self):
+
+        for timeRange in self.varDateRange:
+
+            startDate = timeRange['start_date']
+            endDate = timeRange['end_date']
+
+            logging.info("Starting download for period from %s to %s." %
+                         (startDate, endDate))
+
+            allData = self.client.getPagedCommissions(advOrPub=self.paramAdvOrPub,
+                                                      entities=json.dumps(
+                                                          self.paramEntityId),
+                                                      startDate=startDate, endDate=endDate,
+                                                      dateField=self.paramDateField,
+                                                      recordsQuery=self.varRecordsQuery)
+
+            for obj in allData:
+
+                commissionId = obj['commissionId']
+
+                if 'items' in obj:
+
+                    itemsList = obj['items']
+                    del obj['items']
+
+                    for item in itemsList:
+
+                        item['commissionId'] = commissionId
+                        self.writer.writerItems.writerow(item)
+
+                flattenedObj = self.writer.flattenJSON(obj)
+                self.writer.writerCommissions.writerow(flattenedObj)
+
+
+================================================
+File: src/lib/result.py
+================================================
+import csv
+import json
+import logging
+import os
+import sys
+from kbc.result import KBCResult, KBCTableDef
+
+
+class cjWriter:
+
+    def __init__(self, dataPath, tableDict, incremental):
+
+        self.paramDataPath = dataPath
+        self.paramTableDict = tableDict
+        self.paramIncremental = incremental
+        self.run()
+
+    def createTableDefinition(self, tableName, tableColumns, tablePK):
+
+        _fileName = tableName + '.csv'
+        _fullPath = os.path.join(
+            self.paramDataPath, 'out', 'tables', _fileName)
+
+        _tableDef = KBCTableDef(
+            name=tableName, columns=tableColumns, pk=tablePK)
+        _resultDef = KBCResult(file_name=_fileName,
+                               full_path=_fullPath, table_def=_tableDef)
+
+        return _resultDef
+
+    @staticmethod
+    def createWriter(tableDefinition):
+
+        _writer = csv.DictWriter(open(tableDefinition.full_path, 'w'),
+                                 fieldnames=tableDefinition.table_def.columns,
+                                 restval='', extrasaction='ignore',
+                                 quotechar='"', quoting=csv.QUOTE_ALL)
+
+        _writer.writeheader()
+
+        return _writer
+
+    @staticmethod
+    def createManifest(destination, pk=[], incremental=False):
+
+        _manifest = {'primary_key': pk, 'incremental': incremental}
+
+        with open(destination, 'w') as _manFile:
+
+            json.dump(_manifest, _manFile)
+
+    @staticmethod
+    def flattenJSON(y):
+        out = {}
+
+        def flatten(x, name=''):
+            if type(x) is dict:
+                for a in x:
+                    flatten(x[a], name + a + '_')
+            elif type(x) is list:
+                i = 0
+                for a in x:
+                    flatten(a, name + str(i) + '_')
+                    i += 1
+            else:
+                out[name[:-1]] = x
+
+        flatten(y)
+        return out
+
+    def run(self):
+
+        for t in self.paramTableDict:
+
+            _tableName = t
+            _fields = self.paramTableDict[t]['fields']
+            _primaryKey = self.paramTableDict[t]['primaryKey']
+
+            tableDefinition = self.createTableDefinition(
+                _tableName, _fields, _primaryKey)
+            self.createManifest(destination=tableDefinition.full_path + '.manifest',
+                                pk=tableDefinition.table_def.pk,
+                                incremental=self.paramIncremental)
+
+            if _tableName == 'commissions':
+
+                self.writerCommissions = self.createWriter(tableDefinition)
+                logging.info("Created commissions table.")
+
+            elif _tableName == 'commissions-items':
+
+                self.writerItems = self.createWriter(tableDefinition)
+                logging.info("Created commissions-items table.")
+
+            else:
+
+                logging.error("Unknown table definition received!")
+                sys.exit(2)
+
+
+================================================
+File: .github/workflows/push.yml
+================================================
+name: Keboola Component Build & Deploy Pipeline
+on:
+  push:
+    branches:
+      - 'feature/*'
+      - 'bug/*'
+    tags:
+      - '*' # Skip the workflow on the main branch without tags
+
+concurrency: ci-${{ github.ref }} # to avoid tag collisions in the ECR
+env:
+  # repository variables:
+  KBC_DEVELOPERPORTAL_APP: "kds-team.ex-cj-affiliate" # replace with your component id
+  KBC_DEVELOPERPORTAL_VENDOR: "kds-team" # replace with your vendor
+  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+  KBC_DEVELOPERPORTAL_USERNAME: ${{ vars.KBC_DEVELOPERPORTAL_USERNAME }}
+
+  # repository secrets:
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }} # recommended for pushing to ECR
+  KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+
+  # (Optional) Test KBC project: https://connection.keboola.com/admin/projects/0000
+  KBC_TEST_PROJECT_CONFIGS: "" # space separated list of config ids
+  KBC_STORAGE_TOKEN: ${{ secrets.KBC_STORAGE_TOKEN }} # required for running KBC tests
+
+jobs:
+  push_event_info:
+    name: Push Event Info
+    runs-on: ubuntu-latest
+    outputs:
+      app_image_tag: ${{ steps.tag.outputs.app_image_tag }}
+      is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
+      is_default_branch: ${{ steps.default_branch.outputs.is_default_branch }}
+      is_deploy_ready: ${{ steps.deploy_ready.outputs.is_deploy_ready }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Fetch all branches from remote repository
+        run: git fetch --prune --unshallow --tags -f
+
+      - name: Get current branch name
+        id: current_branch
+        run: |
+          if [[ ${{ github.ref }} != "refs/tags/"* ]]; then
+            branch_name=${{ github.ref_name }}
+            echo "branch_name=$branch_name" | tee -a $GITHUB_OUTPUT
+          else
+            raw=$(git branch -r --contains ${{ github.ref }})
+            branch="$(echo ${raw//origin\//} | tr -d '\n')"
+            echo "branch_name=$branch" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Is current branch the default branch
+        id: default_branch
+        run: |
+          echo "default_branch='${{ github.event.repository.default_branch }}'"
+          if [ "${{ github.event.repository.default_branch }}" = "${{ steps.current_branch.outputs.branch_name }}" ]; then
+             echo "is_default_branch=true" | tee -a $GITHUB_OUTPUT
+          else
+             echo "is_default_branch=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Set image tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
+          echo "is_semantic_tag=$IS_SEMANTIC_TAG" | tee -a $GITHUB_OUTPUT
+          echo "app_image_tag=$TAG" | tee -a $GITHUB_OUTPUT
+
+      - name: Deploy-Ready check
+        id: deploy_ready
+        run: |
+          if [[ "${{ steps.default_branch.outputs.is_default_branch }}" == "true" \
+            && "${{ github.ref }}" == refs/tags/* \
+            && "${{ steps.tag.outputs.is_semantic_tag }}" == "true" ]]; then
+              echo "is_deploy_ready=true" | tee -a $GITHUB_OUTPUT
+          else
+              echo "is_deploy_ready=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Docker Image Build
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest
+          outputs: type=docker,dest=/tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - build
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Tests
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest flake8 . --config=flake8.cfg
+          echo "Running unit-tests..."
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest python -m unittest discover
+
+  tests-kbc:
+    name: Run KBC Tests
+    needs:
+      - push_event_info
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up environment variables
+        run: |
+          echo "KBC_TEST_PROJECT_CONFIGS=${KBC_TEST_PROJECT_CONFIGS}" >> $GITHUB_ENV
+          echo "KBC_STORAGE_TOKEN=${{ secrets.KBC_STORAGE_TOKEN }}" >> $GITHUB_ENV
+
+      - name: Run KBC test jobs
+        if: env.KBC_TEST_PROJECT_CONFIGS != '' && env.KBC_STORAGE_TOKEN != ''
+        uses: keboola/action-run-configs-parallel@master
+        with:
+          token: ${{ secrets.KBC_STORAGE_TOKEN }}
+          componentId: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          configs: ${{ env.KBC_TEST_PROJECT_CONFIGS }}
+
+  push:
+    name: Docker Image Push
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - tests
+      - tests-kbc
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Tests
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+
+      - name: Docker login
+        if: env.DOCKERHUB_TOKEN
+        run: docker login --username "${{ env.DOCKERHUB_USER }}" --password "${{ env.DOCKERHUB_TOKEN }}"
+
+      - name: Push image to ECR
+        uses: keboola/action-push-to-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          push_latest: ${{ needs.push_event_info.outputs.is_deploy_ready }}
+          source_image: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+
+  deploy:
+    name: Deploy to KBC
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Developer Portal Tag
+        uses: keboola/action-set-tag-developer-portal@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+
+  update_developer_portal_properties:
+    name: Developer Portal Properties Update
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    runs-on: ubuntu-latest
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Update developer portal properties
+        run: |
+          chmod +x scripts/developer_portal/*.sh
+          scripts/developer_portal/update_properties.sh
+

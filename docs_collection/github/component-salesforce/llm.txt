@@ -1,0 +1,2620 @@
+Directory structure:
+└── keboola-component-salesforce/
+    ├── README.md
+    ├── Dockerfile
+    ├── LICENSE.md
+    ├── change_log.md
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── flake8.cfg
+    ├── requirements.txt
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── component_short_description.md
+    │   ├── configRowSchema.json
+    │   ├── configSchema.json
+    │   ├── configuration_description.md
+    │   ├── documentationUrl.md
+    │   ├── licenseUrl.md
+    │   ├── logger
+    │   ├── loggerConfiguration.json
+    │   ├── sourceCodeUrl.md
+    │   └── sample-config/
+    │       ├── config.json
+    │       ├── in/
+    │       │   ├── state.json
+    │       │   ├── files/
+    │       │   │   └── order1.xml
+    │       │   └── tables/
+    │       │       ├── test.csv
+    │       │       └── test.csv.manifest
+    │       └── out/
+    │           ├── files/
+    │           │   └── order1.xml
+    │           └── tables/
+    │               └── test.csv
+    ├── docs/
+    │   └── imgs/
+    ├── scripts/
+    │   ├── build_n_run.ps1
+    │   ├── build_n_test.sh
+    │   ├── run.bat
+    │   ├── run_kbc_tests.ps1
+    │   ├── update_dev_portal_properties.sh
+    │   └── developer_portal/
+    │       ├── fn_actions_md_update.sh
+    │       └── update_properties.sh
+    ├── src/
+    │   ├── buffer_management.py
+    │   ├── component.py
+    │   └── salesforce/
+    │       └── client.py
+    ├── tests/
+    │   ├── __init__.py
+    │   └── test_component.py
+    └── .github/
+        └── workflows/
+            └── push.yml
+
+================================================
+File: README.md
+================================================
+# Salesforce writer
+
+The component takes files from in/tables directory and insert/upsert/update/delete appropriate records. The input table
+must have a header with field names, which has to exist in Salesforce. ID column is used to identify record which will
+be updated. When inserting records all required fields has to be filled in.
+
+The process can fail on any records (due to missing required field or too large string) and this specific record will
+not be inserted/updated/upserted/deleted. In case of failure, the failed rows with additional detail will be stored in
+result table  `{OBJECT_NAME}_{LOAD_TYPE}_unsuccessful` e.g. `Contact_upsert_unsuccessful`
+
+Everything else will finish with success. There is no way how to rollback this transaction, so you have to carefully
+check the log each time. It is also great idea to include a column with external IDs and based on them do upsert later.
+External IDs will also save you from duplicated records when running insert several times.
+
+If you need you can set the fail on error parameter true, this will cause the job of a component to fail if 1 or more
+records fail to be inserted/updated/upserted/deleted.
+
+**NOTE** The component processes all records on the input and outputs tables containing the failed records with reason
+of failure. The table names are constructed as `{OBJECT_NAME}_{LOAD_TYPE}_unsuccessful`
+e.g. `Contact_upsert_unsuccessful`
+
+**Table of contents:**
+
+[TOC]
+
+# Configuration
+
+## Authorization
+
+- **User Name** - (REQ) your user name, when exporting data from sandbox don't forget to add .sandboxname at the end
+- **Password** - (REQ) your password
+- **Security Token** - (REQ) your security token, don't forget it is different for sandbox
+- **sandbox** - (REQ) true when you want to push data to sandbox
+- **Use Proxy** - (OPT) Section where you can configure https proxy
+  - **Proxy Server** - `STRING` (REQ if Use Proxy is selected) HTTPS Proxy Server Address
+  - **Proxy Port** - `STRING` Proxy Server Port
+  - **Proxy Username** - `STRING` Proxy Server Username
+  - **Proxy Password** - `STRING` Proxy Server Password
+  - **Use HTTP proxy for HTTPS** - `BOOL` This is a hidden configuration option for a type of HTTP proxy that also handles HTTPS.
+- **Print Failed to log** - `BOOL` If set to true, the component will log all failed operations into the job's log.
+
+### Proxy configuration example:
+
+```
+"proxy": {
+  "use_proxy": true,
+  "proxy_server": "144.49.99.170",
+  "username": "user",
+  "#password": "pwdpwd",
+  "port": "8080"
+}
+```
+
+With this configuration, a proxy server with address `https://user:pwdpwd@144.49.99.170:8080` will be used.
+
+If you set the **Use HTTP proxy for HTTPS** option to `true`, `http://user:pwdpwd@144.49.99.170:8080` will be used.
+
+
+
+## Row configuration
+
+* object - (REQ) name of object you wish to perform the operation on
+* upsertField - required when the operation is upsert, in case you have no external ID, you must set it up, or use insert and update operations separately to perform the upsert.
+* operation - (REQ) specify the operation you wish to do. Insert/Upsert/Update/Delete are supported.
+* serialMode - true if you wish to run the import in serial mode.
+* Assignment rule ID - ID of Lead [Assignment rule](https://help.salesforce.com/s/articleView?id=sf.customize_leadrules.htm&language=en_US&type=5) you want to run after import. [How to find it](https://help.salesforce.com/s/articleView?id=000381858&type=1).
+* replaceString - string to be replaced in column name for dot, so you can use that column as reference to other record
+  via external id
+* fail_on_error - if you want the job to fail on any error, set this to true and the job will fail if more than 0 errors
+  occur during the execution. When unchecked, the component will continue on failure. In both cases an output table with
+  unsuccessful records is saved. The table name will be constructed as `{OBJECT_NAME}_{LOAD_TYPE}_unsuccessful`
+  e.g. `Contact_upsert_unsuccessful`
+
+- when inserting you cannot specify ID field
+- when upserting the upsertField parameter is required
+- when updating the ID field in CSV file is required
+- when deleting, keep in mind that Salesforce's recycle bin can take less records than you are trying to delete, so they
+  will be hard deleted. Also the CSV file must contain only ID field
+
+
+
+
+
+================================================
+File: Dockerfile
+================================================
+FROM python:3.11-slim
+ENV PYTHONIOENCODING utf-8
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY requirements.txt /code/requirements.txt
+COPY flake8.cfg /code/flake8.cfg
+COPY deploy.sh /code/deploy.sh
+
+# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
+RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install flake8
+
+RUN pip install -r /code/requirements.txt
+
+WORKDIR /code/
+
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+================================================
+File: LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================
+File: change_log.md
+================================================
+**0.1.1**
+
+- fix requirements
+- add src folder to path for tests
+
+**0.1.0**
+
+- src folder structure
+- remove dependency on handler lib - import the code directly to enable modifications until its released
+
+**0.0.2**
+
+- add dependency to base lib
+- basic tests
+
+**0.0.1**
+
+- add utils scripts
+- move kbc tests directly to pipelines file
+- use uptodate base docker image
+- add changelog
+
+
+================================================
+File: deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "asigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "asigning travis tag"
+	export TAG="$TRAVIS_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+================================================
+File: docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+================================================
+File: flake8.cfg
+================================================
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    tests,
+    example
+    venv
+max-line-length = 120
+
+# F812: list comprehension redefines ...
+# H101: Use TODO(NAME)
+# H202: assertRaises Exception too broad
+# H233: Python 3.x incompatible use of print operator
+# H301: one import per line
+# H306: imports not in alphabetical order (time, os)
+# H401: docstring should not start with a space
+# H403: multi line docstrings should end on a new line
+# H404: multi line docstring should start without a leading new line
+# H405: multi line docstring summary not separated with an empty line
+# H501: Do not use self.__dict__ for string formatting
+
+
+================================================
+File: requirements.txt
+================================================
+mock~=4.0.3
+freezegun~=1.1.0
+keboola.component==1.4.0
+keboola.http-client
+salesforce_bulk==2.2.0
+simple-salesforce==1.12.5
+requests==2.31.0
+pyOpenSSL==24.1.0
+retry~=0.9.2
+backoff~=2.2.1
+six~=1.16.0
+urllib3~=2.2.1
+
+================================================
+File: component_config/component_long_description.md
+================================================
+Upload data to Salesforce via Bulk API 2.0. Supports INSERT, UPDATE, UPSERT and DELETE operations.
+
+================================================
+File: component_config/component_short_description.md
+================================================
+A customer relationship management service (CRM).
+
+================================================
+File: component_config/configRowSchema.json
+================================================
+{
+  "title": "Operation Configuration",
+  "type": "object",
+  "required": [
+    "operation",
+    "sf_object"
+  ],
+  "properties": {
+    "sf_object": {
+      "title": "Object",
+      "type": "string",
+      "enum": [],
+      "format": "select",
+      "propertyOrder": 10,
+      "options": {
+        "async": {
+          "label": "Re-load Objects",
+          "action": "loadObjects"
+        }
+      },
+      "description": "Salesforce object eg. Contact"
+    },
+    "operation": {
+      "title": "Operation",
+      "type": "string",
+      "enum": [
+        "Insert",
+        "Update",
+        "Upsert",
+        "Delete"
+      ],
+      "default": "Insert",
+      "propertyOrder": 20
+    },
+    "replace_string": {
+      "title": "Replace string",
+      "type": "string",
+      "description": "Set the string that should be replaced for a dot (\".\") in all column names that contain the replace. e.g. with replace string set to __ the column contact__address will be sent to salesforce as contact.address.",
+      "propertyOrder": 40
+    },
+    "upsert_field_name": {
+      "title": "External ID",
+      "type": "string",
+      "description": "Specify which column in the input table is an External ID for the upsert operation. Values in the External ID column must be unique. More information on importing with External IDs can be found in <a href='https://help.salesforce.com/s/articleView?id=sf.faq_import_general_what_is_an_external.htm&type=5'>Salesforce documentation</a>.",
+      "options": {
+        "dependencies": {
+          "operation": "Upsert"
+        }
+      },
+      "propertyOrder": 50
+    },
+    "assignment_id": {
+      "title": "Assignment Id",
+      "type": "string",
+      "description": "ID of Lead <a href =\"https://help.salesforce.com/s/articleView?id=sf.customize_leadrules.htm&language=en_US&type=5\">Assignment rule</a> you want to run after import. <a href=\"https://help.salesforce.com/s/articleView?id=000381858&type=1\">See how to find it</a>.",
+      "propertyOrder": 60
+    },
+    "advanced_options": {
+      "title": "Additional options",
+      "type": "object",
+      "propertyOrder": 65,
+      "properties": {
+        "serial_mode": {
+          "title": "Serial Mode",
+          "description": "Run batches in serial mode. This is useful to prevent locks on objects, but will increase run time significantly.",
+          "type": "boolean",
+          "required": true,
+          "default": false,
+          "propertyOrder": 1
+        },
+        "override_batch_size": {
+          "title": "Batch Size override",
+          "description": "Toggle if you wish to override the batch size. Otherwise, the batch size will be estimated based on the data size. Manual setup of batch size is not recommended.",
+          "type": "boolean",
+          "format": "checkbox",
+          "default": false,
+          "required": true,
+          "propertyOrder": 3,
+          "options": {
+            "dependencies": {
+              "serial_mode": false
+            }
+          }
+        },
+        "batch_size": {
+          "title": "Batch Size",
+          "description": "Batch size. In serial mode (max 10 000), in standard mode the limit is 100MB. Change this to lower value if you experience connection errors. It is not recommended",
+          "type": "integer",
+          "minimum": 1,
+          "default": 2500,
+          "propertyOrder": 15
+        }
+      },
+      "if": {
+        "properties": {
+          "serial_mode": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "batch_size": {
+            "maximum": 10000,
+            "options": {
+              "dependencies": {
+                "serial_mode": true
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "batch_size": {
+            "maximum": 1000000000,
+            "options": {
+              "dependencies": {
+                "override_batch_size": true
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+================================================
+File: component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Salesforce Credentials",
+  "format": "table",
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "required": [
+    "username",
+    "#password",
+    "#security_token"
+  ],
+  "properties": {
+    "login_method": {
+      "title": "Login Method",
+      "type": "string",
+      "enum": [
+        "security_token",
+        "connected_app_oauth_cc"
+      ],
+      "options": {
+        "enum_titles": [
+          "Security Token with Username and Password",
+          "Connected App oAuth 2.0 Client Credentials"
+        ]
+      },
+      "default": "security_token",
+      "description": "Specify the login method you wish to use",
+      "propertyOrder": 1
+    },
+    "username": {
+      "type": "string",
+      "title": "Login Name",
+      "default": "",
+      "minLength": 1,
+      "description": "Login name for Salesforce",
+      "options": {
+        "dependencies": {
+          "login_method": "security_token"
+        }
+      },
+      "propertyOrder": 10
+    },
+    "#password": {
+      "type": "string",
+      "title": "Password",
+      "format": "password",
+      "default": "",
+      "minLength": 1,
+      "description": "Salesforce password",
+      "options": {
+        "dependencies": {
+          "login_method": "security_token"
+        }
+      },
+      "propertyOrder": 20
+    },
+    "#security_token": {
+      "type": "string",
+      "title": "Security token",
+      "format": "password",
+      "default": "",
+      "options": {
+        "dependencies": {
+          "login_method": "security_token"
+        }
+      },
+      "description": "Salesforce security token",
+      "propertyOrder": 30
+    },
+    "domain": {
+      "type": "string",
+      "title": "My Domain URL",
+      "options": {
+        "inputAttributes": {
+          "placeholder": "my-domain.sandbox.my.salesforce.com"
+        },
+        "dependencies": {
+          "login_method": "connected_app_oauth_cc"
+        }
+      },
+      "description": "To find your My Domain URL, login to Salesforce and from Setup, in the Quick Find box, enter My Domain, and then select My Domain.",
+      "propertyOrder": 33
+    },
+    "consumer_key": {
+      "type": "string",
+      "title": "Consumer Key",
+      "options": {
+        "dependencies": {
+          "login_method": "connected_app_oauth_cc"
+        }
+      },
+      "description": "Salesforce Connected App Consumer Key",
+      "propertyOrder": 33
+    },
+    "#consumer_secret": {
+      "type": "string",
+      "title": "Consumer Secret",
+      "format": "password",
+      "options": {
+        "dependencies": {
+          "login_method": "connected_app_oauth_cc"
+        }
+      },
+      "description": "Salesforce Connected App Consumer Secret",
+      "propertyOrder": 36
+    },
+    "sandbox": {
+      "type": "boolean",
+      "title": "Sandbox",
+      "format": "checkbox",
+      "description": "Download records from sandbox instead of the production environment.",
+      "options": {
+        "dependencies": {
+          "login_method": "security_token"
+        }
+      },
+      "propertyOrder": 40
+    },
+    "api_version": {
+      "title": "API version",
+      "type": "string",
+      "enum": [
+        "21.0",
+        "22.0",
+        "23.0",
+        "24.0",
+        "25.0",
+        "26.0",
+        "27.0",
+        "28.0",
+        "29.0",
+        "30.0",
+        "31.0",
+        "32.0",
+        "34.0",
+        "35.0",
+        "36.0",
+        "37.0",
+        "38.0",
+        "39.0",
+        "40.0",
+        "41.0",
+        "42.0",
+        "43.0",
+        "44.0",
+        "45.0",
+        "46.0",
+        "47.0",
+        "48.0",
+        "49.0",
+        "50.0",
+        "51.0",
+        "52.0",
+        "53.0",
+        "54.0",
+        "55.0",
+        "56.0",
+        "57.0",
+        "58.0"
+      ],
+      "default": "58.0",
+      "description": "Specify the version of API you want to extract data from",
+      "propertyOrder": 50
+    },
+    "proxy": {
+      "type": "object",
+      "title": "Proxy Settings",
+      "format": "grid-strict",
+      "description": "Proxy address will be constructed in (username:password@)your.proxy.server.com(:port) format.",
+      "propertyOrder": 60,
+      "properties": {
+        "use_proxy": {
+          "title": "Use Proxy",
+          "type": "boolean",
+          "format": "checkbox",
+          "default": false,
+          "options": {
+            "grid_columns": 6,
+            "grid_break": true
+          },
+          "propertyOrder": 1
+        },
+        "proxy_server": {
+          "type": "string",
+          "title": "HTTPS Proxy Server Address",
+          "options": {
+            "grid_columns": 8,
+            "dependencies": {
+              "use_proxy": true
+            }
+          },
+          "propertyOrder": 2
+        },
+        "proxy_port": {
+          "type": "string",
+          "title": "HTTPS Proxy Server Port",
+          "options": {
+            "grid_columns": 4,
+            "dependencies": {
+              "use_proxy": true
+            }
+          },
+          "propertyOrder": 3
+        },
+        "basic_auth": {
+          "title": "Basic Authentication",
+          "type": "boolean",
+          "format": "checkbox",
+          "default": false,
+          "options": {
+            "grid_columns": 6,
+            "grid_break": true,
+            "dependencies": {
+              "use_proxy": true
+            }
+          },
+          "propertyOrder": 6
+        },
+        "username": {
+          "type": "string",
+          "title": "HTTPS Proxy Server Username",
+          "options": {
+            "dependencies": {
+              "use_proxy": true,
+              "basic_auth": true
+            }
+          },
+          "propertyOrder": 10
+        },
+        "#password": {
+          "type": "string",
+          "title": "HTTPS Proxy Server Password",
+          "format": "password",
+          "options": {
+            "dependencies": {
+              "use_proxy": true,
+              "basic_auth": true
+            }
+          },
+          "propertyOrder": 15
+        }
+      }
+    },
+    "test_connection": {
+      "type": "button",
+      "format": "test-connection",
+      "propertyOrder": 70
+    }
+  }
+}
+
+================================================
+File: component_config/logger
+================================================
+gelf
+
+================================================
+File: component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+================================================
+File: component_config/sample-config/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "#api_token": "demo",
+    "period_from": "yesterday",
+    "endpoints": [
+      "deals",
+      "companies"
+    ],
+    "company_properties": "",
+    "deal_properties": "",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+================================================
+File: component_config/sample-config/in/state.json
+================================================
+{"data_delta": "10222018"}
+
+================================================
+File: component_config/sample-config/in/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: component_config/sample-config/in/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: component_config/sample-config/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+================================================
+File: component_config/sample-config/out/files/order1.xml
+================================================
+<?xml version='1.0' ?>
+<root_el>
+    <orders>
+        <order>
+            <id>1</id>
+            <date>2018-01-01</date>
+            <cust_name>David</cust_name>	
+            <order-item>
+                <price currency="CZK">100</price>
+                <item>Umbrella</item>
+            </order-item>
+            <order-item>
+                <price currency="CZK">200</price>
+                <item>Rain Coat</item>
+            </order-item>
+        </order>
+    </orders>
+</root_el>
+
+================================================
+File: component_config/sample-config/out/tables/test.csv
+================================================
+"Type","Campaign_Name","Status","Start_Date","End_Date","Location","Eventbrite_link"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","How to become data driven startup","Complete","2015-10-13","2015-10-13","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711425377"
+"Event","How to become data driven startup","Complete","2015-11-04","2015-11-04","United Kingdom","https://www.eventbrite.co.uk/e/how-to-become-data-driven-startup-registration-18711426380"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-01-14","2016-01-14","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20152992142"
+"Event","DATAGIRLS PRESENT: HOW TO BECOME DATA-DRIVEN","Complete","2016-02-25","2016-02-25","United Kingdom","https://www.eventbrite.co.uk/e/datagirls-present-how-to-become-data-driven-tickets-20967439175"
+"Event","Data Tools for Startups","Complete","2016-03-17","2016-03-17","United Kingdom","https://www.eventbrite.co.uk/e/data-tools-for-startups-tickets-21257426535"
+"Event","Data Festival London 2016","Complete","2016-06-24","2016-06-26","United Kingdom","https://www.eventbrite.co.uk/e/data-festival-london-2016-tickets-25192608771"
+"Event","Becoming data driven in the high street fashion","Complete","2016-10-12","2016-10-12","United Kingdom","https://www.eventbrite.co.uk/e/becoming-data-driven-in-the-high-street-fashion-tickets-27481268213"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola DataBrunch - Amazon Go a ako s ním v maloobchode “bojovať”","Complete","2017-03-09","2017-03-09","Slovakia","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-ako-s-nim-v-maloobchode-bojovat-tickets-31827553068"
+"Event","Keboola DataBrunch - Amazon Go a jak s nim v maloobchodě “bojovat”","Complete","2017-03-29","2017-03-29","Czech Republic","https://www.eventbrite.co.uk/e/keboola-databrunch-amazon-go-a-jak-s-nim-v-maloobchode-bojovat-tickets-32182393405"
+"Event","The Data Foundry present: DATAGIRLS Weekend","Complete","2016-10-14","2016-10-16","United Kingdom","https://www.eventbrite.co.uk/e/the-data-foundry-present-datagirls-weekend-tickets-27350069795"
+"Event","[NLP] How to analyse text data for knowledge discovery","Complete","2017-04-10","2017-04-10","United Kingdom","https://www.eventbrite.co.uk/e/nlp-how-to-analyse-text-data-for-knowledge-discovery-tickets-32320274812"
+"Event","Keboola Data Brunch - KPIs and AmazonGo, budoucnost retailu? ","Complete","2017-06-27","2017-06-27","Czech Republic","https://www.eventbrite.co.uk/e/keboola-data-brunch-kpis-amazongo-budoucnost-retailu-tickets-35257195220"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+"Event","Conversion Rate Optimisation in Travel Industry","Complete","2018-01-30","2018-01-30","United Kingdom","https://www.eventbrite.co.uk/e/conversion-rate-optimisation-in-travel-industry-tickets-38951076719"
+"Event","Learn how to #DoMoreWithData with DataGirls","Complete","2017-10-01","2017-10-01","United Kingdom","https://www.eventbrite.co.uk/e/learn-how-to-domorewithdata-with-datagirls-tickets-36777944823"
+"Event","Are You Using Data to Understand Your Customers? ","Complete","2018-02-27","2018-02-27","United Kingdom","https://www.eventbrite.co.uk/e/are-you-using-data-to-understand-your-customers-tickets-42000160611"
+
+
+================================================
+File: scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+================================================
+File: scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+================================================
+File: scripts/run.bat
+================================================
+@echo off
+
+echo Running component...
+docker run -v %cd%:/data -e KBC_DATADIR=/data comp-tag
+
+================================================
+File: scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+================================================
+File: scripts/update_dev_portal_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+# Obtain the component repository and log in
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+
+# Update properties in Keboola Developer Portal
+echo "Updating long description"
+value=`cat component_config/component_long_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} longDescription --value="$value"
+else
+    echo "longDescription is empty!"
+    exit 1
+fi
+
+echo "Updating config schema"
+value=`cat component_config/configSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationSchema --value="$value"
+else
+    echo "configurationSchema is empty!"
+fi
+
+echo "Updating row config schema"
+value=`cat component_config/configRowSchema.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationRowSchema --value="$value"
+else
+    echo "configurationRowSchema is empty!"
+fi
+
+
+echo "Updating config description"
+
+value=`cat component_config/configuration_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} configurationDescription --value="$value"
+else
+    echo "configurationDescription is empty!"
+fi
+
+
+echo "Updating short description"
+
+value=`cat component_config/component_short_description.md`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} shortDescription --value="$value"
+else
+    echo "shortDescription is empty!"
+fi
+
+echo "Updating logger settings"
+
+value=`cat component_config/logger`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} logger --value="$value"
+else
+    echo "logger type is empty!"
+fi
+
+echo "Updating logger configuration"
+value=`cat component_config/loggerConfiguration.json`
+echo "$value"
+if [ ! -z "$value" ]
+then
+    docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} loggerConfiguration --value="$value"
+else
+    echo "loggerConfiguration is empty!"
+fi
+
+================================================
+File: scripts/developer_portal/fn_actions_md_update.sh
+================================================
+#!/bin/bash
+
+# Set the path to the Python script file
+PYTHON_FILE="src/component.py"
+# Set the path to the Markdown file containing actions
+MD_FILE="component_config/actions.md"
+
+# Check if the file exists before creating it
+if [ ! -e "$MD_FILE" ]; then
+    touch "$MD_FILE"
+else
+    echo "File already exists: $MD_FILE"
+    exit 1
+fi
+
+# Get all occurrences of lines containing @sync_action('XXX') from the .py file
+SYNC_ACTIONS=$(grep -o -E "@sync_action\(['\"][^'\"]*['\"]\)" "$PYTHON_FILE" | sed "s/@sync_action(\(['\"]\)\([^'\"]*\)\(['\"]\))/\2/" | sort | uniq)
+
+# Check if any sync actions were found
+if [ -n "$SYNC_ACTIONS" ]; then
+    # Iterate over each occurrence of @sync_action('XXX')
+    for sync_action in $SYNC_ACTIONS; do
+        EXISTING_ACTIONS+=("$sync_action")
+    done
+
+    # Convert the array to JSON format
+    JSON_ACTIONS=$(printf '"%s",' "${EXISTING_ACTIONS[@]}")
+    JSON_ACTIONS="[${JSON_ACTIONS%,}]"
+
+    # Update the content of the actions.md file
+    echo "$JSON_ACTIONS" > "$MD_FILE"
+else
+    echo "No sync actions found. Not creating the file."
+fi
+
+================================================
+File: scripts/developer_portal/update_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+
+# Check if the KBC_DEVELOPERPORTAL_APP environment variable is set
+if [ -z "$KBC_DEVELOPERPORTAL_APP" ]; then
+    echo "Error: KBC_DEVELOPERPORTAL_APP environment variable is not set."
+    exit 1
+fi
+
+# Pull the latest version of the developer portal CLI Docker image
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+# Function to update a property for the given app ID
+update_property() {
+    local app_id="$1"
+    local prop_name="$2"
+    local file_path="$3"
+
+    if [ ! -f "$file_path" ]; then
+        echo "File '$file_path' not found. Skipping update for property '$prop_name' of application '$app_id'."
+        return
+    fi
+
+    # shellcheck disable=SC2155
+    local value=$(<"$file_path")
+
+    echo "Updating $prop_name for $app_id"
+    echo "$value"
+
+    if [ -n "$value" ]; then
+        docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property "$KBC_DEVELOPERPORTAL_VENDOR" "$app_id" "$prop_name" --value="$value"
+        echo "Property $prop_name updated successfully for $app_id"
+    else
+        echo "$prop_name is empty for $app_id, skipping..."
+    fi
+}
+
+app_id="$KBC_DEVELOPERPORTAL_APP"
+
+update_property "$app_id" "isDeployReady" "component_config/isDeployReady.md"
+update_property "$app_id" "longDescription" "component_config/component_long_description.md"
+update_property "$app_id" "configurationSchema" "component_config/configSchema.json"
+update_property "$app_id" "configurationRowSchema" "component_config/configRowSchema.json"
+update_property "$app_id" "configurationDescription" "component_config/configuration_description.md"
+update_property "$app_id" "shortDescription" "component_config/component_short_description.md"
+update_property "$app_id" "logger" "component_config/logger"
+update_property "$app_id" "loggerConfiguration" "component_config/loggerConfiguration.json"
+update_property "$app_id" "licenseUrl" "component_config/licenseUrl.md"
+update_property "$app_id" "documentationUrl" "component_config/documentationUrl.md"
+update_property "$app_id" "sourceCodeUrl" "component_config/sourceCodeUrl.md"
+update_property "$app_id" "uiOptions" "component_config/uiOptions.md"
+
+# Update the actions.md file
+source "$(dirname "$0")/fn_actions_md_update.sh"
+# update_property actions
+update_property "$app_id" "actions" "component_config/actions.md"
+
+================================================
+File: src/buffer_management.py
+================================================
+import os
+import json
+import logging
+from keboola.component.dao import TableDefinition
+
+
+class DataChunkBuffer:
+    current_id = 0
+
+    def __init__(self, manager, chunk):
+        self.manager = manager
+        self.row_count = len(chunk)
+        self.error = len(chunk)
+        self.success = 0
+        self.result_file_path = None
+        self.finished_job = None
+        self.result = None
+        self.job_id = None
+        self.result_path = None
+        self.job_error_message = None
+        self.result_table = manager.result_table
+        self.data_folder_path = manager.data_folder_path
+        self.serial_mode = manager.serial_mode
+        self.processed = False
+        self.id = DataChunkBuffer._get_id()
+        self.file_name = f'{self.id}'
+        self.file_path = self._get_temp_file_path()
+        self.save(chunk)
+
+    @staticmethod
+    def _get_id():
+        DataChunkBuffer.current_id += 1
+        return DataChunkBuffer.current_id
+
+    def _get_temp_folder(self):
+        tmp_folder = os.path.join(self.data_folder_path, 'tmp')
+        os.makedirs(tmp_folder, exist_ok=True)
+        return tmp_folder
+
+    def _get_temp_file_path(self):
+        return os.path.join(self._get_temp_folder(), self.file_name)
+
+    def add_job(self, job_id):
+        self.job_id = job_id
+        new_file_name = f'{self.id}_{self.job_id}'
+        logging.debug(f'Added job id to a buffer and rename buffer file to {new_file_name}')
+        new_file_path = os.path.join(os.path.dirname(self.file_path), new_file_name)
+        os.rename(self.file_path, new_file_path)
+        self.file_name = new_file_name
+        self.file_path = new_file_path
+        return new_file_path
+
+    def save(self, chunk):
+        self.error = len(chunk)
+        with open(self.file_path, 'a') as buffer_file:
+            json.dump(chunk, buffer_file)
+            buffer_file.write('\n')  # Add a newline for each chunk
+        logging.debug(f'Written chunk "{self.file_name}" to buffer file')
+        return self
+
+    def get_buffer_data(self):
+        with open(self.file_path, 'r') as buffer_file:
+            return json.loads(buffer_file.read())
+
+    def process_done(self):
+        self.processed = True
+        logging.debug(f"Buffer {self.id} processed. Removing buffer file {self.file_path}")
+        if os.path.exists(self.file_path):
+            os.remove(self.file_path)
+
+    def finish_job(self, result):
+        self.finished_job = True
+        self.result = result
+
+
+class DataChunkBufferManager:
+    def __init__(self, data_folder, result_table: TableDefinition, serial_mode):
+        self.buffers = []
+        self.result_table = result_table
+        self.data_folder_path = data_folder
+        self.serial_mode = serial_mode
+
+    def create_buffer(self, chunk):
+        buffer = DataChunkBuffer(self, chunk)
+        self.buffers.append(buffer)
+        return buffer
+
+    def get_buffers(self):
+        return self.buffers
+
+    def finished_jobs(self):
+        return sum(1 for buffer in self.buffers if buffer.finished_job)
+
+    def unfinished_jobs(self):
+        return [buffer for buffer in self.buffers if not buffer.finished_job]
+
+    def total_success(self):
+        return sum(buffer.success for buffer in self.buffers)
+
+    def total_error(self):
+        return sum(buffer.error for buffer in self.buffers)
+
+    def total_rows(self):
+        return sum(buffer.row_count for buffer in self.buffers)
+
+    def total_unprocessed_buffers(self):
+        return sum(1 for buffer in self.buffers if not buffer.processed)
+
+    def unprocessed_buffers(self):
+        return [buffer for buffer in self.buffers if not buffer.processed]
+
+
+================================================
+File: src/component.py
+================================================
+import csv
+import json
+import logging
+import os
+import shutil
+import subprocess
+from enum import Enum
+from math import floor, ceil
+from time import sleep
+from typing import Dict, List, Iterator
+
+import requests
+from keboola.component.base import ComponentBase, sync_action
+from keboola.component.dao import TableDefinition
+from keboola.component.exceptions import UserException
+from retry import retry
+from salesforce_bulk import CsvDictsAdapter
+from simple_salesforce.exceptions import SalesforceAuthenticationFailed
+
+from salesforce.client import SalesforceClient, LineEnding
+
+from buffer_management import DataChunkBufferManager, DataChunkBuffer
+
+KEY_ADVANCED_OPTIONS = 'advanced_options'
+
+KEY_USERNAME = "username"
+KEY_PASSWORD = "#password"
+KEY_SECURITY_TOKEN = "#security_token"
+
+KEY_LOGIN_METHOD = "login_method"
+KEY_CONSUMER_KEY = "consumer_key"
+KEY_CONSUMER_SECRET = "#consumer_secret"
+KEY_DOMAIN = "domain"
+KEY_API_VERSION = "api_version"
+KEY_SANDBOX = "sandbox"
+
+KEY_OBJECT = "sf_object"
+KEY_REPLACE_STRING = "replace_string"
+KEY_OPERATION = "operation"
+KEY_ASSIGNMENT_ID = "assignment_id"
+KEY_UPSERT_FIELD_NAME = "upsert_field_name"
+KEY_SERIAL_MODE = "serial_mode"
+KEY_OVERRIDE_BATCH_SIZE = "override_batch_size"
+KEY_BATCH_SIZE = "batch_size"
+KEY_FAIL_ON_ERROR = "fail_on_error"
+KEY_PRINT_FAILED_TO_LOG = "print_failed_to_log"
+
+KEY_PROXY = "proxy"
+KEY_USE_PROXY = "use_proxy"
+KEY_PROXY_SERVER = "proxy_server"
+KEY_PROXY_PORT = "proxy_port"
+KEY_PROXY_USERNAME = "username"
+KEY_PROXY_PASSWORD = "#password"
+KEY_USE_HTTP_PROXY_AS_HTTPS = "use_http_proxy_as_https"
+
+REQUIRED_PARAMETERS = [KEY_OBJECT, KEY_OPERATION]
+REQUIRED_IMAGE_PARS = []
+
+LOG_LIMIT = 15
+MAX_INGEST_JOB_FILE_SIZE = 100 * 1024 * 1024
+MAX_SERIAL_BATCH_SIZE = 2500
+
+DEFAULT_API_VERSION = "40.0"
+
+
+class LoginType(str, Enum):
+    SECURITY_TOKEN_LOGIN = "security_token"
+    CONNECTED_APP_OAUTH_CC = "connected_app_oauth_cc"
+    CONNECTED_APP_OAUTH_AUTH_CODE = "connected_app_oauth_auth_code"
+
+    @classmethod
+    def list(cls):
+        return list(map(lambda c: c.value, cls))
+
+
+def estimate_chunk_size(csv_path: str) -> int:
+    csv_data_size = os.path.getsize(csv_path)
+    max_bytes = min(
+        csv_data_size, MAX_INGEST_JOB_FILE_SIZE - 1 * 1024 * 1024
+    )  # -1 MB for sentinel
+    num_lines = get_file_row_count(csv_path)
+    if max_bytes == csv_data_size:
+        return num_lines
+    else:
+        return floor(num_lines / ceil(csv_data_size / max_bytes))
+
+
+def get_file_row_count(input_table_path):
+    row_count = int(subprocess.check_output(f"wc -l '{input_table_path}'", shell=True).split()[0])
+    return row_count
+
+
+def skip_first_line(file_path: str) -> list[str]:
+    with open(file_path, 'r') as source_file:
+        header = next(csv.reader(source_file))  # skip the first line
+        with open(file_path + '.mod.csv', 'w') as target_file:
+            shutil.copyfileobj(source_file, target_file)
+    # remove original
+    os.remove(file_path)
+    os.rename(file_path + '.mod.csv', file_path)
+    return header
+
+
+def write_table_manifest(table: TableDefinition):
+    manifest = table.get_manifest_dictionary()
+    # TODO why it is not in the library?
+    manifest['incremental'] = False
+    if 'queuev2' in os.environ.get('KBC_PROJECT_FEATURE_GATES', ''):
+        manifest['write_always'] = True
+    else:
+        logging.warning("Running on old queue, "
+                        "result log will not be stored unless continue on failure is selected")
+    with open(table.full_path + '.manifest', 'w') as manifest_file:
+        json.dump(manifest, manifest_file)
+
+
+def get_result_table_name(operation, sf_object):
+    config_row_id = os.environ.get("KBC_CONFIGROWID", "KBC_CONFIGROWID")
+    result_table_name = f"{sf_object}_{operation}_result_{config_row_id}.csv"
+    return result_table_name
+
+
+class Component(ComponentBase):
+    def __init__(self):
+        super().__init__()
+        self.print_failed_to_log = False
+        params = self.configuration.parameters
+        login_method = self._get_login_method()
+        if login_method == LoginType.CONNECTED_APP_OAUTH_AUTH_CODE:
+            # oauth login
+            self.client = SalesforceClient(consumer_key=self.configuration.oauth_credentials.appKey,
+                                           consumer_secret=self.configuration.oauth_credentials.appSecret,
+                                           refresh_token=self.configuration.oauth_credentials.data['refresh_token'],
+                                           api_version=params.get(KEY_API_VERSION, DEFAULT_API_VERSION),
+                                           is_sandbox=params.get(KEY_SANDBOX))
+        elif login_method == LoginType.SECURITY_TOKEN_LOGIN:
+
+            self.validate_configuration_parameters([KEY_USERNAME, KEY_PASSWORD, KEY_SECURITY_TOKEN])
+            self.client = SalesforceClient(legacy_credentials=dict(username=params.get(KEY_USERNAME),
+                                                                   password=params.get(KEY_PASSWORD),
+                                                                   security_token=params.get(KEY_SECURITY_TOKEN)),
+                                           api_version=params.get(KEY_API_VERSION, DEFAULT_API_VERSION),
+                                           is_sandbox=params.get(KEY_SANDBOX))
+
+        elif login_method == LoginType.CONNECTED_APP_OAUTH_CC:
+            self.validate_configuration_parameters([KEY_CONSUMER_KEY, KEY_CONSUMER_SECRET, KEY_DOMAIN])
+            self.client = SalesforceClient(consumer_key=params[KEY_CONSUMER_KEY],
+                                           consumer_secret=params[KEY_CONSUMER_SECRET],
+                                           api_version=params.get(KEY_API_VERSION, DEFAULT_API_VERSION),
+                                           is_sandbox=params.get(KEY_SANDBOX),
+                                           domain=params[KEY_DOMAIN])
+
+    def run(self):
+        self.validate_configuration_parameters(REQUIRED_PARAMETERS)
+        self.validate_image_parameters(REQUIRED_IMAGE_PARS)
+
+        params = self.configuration.parameters
+
+        input_table = self.get_input_table()
+
+        if not input_table:
+            return
+
+        self.print_failed_to_log = params.get(KEY_PRINT_FAILED_TO_LOG, False)
+
+        sf_object = params.get(KEY_OBJECT)
+        operation = params.get(KEY_OPERATION).lower()
+
+        upsert_field_name = params.get(KEY_UPSERT_FIELD_NAME)
+        if upsert_field_name:
+            upsert_field_name = upsert_field_name.strip()
+
+        assignment_id = params.get(KEY_ASSIGNMENT_ID)
+        if assignment_id:
+            assignment_id = assignment_id.strip()
+
+        logging.info(f"Running {operation} operation with input table to the {sf_object} Salesforce object")
+
+        serial_mode = params.get(KEY_ADVANCED_OPTIONS, {}).get(KEY_SERIAL_MODE, False)
+
+        replace_string = params.get(KEY_REPLACE_STRING)
+        input_headers = input_table.columns
+        if replace_string:
+            input_table.columns = self.replace_headers(input_headers, replace_string)
+
+        if upsert_field_name and upsert_field_name.strip() not in input_headers:
+            raise UserException(
+                f"Upsert field name {upsert_field_name} not in input table with headers {input_headers}")
+
+        if operation == "delete" and len(input_headers) != 1:
+            raise UserException("Delete operation should only have one column with id, input table contains "
+                                f"{len(input_headers)} columns")
+
+        result_table = self.create_result_table(input_table.columns, operation, sf_object)
+        buffer_manager = DataChunkBufferManager(self.data_folder_path, result_table, serial_mode)
+
+        run_error: Exception = None
+        try:
+            self.write_to_salesforce(input_table, upsert_field_name,
+                                     sf_object, operation, assignment_id, serial_mode, buffer_manager)
+        except SalesforceAuthenticationFailed as e:
+            run_error = UserException(f"Authentication Failed: recheck your username, password, and security token. "
+                                      f"Exception detail: {e}")
+        except Exception as ex:
+            run_error = ex
+
+        if buffer_manager.total_unprocessed_buffers() > 0:
+            self.write_unprocessed_buffers(buffer_manager, str(run_error))
+            logging.warning(f"{buffer_manager.total_unprocessed_buffers()} "
+                            f"buffers were not processed will be written to the result table with error message")
+
+        logging.info(f"{operation}ed {buffer_manager.total_success()} records,"
+                     f" {buffer_manager.total_error()} errors occurred,"
+                     f" more details in {buffer_manager.result_table.full_path}")
+
+        if run_error:
+            raise UserException(run_error)
+        elif buffer_manager.total_error() > 0:
+            raise UserException("Process was unsuccessful due to errors in the result table. Check the result table.")
+        else:
+            logging.info("Process was successful.")
+
+    def _get_login_method(self) -> LoginType:
+        if self.configuration.oauth_credentials:
+
+            login_type_name = 'connected_app_oauth_auth_code'
+        else:
+            login_type_name = self.configuration.parameters.get(KEY_LOGIN_METHOD, 'security_token')
+
+        try:
+            return LoginType(login_type_name)
+        except ValueError as val_err:
+            raise UserException(
+                f"'{login_type_name}' is not a valid Login Type. Enter one of : {LoginType.list()}") from val_err
+
+    @retry(SalesforceAuthenticationFailed, tries=3, delay=10)
+    def login_to_salesforce(self):
+        self.set_proxy()
+        try:
+            self.client.login()
+        except requests.exceptions.ProxyError as e:
+            raise UserException(f"Cannot connect to proxy: {e}")
+
+    def get_input_table(self):
+        input_tables = self.get_input_tables_definitions()
+        if len(input_tables) == 0:
+            raise UserException("No input table added. Please add an input table")
+        elif len(input_tables) > 1:
+            raise UserException("Too many input tables added. Please add only one input table")
+        if get_file_row_count(input_tables[0].full_path) < 2:
+            logging.warning("Input table is empty, no data to process")
+            return None
+        return input_tables[0]
+
+    @staticmethod
+    def replace_headers(input_headers, replace_string):
+        input_headers = [header.replace(replace_string, ".") for header in input_headers]
+        return input_headers
+
+    @staticmethod
+    def get_input_file_data(input_table: TableDefinition) -> Iterator[dict]:
+        with open(input_table.full_path, mode='r') as in_file:
+            reader = csv.DictReader(in_file, fieldnames=input_table.columns)
+            # if exists manifest, skip first row
+            if input_table.get_manifest_dictionary():
+                next(reader)
+            for input_row in reader:
+                yield input_row
+
+    @staticmethod
+    def create_buffers(generator, chunk_size, buffer_manager):
+        chunk = []
+        for item in generator:
+            if len(chunk) >= chunk_size:
+                buffer_manager.create_buffer(chunk)
+                chunk = [item]
+            else:
+                chunk.append(item)
+        if chunk:
+            buffer_manager.create_buffer(chunk)
+        logging.debug(
+            f"Input data ({buffer_manager.total_rows()} rows) split to {len(buffer_manager.buffers)} chunks")
+
+    def write_to_salesforce(self, input_table: TableDefinition, upsert_field_name,
+                            sf_object, operation, assignment_id, serial_mode, buffer_manager):
+
+        input_file_reader = self.get_input_file_data(input_table)
+        chunk_size = self.define_chunk_size(input_table, serial_mode)
+
+        self.create_buffers(input_file_reader, chunk_size, buffer_manager)
+
+        # Login needs to be here for possibility write all unprocessed buffers
+        self.login_to_salesforce()
+
+        if serial_mode:
+            logging.info("Running in serial mode (fall back to Bulk API v1)")
+            return self.upload_data_serial(upsert_field_name, sf_object, operation, assignment_id, buffer_manager)
+        else:
+            logging.info("Running batches in parallel (Bulk 2.0)")
+            return self.upload_data_bulk2(upsert_field_name, sf_object, operation, assignment_id, buffer_manager)
+
+    def define_chunk_size(self, input_table, serial_mode):
+        batch_size_override = None
+        if self.configuration.parameters.get(KEY_ADVANCED_OPTIONS, {}).get(KEY_OVERRIDE_BATCH_SIZE, None):
+            batch_size_override = self.configuration.parameters.get(KEY_ADVANCED_OPTIONS, {}).get(KEY_BATCH_SIZE, None)
+        if serial_mode:
+            chunk_size = batch_size_override or MAX_SERIAL_BATCH_SIZE
+        else:
+            chunk_size = batch_size_override or estimate_chunk_size(input_table.full_path)
+
+        logging.info(f'Batch size set to: {chunk_size:,}')
+        return chunk_size
+
+    def upload_data_bulk2(self, upsert_field_name, sf_object, operation, assignment_id,
+                          buffer_manager: DataChunkBufferManager):
+        for buffer in buffer_manager.buffers:
+            chunk = buffer.get_buffer_data()
+            csv_iter = CsvDictsAdapter(iter(chunk))
+            logging.info(f"Creating job and uploading buffer #{buffer.id}")
+            upload_job = self.client.create_job_and_upload_data(sf_object, operation,
+                                                                external_id_field=upsert_field_name,
+                                                                line_ending=LineEnding.CRLF,
+                                                                assignment_rule_id=assignment_id,
+                                                                input_stream=csv_iter)
+            buffer.add_job(upload_job.get('id'))
+        job_count = len(buffer_manager.buffers)
+        logging.info(f"Created and uploaded {job_count} jobs, waiting for the finish")
+        finished_jobs = 0
+        while job_count > finished_jobs:
+            for buffer in buffer_manager.unfinished_jobs():
+                sleep(2)
+                actual_job = self.client.get_job_status(buffer.job_id)
+                if self.client.is_job_done(actual_job):
+                    buffer.finish_job(actual_job)
+                    self.process_buffer(buffer)
+                    finished_jobs = buffer_manager.finished_jobs()
+                    logging.info(f'{finished_jobs} jobs finished out of {job_count}')
+
+    def upload_data_serial(self, upsert_field_name, sf_object, operation, assignment_id,
+                           buffer_manager: DataChunkBufferManager):
+
+        job_id = self.client.create_job_v1(sf_object, operation, external_id_name=upsert_field_name,
+                                           contentType='CSV', concurrency='Serial',
+                                           assignement_id=assignment_id)
+        logging.info(f"Created job {job_id}")
+        for buffer in buffer_manager.get_buffers():
+            logging.info(f"Uploading buffer and processing job #{buffer.id}")
+            buffer.add_job(job_id)
+            chunk = buffer.get_buffer_data()
+            csv_iter = CsvDictsAdapter(iter(chunk))
+            result = self.client.get_batch_result_v1(job_id, csv_iter)
+            buffer.finish_job(result)
+            self.process_buffer(buffer)
+            logging.info(f"Processing response for #{job_id}")
+        self.client.close_job_v1(job_id)
+        logging.info(f"Job #{job_id} done")
+
+    def process_buffer(self, buffer):
+        if buffer.serial_mode:
+            self.parse_result_v1(buffer)
+            self.write_result_v1(buffer)
+        else:
+            self.parse_result_v2(buffer)
+            if buffer.job_error_message:
+                Component.write_buffer(buffer)
+            else:
+                self.write_result_v2(buffer)
+
+    @staticmethod
+    def parse_result_v1(buffer: DataChunkBuffer):
+        num_errors = 0
+        num_success = 0
+        for chunk in buffer.result:
+            if chunk.success == "false":
+                num_errors = num_errors + 1
+            else:
+                num_success = num_success + 1
+        buffer.success = num_success
+        buffer.error = num_errors
+
+    @staticmethod
+    def parse_result_v2(buffer: DataChunkBuffer):
+        num_errors = 0
+        num_success = 0
+        if buffer.result['state'] == 'Failed':
+            num_errors = buffer.row_count
+            buffer.job_error_message = buffer.result['errorMessage']
+            logging.debug(f"Job {buffer.job_id} failed with message: {buffer.job_error_message}")
+        else:
+            num_errors = num_errors + buffer.result['numberRecordsFailed']
+            num_success = num_success + (buffer.result['numberRecordsProcessed'] - buffer.result['numberRecordsFailed'])
+        buffer.success = num_success
+        buffer.error = num_errors
+
+    def write_result_v2(self, buffer: DataChunkBuffer):
+
+        result_table = buffer.result_table
+        if buffer.success > 0:
+            success_result_key = "successfulResults"
+            self.process_result_v2(buffer, result_table, success_result_key)
+        if buffer.error > 0:
+            error_result_key = "failedResults"
+            self.process_result_v2(buffer, result_table, error_result_key)
+        buffer.process_done()
+        # TODO: remove when write_always added to the library
+        write_table_manifest(result_table)
+
+    def process_result_v2(self, buffer, result_table, result_key):
+        file_path = os.path.join(result_table.full_path, f'{buffer.id}.csv')
+        sf_job_result_file_path = os.path.join(result_table.full_path, f'{buffer.id}_{result_key}.csv')
+        self.client.download_results(buffer.job_id, sf_job_result_file_path, result_key)
+        with open(sf_job_result_file_path, 'r') as result_file:
+            result_file_reader = csv.DictReader(result_file)
+            with open(file_path, 'a', newline='') as out_table:
+                writer = csv.DictWriter(out_table, fieldnames=result_table.columns, lineterminator='\n', delimiter=',')
+                writer.writerows(result_file_reader)
+        os.remove(sf_job_result_file_path)
+
+    @staticmethod
+    def write_result_v1(buffer: DataChunkBuffer):
+        result_table = buffer.result_table
+
+        file_path = os.path.join(result_table.full_path, f'{buffer.id}.csv')
+        with open(file_path, 'w+', newline='') as out_table:
+            writer = csv.DictWriter(out_table, fieldnames=result_table.columns, lineterminator='\n', delimiter=',')
+            for i, row in enumerate(buffer.get_buffer_data()):
+                if buffer.result[i].success == "true":
+                    row["sf__Id"] = buffer.result[i].id
+                    row["sf__Created"] = buffer.result[i].created
+                    writer.writerow(row)
+                else:
+                    row["sf__Error"] = buffer.result[i].error
+                    writer.writerow(row)
+            buffer.process_done()
+
+        # TODO: remove when write_always added to the library
+        write_table_manifest(result_table)
+
+    @staticmethod
+    def write_unprocessed_buffers(buffer_manager: DataChunkBufferManager, error_message):
+        for buffer in buffer_manager.unprocessed_buffers():
+            Component.write_buffer(buffer, error_message)
+
+    @staticmethod
+    def write_buffer(buffer, error_message=None):
+        """
+        Writes buffer to the result table with error message
+        write_table_manifest is called every time to create a new manifest file in case when new columns are added
+        to the result table.
+        """
+        logging.debug(f"Writing buffer {buffer.id} to the result table")
+        result_table = buffer.result_table
+        file_path = os.path.join(result_table.full_path, f'{buffer.id}.csv')
+        with open(file_path, 'w+', newline='') as out_table:
+            writer = csv.DictWriter(out_table, fieldnames=result_table.columns, lineterminator='\n', delimiter=',')
+            for i, row in enumerate(buffer.get_buffer_data()):
+                row["kbc__Error"] = error_message
+                row["sf__Error"] = buffer.job_error_message
+                writer.writerow(row)
+        buffer.process_done()
+
+        write_table_manifest(result_table)
+
+    def create_result_table(self, columns, operation, sf_object) -> TableDefinition:
+        """
+        Ensures the result table and its manifest file are created at the beginning of the run.
+        write_table_manifest is called every time to create a new manifest file in case when new columns are added
+        to the result table.
+        """
+        fieldnames = ["sf__Id", "sf__Created", "sf__Error", "kbc__Error"]
+        fieldnames.extend(columns)
+        result_table_name = get_result_table_name(operation, sf_object)
+        logging.debug(f"Creating result table {result_table_name} with columns {fieldnames}")
+        result_table = self.create_out_table_definition(name=result_table_name)
+        result_table.columns = fieldnames
+        os.makedirs(result_table.full_path, exist_ok=True)
+
+        write_table_manifest(result_table)
+        return result_table
+
+    def set_proxy(self) -> None:
+        """Sets proxy if defined"""
+        proxy_config = self.configuration.parameters.get(KEY_PROXY, {})
+        if proxy_config.get(KEY_USE_PROXY):
+            self._set_proxy(proxy_config)
+
+    def _set_proxy(self, proxy_config: dict) -> None:
+        """
+        Sets proxy using environmental variables.
+        Also, a special case when http proxy is used for https is handled by using KEY_USE_HTTP_PROXY_AS_HTTPS.
+        os.environ['HTTPS_PROXY'] = (username:password@)your.proxy.server.com(:port)
+        """
+        proxy_server = proxy_config.get(KEY_PROXY_SERVER)
+        proxy_port = str(proxy_config.get(KEY_PROXY_PORT))
+        proxy_username = proxy_config.get(KEY_PROXY_USERNAME)
+        proxy_password = proxy_config.get(KEY_PROXY_PASSWORD)
+        use_http_proxy_as_https = proxy_config.get(
+            KEY_USE_HTTP_PROXY_AS_HTTPS) or self.configuration.image_parameters.get(KEY_USE_HTTP_PROXY_AS_HTTPS)
+
+        if not proxy_server:
+            raise UserException("You have selected use_proxy parameter, but you have not specified proxy server.")
+        if not proxy_port:
+            raise UserException("You have selected use_proxy parameter, but you have not specified proxy port.")
+
+        _proxy_credentials = f"{proxy_username}:{proxy_password}@" if proxy_username and proxy_password else ""
+        _proxy_server = f"{_proxy_credentials}{proxy_server}:{proxy_port}"
+
+        if use_http_proxy_as_https:
+            # This is a case of http proxy which also supports https.
+            _proxy_server = f"http://{_proxy_server}"
+        else:
+            _proxy_server = f"https://{_proxy_server}"
+
+        os.environ["HTTPS_PROXY"] = _proxy_server
+
+        logging.info(f"Component will use proxy server {_proxy_server}.")
+
+    @sync_action('loadObjects')
+    def load_possible_objects(self) -> List[Dict]:
+        """
+        Finds all possible objects in Salesforce that can be fetched by the Bulk API
+
+        Returns: a List of dictionaries containing 'name' and 'value' of the SF object, where 'name' is the Label name/
+        readable name of the object, and 'value' is the name of the object you can use to query the object
+
+        """
+        self.get_salesforce_client()
+        return self.client.get_bulk_fetchable_objects()
+
+    def get_salesforce_client(self) -> SalesforceClient:
+        try:
+            return self.login_to_salesforce()
+        except SalesforceAuthenticationFailed as e:
+            raise UserException("Authentication Failed : recheck your username, password, and security token ") from e
+
+    @sync_action('testConnection')
+    def test_connection(self):
+        """
+        Tries to log into Salesforce, raises user exception if login params are incorrect
+        """
+        self.get_salesforce_client()
+
+
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+================================================
+File: src/salesforce/client.py
+================================================
+import base64
+import logging
+import xml.etree.ElementTree as ET
+from collections import OrderedDict
+from json import JSONDecodeError
+from typing import Iterable
+
+import backoff
+import requests
+import salesforce_bulk
+from keboola.http_client import HttpClient
+from salesforce_bulk import SalesforceBulk
+from salesforce_bulk.salesforce_bulk import DEFAULT_API_VERSION, BulkApiError
+from simple_salesforce import Salesforce
+from simple_salesforce.bulk2 import Operation, ColumnDelimiter, LineEnding
+from six import text_type
+from urllib3.exceptions import SSLError as urllib3_SSLError
+from requests.exceptions import SSLError
+
+NON_SUPPORTED_BULK_FIELD_TYPES = ["address", "location", "base64", "reference"]
+
+# Some objects are not supported by bulk and there is no exact way to determine them, they must be set like this
+# https://help.salesforce.com/s/articleView?id=000383508&type=1
+OBJECTS_NOT_SUPPORTED_BY_BULK = ["AccountFeed", "AssetFeed", "AccountHistory", "AcceptedEventRelation",
+                                 "DeclinedEventRelation", "AggregateResult", "AttachedContentDocument", "CaseStatus",
+                                 "CaseTeamMember", "CaseTeamRole", "CaseTeamTemplate", "CaseTeamTemplateMember",
+                                 "CaseTeamTemplateRecord", "CombinedAttachment", "ContentFolderItem", "ContractStatus",
+                                 "EventWhoRelation", "FolderedContentDocument", "KnowledgeArticleViewStat",
+                                 "KnowledgeArticleVoteStat", "LookedUpFromActivity", "Name", "NoteAndAttachment",
+                                 "OpenActivity", "OwnedContentDocument", "PartnerRole", "RecentlyViewed",
+                                 "ServiceAppointmentStatus", "SolutionStatus", "TaskPriority", "TaskStatus",
+                                 "TaskWhoRelation", "UserRecordAccess", "WorkOrderLineItemStatus", "WorkOrderStatus"]
+
+MAX_RETRIES = 9
+
+
+def _backoff_handler(details):
+    # this should never happen, but if it does retry login
+    if 'InvalidSessionId' in str(details['exception']):
+        logging.warning('SessionID invalid, trying to re-login.')
+        details['args'][0].relogin()
+
+
+class SalesforceAuthenticationFailed(Exception):
+    pass
+
+
+class SalesforceClient(HttpClient):
+    def __init__(self, consumer_key: str = None, consumer_secret: str = None, refresh_token: str = None,
+                 is_sandbox: bool = False, api_version=DEFAULT_API_VERSION, legacy_credentials: dict = None,
+                 domain=None):
+
+        super().__init__('NONE', max_retries=MAX_RETRIES)
+
+        self._legacy_credentials = legacy_credentials
+        self.is_sandbox = is_sandbox
+        self._consumer_key = consumer_key
+        self._consumer_secret = consumer_secret
+        self._refresh_token = refresh_token
+        self.is_logged_in = False
+        self.api_version = api_version
+        self.simple_client: Salesforce
+        self.bulk1_client: salesforce_bulk.SalesforceBulk
+        self.domain = domain
+        self._max_retries = 3
+
+    def login(self):
+        # present only for client credentials flow
+        if not self.domain:
+            self.domain = 'login' if not self.is_sandbox else 'test'
+
+        if self._legacy_credentials:
+
+            access_token, instance_url = SalesforceBulk.login_to_salesforce(self._legacy_credentials['username'],
+                                                                            self._legacy_credentials['password'],
+                                                                            sandbox=self.is_sandbox,
+                                                                            security_token=self._legacy_credentials[
+                                                                                'security_token'],
+                                                                            API_version=self.api_version)
+
+        else:
+            instance_url, access_token = self._login_oauth(self.domain)
+
+        sf_instance = instance_url.replace(
+            'http://', '').replace(
+            'https://', '')
+
+        self.is_logged_in = True
+        if sf_instance[0:4] == 'http':
+            self.base_url = sf_instance
+        else:
+            self.base_url = "https://" + sf_instance
+
+        self.update_auth_header({"Authorization": f"Bearer {access_token}"})
+
+        # init simple client
+        self._init_simple_client(access_token, self.domain)
+        self._init_bulk1_client(access_token)
+
+    def _login_oauth(self, domain: str):
+        if self._refresh_token:
+            token_data = {'grant_type': 'refresh_token',
+                          'refresh_token': self._refresh_token}
+            token_url = f'https://{domain}.salesforce.com/services/oauth2/token'
+
+        else:
+            token_data = {'grant_type': 'client_credentials'}
+            token_url = f'https://{domain}/services/oauth2/token'
+
+        authorization = f'{self._consumer_key}:{self._consumer_secret}'
+        encoded = base64.b64encode(authorization.encode()).decode()
+        headers = {
+            'Authorization': f'Basic {encoded}'
+        }
+        response = requests.post(token_url, token_data, headers=headers)
+
+        try:
+            json_response = response.json()
+        except JSONDecodeError as exc:
+            raise SalesforceAuthenticationFailed(
+                response.status_code, response.text
+            ) from exc
+
+        if response.status_code != 200:
+            except_code = json_response.get('error')
+            except_msg = json_response.get('error_description')
+            if except_msg == "user hasn't approved this consumer":
+                auth_url = f'https://{domain}.salesforce.com/services/oauth2/' \
+                           'authorize?response_type=code&client_id=' \
+                           f'{self._consumer_key}&redirect_uri=<approved URI>'
+                except_msg += f"""\n
+                          If your connected app policy is set to "All users may
+                          self-authorize", you may need to authorize this
+                          application first. Browse to
+                          {auth_url}
+                          in order to Allow Access. Check first to ensure you have a valid
+                          <approved URI>."""
+            raise SalesforceAuthenticationFailed(except_code, except_msg)
+
+        access_token = json_response.get('access_token')
+        instance_url = json_response.get('instance_url')
+        return instance_url, access_token
+
+    def _init_simple_client(self, access_token: str, domain: str):
+        instance_url = self.base_url
+        self.simple_client = Salesforce(session_id=access_token, instance_url=instance_url,
+                                        domain=domain, version=self.api_version)
+
+    def _init_bulk1_client(self, access_token: str):
+        instance_url = self.base_url
+        self.bulk1_client = LegacyBulkClient(session_id=access_token, instance_url=instance_url,
+                                             api_version=self.api_version)
+
+    def create_job_and_upload_data(self, sf_object: str,
+                                   operation: Operation,
+                                   input_stream: Iterable,
+                                   column_delimiter=ColumnDelimiter.COMMA,
+                                   line_ending=LineEnding.LF,
+                                   external_id_field=None,
+                                   assignment_rule_id=None):
+        """
+        Creates job, uploads data and marks upload job as uploadComplete to start processing on salesforce side.
+        Returns resulting job
+        Args:
+            sf_object:
+            operation:
+            input_stream:
+            column_delimiter:
+            line_ending:
+            external_id_field:
+            assignment_rule_id:
+
+        Returns: dict: job object with current status
+
+        """
+        job = self.create_upload_job(sf_object, operation,
+                                     column_delimiter,
+                                     line_ending,
+                                     external_id_field,
+                                     assignment_rule_id)
+        logging.debug(job)
+        logging.debug(job)
+        self.upload_data(job['contentUrl'], input_stream)
+        self.mark_upload_job_complete(job_id=job['id'])
+        return self.get_job_status(job['id'])
+
+    def create_upload_job(
+            self,
+            sf_object: str,
+            operation: Operation,
+            column_delimiter=ColumnDelimiter.COMMA,
+            line_ending=LineEnding.LF,
+            external_id_field=None,
+            assignment_rule_id=None
+    ):
+        payload = {
+            "operation": operation,
+            "columnDelimiter": column_delimiter,
+            "lineEnding": line_ending,
+        }
+        if external_id_field:
+            payload["externalIdFieldName"] = external_id_field
+
+        if assignment_rule_id:
+            payload["assignment_rule_id"] = assignment_rule_id
+
+        payload["object"] = sf_object
+        payload["contentType"] = "CSV"
+
+        endpoint = f"/services/data/v{self.api_version}/jobs/ingest"
+        logging.debug(f"Creating job for {sf_object}")
+        result = self.post_raw(
+            endpoint_path=endpoint,
+            json=payload,
+        )
+        if result.status_code >= 300:
+            raise BulkApiError(result.text, result.status_code)
+        return result.json(object_pairs_hook=OrderedDict)
+
+    @backoff.on_exception(backoff.expo, (SSLError, ConnectionError), max_tries=MAX_RETRIES, on_backoff=_backoff_handler)
+    def upload_data(self, content_url: str, input_stream: Iterable):
+        logging.debug(f"uploading data to {content_url}")
+        headers = {'Content-Type': 'text/csv'}
+        self.put_raw(endpoint_path=content_url, headers=headers, data=input_stream)
+
+    @backoff.on_exception(backoff.expo, (SSLError, urllib3_SSLError, ConnectionError), max_tries=MAX_RETRIES,
+                          on_backoff=_backoff_handler)
+    def mark_upload_job_complete(self, job_id: str):
+        endpoint = f'/services/data/v{self.api_version}/jobs/ingest/{job_id}'
+        self.patch(endpoint, json={"state": "UploadComplete"})
+
+    @backoff.on_exception(backoff.expo, (SSLError, urllib3_SSLError, ConnectionError), max_tries=MAX_RETRIES,
+                          on_backoff=_backoff_handler)
+    def get_job_status(self, job_id: str):
+        endpoint = f'/services/data/v{self.api_version}/jobs/ingest/{job_id}'
+        return self.get(endpoint)
+
+    @backoff.on_exception(backoff.expo, (SSLError, urllib3_SSLError, ConnectionError), max_tries=MAX_RETRIES,
+                          on_backoff=_backoff_handler)
+    def download_results(self, job_id: str, result_path: str, results_type: str):
+        endpoint = f'/services/data/v{self.api_version}/jobs/ingest/{job_id}/{results_type}'
+        res = self.get_raw(endpoint, stream=True)
+
+        with open(result_path, 'wb+') as out:
+            for chunk in res.iter_content(chunk_size=8192):
+                out.write(chunk)
+
+    @staticmethod
+    def is_job_done(job: dict):
+        outcome_states = ['JobComplete', 'Failed', 'Aborted']
+        return job['state'] in outcome_states
+
+    def get_bulk_fetchable_objects(self):
+        all_s_objects = self.simple_client.describe()["sobjects"]
+        to_fetch = []
+        # Only objects with the 'queryable' set to True and ones that are not in the OBJECTS_NOT_SUPPORTED_BY_BULK are
+        # queryable by the Bulk API. This list might not be exact, and some edge-cases might have to be addressed.
+        for sf_object in all_s_objects:
+            if sf_object.get('queryable') and not sf_object.get('name') in OBJECTS_NOT_SUPPORTED_BY_BULK:
+                to_fetch.append({"label": sf_object.get('label'), 'value': sf_object.get('name')})
+        return to_fetch
+
+    @backoff.on_exception(backoff.expo, (SSLError, urllib3_SSLError, ConnectionError), max_tries=MAX_RETRIES,
+                          on_backoff=_backoff_handler)
+    def create_job_v1(self, object_name=None, operation=None, contentType='CSV',
+                      concurrency=None, external_id_name=None, pk_chunking=False, assignement_id=None):
+        assert (object_name is not None)
+        assert (operation is not None)
+
+        extra_headers = {}
+        if pk_chunking:
+            if pk_chunking is True:
+                pk_chunking = u'true'
+            elif isinstance(pk_chunking, int):
+                pk_chunking = u'chunkSize=%d;' % pk_chunking
+            else:
+                pk_chunking = text_type(pk_chunking)
+
+            extra_headers['Sforce-Enable-PKChunking'] = pk_chunking
+
+        if assignement_id:
+            extra_headers['assignmentRuleId'] = assignement_id
+
+        doc = self.bulk1_client.create_job_doc(object_name=object_name,
+                                               operation=operation,
+                                               contentType=contentType,
+                                               concurrency=concurrency,
+                                               external_id_name=external_id_name)
+
+        resp = requests.post(self.bulk1_client.endpoint + "/job",
+                             headers=self.bulk1_client.headers(extra_headers),
+                             data=doc)
+        self.bulk1_client.check_status(resp)
+
+        tree = ET.fromstring(resp.content)
+        job_id = tree.findtext("{%s}id" % self.bulk1_client.jobNS)
+        self.bulk1_client.jobs[job_id] = job_id
+        self.bulk1_client.job_content_types[job_id] = contentType
+
+        return job_id
+
+    @backoff.on_exception(backoff.expo, (SSLError, urllib3_SSLError, ConnectionError), max_tries=MAX_RETRIES,
+                          on_backoff=_backoff_handler)
+    def close_job_v1(self, job_id):
+        self.bulk1_client.close_job(job_id)
+
+    def get_batch_result_v1(self, job, csv_iter):
+        batch = self.retry_post_batch_v1(job, csv_iter)
+        logging.info(f"Batch ID '{batch}' created.")
+        try:
+            self.retry_wait_for_batch_v1(job, batch)
+        except BulkApiError as e:
+            logging.warning(f"Batch ID '{batch}' failed: {e}")
+        status = self.bulk1_client.batch_status(batch, job, reload=True)
+        logging.info(f"Batch status: {status}")
+        return self.bulk1_client.get_batch_results(batch)
+
+    @backoff.on_exception(backoff.expo, (SSLError, urllib3_SSLError, ConnectionError), max_tries=MAX_RETRIES,
+                          on_backoff=_backoff_handler)
+    def retry_post_batch_v1(self, job, csv_iter):
+        return self.bulk1_client.post_batch(job, csv_iter)
+
+    @backoff.on_exception(backoff.expo, (SSLError, urllib3_SSLError, ConnectionError), max_tries=MAX_RETRIES,
+                          on_backoff=_backoff_handler)
+    def retry_wait_for_batch_v1(self, job, batch):
+        self.bulk1_client.wait_for_batch(job, batch)
+
+    @property
+    def max_retries(self) -> int:
+        return self._max_retries
+
+    @max_retries.setter
+    def max_retries(self, value: int):
+        self._max_retries = value
+
+
+class LegacyBulkClient(SalesforceBulk):
+    def __init__(self, session_id: str, instance_url: str, api_version: str):
+
+        super().__init__(sessionId=session_id, host=instance_url, API_version=api_version)
+        if instance_url[0:4] == 'http':
+            self.endpoint = instance_url
+        else:
+            self.endpoint = "https://" + instance_url
+        self.endpoint += "/services/async/%s" % api_version
+        self.sessionId = session_id
+        self.jobNS = 'http://www.force.com/2009/06/asyncapi/dataload'
+        self.jobs = {}  # dict of job_id => job_id
+        self.batches = {}  # dict of batch_id => job_id
+        self.job_content_types = {}  # dict of job_id => contentType
+        self.batch_statuses = {}
+        self.API_version = api_version
+
+
+================================================
+File: tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+================================================
+File: tests/test_component.py
+================================================
+'''
+Created on 12. 11. 2018
+
+@author: esner
+'''
+import unittest
+import mock
+import os
+from freezegun import freeze_time
+
+from component import Component
+
+
+class TestComponent(unittest.TestCase):
+
+    # set global time to 2010-10-10 - affects functions like datetime.now()
+    @freeze_time("2010-10-10")
+    # set KBC_DATADIR env to non-existing dir
+    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    def test_run_no_cfg_fails(self):
+        with self.assertRaises(ValueError):
+            comp = Component()
+            comp.run()
+
+
+if __name__ == "__main__":
+    # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+================================================
+File: .github/workflows/push.yml
+================================================
+name: Keboola Component Build & Deploy Pipeline
+on:
+  push:
+    branches:
+      - 'feature/*'
+      - 'bug/*'
+    tags:
+      - '*' # Skip the workflow on the main branch without tags
+
+concurrency: ci-${{ github.ref }} # to avoid tag collisions in the ECR
+env:
+  # repository variables:
+  KBC_DEVELOPERPORTAL_APP: "kds-team.wr-salesforce" # replace with your component id
+  KBC_DEVELOPERPORTAL_VENDOR: "kds-team" # replace with your vendor
+  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+  KBC_DEVELOPERPORTAL_USERNAME: ${{ vars.KBC_DEVELOPERPORTAL_USERNAME }}
+
+  # repository secrets:
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }} # recommended for pushing to ECR
+  KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+
+  # (Optional) Test KBC project: https://connection.keboola.com/admin/projects/0000
+  KBC_TEST_PROJECT_CONFIGS: "" # space separated list of config ids
+  KBC_STORAGE_TOKEN: ${{ secrets.KBC_STORAGE_TOKEN }} # required for running KBC tests
+
+jobs:
+  push_event_info:
+    name: Push Event Info
+    runs-on: ubuntu-latest
+    outputs:
+      app_image_tag: ${{ steps.tag.outputs.app_image_tag }}
+      is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
+      is_default_branch: ${{ steps.default_branch.outputs.is_default_branch }}
+      is_deploy_ready: ${{ steps.deploy_ready.outputs.is_deploy_ready }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Fetch all branches from remote repository
+        run: git fetch --prune --unshallow --tags -f
+
+      - name: Get current branch name
+        id: current_branch
+        run: |
+          if [[ ${{ github.ref }} != "refs/tags/"* ]]; then
+            branch_name=${{ github.ref_name }}
+            echo "branch_name=$branch_name" | tee -a $GITHUB_OUTPUT
+          else
+            raw=$(git branch -r --contains ${{ github.ref }})
+            branch="$(echo ${raw//origin\//} | tr -d '\n')"
+            echo "branch_name=$branch" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Is current branch the default branch
+        id: default_branch
+        run: |
+          echo "default_branch='${{ github.event.repository.default_branch }}'"
+          if [ "${{ github.event.repository.default_branch }}" = "${{ steps.current_branch.outputs.branch_name }}" ]; then
+             echo "is_default_branch=true" | tee -a $GITHUB_OUTPUT
+          else
+             echo "is_default_branch=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Set image tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
+          echo "is_semantic_tag=$IS_SEMANTIC_TAG" | tee -a $GITHUB_OUTPUT
+          echo "app_image_tag=$TAG" | tee -a $GITHUB_OUTPUT
+
+      - name: Deploy-Ready check
+        id: deploy_ready
+        run: |
+          if [[ "${{ steps.default_branch.outputs.is_default_branch }}" == "true" \
+            && "${{ github.ref }}" == refs/tags/* \
+            && "${{ steps.tag.outputs.is_semantic_tag }}" == "true" ]]; then
+              echo "is_deploy_ready=true" | tee -a $GITHUB_OUTPUT
+          else
+              echo "is_deploy_ready=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Docker Image Build
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest
+          outputs: type=docker,dest=/tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - build
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Tests
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest flake8 . --config=flake8.cfg
+          echo "Running unit-tests..."
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest python -m unittest discover
+
+  tests-kbc:
+    name: Run KBC Tests
+    needs:
+      - push_event_info
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up environment variables
+        run: |
+          echo "KBC_TEST_PROJECT_CONFIGS=${KBC_TEST_PROJECT_CONFIGS}" >> $GITHUB_ENV
+          echo "KBC_STORAGE_TOKEN=${{ secrets.KBC_STORAGE_TOKEN }}" >> $GITHUB_ENV
+
+      - name: Run KBC test jobs
+        if: env.KBC_TEST_PROJECT_CONFIGS != '' && env.KBC_STORAGE_TOKEN != ''
+        uses: keboola/action-run-configs-parallel@master
+        with:
+          token: ${{ secrets.KBC_STORAGE_TOKEN }}
+          componentId: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          configs: ${{ env.KBC_TEST_PROJECT_CONFIGS }}
+
+  push:
+    name: Docker Image Push
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - tests
+      - tests-kbc
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Tests
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+
+      - name: Docker login
+        if: env.DOCKERHUB_TOKEN
+        run: docker login --username "${{ env.DOCKERHUB_USER }}" --password "${{ env.DOCKERHUB_TOKEN }}"
+
+      - name: Push image to ECR
+        uses: keboola/action-push-to-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          push_latest: ${{ needs.push_event_info.outputs.is_deploy_ready }}
+          source_image: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+
+  deploy:
+    name: Deploy to KBC
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Developer Portal Tag
+        uses: keboola/action-set-tag-developer-portal@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+
+  update_developer_portal_properties:
+    name: Developer Portal Properties Update
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    runs-on: ubuntu-latest
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Update developer portal properties
+        run: |
+          chmod +x scripts/developer_portal/*.sh
+          scripts/developer_portal/update_properties.sh
+
