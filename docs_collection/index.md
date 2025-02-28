@@ -817,6 +817,11 @@
 - Repository: https://github.com/keboola/component-energis
 - Description: A KBC extractor for Energis 
 
+### component-esg
+- [Documentation](github/component-esg/llm.txt)
+- Repository: https://github.com/keboola/component-esg
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
