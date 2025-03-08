@@ -822,6 +822,11 @@
 - Repository: https://github.com/keboola/component-esg
 - Description: None
 
+### component-google-play-console
+- [Documentation](github/component-google-play-console/llm.txt)
+- Repository: https://github.com/keboola/component-google-play-console
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
