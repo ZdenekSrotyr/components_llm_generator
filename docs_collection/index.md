@@ -827,6 +827,11 @@
 - Repository: https://github.com/keboola/component-google-play-console
 - Description: None
 
+### component-app-store-connect
+- [Documentation](github/component-app-store-connect/llm.txt)
+- Repository: https://github.com/keboola/component-app-store-connect
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
