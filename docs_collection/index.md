@@ -832,6 +832,11 @@
 - Repository: https://github.com/keboola/component-app-store-connect
 - Description: None
 
+### component-turvo
+- [Documentation](github/component-turvo/llm.txt)
+- Repository: https://github.com/keboola/component-turvo
+- Description: A KBC Extractor for Turvo API (https://app.turvo.com/lobby/documentation)
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
