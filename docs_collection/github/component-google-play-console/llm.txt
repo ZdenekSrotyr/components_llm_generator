@@ -45,6 +45,7 @@ Directory structure:
     ├── src/
     │   ├── component.py
     │   ├── configuration.py
+    │   ├── mapping.json
     │   └── client/
     │       └── cloud_storage_client.py
     ├── tests/
@@ -60,19 +61,28 @@ File: README.md
 Google Play Console
 =============
 
-Description
+This component extracts various reports from the Google Play Console API, supporting both full and incremental data loading with configurable date ranges.
 
-**Table of Contents:**
+## Prerequisites
 
-[TOC]
+To use this component, you need:
 
-Functionality Notes
-===================
+1. **Google Cloud Platform Service Account**
+   - Create a service account with access to Google Play Console API: [Create Service Account](https://cloud.google.com/iam/docs/service-accounts-create#console)
+   - Generate a service account key in JSON format: [Create Service Account Key](https://cloud.google.com/iam/docs/keys-create-delete#console)
 
-Prerequisites
-=============
+2. **Google Play Console Access**
+   - In Google Play Console, navigate to "Users and permissions"
+   - Click "Invite new users" and enter the service account email address
+   - Grant the following permissions:
+     - "View app information and download bulk reports (read-only)"
+     - "View financial data, orders, and cancellation survey responses"
+   - Click "Invite User"
 
-Ensure you have the necessary API token, register the application, etc.
+3. **Google Cloud Storage Bucket ID**
+   - In Google Play Console, navigate to "Download reports"
+   - Select any report and click "Copy Cloud Storage URI"
+   - From the URI `gs://name_of_your_bucket_123456789/earnings/`, extract only the bucket name: `name_of_your_bucket_123456789`
 
 Features
 ========
@@ -81,27 +91,35 @@ Features
 |-------------------------|-----------------------------------------------|
 | Generic UI Form         | Dynamic UI form for easy configuration.       |
 | Row-Based Configuration | Allows structuring the configuration in rows. |
-| OAuth                   | OAuth authentication enabled.                 |
 | Incremental Loading     | Fetch data in new increments.                 |
-| Backfill Mode           | Supports seamless backfill setup.             |
 | Date Range Filter       | Specify the date range for data retrieval.    |
 
 Supported Endpoints
 ===================
 
-If you need additional endpoints, please submit your request to
-[ideas.keboola.com](https://ideas.keboola.com/).
+The component currently supports the following Google Play Console reports:
+- earnings
+- sales
+- play_balance_krw
+- reviews
+- financial-stats/subscriptions
+- stats/installs
+- stats/crashes
+- stats/promotional_content
+- stats/ratings
+- stats/store_performance
+
+Need additional endpoints? Submit your request to [ideas.keboola.com](https://ideas.keboola.com/).
 
 Configuration
 =============
+At the configuration component level, insert the contents of the service account’s JSON key.
+At the row level configuration, specify the following parameters:
+- Bucket ID
+- Report Type
+- Date Range
+- Incremental Loading
 
-Param 1
--------
-Details about parameter 1.
-
-Param 2
--------
-Details about parameter 2.
 
 Output
 ======
@@ -114,9 +132,9 @@ Development
 To customize the local data folder path, replace the `CUSTOM_FOLDER` placeholder with your desired path in the `docker-compose.yml` file:
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    volumes:
-      - ./:/code
-      - ./CUSTOM_FOLDER:/data
+volumes:
+  - ./:/code
+  - ./CUSTOM_FOLDER:/data
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Clone this repository, initialize the workspace, and run the component using the following
@@ -557,6 +575,7 @@ mock
 pydantic
 google-auth-oauthlib
 google-cloud-storage
+duckdb
 
 
 ================================================
@@ -587,24 +606,72 @@ File: component_config/configRowSchema.json
       "description": "Insert the id of the bucket.",
       "propertyOrder": 1
     },
-    "report": {
-      "enum": [
-        "reviews",
-        "statistics",
-        "financial"
-      ],
-      "type": "string",
-      "title": "Report to download",
-      "default": "reviews",
-      "options": {
-        "enum_titles": [
-          "Reviews",
-          "Statistics",
-          "Financial"
-        ]
+    "reports": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "earnings",
+          "sales",
+          "play_balance_krw",
+          "reviews",
+          "financial-stats/subscriptions",
+          "stats/installs",
+          "stats/crashes",
+          "stats/promotional_content",
+          "stats/ratings",
+          "stats/store_performance"
+        ],
+        "type": "string"
       },
-      "required": true,
+      "title": "Reports",
+      "format": "select",
+      "default": [
+      ],
+      "description": "Report to download",
+      "uniqueItems": true,
       "propertyOrder": 2
+    },
+    "date_from": {
+      "type": "string",
+      "title": "Fetch From Date",
+      "default": "last_run",
+      "description": "Date in YYYY-MM-DD format. You can also set this as `last_run`, which will fetch data from the last run of the component; if no previous successful run exists, all data since 2024-01-01 will be downloaded.",
+      "propertyOrder": 3
+    },
+    "destination": {
+      "type": "object",
+      "title": "Destination",
+      "required": [
+        "load_type"
+      ],
+      "properties": {
+        "load_type": {
+          "enum": [
+            "incremental_load",
+            "full_load"
+          ],
+          "type": "string",
+          "title": "Load Type",
+          "default": "incremental_load",
+          "options": {
+            "enum_titles": [
+              "Incremental Load",
+              "Full Load"
+            ]
+          },
+          "description": "If Full load is used, the destination table will be overwritten every run. If Incremental Load is used, data will be appended instead.",
+          "propertyOrder": 41
+        }
+      },
+      "propertyOrder": 4
+    },
+    "debug": {
+      "type": "boolean",
+      "title": "Debug mode",
+      "format": "checkbox",
+      "default": false,
+      "description": "If enabled, the component will produce detailed logs",
+      "propertyOrder": 5
     }
   }
 }
@@ -1128,14 +1195,24 @@ Template Component main class.
 
 """
 
-import os
+import codecs
+import json
 import logging
+import os
+import zipfile
+from datetime import datetime
 
+import duckdb
+from duckdb import DuckDBPyConnection
 from keboola.component.base import ComponentBase
 from keboola.component.exceptions import UserException
 
-from configuration import Configuration
 from client.cloud_storage_client import CloudStorageClient
+from configuration import Configuration
+
+DUCK_DB_MAX_MEMORY = "128MB"
+DUCK_DB_DIR = os.path.join(os.environ.get("TMPDIR", "/tmp"), "duckdb")
+FILES_TEMP_DIR = os.path.join(os.environ.get("TMPDIR", "/tmp"), "files")
 
 
 class Component(ComponentBase):
@@ -1151,27 +1228,130 @@ class Component(ComponentBase):
 
     def __init__(self):
         super().__init__()
+        self.duck = self.init_duckdb()
+        self.state = self.get_state_file()
+        self.params = Configuration(**self.configuration.parameters)
+        self.mapping = None
 
     def run(self):
-        """
-        Main execution code
-        """
+        date_from = self._get_date_from()
+        self.state["last_run"] = datetime.now().timestamp()
 
-        params = Configuration(**self.configuration.parameters)
+        client = CloudStorageClient(self.params.gcp_service_account_key)
 
-        logging.info("Config initialized.")
+        logging.info(f"Downloading files from bucket {self.params.bucket_id}")
 
-        client = CloudStorageClient(params.gcp_service_account_key)
+        client.download_files_from_bucket(FILES_TEMP_DIR, date_from, self.params.bucket_id)
 
-        logging.info("Client initialized.")
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        mapping_paths = [os.path.join(current_dir, "mapping.json"), "/code/src/mapping.json"]
 
-        path = os.path.join(self.data_folder_path, "artifacts", "out", "current")
+        for mapping_path in mapping_paths:
+            if os.path.exists(mapping_path):
+                with open(mapping_path, "r") as f:
+                    self.mapping = json.load(f)
+                    break
 
-        logging.info(f"Path set to {path}")
+        for report in self.params.reports:
+            self.process_report(report)
 
-        client.download_files_from_bucket(params.bucket_id, path)
+        self.write_state_file(self.state)
 
-        logging.info("Downloading files from bucket.")
+    def process_report(self, report_name):
+        logging.info(f"Processing report {report_name}")
+        path = os.path.join(FILES_TEMP_DIR, report_name)
+        report_config = self.mapping.get(report_name)
+
+        if report_config.get("is_zipped"):
+            path = self.unzip_files_in_folder(path)
+            path_pattern = f"{path}/*"
+        else:
+            path_pattern = path
+
+        if report_config.get("encoding"):
+            path_pattern = self.convert_to_utf8(path, report_config["encoding"])
+
+        if report_config.get("subreports"):
+            reports = [
+                (f"{report_name}{subreport}", f"{path_pattern}/{subreport}.csv")
+                for subreport in report_config["subreports"]
+            ]
+        else:
+            reports = [(report_name, f"{path_pattern}/*.csv")]
+
+        for name, path in reports:
+            self.export_table(name, path)
+
+    def export_table(self, report_name, report_path, primary_key=None):
+        report_name = report_name.replace("/", "_").replace("*", "")
+
+        try:
+            self.duck.execute(f"""
+            CREATE TABLE '{report_name}'  AS
+                    SELECT * FROM read_csv('{report_path}')
+                    """).fetchall()
+
+            out_table = self.create_out_table_definition(
+                report_name,
+                primary_key=primary_key,
+                incremental=self.params.destination.incremental,
+            )
+
+            self.duck.execute(f"""
+                COPY '{report_name}' TO '{out_table.full_path}' (HEADER, DELIMITER ',', FORCE_QUOTE *)
+            """).fetchall()
+            self.write_manifest(out_table)
+        except duckdb.IOException as e:
+            logging.warning(f"Unable to export table {report_name}: {e}")
+
+    def _get_date_from(self) -> datetime:
+        if self.params.date_from == "last_run" and not self.state.get("last_run"):
+            date_from = datetime.strptime("2024-01-01", "%Y-%m-%d")
+        elif self.params.date_from == "last_run":
+            date_from = datetime.fromtimestamp(self.state.get("last_run"))
+        else:
+            date_from = datetime.strptime(self.params.date_from, "%Y-%m-%d")
+        return date_from
+
+    @staticmethod
+    def init_duckdb() -> DuckDBPyConnection:
+        os.makedirs(DUCK_DB_DIR, exist_ok=True)
+        config = dict(temp_directory=DUCK_DB_DIR, threads="1", max_memory=DUCK_DB_MAX_MEMORY)
+        conn = duckdb.connect(config=config)
+
+        return conn
+
+    @staticmethod
+    def unzip_files_in_folder(folder_path) -> str:
+        output_folder = os.path.join(folder_path, "unzipped")
+        os.makedirs(output_folder, exist_ok=True)
+
+        for file_name in os.listdir(folder_path):
+            file_path = os.path.join(folder_path, file_name)
+
+            if file_name.endswith(".zip") and os.path.isfile(file_path):
+                with zipfile.ZipFile(file_path, "r") as zip_ref:
+                    extract_path = os.path.join(output_folder, file_name[:-4])
+                    os.makedirs(extract_path, exist_ok=True)
+                    zip_ref.extractall(extract_path)
+        return output_folder
+
+    @staticmethod
+    def convert_to_utf8(folder_path, in_encoding) -> str:
+        output_folder = os.path.join(folder_path, "utf_8")
+        os.makedirs(output_folder, exist_ok=True)
+
+        for filename in os.listdir(folder_path):
+            if filename.lower().endswith(".csv"):
+                input_file_path = os.path.join(folder_path, filename)
+                output_file_path = os.path.join(output_folder, filename)
+
+                with codecs.open(input_file_path, "r", encoding=in_encoding) as infile:
+                    content = infile.read()
+
+                with codecs.open(output_file_path, "w", encoding="utf-8") as outfile:
+                    outfile.write(content)
+        return output_folder
 
 
 """
@@ -1195,14 +1375,30 @@ if __name__ == "__main__":
 File: src/configuration.py
 ================================================
 import logging
-from pydantic import BaseModel, Field, ValidationError
+from enum import Enum
+from pydantic import BaseModel, Field, ValidationError, computed_field
 from keboola.component.exceptions import UserException
+
+
+class LoadType(str, Enum):
+    full_load = "full_load"
+    incremental_load = "incremental_load"
+
+
+class Destination(BaseModel):
+    load_type: LoadType = Field(default=LoadType.incremental_load)
+
+    @computed_field
+    def incremental(self) -> bool:
+        return self.load_type == LoadType.incremental_load
 
 
 class Configuration(BaseModel):
     gcp_service_account_key: str = Field(alias="#gcp_service_account_key")
     bucket_id: str
-    report: str
+    reports: list[str]
+    date_from: str
+    destination: Destination
     debug: bool = False
 
     def __init__(self, **data):
@@ -1218,6 +1414,77 @@ class Configuration(BaseModel):
 
 
 ================================================
+File: src/mapping.json
+================================================
+{
+  "earnings": {
+    "is_zipped": true
+  },
+  "sales": {
+    "is_zipped": true
+  },
+  "play_balance_krw": {
+    "is_zipped": true
+  },
+  "reviews": {
+    "encoding": "utf-16-le"
+  },
+  "financial-stats/subscriptions": {
+    "encoding": "utf-16-le"
+  },
+  "stats/installs": {
+    "encoding": "utf-16-le",
+    "subreports": [
+      "*_app_version",
+      "*_carrier",
+      "*_country",
+      "*_device",
+      "*_language",
+      "*_os_version",
+      "*_overview"
+    ]
+  },
+  "stats/crashes": {
+    "encoding": "utf-16-le",
+    "subreports": [
+      "*_app_version",
+      "*_device",
+      "*_os_version",
+      "*_overview"
+    ]
+  },
+  "stats/promotional_content": {
+    "encoding": "utf-16-le",
+    "subreports": [
+      "*_overview",
+      "*_promotional_content_id"
+    ]
+  },
+  "stats/ratings": {
+    "encoding": "utf-16-le",
+    "subreports": [
+      "*_app_version",
+      "*_carrier",
+      "*_country",
+      "*_device",
+      "*_language",
+      "*_os_version",
+      "*_overview"
+    ]
+  },
+  "stats/store_performance": {
+    "encoding": "utf-16-le",
+    "subreports": [
+      "store_performance_is*_country",
+      "store_performance_is*_traffic_source",
+      "total_store_performance_is*_country",
+      "total_store_performance_is*_traffic_source"
+    ]
+  }
+}
+
+
+================================================
 File: src/client/cloud_storage_client.py
 ================================================
 import os
@@ -1227,6 +1494,7 @@ from pathlib import Path
 
 from google.cloud import storage
 from google.oauth2 import service_account
+from datetime import datetime, timezone
 
 
 class CloudStorageClient:
@@ -1234,23 +1502,26 @@ class CloudStorageClient:
         self.credentials = service_account.Credentials.from_service_account_info(json.loads(service_account_key))
         self.client = storage.Client(credentials=self.credentials)
 
-    def download_files_from_bucket(self, bucket_name: str, destination_folder: str):
+    def download_files_from_bucket(
+        self, destination_folder: str, date_from: datetime, bucket_name: str, blob_name: str = None
+    ):
         os.makedirs(destination_folder, exist_ok=True)
 
         bucket = self.client.bucket(bucket_name)
-        blobs = bucket.list_blobs()
+        blobs = bucket.list_blobs(prefix=blob_name)
 
         for blob in blobs:
             if blob.name.endswith("/"):
                 continue
 
-            relative_path = blob.name
+            if blob.updated > date_from.replace(tzinfo=timezone.utc):
+                relative_path = blob.name
 
-            destination_path = Path(destination_folder) / relative_path
+                destination_path = Path(destination_folder) / relative_path
 
-            os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+                os.makedirs(os.path.dirname(destination_path), exist_ok=True)
 
-            blob.download_to_filename(destination_path)
+                blob.download_to_filename(destination_path)
 
 
 
