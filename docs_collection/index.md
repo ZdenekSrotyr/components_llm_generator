@@ -397,9 +397,9 @@
 - Repository: https://github.com/keboola/component-azure-blob
 - Description: None
 
-### component-microsoft-dynamics
-- [Documentation](github/component-microsoft-dynamics/llm.txt)
-- Repository: https://github.com/keboola/component-microsoft-dynamics
+### component-microsoft-dynamics-ex
+- [Documentation](github/component-microsoft-dynamics-ex/llm.txt)
+- Repository: https://github.com/keboola/component-microsoft-dynamics-ex
 - Description: None
 
 ### component-ms-sharepoint
@@ -836,6 +836,11 @@
 - [Documentation](github/component-turvo/llm.txt)
 - Repository: https://github.com/keboola/component-turvo
 - Description: A KBC Extractor for Turvo API (https://app.turvo.com/lobby/documentation)
+
+### component-microsoft-dynamics-wr
+- [Documentation](github/component-microsoft-dynamics-wr/llm.txt)
+- Repository: https://github.com/keboola/component-microsoft-dynamics-wr
+- Description: None
 
 ## Bitbucket Repositories
 

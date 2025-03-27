@@ -132,8 +132,6 @@ File: Dockerfile
 FROM python:3.8.6-slim
 ENV PYTHONIOENCODING utf-8
 
-COPY . /code/
-
 # install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
 RUN apt-get update && apt-get install -y build-essential
 
@@ -141,10 +139,14 @@ RUN pip install --upgrade pip
 
 RUN pip install flake8
 
+# Copy and install requirements first to leverage Docker cache
+COPY requirements.txt /code/requirements.txt
 RUN pip install -r /code/requirements.txt
 
-WORKDIR /code/
+# Copy the rest of the code
+COPY . /code/
 
+WORKDIR /code/
 
 CMD ["python", "-u", "/code/src/component.py"]
 
@@ -426,6 +428,13 @@ File: component_config/configSchema.json
                 ]
             },
             "default": "CREATE"
+        },
+        "continue_on_error": {
+            "type": "boolean",
+            "title": "Continue on Error",
+            "propertyOrder": 600,
+            "description": "Marks, if the writer should continue writing data, if an error with any record occured.",
+            "default": false
         }
     }
 }
@@ -1287,6 +1296,7 @@ KEY_API_TOKEN = '#api_token'
 KEY_DOMAIN = 'domain'
 KEY_FULL_URL = 'full_url'
 KEY_FUNCTION = 'function'
+KEY_CONTINUE_ON_ERROR = 'continue_on_error'
 
 MANDATORY_PARS = [
     KEY_EMAIL,
@@ -1517,6 +1527,8 @@ class Component(KBCEnvHandler):
         self.domain = params_obj[KEY_DOMAIN]
         self.full_url = params_obj[KEY_FULL_URL]
         self.function = params_obj[KEY_FUNCTION]
+        # Set continue_on_error (default False for backward compatibility)
+        self.continue_on_error = params_obj.get(KEY_CONTINUE_ON_ERROR, False)
 
     def _convert_datatype(self, datatype, row_name, row_value, required):
         '''
@@ -1660,8 +1672,15 @@ class Component(KBCEnvHandler):
         try:
             status_code, response = self._try_request(url, payload)
         except requests.exceptions.RequestException as e:
-            logging.error(f"Request error for url {url} with payload {payload}: {e}")
-            exit(1)
+            error_msg = f"Request error for url {url} with payload {payload}: {e}"
+            logging.warning(error_msg)
+
+            # If continue_on_error is disabled, component will exit
+            if not self.continue_on_error:
+                logging.error("'Continue on error' feature is disabled, component will exit")
+                exit(1)
+            # If continue_on_error is enabled, return the original error
+            return e.response.status_code if hasattr(e, 'response') else 0, {'error': error_msg}
 
         return status_code, response
 
@@ -2107,7 +2126,7 @@ jobs:
             echo "branch_name=$branch_name" | tee -a $GITHUB_OUTPUT
           else
             raw=$(git branch -r --contains ${{ github.ref }})
-            branch="$(echo ${raw//origin\//} | tr -d '\n')"
+            branch="$(echo $raw | sed "s/.*origin\///" | tr -d '\n')"
             echo "branch_name=$branch" | tee -a $GITHUB_OUTPUT
           fi
 
