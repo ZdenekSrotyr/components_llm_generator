@@ -150,8 +150,6 @@ File: Dockerfile
 FROM python:3.11-slim
 ENV PYTHONIOENCODING utf-8
 
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
 RUN pip install flake8
 
 COPY requirements.txt /code/requirements.txt
@@ -577,44 +575,26 @@ File: component_config/configRowSchema.json
   "type": "object",
   "title": "Component configuration",
   "required": [
-    "entity_id",
-    "client_reporting_period_id",
+    "entity_period",
     "endpoint"
   ],
   "properties": {
-    "entity_id": {
+    "entity_period": {
       "enum": [],
       "type": "string",
       "items": {
         "enum": [],
         "type": "string"
       },
-      "title": "Entity ID",
+      "title": "Reporting Period ID  +  Entity ID",
       "options": {
         "async": {
           "cache": false,
-          "label": "List Entities",
-          "action": "list_entities"
+          "label": "List Reporting Periods and Entities",
+          "action": "list_entities_with_periods"
         }
       },
       "propertyOrder": 1
-    },
-    "client_reporting_period_id": {
-      "enum": [],
-      "type": "string",
-      "items": {
-        "enum": [],
-        "type": "string"
-      },
-      "title": "Reporting Period ID",
-      "options": {
-        "async": {
-          "cache": false,
-          "label": "List Reporting Periods",
-          "action": "list_reporting_periods"
-        }
-      },
-      "propertyOrder": 2
     },
     "endpoint": {
       "enum": [
@@ -647,7 +627,7 @@ File: component_config/configRowSchema.json
         ]
       },
       "required": true,
-      "propertyOrder": 3
+      "propertyOrder": 2
     },
     "template_id": {
       "enum": [],
@@ -667,7 +647,7 @@ File: component_config/configRowSchema.json
           "endpoint": "generic"
         }
       },
-      "propertyOrder": 4
+      "propertyOrder": 3
     },
     "debug": {
       "type": "boolean",
@@ -675,7 +655,7 @@ File: component_config/configRowSchema.json
       "format": "checkbox",
       "default": false,
       "description": "If enabled, the component will produce detailed logs",
-      "propertyOrder": 7
+      "propertyOrder": 4
     }
   }
 }
@@ -692,9 +672,21 @@ File: component_config/configSchema.json
   ],
   "properties": {
     "client_id": {
+      "enum": [],
       "type": "string",
+      "items": {
+        "enum": [],
+        "type": "string"
+      },
       "title": "Client ID",
-      "propertyOrder": 2
+      "options": {
+        "async": {
+          "cache": false,
+          "label": "List Clients",
+          "action": "list_clients"
+        }
+      },
+      "propertyOrder": 1
     }
   }
 }
@@ -1194,18 +1186,16 @@ Template Component main class.
 
 import csv
 import logging
-import requests
 from io import StringIO
-from wurlitzer import pipes
 
-
+import requests
 from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
 from keboola.component.sync_actions import SelectElement
-
-from esg.client import EsgClient
+from wurlitzer import pipes
 
 from configuration import Configuration
+from esg.client import EsgClient
 
 
 class Component(ComponentBase):
@@ -1231,10 +1221,10 @@ class Component(ComponentBase):
         in_tables = self.get_input_tables_definitions()
 
         if self.params.endpoint == "investments":
-
             if len(in_tables) != 2:
-                raise UserException("Investments endpoints needs 2 tables in input mapping: "
-                                    "project finance, equity investments ")
+                raise UserException(
+                    "Investments endpoints needs 2 tables in input mapping: project finance, equity investments "
+                )
 
             investments_table = [table for table in in_tables if "share_of_equity" in table.schema][0]
             investments_data = []
@@ -1250,11 +1240,12 @@ class Component(ComponentBase):
                 for row in reader:
                     finance_data.append(row)
 
-            self.import_investments_ui_data(entity_id=self.params.entity_id,
-                                            client_reporting_period_id=self.params.client_reporting_period_id,
-                                            investments_data=investments_data,
-                                            finance_data=finance_data
-                                            )
+            self.import_investments_ui_data(
+                entity_id=self.params.entity_id,
+                reporting_period_id=self.params.reporting_period_id,
+                investments_data=investments_data,
+                finance_data=finance_data,
+            )
 
         elif self.params.endpoint == "download_lookup_tables":
             self.download_lookup_tables()
@@ -1269,11 +1260,11 @@ class Component(ComponentBase):
                 for row in reader:
                     data.append(row)
 
-            endpoint_to_method[self.params.endpoint](entity_id=self.params.entity_id,
-                                                     client_reporting_period_id=self.params.client_reporting_period_id,
-                                                     data=data)
+            endpoint_to_method[self.params.endpoint](
+                entity_id=self.params.entity_id, reporting_period_id=self.params.reporting_period_id, data=data
+            )
 
-    def refresh_tokens(self):
+    def refresh_tokens(self) -> str:
         statefile = self.get_state_file()
         if statefile.get("#refresh_token") and statefile.get("auth_id") == self.configuration.oauth_credentials.id:
             logging.debug("Using refresh token from state file")
@@ -1306,7 +1297,7 @@ class Component(ComponentBase):
         )
         return data["id_token"]
 
-    def download_lookup_tables(self):
+    def download_lookup_tables(self) -> None:
         lookups = self.get_lookup_tables_names()
 
         lookups.update(
@@ -1328,7 +1319,7 @@ class Component(ComponentBase):
                     writer.writerow([row])
             self.write_manifest(out_table)
 
-    def get_lookup_tables_names(self):
+    def get_lookup_tables_names(self) -> set[str]:
         lookups = []
         templates = self.client.get_template_structure()
 
@@ -1342,19 +1333,17 @@ class Component(ComponentBase):
 
         return set(lookups)
 
-    def import_franchises_ui_data(self, entity_id, client_reporting_period_id, data):
+    def import_franchises_ui_data(self, entity_id, reporting_period_id, data):
         result = self.client.import_franchises_ui_data(
             entity_id=entity_id,
-            client_reporting_period_id=client_reporting_period_id,
+            reporting_period_id=reporting_period_id,
             franchises_data=data,
             data_not_available=False,
             data_not_available_comment=None,
         )
         logging.info(result)
 
-    def import_intensity_metrics_ui_data(
-        self, entity_id: int, client_reporting_period_id: int, data: list
-    ):
+    def import_intensity_metrics_ui_data(self, entity_id: int, reporting_period_id: int, data: list):
         processed_data = []
         for row in data:
             processed_row = {}
@@ -1373,7 +1362,7 @@ class Component(ComponentBase):
         logging.info(f"Importing {len(processed_data)} intensity metrics data to ESG API...")
         result = self.client.import_intensity_metrics_ui_data(
             entity_id=entity_id,
-            client_reporting_period_id=client_reporting_period_id,
+            reporting_period_id=reporting_period_id,
             intensity_metrics_data=processed_data,
             data_not_available=False,
             data_not_available_comment=None,
@@ -1381,11 +1370,11 @@ class Component(ComponentBase):
         logging.info(result)
 
     def import_investments_ui_data(
-        self, entity_id: int, client_reporting_period_id: int, investments_data: list, finance_data: list
+        self, entity_id: int, reporting_period_id: int, investments_data: list, finance_data: list
     ):
         result = self.client.import_investments_ui_data(
             entity_id=entity_id,
-            client_reporting_period_id=client_reporting_period_id,
+            reporting_period_id=reporting_period_id,
             equity_investments_data=investments_data,
             project_finance_data=finance_data,
             data_not_available=False,
@@ -1393,19 +1382,17 @@ class Component(ComponentBase):
         )
         logging.info(result)
 
-    def import_water_storage_ui_data(self, entity_id: int, client_reporting_period_id: int, data: list):
+    def import_water_storage_ui_data(self, entity_id: int, reporting_period_id: int, data: list):
         result = self.client.import_water_storage_ui_data(
             entity_id=entity_id,
-            client_reporting_period_id=client_reporting_period_id,
+            reporting_period_id=reporting_period_id,
             water_storage_data=data,
             data_not_available=False,
             data_not_available_comment=None,
         )
         logging.info(result)
 
-    def import_employee_benefits_ui_data(
-        self, entity_id: int, client_reporting_period_id: int, data: list
-    ):
+    def import_employee_benefits_ui_data(self, entity_id: int, reporting_period_id: int, data: list):
         grouped_data = {}
         for row in data:
             location = row["location"]
@@ -1465,17 +1452,14 @@ class Component(ComponentBase):
         logging.info(f"Importing employee benefits data for {len(result_data)} locations to ESG API...")
         result = self.client.import_benefit_for_employees_ui_data(
             entity_id=entity_id,
-            client_reporting_period_id=client_reporting_period_id,
+            reporting_period_id=reporting_period_id,
             employee_benefits_data=result_data,
             data_not_available=False,
             data_not_available_comment=None,
         )
         logging.info(result)
 
-    def import_social_protection_ui_data(
-        self, entity_id: int, client_reporting_period_id: int, data: list
-    ):
-
+    def import_social_protection_ui_data(self, entity_id: int, reporting_period_id: int, data: list):
         location_groups = {}
         for row in data:
             location = row["location"]
@@ -1540,15 +1524,14 @@ class Component(ComponentBase):
         logging.info(f"Importing social protection data for {len(result_data)} locations to ESG API...")
         result = self.client.import_social_protection_ui_data(
             entity_id=entity_id,
-            client_reporting_period_id=client_reporting_period_id,
+            reporting_period_id=reporting_period_id,
             social_protection_data=result_data,
             data_not_available=False,
             data_not_available_comment=None,
         )
         logging.info(result)
 
-    def import_non_compliance_ui_data(self, entity_id: int, client_reporting_period_id: int, data: list):
-
+    def import_non_compliance_ui_data(self, entity_id: int, reporting_period_id: int, data: list):
         processed_data = []
         for row in data:
             processed_row = {}
@@ -1564,14 +1547,14 @@ class Component(ComponentBase):
         logging.info(f"Importing {len(processed_data)} non-compliance incidents to ESG API...")
         result = self.client.import_non_compliance_ui_data(
             entity_id=entity_id,
-            client_reporting_period_id=client_reporting_period_id,
+            reporting_period_id=reporting_period_id,
             non_compliance_data=processed_data,
             data_not_available=False,
             data_not_available_comment=None,
         )
         logging.info(result)
 
-    def import_locations_ui_data(self, entity_id: int, client_reporting_period_id: int, data: list):
+    def import_locations_ui_data(self, entity_id: int, reporting_period_id: int, data: list):
         processed_data = []
         for row in data:
             location_entry = {
@@ -1585,7 +1568,7 @@ class Component(ComponentBase):
         logging.info(f"Importing {len(processed_data)} locations to ESG API...")
         result = self.client.import_locations_ui_data(
             entity_id=entity_id,
-            client_reporting_period_id=client_reporting_period_id,
+            reporting_period_id=reporting_period_id,
             locations_data=processed_data,
             ignore_locations=False,
             data_not_available=False,
@@ -1593,40 +1576,59 @@ class Component(ComponentBase):
         )
         logging.info(result)
 
-    def import_generic_data(
-        self, entity_id: int, client_reporting_period_id: int, data: list
-    ):
+    def import_generic_data(self, entity_id: int, reporting_period_id: int, data: list):
         result = self.client.import_generic_data(
             entity_id=entity_id,
-            client_reporting_period_id=client_reporting_period_id,
+            reporting_period_id=reporting_period_id,
             template_id=self.params.template_id,
             data=data,
         )
         logging.info(result)
 
+    @sync_action("list_clients")
+    def list_clients(self) -> list[SelectElement]:
+        out = StringIO()
+        with pipes(stdout=out, stderr=out):
+            self.client = EsgClient(self.refresh_tokens())
+            clients = self.client.get_clients()
+            return [SelectElement(value=f"{client['id']}-{client['name']}") for client in clients]
+
+    @sync_action("list_entities_with_periods")
+    def list_entities_with_periods(self) -> list[SelectElement]:
+        out = StringIO()
+        with pipes(stdout=out, stderr=out):
+            self.client = EsgClient(self.refresh_tokens())
+            data = self.client.get_entities_with_periods(self.params.client_id)
+
+            return [
+                SelectElement(value=f"{pid}-{pname}   {eid}-{ename}")
+                for pid, pname in data["reportingPeriods"].items()
+                for eid, ename in data["entities"].items()
+            ]
+
     @sync_action("list_entities")
-    def list_entities(self):
+    def list_entities(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
             self.client = EsgClient(self.refresh_tokens())
             entities = self.client.get_entities(self.params.client_id)
-            return [SelectElement(value, label) for value, label in entities.items()]
+            return [SelectElement(value=f"{value}-{label}") for value, label in entities.items()]
 
     @sync_action("list_reporting_periods")
-    def list_reporting_periods(self):
+    def list_reporting_periods(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
             self.client = EsgClient(self.refresh_tokens())
             entities = self.client.get_reporting_periods(self.params.client_id)
-            return [SelectElement(value, label) for value, label in entities.items()]
+            return [SelectElement(value=f"{value}-{label}") for value, label in entities.items()]
 
     @sync_action("list_templates")
-    def list_templates(self):
+    def list_templates(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
             self.client = EsgClient(self.refresh_tokens())
             templates = self.client.get_template_structure()
-            return [SelectElement(val["templateId"], val["templateName"]) for val in templates]
+            return [SelectElement(value=f"{val['templateId']}-{val['templateName']}") for val in templates]
 
 
 """
@@ -1650,17 +1652,40 @@ if __name__ == "__main__":
 File: src/configuration.py
 ================================================
 import logging
-from pydantic import BaseModel, ValidationError
+import re
+
 from keboola.component.exceptions import UserException
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 
 class Configuration(BaseModel):
-    client_id: int = None
-    entity_id: int = None
-    client_reporting_period_id: int = None
-    endpoint: str
-    template_id: int = None
+    client_id: str = ""
+    entity_period: str = ""
+    reporting_period_id: int = 0
+    entity_id: int = 0
+    endpoint: str = ""
+    template_id: str = ""
     debug: bool = False
+
+    @field_validator("client_id", "template_id")
+    def split_id_string(cls, v):
+        if v != "" and isinstance(v, str):
+            return int(v.split("-", 1)[0])
+        return v
+
+    @model_validator(mode="after")
+    def extract_entity_period_ids(self):
+        if not self.entity_period:
+            return self
+        try:
+            match = re.match(r"(\d+)-.*?\s{3}(\d+)-", self.entity_period)
+            if not match:
+                raise ValueError("Invalid format for 'entity_period'. Expected '123-Period name   456-Entity name'.")
+            self.reporting_period_id = int(match.group(1))
+            self.entity_id = int(match.group(2))
+        except Exception as e:
+            raise UserException(f"Error parsing entity_period: {e}")
+        return self
 
     def __init__(self, **data):
         try:
@@ -1677,12 +1702,15 @@ class Configuration(BaseModel):
 ================================================
 File: src/esg/client.py
 ================================================
-from keboola.http_client import HttpClient
+from typing import Any, Callable, Dict, List, Optional
+
 from keboola.component.exceptions import UserException
-from typing import Dict, Any, List, Optional, Callable
+from keboola.http_client import HttpClient
 
 BASE_URL = "https://esg-externalintegrationapi-keboola-stg.azurewebsites.net/api/"
 
+ENDPOINT_GET_CLIENTS = "ExternalIntegration/ClientData/GetClientIds"
+ENDPOINT_GET_ENTITIES_WITH_PERIODS = "ExternalIntegration/ClientData/GetEntitiesWithReportingPeriods"
 ENDPOINT_GET_ENTITIES = "ExternalIntegration/ClientData/GetEntities"
 ENDPOINT_GET_REPORTING_PERIODS = "ExternalIntegration/ClientData/GetReportingPeriods"
 ENDPOINT_GET_LOOKUP_DATA = "ExternalIntegration/LookupData/GetLookupData"
@@ -1702,36 +1730,19 @@ BATCHE_SIZE = 100
 
 
 class EsgClient(HttpClient):
-    """Client for interacting with the ESG External Integration API."""
-
     def __init__(self, id_token: Optional[str] = None):
-        """Initialize the ESG client.
-
-        Args:
-            id_token: Bearer token for authentication
-        """
         super().__init__(base_url=BASE_URL)
         if id_token:
             self.update_auth_header({"Authorization": f"Bearer {id_token}"})
 
     def _make_request(self, method: Callable, endpoint_path: str, error_message: str, **kwargs) -> Dict[str, Any]:
-        """Make an HTTP request and handle common error cases.
-
-        Args:
-            method: The HTTP method to call (self.get_raw or self.post_raw)
-            endpoint_path: The API endpoint path
-            error_message: Custom error message for exceptions
-            **kwargs: Additional arguments to pass to the HTTP method
-
-        Returns:
-            Dict containing the JSON response or a success message for empty responses
-
-        Raises:
-            UserException: If the request fails
-        """
         try:
             response = method(endpoint_path=endpoint_path, **kwargs)
             response.raise_for_status()
+
+            if response.status_code != 200:
+                raise UserException(f"Request to {endpoint_path} failed with status code {response.status_code},"
+                                    f"{response.text}")
 
             # Handle empty response
             if not response.text:
@@ -1745,7 +1756,7 @@ class EsgClient(HttpClient):
         self,
         endpoint: str,
         entity_id: int,
-        client_reporting_period_id: int,
+        reporting_period_id: int,
         template_data: Any,
         data_not_available: bool = False,
         data_not_available_comment: Optional[str] = None,
@@ -1756,7 +1767,7 @@ class EsgClient(HttpClient):
         Args:
             endpoint: The API endpoint to use
             entity_id: The entity ID
-            client_reporting_period_id: The reporting period ID
+            reporting_period_id: The reporting period ID
             template_data: The data to import
             data_not_available: Whether data is not available
             data_not_available_comment: Comment for unavailable data
@@ -1767,7 +1778,7 @@ class EsgClient(HttpClient):
         """
         payload = {
             "entityId": entity_id,
-            "clientReportingPeriodId": client_reporting_period_id,
+            "clientReportingPeriodId": reporting_period_id,
             "templateData": template_data,
             "dataNotAvailable": data_not_available,
             "dataNotAvailableComment": data_not_available_comment,
@@ -1776,14 +1787,23 @@ class EsgClient(HttpClient):
 
         return self._make_request(self.post_raw, endpoint, f"Failed to import data to {endpoint}", json=payload)
 
+    def get_clients(self) -> Dict[str, Any]:
+        return self._make_request(self.get_raw, ENDPOINT_GET_CLIENTS, "Failed to retrieve clients")
+
+    def get_entities_with_periods(self, client_id: int) -> Dict[str, Any]:
+        return self._make_request(
+            self.get_raw,
+            ENDPOINT_GET_ENTITIES_WITH_PERIODS,
+            "Failed to retrieve clients",
+            params={"clientId": client_id},
+        )
+
     def get_entities(self, client_id: int) -> Dict[str, Any]:
-        """Get entities for a client."""
         return self._make_request(
             self.get_raw, ENDPOINT_GET_ENTITIES, "Failed to retrieve entities", params={"clientId": client_id}
         )
 
     def get_reporting_periods(self, client_id: int) -> Dict[str, Any]:
-        """Get reporting periods for a client."""
         return self._make_request(
             self.get_raw,
             ENDPOINT_GET_REPORTING_PERIODS,
@@ -1792,13 +1812,11 @@ class EsgClient(HttpClient):
         )
 
     def get_lookup_data(self, lookup_name: str) -> Dict[str, Any]:
-        """Get lookup data by name."""
         return self._make_request(
             self.get_raw, ENDPOINT_GET_LOOKUP_DATA, "Failed to retrieve lookup data", params={"lookupName": lookup_name}
         )
 
     def get_template_structure(self) -> Dict[str, Any]:
-        """Get template structure."""
         return self._make_request(
             self.get_raw, ENDPOINT_GET_TEMPLATE_STRUCTURE, "Failed to retrieve template structure"
         )
@@ -1806,19 +1824,18 @@ class EsgClient(HttpClient):
     def import_franchises_ui_data(
         self,
         entity_id: int,
-        client_reporting_period_id: int,
+        reporting_period_id: int,
         franchises_data: List[Dict[str, Any]],
         data_not_available: bool = False,
         data_not_available_comment: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Import franchises UI data."""
         rows = [{"data": data, "index": i + 1} for i, data in enumerate(franchises_data)]
         template_data = {"franchisesTable": {"rows": rows}}
 
         return self._import_ui_data(
             ENDPOINT_IMPORT_FRANCHISES_UI_DATA,
             entity_id,
-            client_reporting_period_id,
+            reporting_period_id,
             template_data,
             data_not_available,
             data_not_available_comment,
@@ -1827,16 +1844,15 @@ class EsgClient(HttpClient):
     def import_intensity_metrics_ui_data(
         self,
         entity_id: int,
-        client_reporting_period_id: int,
+        reporting_period_id: int,
         intensity_metrics_data: List[Dict[str, Any]],
         data_not_available: bool = False,
         data_not_available_comment: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Import intensity metrics UI data."""
         return self._import_ui_data(
             ENDPOINT_IMPORT_INTENSITY_METRICS_UI_DATA,
             entity_id,
-            client_reporting_period_id,
+            reporting_period_id,
             intensity_metrics_data,
             data_not_available,
             data_not_available_comment,
@@ -1845,13 +1861,12 @@ class EsgClient(HttpClient):
     def import_investments_ui_data(
         self,
         entity_id: int,
-        client_reporting_period_id: int,
+        reporting_period_id: int,
         equity_investments_data: List[Dict[str, Any]],
         project_finance_data: List[Dict[str, Any]],
         data_not_available: bool = False,
         data_not_available_comment: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Import investments UI data."""
         template_data = {
             "equityInvestmentsTable": {
                 "rows": [{"data": data, "index": i + 1} for i, data in enumerate(equity_investments_data)]
@@ -1864,7 +1879,7 @@ class EsgClient(HttpClient):
         return self._import_ui_data(
             ENDPOINT_IMPORT_INVESTMENTS_UI_DATA,
             entity_id,
-            client_reporting_period_id,
+            reporting_period_id,
             template_data,
             data_not_available,
             data_not_available_comment,
@@ -1873,16 +1888,15 @@ class EsgClient(HttpClient):
     def import_water_storage_ui_data(
         self,
         entity_id: int,
-        client_reporting_period_id: int,
+        reporting_period_id: int,
         water_storage_data: List[Dict[str, Any]],
         data_not_available: bool = False,
         data_not_available_comment: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Import water storage UI data."""
         return self._import_ui_data(
             ENDPOINT_IMPORT_WATER_STORAGE_UI_DATA,
             entity_id,
-            client_reporting_period_id,
+            reporting_period_id,
             water_storage_data,
             data_not_available,
             data_not_available_comment,
@@ -1891,16 +1905,15 @@ class EsgClient(HttpClient):
     def import_benefit_for_employees_ui_data(
         self,
         entity_id: int,
-        client_reporting_period_id: int,
+        reporting_period_id: int,
         employee_benefits_data: List[Dict[str, Any]],
         data_not_available: bool = False,
         data_not_available_comment: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Import employee benefits UI data."""
         return self._import_ui_data(
             ENDPOINT_IMPORT_BENEFIT_FOR_EMPLOYEES_UI_DATA,
             entity_id,
-            client_reporting_period_id,
+            reporting_period_id,
             employee_benefits_data,
             data_not_available,
             data_not_available_comment,
@@ -1909,16 +1922,15 @@ class EsgClient(HttpClient):
     def import_social_protection_ui_data(
         self,
         entity_id: int,
-        client_reporting_period_id: int,
+        reporting_period_id: int,
         social_protection_data: List[Dict[str, Any]],
         data_not_available: bool = False,
         data_not_available_comment: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Import social protection UI data."""
         return self._import_ui_data(
             ENDPOINT_IMPORT_SOCIAL_PROTECTION_UI_DATA,
             entity_id,
-            client_reporting_period_id,
+            reporting_period_id,
             social_protection_data,
             data_not_available,
             data_not_available_comment,
@@ -1927,18 +1939,17 @@ class EsgClient(HttpClient):
     def import_non_compliance_ui_data(
         self,
         entity_id: int,
-        client_reporting_period_id: int,
+        reporting_period_id: int,
         non_compliance_data: List[Dict[str, Any]],
         data_not_available: bool = False,
         data_not_available_comment: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Import non-compliance UI data."""
         template_data = {"listOfIncidents": non_compliance_data}
 
         return self._import_ui_data(
             ENDPOINT_IMPORT_NON_COMPLIANCE_UI_DATA,
             entity_id,
-            client_reporting_period_id,
+            reporting_period_id,
             template_data,
             data_not_available,
             data_not_available_comment,
@@ -1947,19 +1958,18 @@ class EsgClient(HttpClient):
     def import_locations_ui_data(
         self,
         entity_id: int,
-        client_reporting_period_id: int,
+        reporting_period_id: int,
         locations_data: List[Dict[str, Any]],
         ignore_locations: bool = False,
         data_not_available: bool = False,
         data_not_available_comment: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Import locations UI data."""
         template_data = {"locations": locations_data}
 
         return self._import_ui_data(
             ENDPOINT_IMPORT_LOCATIONS_UI_DATA,
             entity_id,
-            client_reporting_period_id,
+            reporting_period_id,
             template_data,
             data_not_available,
             data_not_available_comment,
@@ -1967,9 +1977,8 @@ class EsgClient(HttpClient):
         )
 
     def import_generic_data(
-        self, entity_id: int, client_reporting_period_id: int, template_id: int, data: List[Dict[str, Any]]
+        self, entity_id: int, reporting_period_id: int, template_id: int, data: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Import generic template data."""
         rows = [
             {"columns": [{"name": key, "value": str(value)} for key, value in row_data.items()]} for row_data in data
         ]
@@ -1977,7 +1986,7 @@ class EsgClient(HttpClient):
         template_data = {"rows": rows}
 
         return self._import_ui_data(
-            ENDPOINT_IMPORT_GENERIC_DATA, entity_id, client_reporting_period_id, template_data, template_id=template_id
+            ENDPOINT_IMPORT_GENERIC_DATA, entity_id, reporting_period_id, template_data, template_id=template_id
         )
 
 
