@@ -147,11 +147,9 @@ documentation](https://developers.keboola.com/extend/component/deployment/).
 ================================================
 File: Dockerfile
 ================================================
-FROM python:3.11-slim
+FROM python:3.13-slim
 ENV PYTHONIOENCODING utf-8
 
-# install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
-RUN apt-get update && apt-get install -y build-essential
 RUN pip install flake8
 
 COPY requirements.txt /code/requirements.txt
@@ -497,7 +495,6 @@ fi
 ================================================
 File: docker-compose.yml
 ================================================
-version: "2"
 services:
   # for development purposes
   dev:
@@ -616,7 +613,7 @@ File: component_config/configRowSchema.json
             "ONE_TIME_SNAPSHOT"
           ],
           "type": "string",
-          "title": "Granularity",
+          "title": "Access Type",
           "default": "ONGOING",
           "required": true,
           "propertyOrder": 2
@@ -667,6 +664,13 @@ File: component_config/configRowSchema.json
           "default": "DAILY",
           "required": true,
           "propertyOrder": 4
+        },
+        "date_from": {
+          "type": "string",
+          "title": "Fetch From Date",
+          "default": "2000-01-01",
+          "description": "From which date will the reports be downloaded during the first run? Subsequent runs will download only the data since the last component run",
+          "propertyOrder": 5
         }
       },
       "propertyOrder": 1
@@ -692,7 +696,7 @@ File: component_config/configRowSchema.json
               "Full Load"
             ]
           },
-          "description": "If Full load is used, the destination table will be overwritten every run. If Incremental Load is used, data will be upserted into the destination table based on the primary key. Append modes do not contain any primary keys and are not deduplicated.",
+          "description": "If Full Load is used, the destination table will be overwritten every run. If Incremental Load is used, data will be inserted into the destination table and deduplicated.",
           "propertyOrder": 1
         }
       },
@@ -1241,25 +1245,21 @@ Template Component main class.
 
 """
 
-import os
 import gzip
-import shutil
 import logging
+import os
+import shutil
+
 import duckdb
-from duckdb import DuckDBPyConnection
-from collections import OrderedDict
 import requests
-
-
+from duckdb import DuckDBPyConnection
 from keboola.component.base import ComponentBase, sync_action
+from keboola.component.dao import BaseType, ColumnDefinition, SupportedDataTypes
 from keboola.component.exceptions import UserException
 from keboola.component.sync_actions import SelectElement
-from keboola.component.dao import BaseType, ColumnDefinition, SupportedDataTypes
 
-
-from configuration import Configuration
 from client.app_store_connect import AppStoreConnectClient
-
+from configuration import Configuration
 
 DUCK_DB_MAX_MEMORY = "128MB"
 DUCK_DB_DIR = os.path.join(os.environ.get("TMPDIR", "/tmp"), "duckdb")
@@ -1294,14 +1294,9 @@ class Component(ComponentBase):
 
         self.write_state_file(self.state)
 
-    def download_reports_for_app(self, app_id):
-        report_requests = list(self.client.get_reports_requests(app_id))
-        relevant_requests = [
-            r.get("id")
-            for r in report_requests
-            if r.get("attributes").get("accessType") == self.params.source.access_type
-            and r.get("attributes").get("stoppedDueToInactivity") is False
-        ]
+    def download_reports_for_app(self, app_id: str) -> None:
+        report_requests = self.client.get_reports_requests(app_id)
+        relevant_requests = self.get_relevant_report_requests(report_requests)
         if not relevant_requests:
             logging.info(
                 f"No reports to download for app_id: {app_id}, creating report request."
@@ -1311,25 +1306,30 @@ class Component(ComponentBase):
             return
 
         for request in relevant_requests:
-            reports = list(self.client.get_reports(request))
+            reports = self.client.get_reports(request)
 
             for report in reports:
-                if report.get("attributes").get("name") in self.params.source.report_names:
-                    report_name = report.get("attributes").get("name").replace(" ", "_")
-                    instances = list(self.client.get_report_instances(report.get("id"), self.params.source.granularity))
+                if (report_name := report.get("attributes", {}).get("name")) in self.params.source.report_names:
+                    report_name = report_name.replace(" ", "_")
+                    instances = self.client.get_report_instances(report.get("id"), self.params.source.granularity)
                     for instance in instances:
-
-                        last = self.state.get("last_processed", {}).get(app_id, {}).get(report_name, "2000-01-01")
+                        last = (
+                            self.state.get("last_processed", {})
+                            .get(app_id, {})
+                            .get(report_name, self.params.source.date_from)
+                        )
                         current = instance.get("attributes", {}).get("processingDate")
 
                         if current > last:
                             segments = []
                             try:
-                                segments = list(self.client.get_instance_segments(instance.get("id")))
+                                segments = self.client.get_instance_segments(instance.get("id"))
                             except requests.exceptions.HTTPError:
-                                logging.warning(f"Error downloading segment data from the {report_name} report "
-                                                f"from the {instance.get('attributes', {}).get('processingDate')}: the "
-                                                f"data has either expired or is not yet ready.")
+                                logging.warning(
+                                    f"Error downloading segment data from the {report_name} report "
+                                    f"from the {instance.get('attributes', {}).get('processingDate')}: the "
+                                    f"data has either expired or is not yet ready."
+                                )
 
                             for segment in segments:
                                 if not os.path.exists(os.path.join(FILES_TEMP_DIR, report_name)):
@@ -1343,20 +1343,28 @@ class Component(ComponentBase):
                                     instance.get("attributes", {}).get("processingDate")
                                 )
 
+    def get_relevant_report_requests(self, report_requests):
+        """
+        Keep only the report requests with the selected access type that are not stopped due to inactivity.
+        """
+        relevant_requests = [
+            r.get("id")
+            for r in report_requests
+            if r.get("attributes").get("accessType") == self.params.source.access_type
+            and r.get("attributes").get("stoppedDueToInactivity") is False
+        ]
+        return relevant_requests
+
     @staticmethod
     def init_duckdb() -> DuckDBPyConnection:
-        """
-        Returns connection to temporary DuckDB database
-        """
         os.makedirs(DUCK_DB_DIR, exist_ok=True)
-        # TODO: On GCP consider changin tmp to /opt/tmp
         config = dict(temp_directory=DUCK_DB_DIR, threads="1", max_memory=DUCK_DB_MAX_MEMORY)
         conn = duckdb.connect(config=config)
 
         return conn
 
     @staticmethod
-    def ungzip_files_in_folder(folder_path):
+    def ungzip_files_in_folder(folder_path: str) -> None:
         output_folder = os.path.join(folder_path, "ungzipped")
         os.makedirs(output_folder, exist_ok=True)
 
@@ -1370,22 +1378,18 @@ class Component(ComponentBase):
                 with gzip.open(file_path, "rb") as gz_file, open(output_file_path, "wb") as out_file:
                     shutil.copyfileobj(gz_file, out_file)
 
-    def create_table_from_report(self, folder_path):
+    def create_table_from_report(self, folder_path: str) -> None:
         path = os.path.join(FILES_TEMP_DIR, folder_path, "ungzipped")
 
         self.duck.execute(f"CREATE VIEW {folder_path} AS SELECT * FROM read_csv('{path}/*.csv')")
 
         table_meta = self.duck.execute(f"""DESCRIBE {folder_path};""").fetchall()
-        schema = OrderedDict(
-            {c[0]: ColumnDefinition(data_types=BaseType(dtype=self.convert_base_types(c[1]))) for c in table_meta}
-        )
-
-        primary_key = None
+        schema = {c[0]: ColumnDefinition(data_types=BaseType(dtype=self.convert_base_types(c[1]))) for c in table_meta}
 
         out_table = self.create_out_table_definition(
             f"{folder_path}.csv",
             schema=schema,
-            primary_key=primary_key,
+            primary_key=list(schema.keys()),  # all columns to deduplicate date in case of incremental load
             incremental=self.params.destination.incremental,
             has_header=True,
         )
@@ -1426,20 +1430,15 @@ class Component(ComponentBase):
             return SupportedDataTypes.STRING
 
     @sync_action("list_apps")
-    def list_apps(self):
+    def list_apps(self) -> list[SelectElement]:
         apps = self.client.get_apps()
         return [SelectElement(value=f"{val['id']}-{val['attributes']['name']}") for val in apps]
 
     @sync_action("list_reports")
-    def list_reports(self):
+    def list_reports(self) -> list[SelectElement]:
         report_requests = list(self.client.get_reports_requests(self.params.source.app_ids[0]))
 
-        relevant_requests = [
-            r.get("id")
-            for r in report_requests
-            if r.get("attributes").get("accessType") == self.params.source.access_type
-            and r.get("attributes").get("stoppedDueToInactivity") is False
-        ]
+        relevant_requests = self.get_relevant_report_requests(report_requests)
 
         all_reports = []
         for request in relevant_requests:
@@ -1478,9 +1477,8 @@ import logging
 from enum import Enum
 from typing import List, Literal
 
-
-from pydantic import BaseModel, Field, ValidationError, computed_field, field_validator
 from keboola.component.exceptions import UserException
+from pydantic import BaseModel, Field, ValidationError, computed_field, field_validator
 
 
 class LoadType(str, Enum):
@@ -1492,8 +1490,9 @@ class Source(BaseModel):
     app_ids: List[str]
     access_type: Literal["ONGOING", "ONE_TIME_SNAPSHOT"] = Field(default="ONGOING")
     report_categories: List[str] = Field(default=["APP_USAGE"])
-    report_names: List[str] = None
+    report_names: List[str] = Field(default_factory=list)
     granularity: Literal["DAILY", "WEEKLY", "MONTHLY"] = Field(default="DAILY")
+    date_from: str = Field(default="2000-01-01")
 
     @field_validator("app_ids")
     def split_id_string(cls, v):
@@ -1535,15 +1534,15 @@ class Configuration(BaseModel):
 ================================================
 File: src/client/app_store_connect.py
 ================================================
-import jwt
+import logging
 import time
-from typing import Optional, Literal
+from typing import Literal, Optional
 
-from keboola.http_client import HttpClient
-from keboola.component.exceptions import UserException
-import requests
 import backoff
-
+import jwt
+import requests
+from keboola.component.exceptions import UserException
+from keboola.http_client import HttpClient
 
 BASE_URL = "https://api.appstoreconnect.apple.com/v1"
 
@@ -1572,18 +1571,22 @@ class AppStoreConnectClient(HttpClient):
 
         return token
 
-    def get_apps(self):
-        endpoint = "apps"
+    def _paginate(self, endpoint: str, params: dict = None):
         while True:
-            response = self.get(endpoint)
+            response = self.get(endpoint, params=params)
             for item in response.get("data"):
                 yield item
 
-            endpoint = response.get("links").get("next")
+            endpoint = response.get("links", {}).get("next")
             if not endpoint:
                 break
 
+    def get_apps(self):
+        yield from self._paginate("apps")
+
     def create_report_request(self, app_id: str, access_type: Literal["ONGOING", "ONE_TIME_SNAPSHOT"]):
+        headers = {"Content-Type": "application/json"}
+
         payload = {
             "data": {
                 "type": "analyticsReportRequests",
@@ -1592,63 +1595,33 @@ class AppStoreConnectClient(HttpClient):
             }
         }
 
-        response = self.post("analyticsReportRequests", data=payload)
+        response = self.post_raw("analyticsReportRequests", headers=headers, json=payload)
 
-        if response.status_code != 200:
+        if response.status_code == 409:
+            logging.warning(f"Report request already exists for app_id: {app_id}.")
+
+        elif response.status_code != 200:
             raise UserException(f"Failed to create report request: {response.text}")
 
         return response
 
     def get_reports_requests(self, app_id: str):
-        endpoint = f"apps/{app_id}/analyticsReportRequests"
-        while True:
-            response = self.get(endpoint)
-            for item in response.get("data"):
-                yield item
-
-            endpoint = response.get("links").get("next")
-            if not endpoint:
-                break
+        yield from self._paginate(f"apps/{app_id}/analyticsReportRequests")
 
     def get_reports(self, request_id: str, filter_category: Optional[str] = None):
-        endpoint = f"analyticsReportRequests/{request_id}/reports"
         params = {}
         if filter_category:
             params["filter[category]"] = filter_category
+        yield from self._paginate(f"analyticsReportRequests/{request_id}/reports", params)
 
-        while True:
-            response = self.get(endpoint, params=params)
-            for item in response.get("data"):
-                yield item
-
-            endpoint = response.get("links").get("next")
-            if not endpoint:
-                break
-
-    def get_report_instances(self, report_id: str, granularity: Literal["DAILY", "WEEKLY", "MONTHLY"] = None):
-        endpoint = f"analyticsReports/{report_id}/instances"
+    def get_report_instances(self, report_id: str, granularity: Literal["DAILY", "WEEKLY", "MONTHLY"] = "DAILY"):
         params = {}
         if granularity:
             params["filter[granularity]"] = granularity
-        while True:
-            response = self.get(endpoint, params)
-            for item in response.get("data"):
-                yield item
-
-            endpoint = response.get("links").get("next")
-            if not endpoint:
-                break
+        yield from self._paginate(f"analyticsReports/{report_id}/instances", params)
 
     def get_instance_segments(self, instance_id: str):
-        endpoint = f"analyticsReportInstances/{instance_id}/segments"
-        while True:
-            response = self.get(endpoint)
-            for item in response.get("data"):
-                yield item
-
-            endpoint = response.get("links").get("next")
-            if not endpoint:
-                break
+        yield from self._paginate(f"analyticsReportInstances/{instance_id}/segments")
 
     @backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=5)
     def get_segment_data(self, url: str, path: str):
