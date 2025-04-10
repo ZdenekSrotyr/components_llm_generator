@@ -342,11 +342,6 @@
 - Repository: https://github.com/keboola/component-powerbi-refresh
 - Description: None
 
-### component-hubspot-crm
-- [Documentation](github/component-hubspot-crm/llm.txt)
-- Repository: https://github.com/keboola/component-hubspot-crm
-- Description: None
-
 ### component-mailgun-v2
 - [Documentation](github/component-mailgun-v2/llm.txt)
 - Repository: https://github.com/keboola/component-mailgun-v2
@@ -840,6 +835,11 @@
 ### component-microsoft-dynamics-wr
 - [Documentation](github/component-microsoft-dynamics-wr/llm.txt)
 - Repository: https://github.com/keboola/component-microsoft-dynamics-wr
+- Description: None
+
+### component-xero-accounting-v2
+- [Documentation](github/component-xero-accounting-v2/llm.txt)
+- Repository: https://github.com/keboola/component-xero-accounting-v2
 - Description: None
 
 ## Bitbucket Repositories
@@ -1832,6 +1832,11 @@
 ### kds-team.ex-salesforce-commerce-cloud
 - [Documentation](bitbucket/kds-team.ex-salesforce-commerce-cloud/llm.txt)
 - Repository: https://bitbucket.org/kds_consulting_team/kds-team.ex-salesforce-commerce-cloud
+- Description: 
+
+### kds-team.ex-xero-accounting-v2
+- [Documentation](bitbucket/kds-team.ex-xero-accounting-v2/llm.txt)
+- Repository: https://bitbucket.org/kds_consulting_team/kds-team.ex-xero-accounting-v2
 - Description: 
 
 ### kds-team.app-custom-python
