@@ -842,6 +842,11 @@
 - Repository: https://github.com/keboola/component-xero-accounting-v2
 - Description: None
 
+### component-sailthru
+- [Documentation](github/component-sailthru/llm.txt)
+- Repository: https://github.com/keboola/component-sailthru
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
