@@ -847,6 +847,16 @@
 - Repository: https://github.com/keboola/component-sailthru
 - Description: None
 
+### component-sync-actions-test
+- [Documentation](github/component-sync-actions-test/llm.txt)
+- Repository: https://github.com/keboola/component-sync-actions-test
+- Description: None
+
+### component-motherduck
+- [Documentation](github/component-motherduck/llm.txt)
+- Repository: https://github.com/keboola/component-motherduck
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors

@@ -1499,6 +1499,8 @@ Directory structure:
     │   ├── flake8.cfg
     │   ├── requirements.in
     │   ├── requirements.txt
+    │   ├── scripts/
+    │   │   └── build_n_test.sh
     │   ├── src/
     │   │   ├── __init__.py
     │   │   ├── component.py
@@ -1517,12 +1519,14 @@ Directory structure:
     │   └── tests/
     │       ├── __init__.py
     │       ├── _test_calls.py
+    │       ├── test_allowed_hosts.py
     │       ├── test_auth.py
     │       ├── test_component.py
     │       ├── test_configuration.py
     │       ├── test_curl.py
     │       ├── test_functions.py
     │       ├── test_mapping.py
+    │       ├── test_url_builder.py
     │       ├── calls/
     │       │   ├── __init__.py
     │       │   ├── 000-bearer/
@@ -1647,9 +1651,11 @@ Directory structure:
     │           │   └── config.json
     │           ├── test_008_infer_mapping_userdata_child/
     │           │   └── config.json
-    │           └── test_009_empty_datafield/
-    │               ├── config.json
-    │               └── response.json
+    │           ├── test_009_empty_datafield/
+    │           │   ├── config.json
+    │           │   └── response.json
+    │           └── test_allowed_hosts_dummy/
+    │               └── config.json
     ├── src/
     │   ├── Executor.php
     │   ├── GenericExtractor.php
@@ -8960,10 +8966,12 @@ services:
 
   dev:
     << : *ci
-    command: bash
+    command: php /code/src/run.php
     volumes:
       - ./:/code
       - ./data:/data
+    environment:
+      - KBC_DATADIR=/data
 
   jsontest:
       build: ./docker/jsontest
@@ -26030,7 +26038,7 @@ File: python-sync-actions/Dockerfile
 ================================================
 FROM nikolaik/python-nodejs:python3.12-nodejs18
 
-RUN apt-get update && apt-get install -y curl
+RUN apt-get update && apt-get install -y curl php
 
 RUN npm install --global curlconverter
 
@@ -26043,6 +26051,7 @@ COPY flake8.cfg /code/flake8.cfg
 
 COPY /src /code/src/
 COPY /tests /code/tests/
+COPY /scripts /code/scripts/
 
 WORKDIR /code/
 
@@ -26226,6 +26235,16 @@ wrapt==1.17.2
 
 
 ================================================
+File: python-sync-actions/scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m unittest discover
+
+
+================================================
 File: python-sync-actions/src/__init__.py
 ================================================
 import sys
@@ -26246,6 +26265,8 @@ import logging
 import tempfile
 from io import StringIO
 from typing import Any
+from urllib.parse import urlparse
+from urllib.parse import urlencode
 
 import configuration
 import requests
@@ -26315,10 +26336,15 @@ class Component(ComponentBase):
         self.test_request()
 
     def init_component(self):
-
         self._configurations = configuration.convert_to_v2(self.configuration.parameters)
-
         self._configuration = self._configurations[0]
+
+        # Validate allowed hosts
+        self._validate_allowed_hosts(
+            self.configuration.image_parameters.get('allowed_hosts', []),
+            self._configuration.api.base_url,
+            self._configuration.api.jobs
+            )
 
         # build authentication method
         auth_method = None
@@ -26350,6 +26376,75 @@ class Component(ComponentBase):
                                          status_forcelist=self._configuration.api.retry_config.codes,
                                          auth_method=auth_method
                                          )
+
+    def _validate_allowed_hosts(self, allowed_hosts: list[dict], base_url: str, jobs: list[dict]) -> None:
+        """
+        Validates URLs against a whitelist of allowed hosts.
+
+        Args:
+            allowed_hosts: List of allowed hosts from image_parameters.
+            base_url: Base URL from API configuration.
+            jobs: List of job configurations containing endpoint_path, query_parameters, and placeholders.
+        """
+        if not allowed_hosts:
+            return
+
+        urls = self._build_urls(base_url, jobs)
+        url = urls[1]
+
+        parsed_url = urlparse(url)
+        url_scheme = parsed_url.scheme
+        url_host = parsed_url.hostname
+        url_port = parsed_url.port
+        url_path = parsed_url.path.rstrip('/')
+
+        for allowed in allowed_hosts:
+            parsed_allowed = urlparse(allowed['host'])
+            if (
+                url_scheme != parsed_allowed.scheme
+                or url_host != parsed_allowed.hostname
+                or url_port != parsed_allowed.port
+            ):
+                continue
+
+            allowed_path = parsed_allowed.path.rstrip('/')
+
+            if not allowed_path:
+                return  # Allowed without path restriction
+
+            url_segments = url_path.split('/')
+            allowed_segments = allowed_path.split('/')
+
+            if len(url_segments) < len(allowed_segments):
+                continue
+
+            if url_segments[:len(allowed_segments)] == allowed_segments:
+                return  # Path matches
+
+        raise UserException(f'URL "{url}" is not in the allowed hosts whitelist.')
+
+    def _build_urls(self, base_url: str, endpoints: list[dict]) -> list[str]:
+        normalized_base_url = base_url[:-1] if base_url.endswith("/") else base_url
+        urls = [normalized_base_url]
+        for ep in endpoints:
+            endpoint = ep.get("endpoint", "").lstrip("/")
+            placeholders = ep.get("placeholders", {})
+            params = ep.get("params", {})
+
+            try:
+                formatted_path = endpoint.format(**placeholders)
+            except KeyError as e:
+                raise ValueError(f"Missing placeholder for: {e.args[0]} in endpoint: {endpoint}")
+
+            # Create full URL
+            full_url = f"{normalized_base_url}/{formatted_path}" if formatted_path else normalized_base_url
+
+            if params:
+                full_url += "?" + urlencode(params)
+
+            urls.append(full_url)
+
+        return urls
 
     def _get_values_to_hide(self) -> list[str]:
         """
@@ -26870,6 +26965,7 @@ class ApiConfig(ConfigurationBase):
     ssl_verify: bool = True  # toggles requests.[method](verify=True/False)
     ca_cert: str = ""  # if provided, this value will be written to a temp file and used instead of ssl_verify
     client_cert_key: str = ""  # client certificate bundled with private key (will also be written to a temp file)
+    jobs: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -26977,6 +27073,7 @@ def convert_to_v2(configuration: dict) -> list[Configuration]:
 
     api_json = configuration.get('api', {})
     base_url = api_json.get('baseUrl', '')
+    jobs = configuration.get('config', {}).get('jobs', [])
     default_headers_org = api_json.get('http', {}).get('headers', {})
     default_query_parameters_org = api_json.get('http', {}).get('defaultOptions', {}).get('params', {})
 
@@ -27011,6 +27108,7 @@ def convert_to_v2(configuration: dict) -> list[Configuration]:
         ssl_verify=api_json.get("ssl_verify", True),
         ca_cert=ca_cert,
         client_cert_key=client_cert_ley,
+        jobs=jobs
     )
 
     api_config.retry_config = build_retry_config(configuration)
@@ -28707,6 +28805,357 @@ print('\nAll tests finished successfully!')
 
 
 ================================================
+File: python-sync-actions/tests/test_allowed_hosts.py
+================================================
+"""
+Tests for allowed hosts validation
+"""
+import unittest
+import os
+from pathlib import Path
+
+from keboola.component.exceptions import UserException
+from src.component import Component
+
+
+def create_test_config(base_url: str, allowed_hosts: list = None, endpoint: str = '/path/') -> dict:
+    """
+    Create test configuration
+    Args:
+        base_url: Base URL
+        allowed_hosts: List of allowed hosts
+        endpoint: Endpoint path
+
+    Returns:
+        dict: Configuration
+    """
+    config = {
+        'parameters': {
+            'api': {
+                'baseUrl': base_url,
+            },
+            'config': {
+                'jobs': [{'endpoint': endpoint}],
+            },
+            '__SELECTED_JOB': '0',
+        },
+        'image_parameters': {
+            'allowed_hosts': [{'host': host} for host in allowed_hosts] if allowed_hosts else []
+        }
+    }
+    return config
+
+
+class TestAllowedHosts(unittest.TestCase):
+    """Tests for allowed hosts validation"""
+
+    def setUp(self):
+        """Set up test cases"""
+        self.tests_dir = Path(__file__).absolute().parent.joinpath('data_tests').as_posix()
+        test_dir = os.path.join(self.tests_dir, "test_allowed_hosts_dummy")
+        os.environ['KBC_DATADIR'] = test_dir
+        self.component = Component()
+
+    def test_validate_allowed_hosts_exact_match(self):
+        """Test exact match of allowed host"""
+        config = create_test_config(
+            base_url='https://example.com/api',
+            allowed_hosts=['https://example.com/api']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_different_query_string(self):
+        """Test different query string"""
+        config = create_test_config(
+            base_url='https://example.com/api?x=1',
+            allowed_hosts=['https://example.com/api']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_different_trailing_slash(self):
+        """Test different trailing slash"""
+        config = create_test_config(
+            base_url='https://example.com/api/',
+            allowed_hosts=['https://example.com/api']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_different_protocol(self):
+        """Test different protocol"""
+        config = create_test_config(
+            base_url='https://example.com/api',
+            allowed_hosts=['http://example.com/api']
+        )
+        with self.assertRaises(UserException):
+            self.component._validate_allowed_hosts(
+                allowed_hosts=config['image_parameters']['allowed_hosts'],
+                base_url=config['parameters']['api']['baseUrl'],
+                jobs=config['parameters']['config']['jobs']
+            )
+
+    def test_validate_allowed_hosts_different_port(self):
+        """Test different port"""
+        config = create_test_config(
+            base_url='https://example.com/api',
+            allowed_hosts=['https://example.com:443/api']
+        )
+        with self.assertRaises(UserException):
+            self.component._validate_allowed_hosts(
+                allowed_hosts=config['image_parameters']['allowed_hosts'],
+                base_url=config['parameters']['api']['baseUrl'],
+                jobs=config['parameters']['config']['jobs']
+            )
+
+    def test_validate_allowed_hosts_longer_path(self):
+        """Test longer path"""
+        config = create_test_config(
+            base_url='https://example.com/api/resource',
+            allowed_hosts=['https://example.com/api']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_multiple_levels(self):
+        """Test multiple path levels"""
+        config = create_test_config(
+            base_url='https://example.com/api/v1/data',
+            allowed_hosts=['https://example.com/api']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_trailing_slash_in_whitelist(self):
+        """Test trailing slash in whitelist"""
+        config = create_test_config(
+            base_url='https://example.com/api/v1',
+            allowed_hosts=['https://example.com/api/']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_not_real_prefix(self):
+        """Test not real prefix"""
+        config = create_test_config(
+            base_url='https://example.com/api',
+            allowed_hosts=['https://example.com/ap']
+        )
+        with self.assertRaises(UserException):
+            self.component._validate_allowed_hosts(
+                allowed_hosts=config['image_parameters']['allowed_hosts'],
+                base_url=config['parameters']['api']['baseUrl'],
+                jobs=config['parameters']['config']['jobs']
+            )
+
+    def test_validate_allowed_hosts_domain_vs_subdomain(self):
+        """Test domain vs subdomain"""
+        config = create_test_config(
+            base_url='https://sub.example.com/path',
+            allowed_hosts=['https://example.com/']
+        )
+        with self.assertRaises(UserException):
+            self.component._validate_allowed_hosts(
+                allowed_hosts=config['image_parameters']['allowed_hosts'],
+                base_url=config['parameters']['api']['baseUrl'],
+                jobs=config['parameters']['config']['jobs']
+            )
+
+    def test_validate_allowed_hosts_ip_address_exact_match(self):
+        """Test IP address exact match"""
+        config = create_test_config(
+            base_url='http://127.0.0.1:8080/api',
+            allowed_hosts=['http://127.0.0.1:8080/api']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_ip_address_prefix_match(self):
+        """Test IP address prefix match"""
+        config = create_test_config(
+            base_url='http://127.0.0.1:8080/api/v1/data',
+            allowed_hosts=['http://127.0.0.1:8080/api']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_ip_address_different_port(self):
+        """Test IP address different port"""
+        config = create_test_config(
+            base_url='http://127.0.0.1:8000/api',
+            allowed_hosts=['http://127.0.0.1:8080/api']
+        )
+        with self.assertRaises(UserException):
+            self.component._validate_allowed_hosts(
+                allowed_hosts=config['image_parameters']['allowed_hosts'],
+                base_url=config['parameters']['api']['baseUrl'],
+                jobs=config['parameters']['config']['jobs']
+            )
+
+    def test_validate_allowed_hosts_ip_address_no_port_vs_port(self):
+        """Test IP address no port vs port"""
+        config = create_test_config(
+            base_url='http://127.0.0.1:80/api',
+            allowed_hosts=['http://127.0.0.1/api']
+        )
+        with self.assertRaises(UserException):
+            self.component._validate_allowed_hosts(
+                allowed_hosts=config['image_parameters']['allowed_hosts'],
+                base_url=config['parameters']['api']['baseUrl'],
+                jobs=config['parameters']['config']['jobs']
+            )
+
+    def test_validate_allowed_hosts_subdomain(self):
+        """Test subdomain"""
+        config = create_test_config(
+            base_url='https://sub.example.com/path1',
+            allowed_hosts=['https://sub.example.com/']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_shorter_path_prefix(self):
+        """Test shorter path prefix"""
+        config = create_test_config(
+            base_url='https://sub.domain.com/path/1/2',
+            allowed_hosts=['https://sub.domain.com/']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_no_trailing_slash(self):
+        """Test no trailing slash"""
+        config = create_test_config(
+            base_url='https://sub.domain.com/path',
+            allowed_hosts=['https://sub.domain.com']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_longer_prefix(self):
+        """Test longer prefix"""
+        config = create_test_config(
+            base_url='https://sub.domain.com/extra/data',
+            allowed_hosts=['https://sub.domain.com/extra']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_string_prefix_not_path(self):
+        """Test string prefix not path"""
+        config = create_test_config(
+            base_url='https://sub.domain.com/pathology',
+            allowed_hosts=['https://sub.domain.com/path']
+        )
+        with self.assertRaises(UserException):
+            self.component._validate_allowed_hosts(
+                allowed_hosts=config['image_parameters']['allowed_hosts'],
+                base_url=config['parameters']['api']['baseUrl'],
+                jobs=config['parameters']['config']['jobs']
+            )
+
+    def test_validate_allowed_hosts_no_whitelist(self):
+        """Test no whitelist"""
+        config = create_test_config(
+            base_url='https://example.com/api',
+            allowed_hosts=None
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs']
+        )
+
+    def test_validate_allowed_hosts_empty_whitelist(self):
+        """Test empty whitelist"""
+        config = create_test_config(
+            base_url='https://example.com/api',
+            allowed_hosts=[]
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs'])
+
+    def test_validate_allowed_multiple_hosts_success(self):
+        """Test multiple hosts success"""
+        config = create_test_config(
+            base_url='https://example.com/api',
+            allowed_hosts=['https://example.com/api', 'https://sub.example.com/api']
+        )
+        self.component._validate_allowed_hosts(
+            allowed_hosts=config['image_parameters']['allowed_hosts'],
+            base_url=config['parameters']['api']['baseUrl'],
+            jobs=config['parameters']['config']['jobs'])
+
+    def test_validate_allowed_multiple_hosts_failure(self):
+        """Test multiple hosts failure"""
+        config = create_test_config(
+            base_url='https://example.com/api',
+            allowed_hosts=['https://example.com/api1', 'https://example.com/api2']
+        )
+        with self.assertRaises(UserException):
+            self.component._validate_allowed_hosts(
+                allowed_hosts=config['image_parameters']['allowed_hosts'],
+                base_url=config['parameters']['api']['baseUrl'],
+                jobs=config['parameters']['config']['jobs'])
+
+    def test_validate_allowed_hosts_port_prefix_not_allowed(self):
+        """Test port prefix not allowed"""
+        config = create_test_config(
+            base_url='https://example.com:8/api',
+            allowed_hosts=['https://example.com:88/api']
+        )
+        with self.assertRaises(UserException):
+            self.component._validate_allowed_hosts(
+                allowed_hosts=config['image_parameters']['allowed_hosts'],
+                base_url=config['parameters']['api']['baseUrl'],
+                jobs=config['parameters']['config']['jobs'])
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+
+================================================
 File: python-sync-actions/tests/test_auth.py
 ================================================
 import unittest
@@ -29614,6 +30063,265 @@ class TestCurl(unittest.TestCase):
         res = infer_mapping(data, max_level_nest_level=1)
 
         self.assertEqual(res, expected)
+
+
+
+================================================
+File: python-sync-actions/tests/test_url_builder.py
+================================================
+import unittest
+
+from src.component import Component
+
+
+class TestUrlBuilder(unittest.TestCase):
+    def setUp(self):
+        self.component = Component()
+
+    def test_build_urls(self):
+        base_url = 'https://api.example.com'
+        endpoints = [
+            {
+                'endpoint': 'users/{id}',
+                'params': {'page': 1},
+                'placeholders': {'id': 123},
+            },
+            {
+                'endpoint': 'orders',
+                'params': {'status': 'completed'},
+                'placeholders': {},
+            },
+        ]
+
+        urls = self.component._build_urls(base_url, endpoints)
+
+        self.assertEqual([
+            'https://api.example.com',
+            'https://api.example.com/users/123?page=1',
+            'https://api.example.com/orders?status=completed',
+        ], urls)
+
+    def test_build_urls_with_domain_name(self):
+        # Test without trailing slash
+        urls = self.component._build_urls('https://example.com', [
+            {
+                'endpoint': 'users',
+                'params': {'page': 1},
+                'placeholders': {},
+            },
+        ])
+
+        self.assertEqual(
+            [
+                'https://example.com',
+                'https://example.com/users?page=1',
+            ],
+            urls
+        )
+
+        # Test with trailing slash
+        urls = self.component._build_urls('https://example.com/', [
+            {
+                'endpoint': 'users',
+                'params': {'page': 1},
+                'placeholders': {},
+            },
+        ])
+
+        self.assertEqual(
+            [
+                'https://example.com',
+                'https://example.com/users?page=1',
+            ],
+            urls
+        )
+
+        # Test with subdomain and path
+        urls = self.component._build_urls('https://sub.domain.example.com/path/', [
+            {
+                'endpoint': 'users',
+                'params': {'page': 1},
+                'placeholders': {},
+            },
+        ])
+
+        self.assertEqual(
+            [
+                'https://sub.domain.example.com/path',
+                'https://sub.domain.example.com/path/users?page=1',
+            ],
+            urls
+        )
+
+    def test_build_urls_with_port(self):
+        base_url = 'https://api.example.com:8080'
+        endpoints = [
+            {
+                'endpoint': 'users/{id}',
+                'params': {'page': 1},
+                'placeholders': {'id': 123},
+            },
+        ]
+
+        urls = self.component._build_urls(base_url, endpoints)
+
+        self.assertEqual([
+            'https://api.example.com:8080',
+            'https://api.example.com:8080/users/123?page=1',
+        ], urls)
+
+    def test_build_urls_with_path_in_base_url(self):
+        base_url = 'https://api.example.com:8080/v1'
+        endpoints = [
+            {
+                'endpoint': 'users/{id}',
+                'params': {'page': 1},
+                'placeholders': {'id': 123},
+            },
+            {
+                'endpoint': '/orders',
+                'params': {'status': 'completed'},
+                'placeholders': {},
+            },
+        ]
+
+        urls = self.component._build_urls(base_url, endpoints)
+
+        self.assertEqual([
+            'https://api.example.com:8080/v1',
+            'https://api.example.com:8080/v1/users/123?page=1',
+            'https://api.example.com:8080/v1/orders?status=completed',
+        ], urls)
+
+    def test_build_urls_with_ip_address(self):
+        base_url = 'https://192.168.1.1'
+        endpoints = [
+            {
+                'endpoint': 'api/users',
+                'params': {'page': 1},
+                'placeholders': {},
+            },
+        ]
+
+        urls = self.component._build_urls(base_url, endpoints)
+
+        self.assertEqual([
+            'https://192.168.1.1',
+            'https://192.168.1.1/api/users?page=1',
+        ], urls)
+
+    def test_build_urls_with_ip_address_and_port(self):
+        base_url = 'https://192.168.1.1:8080'
+        endpoints = [
+            {
+                'endpoint': 'api/users',
+                'params': {'page': 1},
+                'placeholders': {},
+            },
+        ]
+
+        urls = self.component._build_urls(base_url, endpoints)
+
+        self.assertEqual([
+            'https://192.168.1.1:8080',
+            'https://192.168.1.1:8080/api/users?page=1',
+        ], urls)
+
+    def test_build_urls_with_localhost(self):
+        # Test with localhost IP
+        urls = self.component._build_urls('http://127.0.0.1', [
+            {
+                'endpoint': 'users',
+                'params': {'page': 1},
+                'placeholders': {},
+            },
+        ])
+
+        self.assertEqual(
+            [
+                'http://127.0.0.1',
+                'http://127.0.0.1/users?page=1',
+            ],
+            urls
+        )
+
+        # Test with localhost IP and port
+        urls = self.component._build_urls('http://127.0.0.1:5000', [
+            {
+                'endpoint': 'users',
+                'params': {'page': 1},
+                'placeholders': {},
+            },
+        ])
+
+        self.assertEqual(
+            [
+                'http://127.0.0.1:5000',
+                'http://127.0.0.1:5000/users?page=1',
+            ],
+            urls
+        )
+
+    def test_build_urls_with_different_protocols(self):
+        # Test with HTTP
+        urls = self.component._build_urls('http://example.com', [
+            {
+                'endpoint': 'users',
+                'params': {'page': 1},
+                'placeholders': {},
+            },
+        ])
+
+        self.assertEqual(
+            [
+                'http://example.com',
+                'http://example.com/users?page=1',
+            ],
+            urls
+        )
+
+        # Test with HTTPS
+        urls = self.component._build_urls('https://example.com', [
+            {
+                'endpoint': 'users',
+                'params': {'page': 1},
+                'placeholders': {},
+            },
+        ])
+
+        self.assertEqual(
+            [
+                'https://example.com',
+                'https://example.com/users?page=1',
+            ],
+            urls
+        )
+
+    def test_build_urls_with_multiple_params(self):
+        base_url = 'https://api.example.com'
+        endpoints = [
+            {
+                'endpoint': 'users',
+                'params': {
+                    'page': 1,
+                    'limit': 100,
+                    'sort': 'name',
+                    'filter': 'active'
+                },
+                'placeholders': {},
+            },
+        ]
+
+        urls = self.component._build_urls(base_url, endpoints)
+
+        self.assertEqual([
+            'https://api.example.com',
+            'https://api.example.com/users?page=1&limit=100&sort=name&filter=active',
+        ], urls)
+
+
+if __name__ == '__main__':
+    unittest.main()
 
 
 
@@ -32531,6 +33239,65 @@ File: python-sync-actions/tests/data_tests/test_009_empty_datafield/response.jso
 
 
 ================================================
+File: python-sync-actions/tests/data_tests/test_allowed_hosts_dummy/config.json
+================================================
+{
+    "parameters": {
+        "api": {
+            "baseUrl": "https:\/\/apimocha.com\/qaywsxedc\/",
+            "http": {
+                "retryHeader": "Retry-After",
+                "maxRetries": 10,
+                "codes": [
+                    408,
+                    420,
+                    429,
+                    500,
+                    502,
+                    503,
+                    504
+                ],
+                "connectTimeout": 30,
+                "requestTimeout": 300
+            }
+        },
+        "config": {
+            "outputBucket": "c-data",
+            "incrementalOutput": false,
+            "jobs": [
+                {
+                    "__NAME": "test",
+                    "endpoint": "test",
+                    "method": "GET",
+                    "dataType": "test",
+                    "dataField": {
+                        "path": ".",
+                        "delimiter": "."
+                    }
+                }
+            ],
+            "mappings": [],
+            "debug": true
+        },
+        "__SELECTED_JOB": "0"
+    },
+    "shared_code_row_ids": [],
+    "image_parameters": {
+        "allowed_hosts": [
+            {
+                "host": "https:\/\/apimocha.com\/qaywsxedc\/"
+            }
+        ]
+    },
+    "authorization": {
+        "context": "9382-extractor"
+    },
+    "action": "run",
+    "storage": {}
+}
+
+
+================================================
 File: src/Executor.php
 ================================================
 <?php
@@ -34894,6 +35661,9 @@ class Extractor
     private function loadConfigFile(string $dataDir): array
     {
         $data = $this->loadJSONFile($dataDir, 'config.json');
+
+        $this->validateAllowedHosts($data);
+
         $processor = new Processor();
         try {
             $processor->processConfiguration(new ConfigFile(), $data);
@@ -35115,6 +35885,114 @@ class Extractor
         } catch (Throwable $e) {
             $this->logger->error('Unexpected error: ' . $e->getMessage());
             throw new ApplicationException('Unexpected error: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Builds complete URLs from base URL and endpoints
+     *
+     * @param string $baseUrl Base URL
+     * @param array $endpoints Array of endpoint configurations
+     * @return array List of complete URLs
+     */
+    private function buildUrls(string $baseUrl, array $endpoints): array
+    {
+        $urls = [$baseUrl];
+
+        foreach ($endpoints as $endpointData) {
+            $endpoint = $endpointData['endpoint'];
+
+            // Replace placeholders if present
+            if (!empty($endpointData['placeholders'])) {
+                foreach ($endpointData['placeholders'] as $placeholder => $value) {
+                    $endpoint = str_replace('{' . $placeholder . '}', $value, $endpoint);
+                }
+            }
+
+            // Add params if present
+            if (!empty($endpointData['params'])) {
+                $queryString = http_build_query($endpointData['params']);
+                $endpoint .= (strpos($endpoint, '?') === false ? '?' : '&') . $queryString;
+            }
+
+            $urls[] = rtrim($baseUrl, '/') . '/' . ltrim($endpoint, '/');
+        }
+
+        return $urls;
+    }
+
+    /**
+     * Validates URLs against whitelist
+     *
+     * @param array $config Configuration array
+     * @throws UserException If URL validation fails
+     */
+    private function validateAllowedHosts(array $config): void
+    {
+        if (!isset($config['image_parameters']['allowed_hosts'])) {
+            return;
+        }
+
+        if (empty($config['image_parameters']['allowed_hosts'])) {
+            return;
+        }
+
+        $baseUrl = $config['parameters']['api']['baseUrl'];
+        $endpoints = $config['parameters']['config']['jobs'];
+        $urls = $this->buildUrls($baseUrl, $endpoints);
+
+        $allowedHosts = array_map(function ($host) {
+            return $host['host'];
+        }, $config['image_parameters']['allowed_hosts']);
+
+        foreach ($urls as $url) {
+            $isAllowed = false;
+            $parsedUrl = parse_url($url);
+            $urlPath = $parsedUrl['path'] ?? '';
+            $urlHost = $parsedUrl['host'] ?? '';
+            $urlPort = $parsedUrl['port'] ?? null;
+            $urlScheme = $parsedUrl['scheme'] ?? '';
+
+            foreach ($allowedHosts as $allowedHost) {
+                $parsedAllowedHost = parse_url($allowedHost);
+                $allowedHostPath = $parsedAllowedHost['path'] ?? '';
+                $allowedHostHost = $parsedAllowedHost['host'] ?? '';
+                $allowedHostPort = $parsedAllowedHost['port'] ?? null;
+                $allowedHostScheme = $parsedAllowedHost['scheme'] ?? '';
+
+                // Schema comparison
+                if ($urlScheme !== $allowedHostScheme) {
+                    continue;
+                }
+
+                // Port comparison
+                if ($urlPort !== $allowedHostPort) {
+                    continue;
+                }
+
+                // Host comparison
+                if ($urlHost !== $allowedHostHost) {
+                    continue;
+                }
+
+                // Path comparison
+                $normalizedUrlPath = rtrim($urlPath, '/');
+                $normalizedAllowedPath = rtrim($allowedHostPath, '/');
+
+                if ($normalizedAllowedPath === '') {
+                    $isAllowed = true;
+                    break;
+                }
+
+                if (strpos($normalizedUrlPath . '/', $normalizedAllowedPath . '/') === 0) {
+                    $isAllowed = true;
+                    break;
+                }
+            }
+
+            if (!$isAllowed) {
+                throw new UserException(sprintf('URL "%s" is not in the allowed hosts whitelist.', $url));
+            }
         }
     }
 }
@@ -41010,6 +41888,321 @@ class ConfigurationTest extends ExtractorTestCase
         }
     }
 
+    public function testBuildUrls(): void
+    {
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+
+        $baseUrl = 'https://api.example.com';
+        $endpoints = [
+            [
+                'endpoint' => 'users/{id}',
+                'params' => ['page' => 1],
+                'placeholders' => ['id' => 123],
+            ],
+            [
+                'endpoint' => 'orders',
+                'params' => ['status' => 'completed'],
+                'placeholders' => [],
+            ],
+        ];
+
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [$baseUrl, $endpoints]);
+
+        self::assertEquals([
+            'https://api.example.com',
+            'https://api.example.com/users/123?page=1',
+            'https://api.example.com/orders?status=completed',
+        ], $urls);
+    }
+
+    public function testBuildUrlsWithDomainName(): void
+    {
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+
+        // Test bez lomítka na konci
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [
+            'https://example.com',
+            [
+                [
+                    'endpoint' => 'users',
+                    'params' => ['page' => 1],
+                    'placeholders' => [],
+                ],
+            ],
+        ]);
+
+        self::assertEquals(
+            [
+                'https://example.com',
+                'https://example.com/users?page=1',
+            ],
+            $urls
+        );
+
+        // Test s lomítkem na konci
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [
+            'https://example.com/',
+            [
+                [
+                    'endpoint' => 'users',
+                    'params' => ['page' => 1],
+                    'placeholders' => [],
+                ],
+            ],
+        ]);
+
+        self::assertEquals(
+            [
+                'https://example.com/',
+                'https://example.com/users?page=1',
+            ],
+            $urls
+        );
+
+        // Test s subdoménou a cestou
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [
+            'https://sub.domain.example.com/path/',
+            [
+                [
+                    'endpoint' => 'users',
+                    'params' => ['page' => 1],
+                    'placeholders' => [],
+                ],
+            ],
+        ]);
+
+        self::assertEquals(
+            [
+                'https://sub.domain.example.com/path/',
+                'https://sub.domain.example.com/path/users?page=1',
+            ],
+            $urls
+        );
+    }
+
+    public function testBuildUrlsWithPort(): void
+    {
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+
+        $baseUrl = 'https://api.example.com:8080';
+        $endpoints = [
+            [
+                'endpoint' => 'users/{id}',
+                'params' => ['page' => 1],
+                'placeholders' => ['id' => 123],
+            ],
+        ];
+
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [$baseUrl, $endpoints]);
+
+        self::assertEquals([
+            'https://api.example.com:8080',
+            'https://api.example.com:8080/users/123?page=1',
+        ], $urls);
+    }
+
+    public function testBuildUrlsWithPathInBaseUrl(): void
+    {
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+
+        $baseUrl = 'https://api.example.com:8080/v1';
+        $endpoints = [
+            [
+                'endpoint' => 'users/{id}',
+                'params' => ['page' => 1],
+                'placeholders' => ['id' => 123],
+            ],
+            [
+                'endpoint' => '/orders',
+                'params' => ['status' => 'completed'],
+                'placeholders' => [],
+            ],
+        ];
+
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [$baseUrl, $endpoints]);
+
+        self::assertEquals([
+            'https://api.example.com:8080/v1',
+            'https://api.example.com:8080/v1/users/123?page=1',
+            'https://api.example.com:8080/v1/orders?status=completed',
+        ], $urls);
+    }
+
+    public function testBuildUrlsWithIpAddress(): void
+    {
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+
+        $baseUrl = 'https://192.168.1.1';
+        $endpoints = [
+            [
+                'endpoint' => 'api/users',
+                'params' => ['page' => 1],
+                'placeholders' => [],
+            ],
+        ];
+
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [$baseUrl, $endpoints]);
+
+        self::assertEquals([
+            'https://192.168.1.1',
+            'https://192.168.1.1/api/users?page=1',
+        ], $urls);
+    }
+
+    public function testBuildUrlsWithIpAddressAndPort(): void
+    {
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+
+        $baseUrl = 'https://192.168.1.1:8080';
+        $endpoints = [
+            [
+                'endpoint' => 'api/users',
+                'params' => ['page' => 1],
+                'placeholders' => [],
+            ],
+        ];
+
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [$baseUrl, $endpoints]);
+
+        self::assertEquals([
+            'https://192.168.1.1:8080',
+            'https://192.168.1.1:8080/api/users?page=1',
+        ], $urls);
+    }
+
+    public function testBuildUrlsWithLocalhost(): void
+    {
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+
+        // Test s localhost IP
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [
+            'http://127.0.0.1',
+            [
+                [
+                    'endpoint' => 'users',
+                    'params' => ['page' => 1],
+                    'placeholders' => [],
+                ],
+            ],
+        ]);
+
+        self::assertEquals(
+            [
+                'http://127.0.0.1',
+                'http://127.0.0.1/users?page=1',
+            ],
+            $urls
+        );
+
+        // Test s localhost IP a portem
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [
+            'http://127.0.0.1:5000',
+            [
+                [
+                    'endpoint' => 'users',
+                    'params' => ['page' => 1],
+                    'placeholders' => [],
+                ],
+            ],
+        ]);
+
+        self::assertEquals(
+            [
+                'http://127.0.0.1:5000',
+                'http://127.0.0.1:5000/users?page=1',
+            ],
+            $urls
+        );
+    }
+
+    public function testBuildUrlsWithDifferentProtocols(): void
+    {
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+
+        // Test s HTTP
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [
+            'http://example.com',
+            [
+                [
+                    'endpoint' => 'users',
+                    'params' => ['page' => 1],
+                    'placeholders' => [],
+                ],
+            ],
+        ]);
+
+        self::assertEquals(
+            [
+                'http://example.com',
+                'http://example.com/users?page=1',
+            ],
+            $urls
+        );
+
+        // Test s HTTPS
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [
+            'https://example.com',
+            [
+                [
+                    'endpoint' => 'users',
+                    'params' => ['page' => 1],
+                    'placeholders' => [],
+                ],
+            ],
+        ]);
+
+        self::assertEquals(
+            [
+                'https://example.com',
+                'https://example.com/users?page=1',
+            ],
+            $urls
+        );
+    }
+
+    public function testBuildUrlsWithMultipleParams(): void
+    {
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+
+        $baseUrl = 'https://api.example.com';
+        $endpoints = [
+            [
+                'endpoint' => 'users',
+                'params' => [
+                    'page' => 1,
+                    'limit' => 100,
+                    'sort' => 'name',
+                    'filter' => 'active',
+                ],
+                'placeholders' => [],
+            ],
+        ];
+
+        $urls = $this->invokeMethod($extractor, 'buildUrls', [$baseUrl, $endpoints]);
+
+        self::assertEquals([
+            'https://api.example.com',
+            'https://api.example.com/users?page=1&limit=100&sort=name&filter=active',
+        ], $urls);
+    }
+
+    /**
+     * Call protected/private method of a class.
+     *
+     * @param object $object Instantiated object that we will run method on
+     * @param string $methodName Method name to call
+     * @param array $parameters Array of parameters to pass into method
+     * @return mixed Method return
+     */
+    private function invokeMethod(object $object, string $methodName, array $parameters = [])
+    {
+        $reflection = new \ReflectionClass(get_class($object));
+        $method = $reflection->getMethod($methodName);
+        $method->setAccessible(true);
+
+        return $method->invokeArgs($object, $parameters);
+    }
+
     protected function rmDir(string $dirPath): bool
     {
         $iterator = new \RecursiveIteratorIterator(
@@ -41024,6 +42217,288 @@ class ConfigurationTest extends ExtractorTestCase
             $path->isDir() && !$path->isLink() ? rmdir($path->getPathname()) : unlink($path->getPathname());
         }
         return rmdir($dirPath);
+    }
+
+    /**
+     * URL Validation Tests
+     */
+    private function createTestConfig(
+        string $baseUrl,
+        ?array $allowedHosts = null,
+        array $endpoints = ['/path/']
+    ): array {
+        $config = [
+            'parameters' => [
+                'api' => [
+                    'baseUrl' => $baseUrl,
+                ],
+                'config' => [
+                    'jobs' => array_map(function ($endpoint) {
+                        return ['endpoint' => $endpoint];
+                    }, $endpoints),
+                ],
+            ],
+        ];
+
+        if ($allowedHosts !== null) {
+            $config['image_parameters'] = [
+                'allowed_hosts' => array_map(function ($host) {
+                    return ['host' => $host];
+                }, $allowedHosts),
+            ];
+        }
+
+        return $config;
+    }
+
+    public function testValidateAllowedHostsExactMatch(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com/api',
+            ['https://example.com/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsDifferentQueryString(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com/api?x=1',
+            ['https://example.com/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsDifferentTrailingSlash(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com/api/',
+            ['https://example.com/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsDifferentProtocol(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com/api',
+            ['http://example.com/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        $this->expectException(UserException::class);
+        $this->invokeMethod($extractor, 'validateAllowedHosts', [$config]);
+    }
+
+    public function testValidateAllowedHostsDifferentPort(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com/api',
+            ['https://example.com:443/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        $this->expectException(UserException::class);
+        $this->invokeMethod($extractor, 'validateAllowedHosts', [$config]);
+    }
+
+    public function testValidateAllowedHostsLongerPath(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com/api/resource',
+            ['https://example.com/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsMultipleLevels(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com/api/v1/data',
+            ['https://example.com/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsTrailingSlashInWhitelist(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com/api/v1',
+            ['https://example.com/api/']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsNotRealPrefix(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com/api',
+            ['https://example.com/ap']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        $this->expectException(UserException::class);
+        $this->invokeMethod($extractor, 'validateAllowedHosts', [$config]);
+    }
+
+    public function testValidateAllowedHostsDomainVsSubdomain(): void
+    {
+        $config = $this->createTestConfig(
+            'https://sub.example.com/path',
+            ['https://example.com/']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        $this->expectException(UserException::class);
+        $this->invokeMethod($extractor, 'validateAllowedHosts', [$config]);
+    }
+
+    public function testValidateAllowedHostsIpAddressExactMatch(): void
+    {
+        $config = $this->createTestConfig(
+            'http://127.0.0.1:8080/api',
+            ['http://127.0.0.1:8080/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsIpAddressPrefixMatch(): void
+    {
+        $config = $this->createTestConfig(
+            'http://127.0.0.1:8080/api/v1/data',
+            ['http://127.0.0.1:8080/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsIpAddressDifferentPort(): void
+    {
+        $config = $this->createTestConfig(
+            'http://127.0.0.1:8000/api',
+            ['http://127.0.0.1:8080/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        $this->expectException(UserException::class);
+        $this->invokeMethod($extractor, 'validateAllowedHosts', [$config]);
+    }
+
+    public function testValidateAllowedHostsIpAddressNoPortVsPort(): void
+    {
+        $config = $this->createTestConfig(
+            'http://127.0.0.1:80/api',
+            ['http://127.0.0.1/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        $this->expectException(UserException::class);
+        $this->invokeMethod($extractor, 'validateAllowedHosts', [$config]);
+    }
+
+    public function testValidateAllowedHostsSubdomain(): void
+    {
+        $config = $this->createTestConfig(
+            'https://sub.example.com/path1',
+            ['https://sub.example.com/']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsShorterPathPrefix(): void
+    {
+        $config = $this->createTestConfig(
+            'https://sub.domain.com/path/1/2',
+            ['https://sub.domain.com/']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsNoTrailingSlash(): void
+    {
+        $config = $this->createTestConfig(
+            'https://sub.domain.com/path',
+            ['https://sub.domain.com']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsLongerPrefix(): void
+    {
+        $config = $this->createTestConfig(
+            'https://sub.domain.com/extra/data',
+            ['https://sub.domain.com/extra']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsStringPrefixNotPath(): void
+    {
+        $config = $this->createTestConfig(
+            'https://sub.domain.com/pathology',
+            ['https://sub.domain.com/path']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        $this->expectException(UserException::class);
+        $this->invokeMethod($extractor, 'validateAllowedHosts', [$config]);
+    }
+
+    public function testValidateAllowedHostsNoWhitelist(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com/api',
+            null
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsEmptyWhitelist(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com/api',
+            []
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        self::assertNull($this->invokeMethod($extractor, 'validateAllowedHosts', [$config]));
+    }
+
+    public function testValidateAllowedHostsPortPrefixNotAllowed(): void
+    {
+        $config = $this->createTestConfig(
+            'https://example.com:8/api',
+            ['https://example.com:88/api']
+        );
+
+        $extractor = new Extractor(__DIR__ . '/../data/simple_basic', new NullLogger());
+        $this->expectException(UserException::class);
+        $this->invokeMethod($extractor, 'validateAllowedHosts', [$config]);
     }
 }
 
@@ -43554,7 +45029,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
       - name: Cache Docker layers
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
           key: docker-${{ hashFiles('Dockerfile') }}-${{ github.sha }}
