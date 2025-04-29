@@ -159,15 +159,13 @@ COPY pyproject.toml .
 
 RUN uv pip install --system .
 
-COPY /src /src/
-COPY /tests /tests/
-COPY /scripts /scripts/
+COPY src src/
+COPY tests tests/
+COPY scripts scripts/
 COPY flake8.cfg .
 COPY deploy.sh .
 
-# CMD ["python", "-u", "/code/src/component.py"]
-CMD ["/bin/bash"]
-
+CMD ["python", "-u", "/code/src/component.py"]
 
 
 ================================================
@@ -1261,7 +1259,8 @@ File: component_config/configSchema.json
       "options": {
         "async": {
           "label": "Load databases",
-          "action": "list_databases"
+          "action": "list_databases",
+          "autoload": []
         }
       },
       "propertyOrder": 2
@@ -1269,12 +1268,12 @@ File: component_config/configSchema.json
     "db_schema": {
       "type": "string",
       "enum": [],
-      "title": "Database",
+      "title": "Schema",
       "format": "select",
       "options": {
         "async": {
-          "label": "Load databases",
-          "action": "list_databases"
+          "label": "Load schemas",
+          "action": "list_schemas"
         }
       },
       "propertyOrder": 3
@@ -1806,7 +1805,8 @@ class Component(ComponentBase):
 
         in_table_definition = self.get_in_table()
 
-        kbc_input_table_relation = self.create_temp_table(in_table_definition)
+        # table name is referenced in the query
+        kbc_input_table_relation = self.create_temp_table(in_table_definition)  # noqa: F841
 
         if self.params.destination.incremental:
             self.create_db_table(
@@ -1836,16 +1836,21 @@ class Component(ComponentBase):
 
             strategy = "INSERT"
 
+        columns = ", ".join(
+            [f"{col.source_name}" for col in self.params.destination.columns]
+        )
+
         self._connection.execute(f"""
         {strategy} INTO {self.params.database}.{self.params.db_schema}.{self.params.destination.table}
-        SELECT * FROM kbc_input_table_relation
+        SELECT {columns} FROM kbc_input_table_relation
         """)
 
         self._connection.close()
 
     def check_pks_consistency(self):
         """
-        Check if the primary key columns defined in the configuration match the primary key columns in the destination table.
+        Check if the primary key columns defined in the configuration
+        match the primary key columns in the destination table.
         """
         pk_selected = set(
             [col.destination_name for col in self.params.destination.columns if col.pk]
@@ -1864,12 +1869,12 @@ class Component(ComponentBase):
             )
 
     def create_db_table(
-        self,
-        database: str,
-        db_schema: str,
-        table_name: str,
-        columns_config: list[ColumnConfig],
-        mode: Literal["if_not_exists", "replace"],
+            self,
+            database: str,
+            db_schema: str,
+            table_name: str,
+            columns_config: list[ColumnConfig],
+            mode: Literal["if_not_exists", "replace"],
     ) -> None:
         """
         Creates a db table based on column definitions.
@@ -1893,7 +1898,7 @@ class Component(ComponentBase):
             if not column.nullable:
                 column_definition += " NOT NULL"
 
-            if column.default_value is not None:
+            if column.default_value is not None and column.default_value != "":
                 if column.dtype == "STRING":
                     # String values need quotes
                     column_definition += f" DEFAULT '{column.default_value}'"
@@ -1926,6 +1931,9 @@ class Component(ComponentBase):
         # Finish the query
         query += ");"
 
+        if self.params.debug:
+            logging.debug(f"Executing query: {query}")
+
         self._connection.execute(query)
 
         return
@@ -1951,7 +1959,7 @@ class Component(ComponentBase):
 
         except Exception:
             raise UserException(
-                f"Test connection failed, please check your configuration."
+                "Test connection failed, please check your configuration."
             )
 
         if not self.params.destination.preserve_insertion_order:
@@ -2005,7 +2013,7 @@ class Component(ComponentBase):
     @sync_action("return_columns_data")
     def return_columns_data(self):
         if self.params.destination.columns:
-            columns = self.params.destination.columns
+            columns = [col.model_dump() for col in self.params.destination.columns]
 
         else:
             in_table = self.get_in_table()
@@ -2026,7 +2034,7 @@ class Component(ComponentBase):
 
         return {
             "type": "data",
-            "data": {"columns": columns},
+            "data": {"destination": {"columns": columns}},
         }
 
 
@@ -2050,7 +2058,6 @@ if __name__ == "__main__":
 ================================================
 File: src/configuration.py
 ================================================
-import logging
 from enum import Enum
 from typing import Optional
 
@@ -2098,9 +2105,6 @@ class Configuration(BaseModel):
         except ValidationError as e:
             error_messages = [f"{err['loc'][0]}: {err['msg']}" for err in e.errors()]
             raise UserException(f"Validation Error: {', '.join(error_messages)}")
-
-        if self.debug:
-            logging.debug("Component will run in Debug mode")
 
 
 
