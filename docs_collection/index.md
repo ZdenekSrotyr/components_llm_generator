@@ -857,6 +857,11 @@
 - Repository: https://github.com/keboola/component-motherduck
 - Description: None
 
+### component-aiq
+- [Documentation](github/component-aiq/llm.txt)
+- Repository: https://github.com/keboola/component-aiq
+- Description: A KBC extractor for AIQ (Alpine) Ecommerce API (https://support.alpineiq.com/developer-documentation) 
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
