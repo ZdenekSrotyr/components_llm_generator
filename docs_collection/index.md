@@ -862,6 +862,11 @@
 - Repository: https://github.com/keboola/component-aiq
 - Description: A KBC extractor for AIQ (Alpine) Ecommerce API (https://support.alpineiq.com/developer-documentation) 
 
+### component-treez
+- [Documentation](github/component-treez/llm.txt)
+- Repository: https://github.com/keboola/component-treez
+- Description: A KBC extractor for Treez API (https://code.treez.io) 
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
