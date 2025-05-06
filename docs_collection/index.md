@@ -867,6 +867,11 @@
 - Repository: https://github.com/keboola/component-treez
 - Description: A KBC extractor for Treez API (https://code.treez.io) 
 
+### component-opentable
+- [Documentation](github/component-opentable/llm.txt)
+- Repository: https://github.com/keboola/component-opentable
+- Description: A KBC extractor for OpenTable API (https://docs.opentable.com)
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
