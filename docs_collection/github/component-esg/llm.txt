@@ -247,8 +247,6 @@ from typing import Any, Callable, Dict, List, Optional
 from keboola.component.exceptions import UserException
 from keboola.http_client import HttpClient
 
-BASE_URL = "https://esg-externalintegrationapi-keboola-stg.azurewebsites.net/api/"
-
 ENDPOINT_GET_CLIENTS = "ExternalIntegration/ClientData/GetClientIds"
 ENDPOINT_GET_ENTITIES_WITH_PERIODS = (
     "ExternalIntegration/ClientData/GetEntitiesWithReportingPeriods"
@@ -288,8 +286,14 @@ BATCHE_SIZE = 100
 
 
 class EsgClient(HttpClient):
-    def __init__(self, id_token: Optional[str] = None):
-        super().__init__(base_url=BASE_URL)
+    def __init__(self, component_id: str, id_token: Optional[str] = None):
+
+        if "-stage" in component_id:
+            base_url = "https://esg-externalintegrationapi-keboola-stg.azurewebsites.net/api/"
+        else:
+            base_url = "https://esg-externalintegrationapi-keboola-prod.azurewebsites.net/api/"
+
+        super().__init__(base_url=base_url, max_retries=3)
         if id_token:
             self.update_auth_header({"Authorization": f"Bearer {id_token}"})
 
@@ -370,7 +374,7 @@ class EsgClient(HttpClient):
             self.get_raw, ENDPOINT_GET_CLIENTS, "Failed to retrieve clients"
         )
 
-    def get_entities_with_periods(self, client_id: int) -> Dict[str, Any]:
+    def get_entities_with_periods(self, client_id: str) -> Dict[str, Any]:
         return self._make_request(
             self.get_raw,
             ENDPOINT_GET_ENTITIES_WITH_PERIODS,
@@ -378,7 +382,7 @@ class EsgClient(HttpClient):
             params={"clientId": client_id},
         )
 
-    def get_entities(self, client_id: int) -> Dict[str, Any]:
+    def get_entities(self, client_id: str) -> Dict[str, Any]:
         return self._make_request(
             self.get_raw,
             ENDPOINT_GET_ENTITIES,
@@ -386,7 +390,7 @@ class EsgClient(HttpClient):
             params={"clientId": client_id},
         )
 
-    def get_reporting_periods(self, client_id: int) -> Dict[str, Any]:
+    def get_reporting_periods(self, client_id: str) -> Dict[str, Any]:
         return self._make_request(
             self.get_raw,
             ENDPOINT_GET_REPORTING_PERIODS,
@@ -961,7 +965,7 @@ For information about deployment and integration with KBC, please refer to the [
 ================================================
 File: components/ex-esg-management-solution/VERSION
 ================================================
-0.0.10
+0.0.12
 
 
 ================================================
@@ -1073,6 +1077,7 @@ File: components/ex-esg-management-solution/component_config/configRowSchema.jso
   "properties": {
     "entity_period": {
       "enum": [],
+      "default": "",
       "type": "string",
       "items": {
         "enum": [],
@@ -1089,12 +1094,16 @@ File: components/ex-esg-management-solution/component_config/configRowSchema.jso
       "propertyOrder": 1
     },
     "endpoints": {
-      "enum": [
-        "templates_structure",
-        "lookup_tables"
-      ],
+      "items": {
+        "enum": [
+          "templates_structure",
+          "lookup_tables"
+        ],
+        "type": "string"
+      },
       "type": "array",
       "title": "Endpoints",
+      "format": "select",
       "default": [
         "templates_structure",
         "lookup_tables"
@@ -1106,27 +1115,8 @@ File: components/ex-esg-management-solution/component_config/configRowSchema.jso
         ]
       },
       "required": true,
+      "uniqueItems": true,
       "propertyOrder": 2
-    },
-    "template_id": {
-      "enum": [],
-      "type": "string",
-      "items": {
-        "enum": [],
-        "type": "string"
-      },
-      "title": "Report Template ID",
-      "options": {
-        "async": {
-          "cache": false,
-          "label": "List Templates",
-          "action": "list_templates"
-        },
-        "dependencies": {
-          "endpoint": "generic"
-        }
-      },
-      "propertyOrder": 3
     },
     "debug": {
       "type": "boolean",
@@ -1152,6 +1142,7 @@ File: components/ex-esg-management-solution/component_config/configSchema.json
   "properties": {
     "client_id": {
       "enum": [],
+      "default": "",
       "type": "string",
       "items": {
         "enum": [],
@@ -1686,7 +1677,7 @@ class Component(ComponentBase):
         self.client = None
 
     def run(self):
-        self.client = EsgClient(self.refresh_tokens())
+        self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
 
         templates = self.client.get_template_structure()
 
@@ -1790,9 +1781,10 @@ class Component(ComponentBase):
 
         for template in templates:
             template_id = template.get("templateId", "")
-            template_name = template.get("templateName", "").replace(" ", "_")
+            template_name = (template.get("templateName", "")
+                             .replace(" ", "").replace(",", "").replace("(", "-").replace(")", ""))
 
-            file_name = f"template_{template_id}_{template_name}.csv"
+            file_name = f"template_{template_id}-{template_name}.csv"
             out_table = self.create_out_table_definition(
                 name=file_name,
                 schema=[
@@ -1841,7 +1833,7 @@ class Component(ComponentBase):
     def list_clients(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
-            self.client = EsgClient(self.refresh_tokens())
+            self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
             clients = self.client.get_clients()
             return [
                 SelectElement(value=f"{client['id']}-{client['name']}")
@@ -1852,7 +1844,7 @@ class Component(ComponentBase):
     def list_entities_with_periods(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
-            self.client = EsgClient(self.refresh_tokens())
+            self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
             data = self.client.get_entities_with_periods(self.params.client_id)
 
             return [
@@ -1865,7 +1857,7 @@ class Component(ComponentBase):
     def list_entities(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
-            self.client = EsgClient(self.refresh_tokens())
+            self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
             entities = self.client.get_entities(self.params.client_id)
             return [
                 SelectElement(value=f"{value}-{label}")
@@ -1876,7 +1868,7 @@ class Component(ComponentBase):
     def list_reporting_periods(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
-            self.client = EsgClient(self.refresh_tokens())
+            self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
             entities = self.client.get_reporting_periods(self.params.client_id)
             return [
                 SelectElement(value=f"{value}-{label}")
@@ -1887,7 +1879,7 @@ class Component(ComponentBase):
     def list_templates(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
-            self.client = EsgClient(self.refresh_tokens())
+            self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
             templates = self.client.get_template_structure()
             return [
                 SelectElement(value=f"{val['templateId']}-{val['templateName']}")
@@ -1928,10 +1920,9 @@ class Configuration(BaseModel):
     reporting_period_id: int = 0
     entity_id: int = 0
     endpoints: list[str] = ["templates_structure", "lookup_tables"]
-    template_id: str = ""
     debug: bool = False
 
-    @field_validator("client_id", "template_id")
+    @field_validator("client_id")
     def split_id_string(cls, v):
         if v != "" and isinstance(v, str):
             return int(v.split("-", 1)[0])
@@ -2371,7 +2362,7 @@ For information about deployment and integration with KBC, please refer to the [
 ================================================
 File: components/wr-esg-management-solution/VERSION
 ================================================
-0.0.10
+0.0.12
 
 
 ================================================
@@ -2482,6 +2473,7 @@ File: components/wr-esg-management-solution/component_config/configRowSchema.jso
   "properties": {
     "entity_period": {
       "enum": [],
+      "default": "",
       "type": "string",
       "items": {
         "enum": [],
@@ -2572,6 +2564,7 @@ File: components/wr-esg-management-solution/component_config/configSchema.json
   "properties": {
     "client_id": {
       "enum": [],
+      "default": "",
       "type": "string",
       "items": {
         "enum": [],
@@ -3105,7 +3098,7 @@ class Component(ComponentBase):
         self.client = None
 
     def run(self):
-        self.client = EsgClient(self.refresh_tokens())
+        self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
 
         endpoint_to_method = {
             "franchises": self.import_franchises_ui_data,
@@ -3494,7 +3487,7 @@ class Component(ComponentBase):
     def list_clients(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
-            self.client = EsgClient(self.refresh_tokens())
+            self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
             clients = self.client.get_clients()
             return [
                 SelectElement(value=f"{client['id']}-{client['name']}")
@@ -3505,7 +3498,7 @@ class Component(ComponentBase):
     def list_entities_with_periods(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
-            self.client = EsgClient(self.refresh_tokens())
+            self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
             data = self.client.get_entities_with_periods(self.params.client_id)
 
             return [
@@ -3518,7 +3511,7 @@ class Component(ComponentBase):
     def list_entities(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
-            self.client = EsgClient(self.refresh_tokens())
+            self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
             entities = self.client.get_entities(self.params.client_id)
             return [
                 SelectElement(value=f"{value}-{label}")
@@ -3529,7 +3522,7 @@ class Component(ComponentBase):
     def list_reporting_periods(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
-            self.client = EsgClient(self.refresh_tokens())
+            self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
             entities = self.client.get_reporting_periods(self.params.client_id)
             return [
                 SelectElement(value=f"{value}-{label}")
@@ -3540,7 +3533,7 @@ class Component(ComponentBase):
     def list_templates(self) -> list[SelectElement]:
         out = StringIO()
         with pipes(stdout=out, stderr=out):
-            self.client = EsgClient(self.refresh_tokens())
+            self.client = EsgClient(self.environment_variables.component_id, self.refresh_tokens())
             templates = self.client.get_template_structure()
             return [
                 SelectElement(value=f"{val['templateId']}-{val['templateName']}")
