@@ -42,11 +42,6 @@
 - Repository: https://github.com/keboola/component-generator
 - Description: Tool for creating Keboola Connection components
 
-### ex-docs-tutorial
-- [Documentation](github/ex-docs-tutorial/llm.txt)
-- Repository: https://github.com/keboola/ex-docs-tutorial
-- Description: Tutorial Component
-
 ### ex-email-attachments-lambda
 - [Documentation](github/ex-email-attachments-lambda/llm.txt)
 - Repository: https://github.com/keboola/ex-email-attachments-lambda
@@ -60,11 +55,6 @@
 ### wr-storage
 - [Documentation](github/wr-storage/llm.txt)
 - Repository: https://github.com/keboola/wr-storage
-- Description: None
-
-### component-bitbucket-pipelines-test
-- [Documentation](github/component-bitbucket-pipelines-test/llm.txt)
-- Repository: https://github.com/keboola/component-bitbucket-pipelines-test
 - Description: None
 
 ### ex-storage
@@ -86,16 +76,6 @@
 - [Documentation](github/ex-mpsv-unemployment/llm.txt)
 - Repository: https://github.com/keboola/ex-mpsv-unemployment
 - Description: None
-
-### ex-police-cz-accidents
-- [Documentation](github/ex-police-cz-accidents/llm.txt)
-- Repository: https://github.com/keboola/ex-police-cz-accidents
-- Description: Extractor for accidents statistics in Czech Republic
-
-### ex-jh-csse-covid-19
-- [Documentation](github/ex-jh-csse-covid-19/llm.txt)
-- Repository: https://github.com/keboola/ex-jh-csse-covid-19
-- Description: Extracts data from https://github.com/CSSEGISandData/COVID-19 into keboola storage
 
 ### wr-daktela-covid
 - [Documentation](github/wr-daktela-covid/llm.txt)

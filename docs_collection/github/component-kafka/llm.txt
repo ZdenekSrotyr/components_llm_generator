@@ -218,7 +218,18 @@ Directory structure:
     │               │           └── tables/
     │               │               ├── test.csv
     │               │               └── test.csv.manifest
-    │               └── text/
+    │               ├── text/
+    │               │   ├── expected/
+    │               │   │   └── out.csv
+    │               │   └── source/
+    │               │       ├── config.json
+    │               │       └── in/
+    │               │           ├── files/
+    │               │           │   └── .gitkeep
+    │               │           └── tables/
+    │               │               ├── test.csv
+    │               │               └── test.csv.manifest
+    │               └── text-key-from-config/
     │                   ├── expected/
     │                   │   └── out.csv
     │                   └── source/
@@ -341,7 +352,7 @@ def build_configuration(
                 "session.timeout.ms": 6000,
                 # we are controlling offset ourselves, by default start from start
                 "auto.offset.reset": "earliest",
-                "enable.auto.commit": True,
+                "enable.auto.commit": False,
             }
         )
 
@@ -943,6 +954,40 @@ File: components/ex-kafka/component_config/configRowSchema.json
         }
       },
       "propertyOrder": 8
+    },
+    "destination": {
+      "type": "object",
+      "title": "Destination",
+      "required": [
+        "load_type"
+      ],
+      "properties": {
+        "load_type": {
+          "enum": [
+            "incremental_load",
+            "full_load"
+          ],
+          "type": "string",
+          "title": "Load Type",
+          "default": "incremental_load",
+          "options": {
+            "enum_titles": [
+              "Incremental Load",
+              "Full Load"
+            ]
+          },
+          "description": "If Full load is used, the destination table will be overwritten every run. If Incremental Load is used, data will be upserted into the destination table based on the primary key. Append modes do not contain any primary keys and are not deduplicated.",
+          "propertyOrder": 91
+        },
+        "table_name": {
+          "type": "string",
+          "title": "Table name",
+          "default": "",
+          "description": "(Optional) Specify the table name. If left blank, the topic name will be used.",
+          "propertyOrder": 92
+        }
+      },
+      "propertyOrder": 9
     }
   }
 }
@@ -1042,7 +1087,7 @@ File: components/ex-kafka/component_config/configSchema.json
     },
     "#ssl_ca": {
       "type": "string",
-      "format": "password",
+      "format": "textarea",
       "title": "SSL CA",
       "options": {
         "tooltip": "Insert the entire contents of the .pem file, including newlines. Once saved, the value will be encrypted.",
@@ -1057,7 +1102,7 @@ File: components/ex-kafka/component_config/configSchema.json
     },
     "#ssl_key": {
       "type": "string",
-      "format": "password",
+      "format": "textarea",
       "title": "SSL Key",
       "options": {
         "tooltip": "Insert the entire contents of the .pem file, including newlines. Once saved, the value will be encrypted.",
@@ -1072,7 +1117,7 @@ File: components/ex-kafka/component_config/configSchema.json
     },
     "#ssl_certificate": {
       "type": "string",
-      "format": "password",
+      "format": "textarea",
       "title": "SSL Certificate",
       "options": {
         "tooltip": "Insert the entire contents of the .pem file, including newlines. Once saved, the value will be encrypted.",
@@ -1090,12 +1135,6 @@ File: components/ex-kafka/component_config/configSchema.json
       "title": "Additional Kafka parameters",
       "description": "Dictionary of additional <a href='https://kafka.apache.org/documentation/#configuration'>Kafka parameters</a> in the format {\"auto.offset.reset\": \"earliest\", \"session.timeout.ms\": 6000\n} ",
       "propertyOrder": 9
-    },
-    "group_id": {
-      "type": "string",
-      "title": "Group ID",
-      "description": "Group ID for the consumer",
-      "propertyOrder": 10
     }
   }
 }
@@ -1572,6 +1611,7 @@ from typing import TextIO
 
 import fastavro
 import polars
+from confluent_kafka import KafkaException
 from common.kafka_client import KafkaConsumer
 from configuration import Configuration
 from confluent_kafka.schema_registry import SchemaRegistryClient
@@ -1618,39 +1658,49 @@ class Component(ComponentBase):
          See https://github.com/edenhill/librdkafka/wiki/Statistics” for more information.
         """
 
-        self.params = Configuration(**self.configuration.parameters)
-        self._validate_stack_params()
+        try:
+            self.params = Configuration(**self.configuration.parameters)
+            self._validate_stack_params()
 
-        self.params.group_id = (
-            f"kbc-proj-{self.environment_variables.project_id or 'local'}-{self.environment_variables.config_row_id}"
-        )
-        self.params.client_id = f"kbc-config-{self.environment_variables.config_row_id or 'local'}"
+            self.params.group_id = (f"kbc-proj-{self.environment_variables.project_id or 'local'}-"
+                                    f"{self.environment_variables.config_row_id}")
+            self.params.client_id = f"kbc-config-{self.environment_variables.config_row_id or 'local'}"
 
-        # Generating a string out of the list
-        bootstrap_servers = ",".join(self.params.bootstrap_servers)
+            # Generating a string out of the list
+            bootstrap_servers = ",".join(self.params.bootstrap_servers)
 
-        self.columns = self.get_state_file().get("columns", dict())
-        self.latest_offsets = self.get_state_file().get("prev_offsets", dict())
+            self.columns = self.get_state_file().get("columns", dict())
+            self.latest_offsets = self.get_state_file().get("prev_offsets", dict())
 
-        self.client = self._init_client(debug, self.params, self.latest_offsets, bootstrap_servers)
+            self.client = self._init_client(debug, self.params, self.latest_offsets, bootstrap_servers)
 
-        logging.info("Extracting data from topics {0}".format(self.params.topics))
-        start_time = time.time()
+            logging.info("Extracting data from topics {0}".format(self.params.topics))
+            start_time = time.time()
 
-        for topic in self.params.topics:
-            msg_cnt, res_file_folder, schema = self.consume_topic(topic)
-            self.topics[topic] = {"msg_cnt": msg_cnt, "res_file_folder": res_file_folder, "schema": schema}
+            for topic in self.params.topics:
+                msg_cnt, res_file_folder, schema = self.consume_topic(topic)
+                self.topics[topic] = {
+                    "msg_cnt": msg_cnt,
+                    "res_file_folder": res_file_folder,
+                    "schema": schema,
+                }
 
-        self.close_all_writers()
-        logging.info(f"Extraction finished in {time.time() - start_time:.2f} seconds")
+            self.close_all_writers()
+            logging.info(f"Extraction finished in {time.time() - start_time:.2f} seconds")
 
-        # Store previous offsets and columns
-        state_dict = {"prev_offsets": self.latest_offsets, "columns": self.columns}
-        self.write_state_file(state_dict)
-        logging.info("Offset file stored.")
+            # Store previous offsets and columns
+            state_dict = {"prev_offsets": self.latest_offsets, "columns": self.columns}
+            self.write_state_file(state_dict)
+            logging.info("Offset file stored.")
 
-        self.produce_manifest()
-        logging.info("Extraction finished.")
+            self.produce_manifest()
+            logging.info("Extraction finished.")
+        except KafkaException as e:
+            raise UserException(f"Kafka Exception: {str(e)}")
+        finally:
+            if self.client.consumer:
+                self.client.consumer.close()
+                logging.info("Kafka client closed.")
 
     def _validate_stack_params(self):
         image_parameters = self.configuration.image_parameters or {}
@@ -1677,7 +1727,11 @@ class Component(ComponentBase):
             if consumed["msg_cnt"] > 0:
                 logging.info(f"Fetched {consumed['msg_cnt']} messages from topic - {topic}")
                 out_table = self.create_out_table_definition(
-                    consumed["res_file_folder"], is_sliced=True, primary_key=RESULT_PK, schema=schema, incremental=True
+                    consumed["res_file_folder"],
+                    is_sliced=True,
+                    primary_key=RESULT_PK,
+                    schema=schema,
+                    incremental=self.params.destination.incremental,
                 )
 
                 self.write_manifest(out_table)
@@ -1692,7 +1746,8 @@ class Component(ComponentBase):
         elif self.params.deserialize == "avro" and self.params.schema_str:
             self.schema = fastavro.schema.parse_schema(json.loads(self.params.schema_str))
 
-        res_file_folder = os.path.join(self.tables_out_path, topic)
+        table_name = self.params.destination.table_name or topic
+        res_file_folder = os.path.join(self.tables_out_path, table_name)
         msg_cnt = 0
         last_message = None
         dtypes = []
@@ -1858,7 +1913,6 @@ class Component(ComponentBase):
         bootstrap_servers = ",".join(self.params.bootstrap_servers)
 
         c = self._init_client(False, self.params, dict(), bootstrap_servers)
-        deserializer = self.get_deserializer()
         last_message = None
         topic = self.params.topics[0]
         for msg in c.consume_message_batch(topic):
@@ -1868,7 +1922,7 @@ class Component(ComponentBase):
                 logging.error("Consumer error: {}".format(msg.error()))
                 continue
 
-            extracted_data, _ = self.get_message_data(deserializer, last_message, msg, topic)
+            extracted_data, _ = self.get_message_data(last_message, msg, topic)
 
             polars.Config.set_tbl_formatting("ASCII_MARKDOWN")
             polars.Config.set_tbl_hide_dataframe_shape(True)
@@ -1903,12 +1957,22 @@ import logging
 from enum import Enum
 
 from keboola.component.exceptions import UserException
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, computed_field
 
 
-class Units(str, Enum):
-    metric = "metric"
-    imperial = "imperial"
+class LoadType(str, Enum):
+    full_load = "full_load"
+    incremental_load = "incremental_load"
+
+
+class Destination(BaseModel):
+    load_type: LoadType = Field(default=LoadType.incremental_load)
+    table_name: str | None = None
+
+    @computed_field
+    @property
+    def incremental(self) -> bool:
+        return self.load_type is LoadType.incremental_load
 
 
 class Configuration(BaseModel):
@@ -1933,10 +1997,12 @@ class Configuration(BaseModel):
     kafka_extra_params: str = Field(default=None)
 
     deserialize: str = Field(default=None)
-    flatten_message_value_columns: bool = True
+    flatten_message_value_columns: bool = False
     schema_str: str = Field(default=None)
     schema_registry_url: str = Field(default=None)
     schema_registry_extra_params: str = Field(default={})
+
+    destination: Destination = Field(default_factory=Destination)
 
     debug: bool = False
     freeze_timestamp: bool = False
@@ -2888,6 +2954,23 @@ File: components/wr-kafka/component_config/configRowSchema.json
       },
       "propertyOrder": 7
     },
+    "key_source": {
+      "enum": [
+        "input_table",
+        "configuration"
+      ],
+      "type": "string",
+      "title": "Messages Key Source",
+      "default": "from_input_table",
+      "options": {
+        "enum_titles": [
+          "Input Table",
+          "Configuration"
+        ]
+      },
+      "description": "Key of the messages can either be specified for each message in the input table, or defined once for the entire table.",
+      "propertyOrder": 8
+    },
     "key_column_name": {
       "type": "string",
       "title": "Key column name",
@@ -2895,7 +2978,22 @@ File: components/wr-kafka/component_config/configRowSchema.json
         "columns": "_metadata_.table.columns"
       },
       "enumSource": "columns",
-      "propertyOrder": 8
+      "options": {
+        "dependencies": {
+          "key_source": "input_table"
+        }
+      },
+      "propertyOrder": 9
+    },
+    "key_value": {
+      "type": "string",
+      "title": "Key",
+      "options": {
+        "dependencies": {
+          "key_source": "configuration"
+        }
+      },
+      "propertyOrder": 10
     },
     "value_column_names": {
       "type": "array",
@@ -2913,7 +3011,7 @@ File: components/wr-kafka/component_config/configRowSchema.json
         "tags": true
       },
       "uniqueItems": true,
-      "propertyOrder": 9
+      "propertyOrder": 11
     }
   }
 }
@@ -3013,7 +3111,7 @@ File: components/wr-kafka/component_config/configSchema.json
     },
     "#ssl_ca": {
       "type": "string",
-      "format": "password",
+      "format": "textarea",
       "title": "SSL CA",
       "options": {
         "tooltip": "Insert the entire contents of the .pem file, including newlines. Once saved, the value will be encrypted.",
@@ -3028,7 +3126,7 @@ File: components/wr-kafka/component_config/configSchema.json
     },
     "#ssl_key": {
       "type": "string",
-      "format": "password",
+      "format": "textarea",
       "title": "SSL Key",
       "options": {
         "tooltip": "Insert the entire contents of the .pem file, including newlines. Once saved, the value will be encrypted.",
@@ -3043,7 +3141,7 @@ File: components/wr-kafka/component_config/configSchema.json
     },
     "#ssl_certificate": {
       "type": "string",
-      "format": "password",
+      "format": "textarea",
       "title": "SSL Certificate",
       "options": {
         "tooltip": "Insert the entire contents of the .pem file, including newlines. Once saved, the value will be encrypted.",
@@ -3533,7 +3631,7 @@ import time
 
 import fastavro
 from common.kafka_client import KafkaProducer
-from configuration import Configuration
+from configuration import Configuration, KeySource
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
 from confluent_kafka.serialization import MessageField, SerializationContext
@@ -3616,7 +3714,11 @@ class Component(ComponentBase):
 
     def write_line(self, row):
         topic = self.params.topic
-        key = row.get(self.params.key_column_name, None)
+
+        if self.params.key_source == KeySource.configuration:
+            key = self.params.key
+        else:
+            key = row.get(self.params.key_column_name)
 
         if self.params.value_column_names:
             value = {col: row[col] for col in self.params.value_column_names}
@@ -3759,9 +3861,9 @@ from keboola.component.exceptions import UserException
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 
-class Units(str, Enum):
-    metric = "metric"
-    imperial = "imperial"
+class KeySource(str, Enum):
+    table = "input_table"
+    configuration = "configuration"
 
 
 class Configuration(BaseModel):
@@ -3782,6 +3884,8 @@ class Configuration(BaseModel):
 
     kafka_extra_params: str = Field(default=None)
 
+    key_source: KeySource = Field(default=KeySource.table)
+    key: str = ""
     key_column_name: str = ""
     value_column_names: list[str] = []
     serialize: str = Field(default=None)
@@ -4082,6 +4186,61 @@ class TestKafkaWriter(unittest.TestCase):
             self.assertEqual(
                 expected_item, consumed_messages_sorted[i], f"Message at index {i} doesn't match expected data"
             )
+
+    def test_text_key_from_config(self):
+        data_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "test-data", "text-key-from-config", "source"
+        )
+        os.environ["KBC_DATADIR"] = data_dir
+        topic = "test-text-key-from-config"
+
+        component = Component()
+        component.execute_action()
+        time.sleep(2)
+
+        self.consumer.subscribe([topic])
+
+        # Read expected output data for comparison
+        expected_output_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "test-data", "text-key-from-config", "expected", "out.csv"
+        )
+
+        expected = polars.read_csv(expected_output_path, infer_schema=False).to_dicts()
+
+        # Consume messages and verify
+        consumed_messages = []
+        consumed_message_keys = []
+        for _ in range(len(expected)):
+            msg = self.consumer.poll(timeout=5.0)
+            if msg is None or msg.error():
+                if msg and msg.error().code() != KafkaError._PARTITION_EOF:
+                    print(f"Consumer error: {msg.error()}")
+                break
+
+            # Decode the text message - which is a string representation of a dictionary
+            text_value = msg.value().decode("utf-8")
+
+            json_str = text_value.replace("'", '"')
+            dict_value = json.loads(json_str)
+            consumed_messages.append(dict_value)
+            consumed_message_keys.append(msg.key().decode("utf-8"))
+
+        time.sleep(1)
+
+        self.assertEqual(
+            len(expected), len(consumed_messages), "Number of consumed messages doesn't match expected count"
+        )
+
+        # Sort by row_number for comparison
+        consumed_messages_sorted = sorted(consumed_messages, key=lambda x: x["row_number"])
+
+        for i, expected_item in enumerate(expected):
+            self.assertEqual(
+                expected_item, consumed_messages_sorted[i], f"Message at index {i} doesn't match expected data"
+            )
+
+        for key in consumed_message_keys:
+            self.assertEqual(key, "config")
 
 
 if __name__ == "__main__":
@@ -4713,6 +4872,182 @@ row_number,order_id,order_date,order_amount,discount,is_active,double,large_numb
 
 ================================================
 File: components/wr-kafka/tests/test-data/text/source/in/tables/test.csv.manifest
+================================================
+{
+    "id": "in.c-test.test",
+    "uri": "https:\/\/connection.keboola.com\/v2\/storage\/tables\/in.c-test.test",
+    "name": "test",
+    "primary_key": [],
+    "indexed_columns": [],
+    "created": "2018-03-02T15:36:50+0100",
+    "last_change_date": "2018-03-02T15:36:54+0100",
+    "last_import_date": "2018-03-02T15:36:54+0100",
+    "rows_count": 0,
+    "data_size_bytes": 0,
+    "is_alias": false,
+    "attributes": [],
+    "columns": [
+        "Type",
+        "Campaign_Name",
+        "Status",
+        "Start_Date",
+        "End_Date",
+        "Location",
+        "Eventbrite_link"
+    ],
+    "metadata": [
+        {
+            "id": "18271581",
+            "key": "KBC.createdBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271582",
+            "key": "KBC.createdBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271583",
+            "key": "KBC.createdBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271584",
+            "key": "KBC.lastUpdatedBy.component.id",
+            "value": "transformation",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271585",
+            "key": "KBC.lastUpdatedBy.configuration.id",
+            "value": "361585608",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        },
+        {
+            "id": "18271586",
+            "key": "KBC.lastUpdatedBy.configurationRow.id",
+            "value": "361585762",
+            "provider": "system",
+            "timestamp": "2018-03-02T15:37:02+0100"
+        }
+    ],
+    "column_metadata": {
+        "Type": [],
+        "Campaign_Name": [],
+        "Status": [],
+        "Start_Date": [],
+        "End_Date": [],
+        "Location": [],
+        "Eventbrite_link": []
+    }
+}
+
+
+================================================
+File: components/wr-kafka/tests/test-data/text-key-from-config/expected/out.csv
+================================================
+row_number,order_id,order_date,order_amount,discount,is_active,double,large_number,text
+0,808506,2023-11-16 00:00:00,520.51,18.262887468686788,false,44.0,673.4837458553,How to become data driven startup
+1,758947,2023-02-25 00:00:00,373.86,68.8059867307161,true,21.0,164.21723799795552,How to become data driven startup
+2,60315,2023-07-10 00:00:00,716.22,64.2938330619118,false,248.0,700.8516405625297,How to become data driven startup
+3,850246,2023-07-18 00:00:00,58.62,0.194284303705944,false,212.0,990.4052700964274,How to become data driven startup
+4,508901,2023-04-23 00:00:00,707.71,9.52141773345853,true,12.0,639.231729595647,How to become data driven startup
+5,102927,2023-11-18 00:00:00,555.48,11.092530453096563,false,147.0,47.10262779763779,How to become data driven startup
+6,375233,2023-08-18 00:00:00,361.69,2.1320653388631685,false,145.0,201.7044334924421,How to become data driven startup
+7,223395,2023-12-17 00:00:00,389.18,61.253579915811365,false,113.0,749.0221098337806,How to become data driven startup
+8,759929,2023-04-27 00:00:00,786.86,82.92406137613816,true,179.0,137.3460257427445,How to become data driven startup
+9,719033,2023-12-06 00:00:00,889.77,94.50768506025176,true,187.0,743.8016684636447,How to become data driven startup
+
+
+================================================
+File: components/wr-kafka/tests/test-data/text-key-from-config/source/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "files": [],
+      "tables": [
+        {
+          "source": "in.c-test.test",
+          "destination": "test.csv",
+          "limit": 50,
+          "columns": [],
+          "where_values": [],
+          "where_operator": "eq"
+        }
+      ]
+    },
+    "output": {
+      "files": [],
+      "tables": []
+    }
+  },
+  "parameters": {
+    "bootstrap_servers": ["broker:9092"],
+    "topic": "test-text-key-from-config",
+    "key_source": "configuration",
+    "key": "config",
+    "value_column_names": ["row_number", "order_id", "order_date", "order_amount", "discount", "is_active", "double", "large_number", "text"],
+    "serialize": "text",
+    "debug": true
+  },
+  "image_parameters": {
+    "syrup_url": "https://syrup.keboola.com/"
+  },
+  "authorization": {
+    "oauth_api": {
+      "id": "OAUTH_API_ID",
+      "credentials": {
+        "id": "main",
+        "authorizedFor": "Myself",
+        "creator": {
+          "id": "1234",
+          "description": "me@keboola.com"
+        },
+        "created": "2016-01-31 00:13:30",
+        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
+        "oauthVersion": "2.0",
+        "appKey": "000000004C184A49",
+        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+      }
+    }
+  }
+}
+
+
+
+================================================
+File: components/wr-kafka/tests/test-data/text-key-from-config/source/in/files/.gitkeep
+================================================
+
+
+
+================================================
+File: components/wr-kafka/tests/test-data/text-key-from-config/source/in/tables/test.csv
+================================================
+row_number,order_id,order_date,order_amount,discount,is_active,double,large_number,text
+0,808506,2023-11-16 00:00:00,520.51,18.262887468686788,false,44.0,673.4837458553,How to become data driven startup
+1,758947,2023-02-25 00:00:00,373.86,68.8059867307161,true,21.0,164.21723799795552,How to become data driven startup
+2,60315,2023-07-10 00:00:00,716.22,64.2938330619118,false,248.0,700.8516405625297,How to become data driven startup
+3,850246,2023-07-18 00:00:00,58.62,0.194284303705944,false,212.0,990.4052700964274,How to become data driven startup
+4,508901,2023-04-23 00:00:00,707.71,9.52141773345853,true,12.0,639.231729595647,How to become data driven startup
+5,102927,2023-11-18 00:00:00,555.48,11.092530453096563,false,147.0,47.10262779763779,How to become data driven startup
+6,375233,2023-08-18 00:00:00,361.69,2.1320653388631685,false,145.0,201.7044334924421,How to become data driven startup
+7,223395,2023-12-17 00:00:00,389.18,61.253579915811365,false,113.0,749.0221098337806,How to become data driven startup
+8,759929,2023-04-27 00:00:00,786.86,82.92406137613816,true,179.0,137.3460257427445,How to become data driven startup
+9,719033,2023-12-06 00:00:00,889.77,94.50768506025176,true,187.0,743.8016684636447,How to become data driven startup
+
+
+================================================
+File: components/wr-kafka/tests/test-data/text-key-from-config/source/in/tables/test.csv.manifest
 ================================================
 {
     "id": "in.c-test.test",
