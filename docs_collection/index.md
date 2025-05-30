@@ -852,6 +852,11 @@
 - Repository: https://github.com/keboola/component-opentable
 - Description: A KBC extractor for OpenTable API (https://docs.opentable.com)
 
+### component-crewai-agentic-flow
+- [Documentation](github/component-crewai-agentic-flow/llm.txt)
+- Repository: https://github.com/keboola/component-crewai-agentic-flow
+- Description: Dynamically runs CrewAI agent-based workflows in Keboola using YAML-defined flows stored in a remote Git repository. Supports input from tables or files and outputs structured results for further automation.
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
