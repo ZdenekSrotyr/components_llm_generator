@@ -857,6 +857,11 @@
 - Repository: https://github.com/keboola/component-crewai-agentic-flow
 - Description: Dynamically runs CrewAI agent-based workflows in Keboola using YAML-defined flows stored in a remote Git repository. Supports input from tables or files and outputs structured results for further automation.
 
+### component-meta
+- [Documentation](github/component-meta/llm.txt)
+- Repository: https://github.com/keboola/component-meta
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
