@@ -862,6 +862,11 @@
 - Repository: https://github.com/keboola/component-meta
 - Description: None
 
+### component-data-gateway
+- [Documentation](github/component-data-gateway/llm.txt)
+- Repository: https://github.com/keboola/component-data-gateway
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
