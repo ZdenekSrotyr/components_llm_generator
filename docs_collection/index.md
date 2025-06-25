@@ -862,6 +862,16 @@
 - Repository: https://github.com/keboola/component-meta
 - Description: None
 
+### component-custom-python-example-repo-1
+- [Documentation](github/component-custom-python-example-repo-1/llm.txt)
+- Repository: https://github.com/keboola/component-custom-python-example-repo-1
+- Description: None
+
+### component-custom-python-example-repo-2
+- [Documentation](github/component-custom-python-example-repo-2/llm.txt)
+- Repository: https://github.com/keboola/component-custom-python-example-repo-2
+- Description: None
+
 ### component-data-gateway
 - [Documentation](github/component-data-gateway/llm.txt)
 - Repository: https://github.com/keboola/component-data-gateway
