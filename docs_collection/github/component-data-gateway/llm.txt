@@ -1830,6 +1830,7 @@ from datetime import datetime
 from kbcstorage.client import Client
 from keboola.component.base import ComponentBase
 from keboola.component.exceptions import UserException
+from keboola.utils.date import get_past_date
 from requests import HTTPError
 
 from configuration import Configuration
@@ -1848,6 +1849,7 @@ class Component(ComponentBase):
         )
 
     def run(self):
+        start_timestamp = time.time()
         workspace_id = self.client.configurations.list_config_workspaces(
             "keboola.app-data-gateway",
             self.environment_variables.config_id,
@@ -1872,6 +1874,7 @@ class Component(ComponentBase):
 
             match job["status"]:
                 case "error":
+                    logging.debug(f"Table mapping: {table_mapping}")
                     raise UserException(f"Job {job['id']} failed with error: {job.get('error', {}).get('message')}")
                 case "success":
                     created = datetime.fromisoformat(job["createdTime"])
@@ -1882,10 +1885,12 @@ class Component(ComponentBase):
                         f"{(start - created).seconds}s and processed {(end - start).seconds}s."
                     )
 
-        except HTTPError as exc:
-            raise UserException(f"Loading table failed: {exc.response.text}")
-        except Exception as exc:
-            raise UserException(f"Loadiing table failed: {str(exc)}")
+            self.write_state_file({"last_run": start_timestamp})
+
+        except HTTPError as e:
+            raise UserException(f"Loading table failed: {e.response.text}")
+        except Exception as e:
+            raise UserException(f"Loadiing table failed: {str(e)}")
 
     def build_table_mapping(self) -> list[dict]:
         """
@@ -1896,6 +1901,14 @@ class Component(ComponentBase):
         tbl.destination = self.params.destination_table_name
         tbl.incremental = self.params.incremental
         tbl.overwrite = False if self.params.incremental else tbl.overwrite
+
+        if tbl.changed_since == "adaptive":
+            tbl.changed_since = self.get_state_file().get("last_run")
+        elif tbl.changed_since:
+            try:
+                tbl.changed_since = get_past_date(tbl.changed_since).timestamp()
+            except Exception as e:
+                raise UserException(f"Invalid 'changedSince' value: {tbl.changed_since}. Error: {str(e)}")
 
         tbl.columns = []
 
@@ -1995,7 +2008,6 @@ from typing import Optional
 class BaseConfigModel(BaseModel):
     class Config:
         validate_by_name = True
-        populate_by_name = True
 
 
 class Column(BaseConfigModel):
@@ -2014,7 +2026,7 @@ class Table(BaseConfigModel):
     where_values: list[str] = Field(default_factory=list, alias="whereValues")
     where_operator: Optional[str] = Field(default=None, alias="whereOperator")
     columns: Optional[list[Column] | list[str]] = Field(default_factory=list)
-    changed_since: Optional[str] = Field(default=None, alias="changedSince")
+    changed_since: Optional[str | float] = Field(default=None, alias="changedSince")
     keep_internal_timestamp_column: bool = Field(default=False, exclude=True)
     overwrite: bool = Field(default=True, alias="overwrite")
     incremental: bool = Field(default=False)
