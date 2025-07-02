@@ -141,7 +141,25 @@ Directory structure:
     │   │   │               └── tables/
     │   │   │                   ├── data.csv
     │   │   │                   └── data.csv.manifest
+    │   │   ├── write-column-value-mode-json-partition-key/
+    │   │   │   ├── expected-stdout
+    │   │   │   └── source/
+    │   │   │       └── data/
+    │   │   │           ├── config.json
+    │   │   │           └── in/
+    │   │   │               └── tables/
+    │   │   │                   ├── data.csv
+    │   │   │                   └── data.csv.manifest
     │   │   ├── write-column-value-mode-json-properties/
+    │   │   │   ├── expected-stdout
+    │   │   │   └── source/
+    │   │   │       └── data/
+    │   │   │           ├── config.json
+    │   │   │           └── in/
+    │   │   │               └── tables/
+    │   │   │                   ├── data.csv
+    │   │   │                   └── data.csv.manifest
+    │   │   ├── write-column-value-mode-json-properties-partition-key/
     │   │   │   ├── expected-stdout
     │   │   │   └── source/
     │   │   │       └── data/
@@ -247,6 +265,7 @@ The configuration `config.json` contains following properties in `parameters` ke
     - `column_value` - Message is value of the defined `column`, eg. `John`.
 - `column` - string (optional): Name of the column for `mode` = `column_value`.
 - `propertiesColumns` - string (optional): Name of the column with properties (correlationId, messageId, ...) in JSON format for `mode` = `column_value`.
+- `partitionKeyColumn` - string (optional): Name of the column for partition key. If not set, the partition key is not used. Messages with the same partition key will be batched together.
 
 
 ## Development
@@ -4629,8 +4648,8 @@ RUN docker-php-ext-install sockets \
     && docker-php-ext-install pcntl
 
 # Install ext-event for react-php
-RUN pecl install event \
-    && docker-php-ext-enable event --ini-name zz-event.ini event
+#RUN pecl install event \
+#    && docker-php-ext-enable event --ini-name zz-event.ini event
 
 ENV LANGUAGE=en_US.UTF-8
 ENV LANG=en_US.UTF-8
@@ -5516,6 +5535,17 @@ class Config extends BaseConfig
 
         return $this->getStringValue(['parameters', 'propertiesColumn']);
     }
+
+    public function getPartitionKeyColumn(): ?string
+    {
+        /** @var array $configData */
+        $configData = $this->getData();
+        if (!isset($configData['parameters']['partitionKeyColumn'])) {
+            return null;
+        }
+
+        return $this->getStringValue(['parameters', 'partitionKeyColumn']);
+    }
 }
 
 
@@ -5588,6 +5618,7 @@ class ConfigDefinition extends BaseConfigDefinition
                 ->end()
                 ->scalarNode('column')->end()
                 ->scalarNode('propertiesColumn')->end()
+                ->scalarNode('partitionKeyColumn')->end()
             ->end()
         ;
 
@@ -5604,6 +5635,12 @@ class ConfigDefinition extends BaseConfigDefinition
                     if (!empty($v['propertiesColumn'])) {
                         throw new InvalidConfigurationException(sprintf(
                             'Invalid configuration, "propertiesColumn" is configured, but "mode" is set to "%s".',
+                            self::MODE_MESSAGE_ROW_AS_JSON,
+                        ));
+                    }
+                    if (!empty($v['partitionKeyColumn'])) {
+                        throw new InvalidConfigurationException(sprintf(
+                            'Invalid configuration, "partitionKeyColumn" is configured, but "mode" is set to "%s".',
                             self::MODE_MESSAGE_ROW_AS_JSON,
                         ));
                     }
@@ -5782,6 +5819,10 @@ class ColumnValueMapper implements MessageMapper
     private ?string $propertiesColumn;
     private ?int $propertiesColumnIndex = null;
 
+    private ?string $partitionKeyColumn = null;
+
+    private ?int $partitionKeyColumnIndex = null;
+
     private array $header;
 
     public function __construct(Config $config, CsvReader $csvReader)
@@ -5789,6 +5830,7 @@ class ColumnValueMapper implements MessageMapper
         $this->csvReader = $csvReader;
         $this->column = $config->getColumn();
         $this->propertiesColumn = $config->getPropertiesColumn();
+        $this->partitionKeyColumn = $config->getPartitionKeyColumn();
         $this->header = (array) $csvReader->getHeader();
 
         // Get column index
@@ -5796,6 +5838,10 @@ class ColumnValueMapper implements MessageMapper
 
         if ($this->propertiesColumn) {
             $this->propertiesColumnIndex = $this->getColumnIndex($this->propertiesColumn, $config);
+        }
+
+        if ($this->partitionKeyColumn) {
+            $this->partitionKeyColumnIndex = $this->getColumnIndex($this->partitionKeyColumn, $config);
         }
 
         // Skip header
@@ -5826,6 +5872,10 @@ class ColumnValueMapper implements MessageMapper
                         $this->propertiesColumn,
                     ));
                 }
+            }
+
+            if ($this->partitionKeyColumn !== null) {
+                $message['partitionKey'] = $row[$this->partitionKeyColumnIndex] ?? null;
             }
 
             yield $message;
@@ -6100,9 +6150,10 @@ class Writer {
     this.eventHubName = process.env.EVENT_HUB_NAME;
     this.progressTimer = null;
     this.producer = null;
-    this.batch = null;
-    this.batchSendPromise = null;
     this.batchSize = parseInt(process.env.BATCH_SIZE, 10);
+
+    // Partitioning support - Map of partition key to message queue
+    this.messagesByPartition = new Map();
 
     // Stats
     this.messagesQueuedCount = 0;
@@ -6126,49 +6177,96 @@ class Writer {
   }
 
   async writeMessages() {
+    // Read all messages and group them by partition key
+    await this.readAndGroupMessages();
+
+    // Send messages in batches for each partition key
+    await this.sendPartitionedBatches();
+  }
+
+  async readAndGroupMessages() {
     const messages = this.getMessages();
-    await this.sendBatchAndCreateNew();
-
-    let loadNext = true;
     let message = null;
+
+    // Read all messages and group by partition key
     while (true) {
-      // If the message was not added in the previous step (loadNext = false) => try again.
-      message = loadNext ? (await messages.next()).value : message;
+      message = (await messages.next()).value;
       if (!message) {
-        // No message left => all done => send batch and wait for it
-        await this.sendBatch(true);
-        break;
+        break; // No more messages, done reading
       }
 
-      // Try to add
       const eventData = this.messageToEventData(message);
+      // Use null for messages without a partition key to let Azure assign a partition
+      const partitionKey = eventData.partitionKey || null;
 
-      const isAdded = this.batch.tryAdd(eventData);
-
-      // Message was not added + batch is empty => message is too large
-      if (!isAdded && this.batch.count === 0) {
-        throw new UserError(`Message number="${this.messagesQueuedCount + 1}" is too large.`);
+      // Initialize array for this partition if needed
+      if (!this.messagesByPartition.has(partitionKey)) {
+        this.messagesByPartition.set(partitionKey, []);
       }
+
+      // Add message to its partition group
+      this.messagesByPartition.get(partitionKey).push(eventData);
+      this.messagesQueuedCount++;
+    }
+  }
+
+  async sendPartitionedBatches() {
+    // Process each partition's messages
+    for (const [partitionKey, messages] of this.messagesByPartition.entries()) {
+      await this.sendBatchesForPartition(partitionKey, messages);
+    }
+  }
+
+  async sendBatchesForPartition(partitionKey, messages) {
+    const batchOptions = {};
+
+    // Only set partitionKey option if it's not null
+    if (partitionKey !== null) {
+      batchOptions.partitionKey = partitionKey;
+    }
+
+    // Create first batch for this partition
+    let batch = await this.producer.createBatch(batchOptions);
+    let messageIndex = 0;
+
+    // Process all messages for this partition
+    while (messageIndex < messages.length) {
+      const message = messages[messageIndex];
+      const isAdded = batch.tryAdd(message);
 
       if (isAdded) {
-        // Message was added to the batch => continue => load next
-        this.messagesQueuedCount += 1;
-        loadNext = true;
-      } else {
-        // Message was not added => batch was full => try again with the new batch
-        loadNext = false;
-      }
+        // Message added successfully, move to next message
+        messageIndex++;
 
-      // Crate the new batch, if:
-      // 1. Batch is full (in terms of items count) OR
-      // 2. Message was not added + batch is not empty => batch is full (in terms of size)
-      if (
-        (isAdded && this.batch.count === this.batchSize)
-        || (!isAdded && this.batch.count > 0)
-      ) {
-        await this.sendBatchAndCreateNew();
+        // If batch is full by count, send it and create a new one
+        if (batch.count === this.batchSize) {
+          await this.sendBatch(batch);
+          batch = await this.producer.createBatch(batchOptions);
+        }
+      } else {
+        // Couldn't add message to batch
+
+        // If batch is empty, message is too large
+        if (batch.count === 0) {
+          throw new UserError(`Message number="${this.messagesSentCount + messageIndex + 1}" is too large.`);
+        }
+
+        // Batch is full by size, send it and create a new one
+        await this.sendBatch(batch);
+        batch = await this.producer.createBatch(batchOptions);
       }
     }
+
+    // Send final batch if it has any messages
+    if (batch.count > 0) {
+      await this.sendBatch(batch);
+    }
+  }
+
+  async sendBatch(batch) {
+    await this.producer.sendBatch(batch);
+    this.batchesSentCount++;
+    this.messagesSentCount += batch.count;
   }
 
   messageToEventData(message) {
@@ -6184,44 +6282,17 @@ class Writer {
         eventData.messageId = message.properties.messageId;
         delete message.properties.messageId;
       }
-      if (message.properties) {
+      if (Object.keys(message.properties).length > 0) {
         eventData.properties = message.properties;
       }
+    }
+    if (message.partitionKey) {
+      eventData.partitionKey = message.partitionKey;
+      delete message.partitionKey;
     }
     eventData.contentType = 'application/json'
 
     return eventData;
-  }
-
-  async sendBatchAndCreateNew() {
-    // wait = false => non-blocking
-    // - Only one batch is sent at a time => We are waiting only for the previous batch.
-    // - But we are not waiting for current batch, we are already preparing another one during sending.
-    await this.sendBatch(false);
-    this.batch = await this.producer.createBatch();
-  }
-
-  async sendBatch(wait = false) {
-    await this.batchSendPromise; // Wait for the previous batch to be sent
-    this.batchSendPromise = this.doSendBatch(); // Send current batch
-    if (wait) {
-      await this.batchSendPromise;
-    }
-  }
-
-  async doSendBatch() {
-    this.messagesSendingCount = this.messagesQueuedCount;
-    this.messagesQueuedCount = 0;
-
-    if (this.batch === null || this.batch.count === 0) {
-      // Empty batch => ignore
-      return;
-    }
-
-    await this.producer.sendBatch(this.batch);
-    this.batchesSentCount += 1;
-    this.messagesSentCount += this.messagesSendingCount;
-    this.messagesSendingCount = 0;
   }
 
   async* getMessages() {
@@ -6422,6 +6493,9 @@ async function main() {
           }
           if (event.properties) {
             message += `, properties: ${JSON.stringify(event.properties)}`;
+          }
+          if (event.partitionKey) {
+            message += `, partitionKey: ${JSON.stringify(event.partitionKey)}`;
           }
           console.log(message);
           messageCount++;
@@ -6921,6 +6995,72 @@ FILE: tests/functional/write-column-value-mode-json/source/data/in/tables/data.c
 
 
 ================================================
+FILE: tests/functional/write-column-value-mode-json-partition-key/expected-stdout
+================================================
+Exporting table "in.c-test.data" in "column_value" mode ...
+Connecting to the event hub "test" ...
+Connected to the event hub "test".
+Done: Sent "5" messages / "3" batches to the event hub "test".
+Exported all 5 rows from the table "in.c-test.data".
+
+
+
+================================================
+FILE: tests/functional/write-column-value-mode-json-partition-key/source/data/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "tables": [
+        {
+          "source": "in.c-test.data",
+          "destination": "data.csv"
+        }
+      ]
+    }
+  },
+  "parameters": {
+    "hub": {
+      "#connectionString": "%env(string:CONNECTION_STRING_NORMALIZED)%",
+      "eventHubName": "%env(string:EVENT_HUB_NAME)%"
+    },
+    "tableId": "in.c-test.data",
+    "mode": "column_value",
+    "column": "json",
+    "propertiesColumn": "",
+    "partitionKeyColumn": "partitionKey"
+  }
+}
+
+
+
+================================================
+FILE: tests/functional/write-column-value-mode-json-partition-key/source/data/in/tables/data.csv
+================================================
+"properties","json","partitionKey"
+"{""correlationId"":""1"", ""messageId"":""1"", ""otherProperty"":""something""}","{""foo1"": ""bar1""}","partition-1"
+"{""correlationId"":""2"",  ""messageId"":""2"", ""otherProperty"":""something2""}","{""foo2"": ""bar2""}","partition-1"
+"{""correlationId"":""3"",  ""messageId"":""3"", ""otherProperty"":""something3""}","{""foo3"": ""bar3""}","partition-2"
+"{""correlationId"":""text"", ""otherProperty"":""something2""}","{""foo4"": ""bar4""}","partition-2"
+"{""otherProperty"":""something5""}","{""foo5"": ""bar5""}","partition-3"
+
+
+
+================================================
+FILE: tests/functional/write-column-value-mode-json-partition-key/source/data/in/tables/data.csv.manifest
+================================================
+{
+    "id": "in.c-test.data",
+    "columns": [
+        "properties",
+        "json",
+        "partitionKey"
+    ]
+}
+
+
+
+================================================
 FILE: tests/functional/write-column-value-mode-json-properties/expected-stdout
 ================================================
 Exporting table "in.c-test.data" in "column_value" mode ...
@@ -6979,6 +7119,72 @@ FILE: tests/functional/write-column-value-mode-json-properties/source/data/in/ta
     "columns": [
         "properties",
         "json"
+    ]
+}
+
+
+
+================================================
+FILE: tests/functional/write-column-value-mode-json-properties-partition-key/expected-stdout
+================================================
+Exporting table "in.c-test.data" in "column_value" mode ...
+Connecting to the event hub "test" ...
+Connected to the event hub "test".
+Done: Sent "5" messages / "3" batches to the event hub "test".
+Exported all 5 rows from the table "in.c-test.data".
+
+
+
+================================================
+FILE: tests/functional/write-column-value-mode-json-properties-partition-key/source/data/config.json
+================================================
+{
+  "storage": {
+    "input": {
+      "tables": [
+        {
+          "source": "in.c-test.data",
+          "destination": "data.csv"
+        }
+      ]
+    }
+  },
+  "parameters": {
+    "hub": {
+      "#connectionString": "%env(string:CONNECTION_STRING_NORMALIZED)%",
+      "eventHubName": "%env(string:EVENT_HUB_NAME)%"
+    },
+    "tableId": "in.c-test.data",
+    "mode": "column_value",
+    "column": "json",
+    "propertiesColumn": "properties",
+    "partitionKeyColumn": "partitionKey"
+  }
+}
+
+
+
+================================================
+FILE: tests/functional/write-column-value-mode-json-properties-partition-key/source/data/in/tables/data.csv
+================================================
+"properties","json","partitionKey"
+"{""correlationId"":""1"", ""messageId"":""1"", ""otherProperty"":""something""}","{""foo1"": ""bar1""}","partition-1"
+"{""correlationId"":""2"",  ""messageId"":""2"", ""otherProperty"":""something2""}","{""foo2"": ""bar2""}","partition-1"
+"{""correlationId"":""3"",  ""messageId"":""3"", ""otherProperty"":""something3""}","{""foo3"": ""bar3""}","partition-2"
+"{""correlationId"":""text"", ""otherProperty"":""something2""}","{""foo4"": ""bar4""}","partition-2"
+"{""otherProperty"":""something5""}","{""foo5"": ""bar5""}","partition-3"
+
+
+
+================================================
+FILE: tests/functional/write-column-value-mode-json-properties-partition-key/source/data/in/tables/data.csv.manifest
+================================================
+{
+    "id": "in.c-test.data",
+    "columns": [
+        "properties",
+        "json",
+        "partitionKey"
     ]
 }
 

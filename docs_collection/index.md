@@ -877,6 +877,11 @@
 - Repository: https://github.com/keboola/component-data-gateway
 - Description: None
 
+### component-duckdb-transformation
+- [Documentation](github/component-duckdb-transformation/llm.txt)
+- Repository: https://github.com/keboola/component-duckdb-transformation
+- Description: None
+
 ### component-shopify-v2
 - [Documentation](github/component-shopify-v2/llm.txt)
 - Repository: https://github.com/keboola/component-shopify-v2
