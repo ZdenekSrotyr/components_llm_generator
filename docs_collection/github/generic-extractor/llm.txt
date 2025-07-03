@@ -8780,6 +8780,9 @@ FILE: Dockerfile
 ================================================
 FROM php:7.4-cli
 
+ENV LANG C.UTF-8
+ENV LC_ALL C.UTF-8
+
 ARG COMPOSER_FLAGS="--prefer-dist --no-interaction"
 ARG DEBIAN_FRONTEND=noninteractive
 ENV COMPOSER_ALLOW_SUPERUSER 1
@@ -8883,8 +8886,8 @@ RUN set -eux; \
         *) echo "unsupported architecture"; exit 1 ;; \
     esac; \
     for key in $(curl -sL https://raw.githubusercontent.com/nodejs/docker-node/HEAD/keys/node.keys); do \
-        gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "$key" || \
-        gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key"; \
+        { gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key" && gpg --list-keys "$key" > /dev/null; } || \
+        { gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "$key" && gpg --list-keys "$key" > /dev/null; } \
     done; \
     curl -fsSLO --compressed "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-$ARCH.tar.xz"; \
     curl -fsSLO --compressed "https://nodejs.org/dist/$NODE_VERSION/SHASUMS256.txt.asc"; \
@@ -26107,6 +26110,7 @@ exclude =
     tests,
     example
     venv
+ignore = E203,W503
 max-line-length = 120
 
 # F812: list comprehension redefines ...
@@ -26227,6 +26231,7 @@ FILE: python-sync-actions/src/__init__.py
 ================================================
 import sys
 import os
+
 sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
 
 
@@ -26238,32 +26243,35 @@ FILE: python-sync-actions/src/component.py
 Template Component main class.
 
 """
+
 import copy
 import logging
 import tempfile
+import traceback
+from functools import wraps
 from io import StringIO
 from typing import Any
-from urllib.parse import urlparse
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
+
+import requests
+from keboola.component.base import ComponentBase, sync_action
+from keboola.component.exceptions import UserException
+from requests.exceptions import JSONDecodeError
 
 import configuration
-import requests
 from actions.curl import build_job_from_curl
 from actions.mapping import infer_mapping
 from configuration import ConfigHelpers, Configuration
 from http_generic.auth import AuthBuilderError, AuthMethodBuilder
 from http_generic.client import GenericHttpClient, HttpClientError
 from http_generic.pagination import PaginationBuilder
-from keboola.component.base import ComponentBase, sync_action
-from keboola.component.exceptions import UserException
 from placeholders_utils import PlaceholdersUtils
-from requests.exceptions import JSONDecodeError
 
 MAX_CHILD_CALLS = 20
 
 # configuration variables
-KEY_API_TOKEN = '#api_token'
-KEY_PRINT_HELLO = 'print_hello'
+KEY_API_TOKEN = "#api_token"
+KEY_PRINT_HELLO = "print_hello"
 
 # list of mandatory parameters => if some is missing,
 # component will fail with readable message on initialization.
@@ -26271,15 +26279,29 @@ REQUIRED_PARAMETERS = [KEY_PRINT_HELLO]
 REQUIRED_IMAGE_PARS = []
 
 
+def sync_action_exception_handler(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            return {
+                "status": "exception",
+                "traceback": traceback.format_exception(e),
+            }
+
+    return wrapper
+
+
 class Component(ComponentBase):
     """
-        Extends base class for general Python components. Initializes the CommonInterface
-        and performs configuration validation.
+    Extends base class for general Python components. Initializes the CommonInterface
+    and performs configuration validation.
 
-        For easier debugging the data folder is picked up by default from `../data` path,
-        relative to working directory.
+    For easier debugging the data folder is picked up by default from `../data` path,
+    relative to working directory.
 
-        If `debug` parameter is present in the `config.json`, the default logger is set to verbose DEBUG mode.
+    If `debug` parameter is present in the `config.json`, the default logger is set to verbose DEBUG mode.
     """
 
     def __init__(self):
@@ -26326,27 +26348,30 @@ class Component(ComponentBase):
                 user_params = self._configuration.user_parameters
                 user_params = self._conf_helpers.fill_in_user_parameters(user_params, user_params)
                 # apply user parameters
-                auth_method_params = self._conf_helpers.fill_in_user_parameters(authentication.parameters, user_params,
-                                                                                False)
+                auth_method_params = self._conf_helpers.fill_in_user_parameters(
+                    authentication.parameters, user_params, False
+                )
                 auth_method = AuthMethodBuilder.build(authentication.type, **auth_method_params)
         except AuthBuilderError as e:
             raise UserException(e) from e
 
         # evaluate user_params inside the user params itself
         self._configuration.user_parameters = self._conf_helpers.fill_in_user_parameters(
-            self._configuration.user_parameters,
-            self._configuration.user_parameters)
+            self._configuration.user_parameters, self._configuration.user_parameters
+        )
 
-        self._configuration.user_data = self._conf_helpers.fill_in_user_parameters(self._configuration.user_data,
-                                                                                   self._configuration.user_parameters)
+        self._configuration.user_data = self._conf_helpers.fill_in_user_parameters(
+            self._configuration.user_data, self._configuration.user_parameters
+        )
 
         # init client
-        self._client = GenericHttpClient(base_url=self._configuration.api.base_url,
-                                         max_retries=self._configuration.api.retry_config.max_retries,
-                                         backoff_factor=self._configuration.api.retry_config.backoff_factor,
-                                         status_forcelist=self._configuration.api.retry_config.codes,
-                                         auth_method=auth_method
-                                         )
+        self._client = GenericHttpClient(
+            base_url=self._configuration.api.base_url,
+            max_retries=self._configuration.api.retry_config.max_retries,
+            backoff_factor=self._configuration.api.retry_config.backoff_factor,
+            status_forcelist=self._configuration.api.retry_config.codes,
+            auth_method=auth_method,
+        )
 
     def _validate_allowed_hosts(
         self,
@@ -26377,32 +26402,32 @@ class Component(ComponentBase):
         url_scheme = parsed_url.scheme
         url_host = parsed_url.hostname
         url_port = parsed_url.port
-        url_path = parsed_url.path.rstrip('/')
+        url_path = parsed_url.path.rstrip("/")
 
         for allowed in allowed_hosts:
             # Check if host matches
-            if allowed.get('host') != url_host:
+            if allowed.get("host") != url_host:
                 continue
 
             # Check scheme if specified
-            if allowed.get('scheme', url_scheme) != url_scheme:
+            if allowed.get("scheme", url_scheme) != url_scheme:
                 continue
 
             # Check port if specified
-            if allowed.get('port', url_port) != url_port:
+            if allowed.get("port", url_port) != url_port:
                 continue
 
-            allowed_path = allowed.get('path', '').rstrip('/')
+            allowed_path = allowed.get("path", "").rstrip("/")
             if not allowed_path:
                 return  # Empty path means all paths are allowed
 
-            url_segments = url_path.split('/')
-            allowed_segments = allowed_path.split('/')
+            url_segments = url_path.split("/")
+            allowed_segments = allowed_path.split("/")
 
             if len(url_segments) < len(allowed_segments):
                 continue
 
-            if url_segments[:len(allowed_segments)] == allowed_segments:
+            if url_segments[: len(allowed_segments)] == allowed_segments:
                 return  # Path matches
 
         raise UserException(f'URL "{url}" is not in the allowed hosts whitelist.')
@@ -26423,7 +26448,7 @@ class Component(ComponentBase):
         urls = []
 
         # Get selected job index
-        job_index = int(selected_job.split('_')[0])  # Get parent job index
+        job_index = int(selected_job.split("_")[0])  # Get parent job index
 
         if job_index >= len(endpoints):
             return urls
@@ -26455,7 +26480,7 @@ class Component(ComponentBase):
         Args:
         """
         user_params = self._configuration.user_parameters
-        secrets = [value for key, value in user_params.items() if key.startswith('#') or key.startswith('__')]
+        secrets = [value for key, value in user_params.items() if key.startswith("#") or key.startswith("__")]
 
         # get secrets from the auth method
         if self._client._auth_method:  # noqa
@@ -26522,7 +26547,7 @@ class Component(ComponentBase):
 
         result_path = path
         for key, dict in placeholders[0].items():
-            result_path = result_path.replace(f"{{{dict.get('placeholder')}}}", str(dict.get('value')))
+            result_path = result_path.replace(f"{{{dict.get('placeholder')}}}", str(dict.get("value")))
         return result_path
 
     # def _process_nested_job(self, parent_result, config, parent_results_list, client,
@@ -26604,7 +26629,7 @@ class Component(ComponentBase):
             # find array property in data, if there is only one
             result = find_array_property_path(data)
 
-        elif path.path == '.':
+        elif path.path == ".":
             result = data
         else:
             keys = path.path.split(path.delimiter)
@@ -26663,11 +26688,11 @@ class Component(ComponentBase):
 
         # Validate allowed hosts
         self._validate_allowed_hosts(
-            self.configuration.image_parameters.get('allowed_hosts', []),
+            self.configuration.image_parameters.get("allowed_hosts", []),
             self._configuration.api.base_url,
             self._configuration.api.jobs,
-            self.configuration.parameters.get('__SELECTED_JOB', '')
-            )
+            self.configuration.parameters.get("__SELECTED_JOB", ""),
+        )
         self._client.login()
         # set back to debug because sync action mutes it
         logging.getLogger().setLevel(logging.DEBUG)
@@ -26677,7 +26702,6 @@ class Component(ComponentBase):
         self._parent_results = [{}] * len(self._configurations)
 
         def recursive_call(parent_result, config_index=0):
-
             if parent_result:
                 self._parent_results[config_index - 1] = parent_result
 
@@ -26731,9 +26755,9 @@ class Component(ComponentBase):
             }
 
             if job.request_content.content_type == configuration.ContentType.json:
-                request_parameters['json'] = job.request_content.body
+                request_parameters["json"] = job.request_content.body
             elif job.request_content.content_type == configuration.ContentType.form:
-                request_parameters['data'] = job.request_content.body
+                request_parameters["data"] = job.request_content.body
 
             row_path = job.request_parameters.endpoint_path
 
@@ -26766,7 +26790,7 @@ class Component(ComponentBase):
 
         try:
             recursive_call({})
-            error_message = ''
+            error_message = ""
         except HttpClientError as e:
             error_message = str(e)
             if e.response is not None:
@@ -26776,20 +26800,22 @@ class Component(ComponentBase):
 
         return final_results, self._final_response, self.log.getvalue(), error_message
 
-    @sync_action('load_from_curl')
+    @sync_action("load_from_curl")
+    @sync_action_exception_handler
     def load_from_curl(self) -> dict:
         """
         Load configuration from cURL command
         """
         self.init_component()
-        curl_command = self.configuration.parameters.get('__CURL_COMMAND')
+        curl_command = self.configuration.parameters.get("__CURL_COMMAND")
         if not curl_command:
-            raise ValueError('cURL command not provided')
+            raise ValueError("cURL command not provided")
         job = build_job_from_curl(curl_command, self._configuration.api.base_url)
 
         return job.to_dict()
 
-    @sync_action('infer_mapping')
+    @sync_action("infer_mapping")
+    @sync_action_exception_handler
     def infer_mapping(self) -> dict:
         """
         Load configuration from cURL command
@@ -26800,12 +26826,12 @@ class Component(ComponentBase):
         if error:
             raise UserException(error)
 
-        nesting_level = self.configuration.parameters.get('__NESTING_LEVEL', 2)
-        primary_keys = self.configuration.parameters.get('__PRIMARY_KEY', [])
-        is_child_job = len(self.configuration.parameters.get('__SELECTED_JOB', '').split('_')) > 1
+        nesting_level = self.configuration.parameters.get("__NESTING_LEVEL", 2)
+        primary_keys = self.configuration.parameters.get("__PRIMARY_KEY", [])
+        is_child_job = len(self.configuration.parameters.get("__SELECTED_JOB", "").split("_")) > 1
         parent_pkey = []
         if len(self._configurations) > 1:
-            parent_pkey = [f'parent_{p}' for p in self._configurations[-1].request_parameters.placeholders.keys()]
+            parent_pkey = [f"parent_{p}" for p in self._configurations[-1].request_parameters.placeholders.keys()]
 
         if not data:
             raise UserException("The request returned no data to infer mapping from.")
@@ -26816,30 +26842,36 @@ class Component(ComponentBase):
                 for key, value in self._configuration.user_data.items():
                     user_data_columns.append(key)
                     if key in record:
-                        raise UserException(f"User data key [{key}] already exists in the response data, "
-                                            f"please change the name.")
+                        raise UserException(
+                            f"User data key [{key}] already exists in the response data, please change the name."
+                        )
                     record[key] = value
 
-        mapping = infer_mapping(data, primary_keys, parent_pkey,
-                                user_data_columns=user_data_columns,
-                                max_level_nest_level=nesting_level)
+        mapping = infer_mapping(
+            data, primary_keys, parent_pkey, user_data_columns=user_data_columns, max_level_nest_level=nesting_level
+        )
         return mapping
 
-    @sync_action('perform_function')
+    @sync_action("perform_function")
+    @sync_action_exception_handler
     def perform_function_sync(self) -> dict:
         self.init_component()
-        function_cfg = self.configuration.parameters['__FUNCTION_CFG']
-        return {"result": ConfigHelpers().perform_custom_function('function',
-                                                                  function_cfg, self._configuration.user_parameters)}
+        function_cfg = self.configuration.parameters["__FUNCTION_CFG"]
+        return {
+            "result": ConfigHelpers().perform_custom_function(
+                "function", function_cfg, self._configuration.user_parameters
+            )
+        }
 
-    @sync_action('test_request')
+    @sync_action("test_request")
+    @sync_action_exception_handler
     def test_request(self):
         results, response, log, error_message = self.make_call()
 
         body = None
         if response.request.body:
             if isinstance(response.request.body, bytes):
-                body = response.request.body.decode('utf-8')
+                body = response.request.body.decode("utf-8")
             else:
                 body = response.request.body
 
@@ -26859,16 +26891,16 @@ class Component(ComponentBase):
                 "status_code": filtered_response.status_code,
                 "reason": filtered_response.reason,
                 "data": response_data,
-                "headers": dict(filtered_response.headers)
+                "headers": dict(filtered_response.headers),
             },
             "request": {
                 "url": response.request.url,
                 "method": response.request.method,
                 "data": filtered_body,
-                "headers": dict(filtered_response.request.headers)
+                "headers": dict(filtered_response.request.headers),
             },
             "records": results,
-            "debug_log": filtered_log
+            "debug_log": filtered_log,
         }
         return result
 
@@ -26908,15 +26940,14 @@ from user_functions import UserFunctions
 
 
 class ConfigurationBase:
-
     @staticmethod
     def _convert_private_value(value: str):
         return value.replace('"#', '"pswd_')
 
     @staticmethod
     def _convert_private_value_inv(value: str):
-        if value and value.startswith('pswd_'):
-            return value.replace('pswd_', '#', 1)
+        if value and value.startswith("pswd_"):
+            return value.replace("pswd_", "#", 1)
         else:
             return value
 
@@ -26941,8 +26972,11 @@ class ConfigurationBase:
         Returns: List[str]
 
         """
-        return [cls._convert_private_value_inv(f.name) for f in dataclasses.fields(cls)
-                if f.default == dataclasses.MISSING and f.default_factory == dataclasses.MISSING]
+        return [
+            cls._convert_private_value_inv(f.name)
+            for f in dataclasses.fields(cls)
+            if f.default == dataclasses.MISSING and f.default_factory == dataclasses.MISSING
+        ]
 
 
 @dataclass
@@ -26994,14 +27028,11 @@ class ApiRequest(ConfigurationBase):
 
 @dataclass
 class DataPath(ConfigurationBase):
-    path: str = '.'
-    delimiter: str = '.'
+    path: str = "."
+    delimiter: str = "."
 
     def to_dict(self):
-        return {
-            'path': self.path,
-            'delimiter': self.delimiter
-        }
+        return {"path": self.path, "delimiter": self.delimiter}
 
 
 # CONFIGURATION OBJECT
@@ -27029,9 +27060,9 @@ class Configuration(ConfigurationBase):
 
 
 class ConfigurationKeysV2(Enum):
-    api = 'api'
-    user_parameters = 'user_parameters'
-    request_options = 'request_options'
+    api = "api"
+    user_parameters = "user_parameters"
+    request_options = "request_options"
 
     @classmethod
     def list(cls):
@@ -27059,8 +27090,8 @@ def _return_ui_params(data) -> list[str]:
 def _remove_auth_from_dict(dictionary: dict, to_remove: list, auth_method: str) -> dict:
     filtered_dict = {}
     for key, value in dictionary.items():
-        if isinstance(value, dict) and auth_method == 'bearer':
-            if key != 'Authorization':
+        if isinstance(value, dict) and auth_method == "bearer":
+            if key != "Authorization":
                 filtered_value = _remove_auth_from_dict(value, to_remove)
                 if filtered_value:
                     filtered_dict[key] = filtered_value
@@ -27082,13 +27113,17 @@ def convert_to_v2(configuration: dict) -> list[Configuration]:
     """
     user_parameters = build_user_parameters(configuration)
 
-    api_json = configuration.get('api', {})
-    base_url = api_json.get('baseUrl', '')
-    jobs = configuration.get('config', {}).get('jobs', [])
-    default_headers_org = api_json.get('http', {}).get('headers', {})
-    default_query_parameters_org = api_json.get('http', {}).get('defaultOptions', {}).get('params', {})
+    api_json = configuration.get("api", {})
+    base_url = api_json.get("baseUrl", "")
+    jobs = configuration.get("config", {}).get("jobs", [])
+    default_headers_org = api_json.get("http", {}).get("headers", {})
 
-    auth_method = configuration.get('config').get('__AUTH_METHOD')
+    default_query_parameters_org = {}
+    if http_conf := api_json.get("http"):
+        if default_options := http_conf.get("defaultOptions"):
+            default_query_parameters_org = default_options.get("params") or {}
+
+    auth_method = configuration.get("config").get("__AUTH_METHOD")
 
     default_headers = _remove_auth_from_dict(default_headers_org, _return_ui_params(configuration), auth_method)
     default_query_parameters = _remove_auth_from_dict(
@@ -27096,10 +27131,10 @@ def convert_to_v2(configuration: dict) -> list[Configuration]:
     )
 
     pagination = {}
-    if api_json.get('pagination', {}).get('scrollers'):
-        pagination = api_json.get('pagination', {}).get('scrollers')
-    elif api_json.get('pagination'):
-        pagination['common'] = api_json.get('pagination')
+    if api_json.get("pagination", {}).get("scrollers"):
+        pagination = api_json.get("pagination", {}).get("scrollers")
+    elif api_json.get("pagination"):
+        pagination["common"] = api_json.get("pagination")
 
     if ca_cert := api_json.get("caCertificate"):
         ca_cert = ca_cert.strip()
@@ -27119,7 +27154,7 @@ def convert_to_v2(configuration: dict) -> list[Configuration]:
         ssl_verify=api_json.get("ssl_verify", True),
         ca_cert=ca_cert,
         client_cert_key=client_cert_key,
-        jobs=jobs
+        jobs=jobs,
     )
 
     api_config.retry_config = build_retry_config(configuration)
@@ -27131,13 +27166,14 @@ def convert_to_v2(configuration: dict) -> list[Configuration]:
 
     for api_request, request_content, data_path in jobs:
         requests.append(
-            Configuration(api=api_config,
-                          request_parameters=api_request,
-                          request_content=request_content,
-                          user_parameters=user_parameters,
-                          user_data=configuration.get('config', {}).get('userData', {}),
-                          data_path=data_path
-                          )
+            Configuration(
+                api=api_config,
+                request_parameters=api_request,
+                request_content=request_content,
+                user_parameters=user_parameters,
+                user_data=configuration.get("config", {}).get("userData", {}),
+                data_path=data_path,
+            )
         )
 
     return requests
@@ -27152,9 +27188,11 @@ def build_retry_config(configuration: dict) -> RetryConfig:
     Returns: Retry configuration
 
     """
-    http_section = configuration.get('api', {}).get('http', {})
-    return RetryConfig(max_retries=http_section.get('maxRetries', 10),
-                       codes=http_section.get('codes', (500, 502, 503, 504, 408, 420, 429)))
+    http_section = configuration.get("api", {}).get("http", {})
+    return RetryConfig(
+        max_retries=http_section.get("maxRetries", 10),
+        codes=http_section.get("codes", (500, 502, 503, 504, 408, 420, 429)),
+    )
 
 
 def build_user_parameters(configuration: dict) -> dict:
@@ -27166,10 +27204,22 @@ def build_user_parameters(configuration: dict) -> dict:
     Returns: User parameters
 
     """
-    config_excluded_keys = ['__AUTH_METHOD', '__NAME', '#__BEARER_TOKEN', 'jobs', 'outputBucket', 'incrementalOutput',
-                            'http', 'debug', 'mappings', ' #username', '#password', 'userData']
+    config_excluded_keys = [
+        "__AUTH_METHOD",
+        "__NAME",
+        "#__BEARER_TOKEN",
+        "jobs",
+        "outputBucket",
+        "incrementalOutput",
+        "http",
+        "debug",
+        "mappings",
+        " #username",
+        "#password",
+        "userData",
+    ]
     user_parameters = {}
-    for key, value in configuration.get('config', {}).items():
+    for key, value in configuration.get("config", {}).items():
         if key not in config_excluded_keys:
             user_parameters[key] = value
     return user_parameters
@@ -27187,87 +27237,90 @@ def build_api_request(configuration: dict) -> List[Tuple[ApiRequest, RequestCont
 
     result_requests = []
 
-    job_path: str = configuration.get('__SELECTED_JOB')
+    job_path: str = configuration.get("__SELECTED_JOB")
 
     if not job_path:
         # job path may be empty for other actions
         return [(None, None, None)]
 
-    selected_jobs = job_path.split('_')
+    selected_jobs = job_path.split("_")
 
     nested_path = []
 
     for index in selected_jobs:
         nested_path.append(int(index))
 
-        endpoint_config = configuration.get('config', {}).get('jobs')[nested_path[0]]
+        endpoint_config = configuration.get("config", {}).get("jobs")[nested_path[0]]
 
         if not endpoint_config:
-            raise ValueError('Jobs section not found in the configuration, no endpoint specified')
+            raise ValueError("Jobs section not found in the configuration, no endpoint specified")
 
         for child in nested_path[1:]:
             try:
-                endpoint_config = endpoint_config.get('children', [])[child]
+                endpoint_config = endpoint_config.get("children", [])[child]
             except IndexError:
-                raise ValueError('Jobs section not found in the configuration, no endpoint specified')
+                raise ValueError("Jobs section not found in the configuration, no endpoint specified")
 
-        method = endpoint_config.get('method', 'GET')
+        method = endpoint_config.get("method", "GET")
 
-        request_content = build_request_content(method, endpoint_config.get('params', {}))
+        request_content = build_request_content(method, endpoint_config.get("params", {}))
         # use real method
-        if method.upper() == 'FORM':
-            method = 'POST'
+        if method.upper() == "FORM":
+            method = "POST"
 
-        endpoint_path = endpoint_config.get('endpoint')
+        endpoint_path = endpoint_config.get("endpoint")
 
-        data_field = endpoint_config.get('dataField')
+        data_field = endpoint_config.get("dataField")
 
-        placeholders = endpoint_config.get('placeholders', {})
+        placeholders = endpoint_config.get("placeholders", {})
 
-        scroller = endpoint_config.get('scroller', 'common')
+        scroller = endpoint_config.get("scroller", "common")
 
         if isinstance(data_field, dict):
-            path = data_field.get('path')
+            path = data_field.get("path")
             delimiter = data_field.get("delimiter", ".")
             data_path = DataPath(path=path, delimiter=delimiter)
         elif data_field is None:
             data_path = None
         else:
-            path = data_field or '.'
+            path = data_field or "."
             delimiter = "."
             data_path = DataPath(path=path, delimiter=delimiter)
 
         # query params are supported only for GET requests
         if request_content.content_type == ContentType.none:
-            query_params = endpoint_config.get('params', {})
+            query_params = endpoint_config.get("params", {})
         else:
             query_params = {}
 
         result_requests.append(
-            (ApiRequest(method=method,
-                        endpoint_path=endpoint_path,
-                        placeholders=placeholders,
-                        headers=endpoint_config.get('headers', {}),
-                        query_parameters=query_params,
-                        scroller=scroller),
-             request_content,
-             data_path))
+            (
+                ApiRequest(
+                    method=method,
+                    endpoint_path=endpoint_path,
+                    placeholders=placeholders,
+                    headers=endpoint_config.get("headers", {}),
+                    query_parameters=query_params,
+                    scroller=scroller,
+                ),
+                request_content,
+                data_path,
+            )
+        )
 
     return result_requests
 
 
-def build_request_content(method: Literal['GET', 'POST', 'FORM'], params: dict) -> RequestContent:
+def build_request_content(method: Literal["GET", "POST", "FORM"], params: dict) -> RequestContent:
     match method:
-        case 'GET':
+        case "GET":
             request_content = RequestContent(ContentType.none, query_parameters=params)
-        case 'POST':
-            request_content = RequestContent(ContentType.json,
-                                             body=params)
-        case 'FORM':
-            request_content = RequestContent(ContentType.form,
-                                             body=params)
+        case "POST":
+            request_content = RequestContent(ContentType.json, body=params)
+        case "FORM":
+            request_content = RequestContent(ContentType.form, body=params)
         case _:
-            raise ValueError(f'Unsupported method: {method}')
+            raise ValueError(f"Unsupported method: {method}")
     return request_content
 
 
@@ -27275,21 +27328,21 @@ def _find_api_key_location(dictionary):
     position = None
     final_key = None
 
-    for key, val in dictionary.get('defaultOptions', {}).get('params', {}).items():
-        if val == {'attr': '#__AUTH_TOKEN'}:
+    for key, val in dictionary.get("defaultOptions", {}).get("params", {}).items():
+        if val == {"attr": "#__AUTH_TOKEN"}:
             final_key = key
-            position = 'query'
+            position = "query"
 
-    for key, val in dictionary.get('headers', {}).items():
-        if val == {'attr': '#__AUTH_TOKEN'}:
+    for key, val in dictionary.get("headers", {}).items():
+        if val == {"attr": "#__AUTH_TOKEN"}:
             final_key = key
-            position = 'headers'
+            position = "headers"
 
     return position, final_key
 
 
 class AuthMethodConverter:
-    SUPPORTED_METHODS = ['basic', 'api-key', 'bearer']
+    SUPPORTED_METHODS = ["basic", "api-key", "bearer"]
 
     @classmethod
     def convert(cls, config_parameters: dict) -> Authentication | None:
@@ -27298,19 +27351,19 @@ class AuthMethodConverter:
         Args:
             config_parameters (dict):
         """
-        auth_method = config_parameters.get('config', {}).get('__AUTH_METHOD', None)
+        auth_method = config_parameters.get("config", {}).get("__AUTH_METHOD", None)
         # or take it form the authentication section
-        auth_method = auth_method or config_parameters.get('api', {}).get('authentication', {}).get('type')
-        if not auth_method or auth_method == 'custom':
+        auth_method = auth_method or config_parameters.get("api", {}).get("authentication", {}).get("type")
+        if not auth_method or auth_method == "custom":
             return None
 
         methods = {
-            'basic': cls._convert_basic,
-            'bearer': cls._convert_bearer,
-            'api-key': cls._convert_api_key,
-            'query': cls._convert_query,
-            'login': cls._convert_login,
-            'oauth2': cls._convert_login
+            "basic": cls._convert_basic,
+            "bearer": cls._convert_bearer,
+            "api-key": cls._convert_api_key,
+            "query": cls._convert_query,
+            "login": cls._convert_login,
+            "oauth2": cls._convert_login,
         }
 
         func = methods.get(auth_method)
@@ -27318,45 +27371,45 @@ class AuthMethodConverter:
         if func:
             return func(config_parameters)
         else:
-            raise ValueError(f'Unsupported auth method: {auth_method}')
+            raise ValueError(f"Unsupported auth method: {auth_method}")
 
     @classmethod
     def _convert_basic(cls, config_parameters: dict) -> Authentication:
-        username = config_parameters.get('config').get('username')
-        password = config_parameters.get('config').get('#password')
+        username = config_parameters.get("config").get("username")
+        password = config_parameters.get("config").get("#password")
         if not username or not password:
-            raise ValueError('Username or password not found in the BasicAuth configuration')
+            raise ValueError("Username or password not found in the BasicAuth configuration")
 
-        return Authentication(type='BasicHttp', parameters={'username': username, '#password': password})
+        return Authentication(type="BasicHttp", parameters={"username": username, "#password": password})
 
     @classmethod
     def _convert_api_key(cls, config_parameters: dict) -> Authentication:
         position, key = _find_api_key_location(config_parameters.get("api").get("http"))
-        token = config_parameters.get('config').get('#__AUTH_TOKEN')
+        token = config_parameters.get("config").get("#__AUTH_TOKEN")
 
-        return Authentication(type='ApiKey', parameters={'key': key, 'token': token, 'position': position})
+        return Authentication(type="ApiKey", parameters={"key": key, "token": token, "position": position})
 
     @classmethod
     def _convert_query(cls, config_parameters: dict) -> Authentication:
         query_params = config_parameters.get("api").get("authentication").get("query")
-        query_params_filled = ConfigHelpers().fill_in_user_parameters(query_params, config_parameters.get('config'))
+        query_params_filled = ConfigHelpers().fill_in_user_parameters(query_params, config_parameters.get("config"))
 
-        return Authentication(type='Query', parameters={'params': query_params_filled})
+        return Authentication(type="Query", parameters={"params": query_params_filled})
 
     @classmethod
     def _convert_bearer(cls, config_parameters: dict) -> Authentication:
-        token = config_parameters.get('config').get('#__BEARER_TOKEN')
+        token = config_parameters.get("config").get("#__BEARER_TOKEN")
         if not token:
-            raise ValueError('Bearer token not found in the Bearer Token Authentication configuration')
+            raise ValueError("Bearer token not found in the Bearer Token Authentication configuration")
 
-        return Authentication(type='BearerToken', parameters={'#token': token})
+        return Authentication(type="BearerToken", parameters={"#token": token})
 
     @classmethod
     def _convert_login(cls, config_parameters: dict) -> Authentication:
-        method_mapping = {'GET': 'GET', 'POST': 'POST', 'FORM': 'POST'}
+        method_mapping = {"GET": "GET", "POST": "POST", "FORM": "POST"}
         helpers = ConfigHelpers()
-        login_request: dict = config_parameters.get('api', {}).get("authentication", {}).get("loginRequest", {})
-        api_request: dict = config_parameters.get('api', {}).get("authentication", {}).get("apiRequest", {})
+        login_request: dict = config_parameters.get("api", {}).get("authentication", {}).get("loginRequest", {})
+        api_request: dict = config_parameters.get("api", {}).get("authentication", {}).get("apiRequest", {})
         # evaluate functions and user parameters
         user_parameters = build_user_parameters(config_parameters)
         user_parameters = helpers.fill_in_user_parameters(user_parameters, user_parameters)
@@ -27365,44 +27418,46 @@ class AuthMethodConverter:
         api_request_eval = helpers.fill_in_user_parameters(api_request, user_parameters, False)
 
         if not login_request:
-            raise ValueError('loginRequest configuration not found in the Login 88Authentication configuration')
+            raise ValueError("loginRequest configuration not found in the Login 88Authentication configuration")
 
-        login_endpoint: str = login_request_eval.get('endpoint')
-        login_url = urlparse.urljoin(config_parameters.get('api', {}).get('baseUrl', ''), login_endpoint)
+        login_endpoint: str = login_request_eval.get("endpoint")
+        login_url = urlparse.urljoin(config_parameters.get("api", {}).get("baseUrl", ""), login_endpoint)
 
-        method = login_request_eval.get('method', 'GET')
+        method = login_request_eval.get("method", "GET")
 
-        login_request_content: RequestContent = build_request_content(method, login_request_eval.get('params', {}))
+        login_request_content: RequestContent = build_request_content(method, login_request_eval.get("params", {}))
 
         try:
-            result_method: str = method_mapping[login_request_eval.get('method', 'GET').upper()]
+            result_method: str = method_mapping[login_request_eval.get("method", "GET").upper()]
         except KeyError:
-            raise ValueError(f'Unsupported method: {login_request_eval.get("method")}')
+            raise ValueError(f"Unsupported method: {login_request_eval.get('method')}")
 
         login_query_parameters: dict = login_request_content.query_parameters
-        login_headers: dict = login_request_eval.get('headers', {})
-        api_request_headers: dict = api_request_eval.get('headers', {})
-        api_request_query_parameters: dict = api_request_eval.get('params', {})
+        login_headers: dict = login_request_eval.get("headers", {})
+        api_request_headers: dict = api_request_eval.get("headers", {})
+        api_request_query_parameters: dict = api_request_eval.get("params", {})
 
-        parameters = {'login_endpoint': login_url,
-                      'method': result_method,
-                      'login_query_parameters': login_query_parameters,
-                      'login_headers': login_headers,
-                      'login_query_body': login_request_content.body,
-                      'login_content_type': login_request_content.content_type.value,
-                      'api_request_headers': api_request_headers,
-                      'api_request_query_parameters': api_request_query_parameters}
+        parameters = {
+            "login_endpoint": login_url,
+            "method": result_method,
+            "login_query_parameters": login_query_parameters,
+            "login_headers": login_headers,
+            "login_query_body": login_request_content.body,
+            "login_content_type": login_request_content.content_type.value,
+            "api_request_headers": api_request_headers,
+            "api_request_query_parameters": api_request_query_parameters,
+        }
 
-        return Authentication(type='Login', parameters=parameters)
+        return Authentication(type="Login", parameters=parameters)
 
 
 class ConfigHelpers:
-
     def __init__(self):
         self.user_functions = UserFunctions()
 
-    def fill_in_user_parameters(self, conf_objects: dict, user_param: dict,
-                                evaluate_conf_objects_functions: bool = True):
+    def fill_in_user_parameters(
+        self, conf_objects: dict, user_param: dict, evaluate_conf_objects_functions: bool = True
+    ):
         """
         This method replaces user parameter references via attr + parses functions inside user parameters,
         evaluates them and fills in the resulting values
@@ -27419,7 +27474,7 @@ class ConfigHelpers:
         conf_objects = self.fill_in_time_references(conf_objects)
         user_param = self.fill_in_time_references(user_param)
         # convert to string minified
-        steps_string = json.dumps(conf_objects, separators=(',', ':'))
+        steps_string = json.dumps(conf_objects, separators=(",", ":"))
         # dirty and ugly replace
         for key in user_param:
             if isinstance(user_param[key], dict):
@@ -27430,7 +27485,7 @@ class ConfigHelpers:
             lookup_str = '{"attr":"' + key + '"}'
             steps_string = steps_string.replace(lookup_str, '"' + str(user_param[key]) + '"')
         new_steps = json.loads(steps_string)
-        non_matched = nested_lookup('attr', new_steps)
+        non_matched = nested_lookup("attr", new_steps)
 
         if evaluate_conf_objects_functions:
             for key in new_steps:
@@ -27441,8 +27496,9 @@ class ConfigHelpers:
 
         if non_matched:
             raise ValueError(
-                'Some user attributes [{}] specified in parameters '
-                'are not present in "user_parameters" json_path.'.format(non_matched))
+                "Some user attributes [{}] specified in parameters "
+                'are not present in "user_parameters" json_path.'.format(non_matched)
+            )
         return new_steps
 
     @staticmethod
@@ -27459,11 +27515,11 @@ class ConfigHelpers:
 
         """
         # convert to string minified
-        steps_string = json.dumps(conf_objects, separators=(',', ':'))
+        steps_string = json.dumps(conf_objects, separators=(",", ":"))
         # dirty and ugly replace
 
-        new_cfg_str = steps_string.replace('{"time":"currentStart"}', f'{int(time.time())}')
-        new_cfg_str = new_cfg_str.replace('{"time":"previousStart"}', f'{int(time.time())}')
+        new_cfg_str = steps_string.replace('{"time":"currentStart"}', f"{int(time.time())}")
+        new_cfg_str = new_cfg_str.replace('{"time":"previousStart"}', f"{int(time.time())}")
         new_config = json.loads(new_cfg_str)
         return new_config
 
@@ -27483,23 +27539,23 @@ class ConfigHelpers:
             # in case the function was evaluated as time
             return function_cfg
 
-        elif function_cfg.get('attr'):
-            return user_params[function_cfg['attr']]
+        elif function_cfg.get("attr"):
+            return user_params[function_cfg["attr"]]
 
-        if not function_cfg.get('function'):
+        if not function_cfg.get("function"):
             for key in function_cfg:
                 function_cfg[key] = self.perform_custom_function(key, function_cfg[key], user_params)
 
         new_args = []
-        if function_cfg.get('args'):
-            for arg in function_cfg.get('args'):
+        if function_cfg.get("args"):
+            for arg in function_cfg.get("args"):
                 if isinstance(arg, dict):
                     arg = self.perform_custom_function(key, arg, user_params)
                 new_args.append(arg)
-            function_cfg['args'] = new_args
-        if isinstance(function_cfg, dict) and not function_cfg.get('function'):
+            function_cfg["args"] = new_args
+        if isinstance(function_cfg, dict) and not function_cfg.get("function"):
             return function_cfg
-        return self.user_functions.execute_function(function_cfg['function'], *function_cfg.get('args', []))
+        return self.user_functions.execute_function(function_cfg["function"], *function_cfg.get("args", []))
 
 
 
@@ -27519,14 +27575,14 @@ class NoDataFoundException(Exception):
     pass
 
 
-Placeholder = namedtuple('Placeholder', ['placeholder', 'json_path', 'value'])
+Placeholder = namedtuple("Placeholder", ["placeholder", "json_path", "value"])
 
 
 class PlaceholdersUtils:
-
     @staticmethod
-    def get_params_for_child_jobs(placeholders: Dict[str, Any], parent_results: List[Dict[str, Any]],
-                                  parent_params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def get_params_for_child_jobs(
+        placeholders: Dict[str, Any], parent_results: List[Dict[str, Any]], parent_params: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
         params = {}
         for placeholder, field in placeholders.items():
             params[placeholder] = PlaceholdersUtils.get_placeholder(placeholder, field, parent_results)
@@ -27540,39 +27596,38 @@ class PlaceholdersUtils:
         return PlaceholdersUtils.get_params_per_child_job(params)
 
     @staticmethod
-    def get_placeholder(placeholder: str, field: Union[str, Dict[str, Any]],
-                        parent_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def get_placeholder(
+        placeholder: str, field: Union[str, Dict[str, Any]], parent_results: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         # Determine the level based on the presence of ':' in the placeholder name
-        level = 0 if ':' not in placeholder else int(placeholder.split(':')[0]) - 1
+        level = 0 if ":" not in placeholder else int(placeholder.split(":")[0]) - 1
 
         # Check function (defined as dict)
         if not isinstance(field, str):
-            if 'path' not in field:
-                raise UserException(f"The path for placeholder '{placeholder}' must be a string value"
-                                    f"or an object containing 'path' and 'function'.")
+            if "path" not in field:
+                raise UserException(
+                    f"The path for placeholder '{placeholder}' must be a string value"
+                    f"or an object containing 'path' and 'function'."
+                )
             fn = field.copy()
-            field = fn.pop('path')
+            field = fn.pop("path")
 
         # Get value
         value = PlaceholdersUtils.get_placeholder_value(str(field), parent_results, level, placeholder)
 
         # Run function if provided
-        if 'fn' in locals():
+        if "fn" in locals():
             # Example function to be replaced by actual implementation
             value = value
 
-        return {
-            'placeholder': placeholder,
-            'json_path': field,
-            'value': value
-        }
+        return {"placeholder": placeholder, "json_path": field, "value": value}
 
     @staticmethod
     def get_placeholder_value(field: str, parent_results: List[Dict[str, Any]], level: int, placeholder: str) -> Any:
         try:
             if level >= len(parent_results):
                 max_level = 0 if not parent_results else len(parent_results)
-                raise UserException(f'Level {level + 1} not found in parent results! Maximum level: {max_level}')
+                raise UserException(f"Level {level + 1} not found in parent results! Maximum level: {max_level}")
 
             # Implement get_data_from_path to fetch data using a dot notation
             data = get_data_from_path(field, parent_results[level])
@@ -27582,7 +27637,9 @@ class PlaceholdersUtils:
         except NoDataFoundException:
             raise UserException(
                 f"No value found for placeholder {placeholder} in parent result. (level: {level + 1})",
-                None, None, {'parents': parent_results}
+                None,
+                None,
+                {"parents": parent_results},
             )
 
     @staticmethod
@@ -27590,10 +27647,10 @@ class PlaceholdersUtils:
         # Flatten parameters to a list of lists
         flattened = {}
         for placeholder_name, placeholder in params.items():
-            if isinstance(placeholder['value'], list):
+            if isinstance(placeholder["value"], list):
                 flattened[placeholder_name] = [
-                    {'placeholder': placeholder_name, 'json_path': placeholder['json_path'], 'value': value}
-                    for value in placeholder['value']
+                    {"placeholder": placeholder_name, "json_path": placeholder["json_path"], "value": value}
+                    for value in placeholder["value"]
                 ]
             else:
                 flattened[placeholder_name] = [placeholder]
@@ -27610,7 +27667,7 @@ class PlaceholdersUtils:
         return product_list
 
 
-def get_data_from_path(json_path: str, data: Dict[str, Any], separator: str = '.', strict: bool = True) -> Any:
+def get_data_from_path(json_path: str, data: Dict[str, Any], separator: str = ".", strict: bool = True) -> Any:
     """Mock function to fetch data using a dot-separated path notation. Replace with actual implementation."""
     keys = json_path.split(separator)
     for key in keys:
@@ -27635,7 +27692,7 @@ import keboola.utils as kbcutils
 from keboola.component import UserException
 
 
-def perform_shell_command(command: str, context_detail: str = '') -> tuple[str, str]:
+def perform_shell_command(command: str, context_detail: str = "") -> tuple[str, str]:
     """
     Perform shell command
     Args:
@@ -27666,35 +27723,39 @@ class UserFunctions:
         supp_functions = self.get_supported_functions()
         if function_name not in self.get_supported_functions():
             raise ValueError(
-                F"Specified user function [{function_name}] is not supported! "
-                F"Supported functions are {supp_functions}")
+                f"Specified user function [{function_name}] is not supported! Supported functions are {supp_functions}"
+            )
 
     @classmethod
     def get_supported_functions(cls):
-        return [method_name for method_name in dir(cls)
-                if callable(getattr(cls, method_name)) and not method_name.startswith('__')
-                and method_name not in ['validate_function_name', 'get_supported_functions', 'execute_function']]
+        return [
+            method_name
+            for method_name in dir(cls)
+            if callable(getattr(cls, method_name))
+            and not method_name.startswith("__")
+            and method_name not in ["validate_function_name", "get_supported_functions", "execute_function"]
+        ]
 
     def execute_function(self, function_name, *pars):
         self.validate_function_name(function_name)
         return getattr(UserFunctions, function_name)(self, *pars)
 
     # ############## USER FUNCTIONS
-    def string_to_date(self, date_string, date_format='%Y-%m-%d'):
+    def string_to_date(self, date_string, date_format="%Y-%m-%d"):
         start_date, end_date = kbcutils.parse_datetime_interval(date_string, date_string)
         return start_date.strftime(date_format)
 
     def concat(self, *args):
-        return ''.join(args)
+        return "".join(args)
 
     def base64_encode(self, s):
-        return base64.b64encode(s.encode('utf-8')).decode('utf-8')
+        return base64.b64encode(s.encode("utf-8")).decode("utf-8")
 
     def md5(self, s):
-        return hashlib.md5(s.encode('utf-8')).hexdigest()
+        return hashlib.md5(s.encode("utf-8")).hexdigest()
 
     def sha1(self, s):
-        return hashlib.sha1(s.encode('utf-8')).hexdigest()
+        return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
     def implode(self, delimiter, values):
         return delimiter.join(values)
@@ -27711,8 +27772,8 @@ class UserFunctions:
 
         """
 
-        command = f"php -r 'echo hash_hmac(\"{algorithm}\", \"{message}\", \"{key}\");'"
-        stdout, stderr = perform_shell_command(command, 'hash_hmac function')
+        command = f'php -r \'echo hash_hmac("{algorithm}", "{message}", "{key}");\''
+        stdout, stderr = perform_shell_command(command, "hash_hmac function")
 
         return stdout
 
@@ -27727,8 +27788,8 @@ class UserFunctions:
 
         """
 
-        command = f"php -r 'echo hash(\"{algorithm}\", \"{message}\");'"
-        stdout, stderr = perform_shell_command(command, 'hash function')
+        command = f'php -r \'echo hash("{algorithm}", "{message}");\''
+        stdout, stderr = perform_shell_command(command, "hash function")
 
         return stdout
 
@@ -27744,10 +27805,10 @@ class UserFunctions:
 
         Returns:
 
-            """
+        """
 
         command = f"php -r 'echo date(\"{format_string}\", {timestamp or int(time.time())});'"
-        stdout, stderr = perform_shell_command(command, 'date function')
+        stdout, stderr = perform_shell_command(command, "date function")
 
         return stdout
 
@@ -27763,7 +27824,7 @@ class UserFunctions:
         """
 
         command = f"php -r 'echo strtotime(\"{string}\", {base_time or int(time.time())});'"
-        stdout, stderr = perform_shell_command(command, 'strotime function')
+        stdout, stderr = perform_shell_command(command, "strotime function")
 
         return int(stdout)
 
@@ -27814,7 +27875,7 @@ class JobTemplate:
             "dataType": self.dataType,
             "dataField": self.dataField,
             "params": self.params,
-            "headers": self.headers
+            "headers": self.headers,
         }
 
 
@@ -27843,7 +27904,7 @@ def retrieve_url(curl_command: str) -> str:
         raise ValueError("Not a valid cURL command")
 
     # find valid URL
-    url = ''
+    url = ""
     for t in tokens:
         token_string = t
         if t.startswith("'") and t.endswith("'"):
@@ -27867,16 +27928,16 @@ def normalize_url_in_curl(curl_command: str) -> tuple[str, str]:
     Returns: converted command, original url
 
     """
-    unsupported_characters = ['{', '}']
+    unsupported_characters = ["{", "}"]
     url = retrieve_url(curl_command)
     original_url = None
     new_url = url
 
     if any([char in url for char in unsupported_characters]):
-        original_url = url.split('?')[0]
+        original_url = url.split("?")[0]
 
     for character in unsupported_characters:
-        new_url = new_url.replace(character, '_')
+        new_url = new_url.replace(character, "_")
 
     new_curl_command = curl_command.replace(url, new_url)
     return new_curl_command, original_url
@@ -27917,7 +27978,7 @@ def parse_curl(curl_command: str) -> dict:
     result = json.loads(stdout_str)
     # replace the original URL in case it was changed to enable child job detection
     if original_url:
-        result['url'] = original_url
+        result["url"] = original_url
 
     return result
 
@@ -27933,7 +27994,7 @@ def _get_endpoint_path(base_url: str, url: str) -> str:
 
     """
     if url.startswith(base_url):
-        return url[len(base_url):]
+        return url[len(base_url) :]
     else:
         return url
 
@@ -27948,10 +28009,10 @@ def _get_content_type(headers: dict) -> str:
 
     """
     for key, value in headers.items():
-        if key.lower() == 'content-type':
+        if key.lower() == "content-type":
             return value
 
-    return ''
+    return ""
 
 
 def build_job_from_curl(curl_command: str, base_url: str = None, is_child_job: bool = False) -> JobTemplate:
@@ -27968,32 +28029,33 @@ def build_job_from_curl(curl_command: str, base_url: str = None, is_child_job: b
     parsed_curl = parse_curl(curl_command)
 
     if base_url:
-        job_template.endpoint = _get_endpoint_path(base_url, parsed_curl['url'])
+        job_template.endpoint = _get_endpoint_path(base_url, parsed_curl["url"])
     else:
-        job_template.endpoint = parsed_curl['url']
+        job_template.endpoint = parsed_curl["url"]
 
-    parsed_method = parsed_curl['method'].upper()
-    content_type = _get_content_type(parsed_curl.get('headers', {})).lower()
+    parsed_method = parsed_curl["method"].upper()
+    content_type = _get_content_type(parsed_curl.get("headers", {})).lower()
     if parsed_method == "POST" and content_type == "application/json":
-        job_template.params = parsed_curl.get('data', {})
+        job_template.params = parsed_curl.get("data", {})
         job_template.method = "POST"
 
-        if parsed_curl.get('queries'):
+        if parsed_curl.get("queries"):
             raise UserException("Query parameters are not supported for POST requests with JSON content type")
 
     elif parsed_method == "POST" and content_type == "application/x-www-form-urlencoded":
-        job_template.params = parsed_curl.get('data', {})
+        job_template.params = parsed_curl.get("data", {})
         job_template.method = "FORM"
     elif parsed_method == "GET":
-        job_template.params = parsed_curl.get('queries', {})
+        job_template.params = parsed_curl.get("queries", {})
         job_template.method = "GET"
     else:
-        raise UserException(f"Unsupported method {parsed_method}, "
-                            f"only GET, POST with JSON and POST with form data are supported.")
+        raise UserException(
+            f"Unsupported method {parsed_method}, only GET, POST with JSON and POST with form data are supported."
+        )
 
-    job_template.method = parsed_curl['method'].upper()
-    job_template.headers = parsed_curl.get('headers', {})
-    job_template.dataType = job_template.endpoint.split('/')[-1]
+    job_template.method = parsed_curl["method"].upper()
+    job_template.headers = parsed_curl.get("headers", {})
+    job_template.dataType = job_template.endpoint.split("/")[-1]
     job_template.dataField = {"path": ".", "separator": "."}
 
     return job_template
@@ -28012,23 +28074,21 @@ from keboola.utils.header_normalizer import DefaultHeaderNormalizer
 
 
 class HeaderNormalizer(DefaultHeaderNormalizer):
-
     def _normalize_column_name(self, column_name: str) -> str:
         # Your implementation here
 
         column_name = self._replace_whitespace(column_name)
         column_name = self._replace_forbidden(column_name)
-        if column_name.startswith('_'):
+        if column_name.startswith("_"):
             column_name = column_name[1:]
 
         return column_name
 
 
 class StuctureAnalyzer:
-
     def __init__(self):
         self.analyzer: Analyzer = Analyzer()
-        self.header_normalizer = HeaderNormalizer(forbidden_sub='_')
+        self.header_normalizer = HeaderNormalizer(forbidden_sub="_")
 
     def parse_row(self, row: dict[str, Any]):
         current_path = []
@@ -28039,13 +28099,14 @@ class StuctureAnalyzer:
         for name, value in row.items():
             self.analyzer.analyze_object(current_path, name, value)
 
-    def infer_mapping(self,
-                      primary_keys: Optional[list[str]] = None,
-                      parent_pkeys: Optional[list[str]] = None,
-                      user_data_columns: Optional[list[str]] = None,
-                      path_separator: str = '.',
-                      max_level: int = 2
-                      ) -> dict:
+    def infer_mapping(
+        self,
+        primary_keys: Optional[list[str]] = None,
+        parent_pkeys: Optional[list[str]] = None,
+        user_data_columns: Optional[list[str]] = None,
+        path_separator: str = ".",
+        max_level: int = 2,
+    ) -> dict:
         """
         Infer first level Generic Extractor mapping from data sample.
         Args:
@@ -28058,15 +28119,14 @@ class StuctureAnalyzer:
         Returns:
 
         """
-        result_mapping = self.__infer_mapping_from_structure_recursive(self.analyzer.node_hierarchy['children'],
-                                                                       primary_keys,
-                                                                       path_separator, max_level)
+        result_mapping = self.__infer_mapping_from_structure_recursive(
+            self.analyzer.node_hierarchy["children"], primary_keys, path_separator, max_level
+        )
 
         if parent_pkeys:
             for key in parent_pkeys:
                 if key in result_mapping:
-                    raise UserException(f"Parent {key} is already in the mapping, "
-                                        f"please change the placeholder name")
+                    raise UserException(f"Parent {key} is already in the mapping, please change the placeholder name")
                 result_mapping[key] = MappingElements.parent_primary_key_column(key)
         if user_data_columns:
             for key in user_data_columns:
@@ -28087,7 +28147,7 @@ class StuctureAnalyzer:
             simple_mapping = True
             col_name = value
             if isinstance(value, dict):
-                col_name = value['mapping']['destination']
+                col_name = value["mapping"]["destination"]
                 simple_mapping = False
 
             if col_name in seen.keys():
@@ -28095,16 +28155,20 @@ class StuctureAnalyzer:
                 if simple_mapping:
                     mapping[key] = f"{col_name}_{seen[col_name]}"
                 else:
-                    mapping[key]['mapping']['destination'] = f"{col_name}_{seen[col_name]}"
+                    mapping[key]["mapping"]["destination"] = f"{col_name}_{seen[col_name]}"
             else:
                 seen[col_name] = 0
         return mapping
 
-    def __infer_mapping_from_structure_recursive(self, node_hierarchy: dict[str, Any],
-                                                 primary_keys: Optional[list[str]] = None,
-                                                 path_separator: str = '.',
-                                                 max_level: int = 2, current_mapping: dict = None,
-                                                 current_level: int = 0) -> dict:
+    def __infer_mapping_from_structure_recursive(
+        self,
+        node_hierarchy: dict[str, Any],
+        primary_keys: Optional[list[str]] = None,
+        path_separator: str = ".",
+        max_level: int = 2,
+        current_mapping: dict = None,
+        current_level: int = 0,
+    ) -> dict:
         """
         Infer first level Generic Extractor mapping from data sample.
         Args:
@@ -28120,7 +28184,7 @@ class StuctureAnalyzer:
             current_mapping = {}
         for key, value in node_hierarchy.items():
             if isinstance(value, dict):
-                current_node: Node = value['node']
+                current_node: Node = value["node"]
                 path_key = path_separator.join(current_node.path)
                 normalized_header_name = self.header_normalizer._normalize_column_name(current_node.header_name)  # noqa
                 match current_node.data_type:
@@ -28132,10 +28196,14 @@ class StuctureAnalyzer:
 
                     case NodeType.DICT:
                         if current_level <= max_level:
-                            self.__infer_mapping_from_structure_recursive(value['children'], primary_keys,
-                                                                          path_separator,
-                                                                          max_level, current_mapping,
-                                                                          current_level)
+                            self.__infer_mapping_from_structure_recursive(
+                                value["children"],
+                                primary_keys,
+                                path_separator,
+                                max_level,
+                                current_mapping,
+                                current_level,
+                            )
                         else:
                             current_mapping[path_key] = MappingElements.force_type_column(normalized_header_name)
                     case _:
@@ -28146,9 +28214,9 @@ class StuctureAnalyzer:
                 if all(isinstance(item, dict) for item in value):
                     for idx, item in enumerate(value):
                         list_key = f"{key}[{idx}]"
-                        self.__infer_mapping_from_structure_recursive({list_key: item}, primary_keys,
-                                                                      path_separator, max_level,
-                                                                      current_mapping, current_level)
+                        self.__infer_mapping_from_structure_recursive(
+                            {list_key: item}, primary_keys, path_separator, max_level, current_mapping, current_level
+                        )
                 else:
                     # Handle list of non-dictionary items
                     current_mapping[key] = MappingElements.force_type_column(key)
@@ -28161,49 +28229,29 @@ class StuctureAnalyzer:
 class MappingElements:
     @staticmethod
     def primary_key_column(column_name: str) -> dict:
-        return {
-            "mapping": {
-                "destination": column_name,
-                "primaryKey": True
-            }
-        }
+        return {"mapping": {"destination": column_name, "primaryKey": True}}
 
     @staticmethod
     def parent_primary_key_column(column_name: str) -> dict:
-        return {
-            "type": "user",
-            "mapping": {
-                "destination": column_name,
-                "primaryKey": True
-            }
-        }
+        return {"type": "user", "mapping": {"destination": column_name, "primaryKey": True}}
 
     @staticmethod
     def force_type_column(column_name: str) -> dict:
-        return {
-            "type": "column",
-            "mapping": {
-                "destination": column_name
-            },
-            "forceType": True
-        }
+        return {"type": "column", "mapping": {"destination": column_name}, "forceType": True}
 
     @staticmethod
     def user_data_column(column_name: str) -> dict:
-        return {
-            "type": "user",
-            "mapping": {
-                "destination": column_name
-            }
-        }
+        return {"type": "user", "mapping": {"destination": column_name}}
 
 
-def infer_mapping(data: list[dict],
-                  primary_keys: Optional[list[str]] = None,
-                  parent_pkeys: Optional[list[str]] = None,
-                  user_data_columns: Optional[list[str]] = None,
-                  path_separator: str = '.',
-                  max_level_nest_level: int = 2) -> dict:
+def infer_mapping(
+    data: list[dict],
+    primary_keys: Optional[list[str]] = None,
+    parent_pkeys: Optional[list[str]] = None,
+    user_data_columns: Optional[list[str]] = None,
+    path_separator: str = ".",
+    max_level_nest_level: int = 2,
+) -> dict:
     """
     Infer first level Generic Extractor mapping from data sample.
     Args:
@@ -28228,10 +28276,13 @@ def infer_mapping(data: list[dict],
     for row in data:
         analyzer.parse_row(row)
 
-    result = analyzer.infer_mapping(primary_keys or [], parent_pkeys or [],
-                                    user_data_columns or [],
-                                    path_separator=path_separator,
-                                    max_level=max_level_nest_level)
+    result = analyzer.infer_mapping(
+        primary_keys or [],
+        parent_pkeys or [],
+        user_data_columns or [],
+        path_separator=path_separator,
+        max_level=max_level_nest_level,
+    )
     return result
 
 
@@ -28244,8 +28295,9 @@ def get_primary_key_columns(mapping: dict) -> list[str]:
     Returns:
 
     """
-    return [key for key, value in mapping.items() if
-            isinstance(value, dict) and value.get('mapping', {}).get('primaryKey')]
+    return [
+        key for key, value in mapping.items() if isinstance(value, dict) and value.get("mapping", {}).get("primaryKey")
+    ]
 
 
 
@@ -28302,7 +28354,6 @@ class AuthMethodBase(ABC):
 
 
 class AuthMethodBuilder:
-
     @classmethod
     def build(cls, method_name: str, **parameters):
         """
@@ -28317,8 +28368,9 @@ class AuthMethodBuilder:
         supported_actions = cls.get_methods()
 
         if method_name not in list(supported_actions.keys()):
-            raise AuthBuilderError(f'{method_name} is not supported auth method, '
-                                   f'supported values are: [{list(supported_actions.keys())}]')
+            raise AuthBuilderError(
+                f"{method_name} is not supported auth method, supported values are: [{list(supported_actions.keys())}]"
+            )
         parameters = cls._convert_secret_parameters(supported_actions[method_name], **parameters)
         cls._validate_method_arguments(supported_actions[method_name], **parameters)
 
@@ -28327,20 +28379,21 @@ class AuthMethodBuilder:
     @staticmethod
     def _validate_method_arguments(c_converted_method: object, **args):
         class_prefix = f"_{c_converted_method.__name__}__"
-        arguments = [p for p in inspect.signature(c_converted_method.__init__).parameters if p != 'self']
+        arguments = [p for p in inspect.signature(c_converted_method.__init__).parameters if p != "self"]
         missing_arguments = []
         for p in arguments:
             if p not in args:
-                missing_arguments.append(p.replace(class_prefix, '#'))
+                missing_arguments.append(p.replace(class_prefix, "#"))
         if missing_arguments:
-            raise AuthBuilderError(f'Some arguments of method {c_converted_method.__name__} '
-                                   f'are missing: {missing_arguments}')
+            raise AuthBuilderError(
+                f"Some arguments of method {c_converted_method.__name__} are missing: {missing_arguments}"
+            )
 
     @staticmethod
     def _convert_secret_parameters(c_converted_method: object, **parameters):
         new_parameters = {}
         for p in parameters:
-            new_parameters[p.replace('#', f'_{c_converted_method.__name__}__')] = parameters[p]
+            new_parameters[p.replace("#", f"_{c_converted_method.__name__}__")] = parameters[p]
         return new_parameters
 
     @staticmethod
@@ -28359,8 +28412,8 @@ class AuthMethodBuilder:
 
 # TODO: Add all supported authentication methods that will be covered by the UI
 
-class BasicHttp(AuthMethodBase):
 
+class BasicHttp(AuthMethodBase):
     def __init__(self, username, __password):
         self.username = username
         self.password = __password
@@ -28369,17 +28422,15 @@ class BasicHttp(AuthMethodBase):
         return HTTPBasicAuth(username=self.username, password=self.password)
 
     def __eq__(self, other):
-        return all([
-            self.username == getattr(other, 'username', None),
-            self.password == getattr(other, 'password', None)
-        ])
+        return all(
+            [self.username == getattr(other, "username", None), self.password == getattr(other, "password", None)]
+        )
 
     def get_secrets(self):
         return [auth._basic_auth_str(self.username, self.password)]
 
 
 class BearerToken(AuthMethodBase, AuthBase):
-
     def get_secrets(self) -> list[str]:
         return [self.token]
 
@@ -28390,15 +28441,13 @@ class BearerToken(AuthMethodBase, AuthBase):
         return self
 
     def __eq__(self, other):
-        return all([
-            self.token == getattr(other, 'token', None)
-        ])
+        return all([self.token == getattr(other, "token", None)])
 
     def __ne__(self, other):
         return not self == other
 
     def __call__(self, r):
-        r.headers['authorization'] = f"Bearer {self.token}"
+        r.headers["authorization"] = f"Bearer {self.token}"
         return r
 
 
@@ -28415,18 +28464,16 @@ class ApiKey(AuthMethodBase, AuthBase):
         return self
 
     def __eq__(self, other):
-        return all([
-            self.token == getattr(other, 'token', None)
-        ])
+        return all([self.token == getattr(other, "token", None)])
 
     def __ne__(self, other):
         return not self == other
 
     def __call__(self, r):
-        if self.position == 'headers':
+        if self.position == "headers":
             r.headers[self.key] = f"{self.token}"
 
-        elif self.position == 'query':
+        elif self.position == "query":
             parsed_url = urlparse(r.url)
             query_params = parse_qs(parsed_url.query)
             query_params.update({self.key: self.token})
@@ -28454,13 +28501,17 @@ class Query(AuthMethodBase, AuthBase):
 
 
 class Login(AuthMethodBase, AuthBase):
-
-    def __init__(self, login_endpoint: str, method: str = 'GET',
-                 login_query_parameters: dict = None,
-                 login_query_body=None,
-                 login_content_type: str = ContentType.json.value,
-                 login_headers: dict = None,
-                 api_request_headers: dict = None, api_request_query_parameters: dict = None):
+    def __init__(
+        self,
+        login_endpoint: str,
+        method: str = "GET",
+        login_query_parameters: dict = None,
+        login_query_body=None,
+        login_content_type: str = ContentType.json.value,
+        login_headers: dict = None,
+        api_request_headers: dict = None,
+        api_request_query_parameters: dict = None,
+    ):
         """
 
         Args:
@@ -28481,8 +28532,9 @@ class Login(AuthMethodBase, AuthBase):
         self.api_request_query_parameters = api_request_query_parameters or {}
 
     @classmethod
-    def _retrieve_response_placeholders(cls, request_object: dict, separator: str = '.', current_path: str = '') -> \
-            list[str]:
+    def _retrieve_response_placeholders(
+        cls, request_object: dict, separator: str = ".", current_path: str = ""
+    ) -> list[str]:
         """
         Recursively retreive all values that contain object with key `response` and return it's value and json path
         Args:
@@ -28491,7 +28543,7 @@ class Login(AuthMethodBase, AuthBase):
         Returns:
 
         """
-        request_object_str = json.dumps(request_object, separators=(',', ':'))
+        request_object_str = json.dumps(request_object, separators=(",", ":"))
         lookup_str_func = r'"response":"([^"]*)"'
         # Use re.search to find the pattern in your_string
         matches = re.findall(lookup_str_func, request_object_str)
@@ -28509,10 +28561,10 @@ class Login(AuthMethodBase, AuthBase):
 
         """
         response_placeholders = self._retrieve_response_placeholders(source_object_params)
-        source_object_params_str = json.dumps(source_object_params, separators=(',', ':'))
+        source_object_params_str = json.dumps(source_object_params, separators=(",", ":"))
         for placeholder in response_placeholders:
             lookup_str = '{"response":"' + placeholder + '"}'
-            value_to_replace = get_data_from_path(placeholder, response_data, separator='.', strict=False)
+            value_to_replace = get_data_from_path(placeholder, response_data, separator=".", strict=False)
             source_object_params_str = source_object_params_str.replace(lookup_str, '"' + value_to_replace + '"')
         return json.loads(source_object_params_str)
 
@@ -28520,25 +28572,29 @@ class Login(AuthMethodBase, AuthBase):
         request_parameters = {}
 
         if self.login_content_type == ContentType.json:
-            request_parameters['json'] = self.login_query_body
+            request_parameters["json"] = self.login_query_body
         elif self.login_content_type == ContentType.form:
-            request_parameters['data'] = self.login_query_body
+            request_parameters["data"] = self.login_query_body
 
-        response = requests.request(self.method, self.login_endpoint, params=self.login_query_parameters,
-                                    headers=self.login_headers,
-                                    **request_parameters)
+        response = requests.request(
+            self.method,
+            self.login_endpoint,
+            params=self.login_query_parameters,
+            headers=self.login_headers,
+            **request_parameters,
+        )
 
         response.raise_for_status()
 
         self.api_request_headers = self._replace_placeholders_with_response(response.json(), self.api_request_headers)
-        self.api_request_query_parameters = self._replace_placeholders_with_response(response.json(),
-                                                                                     self.api_request_query_parameters)
+        self.api_request_query_parameters = self._replace_placeholders_with_response(
+            response.json(), self.api_request_query_parameters
+        )
         cfg_helpers = ConfigHelpers()
-        self.api_request_headers = cfg_helpers.fill_in_user_parameters(self.api_request_headers, {},
-                                                                       True)
-        self.api_request_query_parameters = cfg_helpers.fill_in_user_parameters(self.api_request_query_parameters,
-                                                                                {},
-                                                                                True)
+        self.api_request_headers = cfg_helpers.fill_in_user_parameters(self.api_request_headers, {}, True)
+        self.api_request_query_parameters = cfg_helpers.fill_in_user_parameters(
+            self.api_request_query_parameters, {}, True
+        )
         return self
 
     def get_secrets(self) -> list[str]:
@@ -28552,7 +28608,6 @@ class Login(AuthMethodBase, AuthBase):
         return secrets
 
     def __call__(self, r):
-
         r.url = f"{r.url}"
         if self.api_request_query_parameters:
             r.url = f"{r.url}?{urlencode(self.api_request_query_parameters)}"
@@ -28561,12 +28616,14 @@ class Login(AuthMethodBase, AuthBase):
 
 
 class OAuth20ClientCredentials(AuthMethodBase, AuthBase):
-
-    def __init__(self, login_endpoint: str,
-                 client_secret: str,
-                 client_id: str,
-                 method: Literal['client_secret_post', 'client_secret_basic'] = 'client_secret_basic',
-                 scopes: list[str] = None):
+    def __init__(
+        self,
+        login_endpoint: str,
+        client_secret: str,
+        client_id: str,
+        method: Literal["client_secret_post", "client_secret_basic"] = "client_secret_basic",
+        scopes: list[str] = None,
+    ):
         """
 
         Args:
@@ -28587,24 +28644,24 @@ class OAuth20ClientCredentials(AuthMethodBase, AuthBase):
         data = {"grant_type": "client_credentials"}
         auth = None
         if self.scopes:
-            data['scope'] = ' '.join(self.scopes)
+            data["scope"] = " ".join(self.scopes)
 
-        if self.method == 'client_secret_post':
-            data['client_id'] = self.client_id
-            data['client_secret'] = self.client_secret
-        elif self.method == 'client_secret_basic':
+        if self.method == "client_secret_post":
+            data["client_id"] = self.client_id
+            data["client_secret"] = self.client_secret
+        elif self.method == "client_secret_basic":
             auth = (self.client_id, self.client_secret)
 
-        response = requests.request('POST', self.login_endpoint, data=data, auth=auth)
+        response = requests.request("POST", self.login_endpoint, data=data, auth=auth)
 
         response.raise_for_status()
 
-        self.auth_header = {'Authorization': f"Bearer {response.json()['access_token']}"}
+        self.auth_header = {"Authorization": f"Bearer {response.json()['access_token']}"}
 
         return self
 
     def get_secrets(self) -> list[str]:
-        return [self.auth_header['Authorization']]
+        return [self.auth_header["Authorization"]]
 
     def __call__(self, r):
         r.headers.update(self.auth_header)
@@ -28632,18 +28689,24 @@ class HttpClientError(Exception):
 
 # TODO: add support for pagination methods
 class GenericHttpClient(HttpClient):
-
-    def __init__(self, base_url: str,
-                 default_http_header: dict = None,
-                 default_params: dict = None,
-                 auth_method: AuthMethodBase = None,
-                 max_retries: int = 10,
-                 backoff_factor: float = 0.3,
-                 status_forcelist: tuple[int, ...] = (500, 502, 504)
-                 ):
-        super().__init__(base_url=base_url, max_retries=max_retries, backoff_factor=backoff_factor,
-                         status_forcelist=status_forcelist,
-                         default_http_header=default_http_header, default_params=default_params)
+    def __init__(
+        self,
+        base_url: str,
+        default_http_header: dict = None,
+        default_params: dict = None,
+        auth_method: AuthMethodBase = None,
+        max_retries: int = 10,
+        backoff_factor: float = 0.3,
+        status_forcelist: tuple[int, ...] = (500, 502, 504),
+    ):
+        super().__init__(
+            base_url=base_url,
+            max_retries=max_retries,
+            backoff_factor=backoff_factor,
+            status_forcelist=status_forcelist,
+            default_http_header=default_http_header,
+            default_params=default_params,
+        )
 
         self._auth_method = auth_method
 
@@ -28664,15 +28727,21 @@ class GenericHttpClient(HttpClient):
             return resp
         except HTTPError as e:
             if e.response.status_code in self.status_forcelist:
-                message = f'Request "{method}: {endpoint_path}" failed, too many retries. ' \
-                          f'Status Code: {e.response.status_code}. Response: {e.response.text}'
+                message = (
+                    f'Request "{method}: {endpoint_path}" failed, too many retries. '
+                    f"Status Code: {e.response.status_code}. Response: {e.response.text}"
+                )
             else:
-                message = f'Request "{method}: {endpoint_path}" failed with non-retryable error. ' \
-                          f'Status Code: {e.response.status_code}. Response: {e.response.text}'
+                message = (
+                    f'Request "{method}: {endpoint_path}" failed with non-retryable error. '
+                    f"Status Code: {e.response.status_code}. Response: {e.response.text}"
+                )
             raise HttpClientError(message, resp) from e
         except InvalidJSONError:
-            message = f'Request "{method}: {endpoint_path}" failed. The JSON payload is invalid (more in detail). ' \
-                      f'Verify the datatype conversion.'
+            message = (
+                f'Request "{method}: {endpoint_path}" failed. The JSON payload is invalid (more in detail). '
+                f"Verify the datatype conversion."
+            )
             raise HttpClientError(message, resp)
         except ConnectionError as e:
             message = f'Request "{method}: {endpoint_path}" failed with the following error: {e}'
@@ -28692,11 +28761,11 @@ class GenericHttpClient(HttpClient):
             backoff_factor=self.backoff_factor,
             status_forcelist=self.status_forcelist,
             allowed_methods=self.allowed_methods,
-            raise_on_status=False
+            raise_on_status=False,
         )
         adapter = HTTPAdapter(max_retries=retry)
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
         return session
 
 
@@ -28734,13 +28803,12 @@ class PageNumPagination(BasePagination):
 
 
 class PaginationBuilder:
-
     @classmethod
     def get_paginator(cls, pagination):
         """Factory function to create the appropriate paginator configuration."""
-        if pagination == 'offset':
+        if pagination == "offset":
             return OffsetPagination()
-        elif pagination == 'pagenum':
+        elif pagination == "pagenum":
             return PageNumPagination()
         else:
             return DummyPagination()
@@ -28752,7 +28820,9 @@ FILE: python-sync-actions/tests/__init__.py
 ================================================
 import sys
 import os
+
 sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
 
 
 ================================================
@@ -28775,8 +28845,11 @@ def _get_testing_dirs(data_dir: str) -> List:
     Returns:
         list of paths inside directory
     """
-    return [os.path.join(data_dir, o) for o in os.listdir(data_dir) if
-            os.path.isdir(os.path.join(data_dir, o)) and not o.startswith('_') and not o == 'legacy_v1']
+    return [
+        os.path.join(data_dir, o)
+        for o in os.listdir(data_dir)
+        if os.path.isdir(os.path.join(data_dir, o)) and not o.startswith("_") and not o == "legacy_v1"
+    ]
 
 
 def run_component(component_script, data_folder):
@@ -28784,34 +28857,34 @@ def run_component(component_script, data_folder):
     Runs a component script with a specified parameters
     """
     os.environ["KBC_DATADIR"] = data_folder
-    if Path(data_folder).joinpath('exit_code').exists():
-        expected_exitcode = int(open(Path(data_folder).joinpath('exit_code')).readline())
+    if Path(data_folder).joinpath("exit_code").exists():
+        expected_exitcode = int(open(Path(data_folder).joinpath("exit_code")).readline())
     else:
         expected_exitcode = 0
     try:
-        run_path(component_script, run_name='__main__')
+        run_path(component_script, run_name="__main__")
     except SystemExit as exeption:
         exitcode = exeption.code
     else:
         exitcode = 0
 
     if exitcode != expected_exitcode:
-        raise AssertionError(f'Process failed with unexpected exit code {exitcode}, instead of {expected_exitcode}')
+        raise AssertionError(f"Process failed with unexpected exit code {exitcode}, instead of {expected_exitcode}")
     # run_path(component_script, run_name='__main__')
 
 
 test_dirs = _get_testing_dirs(Path(__file__).parent.absolute().joinpath("calls").as_posix())
 
-component_script = Path(__file__).absolute().parent.parent.joinpath('src/component.py').as_posix()
+component_script = Path(__file__).absolute().parent.parent.joinpath("src/component.py").as_posix()
 
 print("\nRunning test calls\n")
-os.environ['KBC_EXAMPLES_DIR'] = '/examples/'
+os.environ["KBC_EXAMPLES_DIR"] = "/examples/"
 for dir_path in test_dirs:
-    print(f'\nRunning test {Path(dir_path).name}')
+    print(f"\nRunning test {Path(dir_path).name}")
     sys.path.append(Path(component_script).parent.as_posix())
     run_component(component_script, dir_path)
 
-print('\nAll tests finished successfully!')
+print("\nAll tests finished successfully!")
 
 
 
@@ -28821,6 +28894,7 @@ FILE: python-sync-actions/tests/test_allowed_hosts.py
 """
 Tests for allowed hosts validation
 """
+
 import unittest
 import os
 from pathlib import Path
@@ -28829,7 +28903,7 @@ from keboola.component.exceptions import UserException
 from src.component import Component
 
 
-def create_test_config(base_url: str, allowed_hosts: list = None, endpoint: str = '/path/') -> dict:
+def create_test_config(base_url: str, allowed_hosts: list = None, endpoint: str = "/path/") -> dict:
     """
     Create test configuration
     Args:
@@ -28845,18 +28919,16 @@ def create_test_config(base_url: str, allowed_hosts: list = None, endpoint: str 
         dict: Configuration
     """
     config = {
-        'parameters': {
-            'api': {
-                'baseUrl': base_url,
+        "parameters": {
+            "api": {
+                "baseUrl": base_url,
             },
-            'config': {
-                'jobs': [{'endpoint': endpoint}],
+            "config": {
+                "jobs": [{"endpoint": endpoint}],
             },
-            '__SELECTED_JOB': '0',
+            "__SELECTED_JOB": "0",
         },
-        'image_parameters': {
-            'allowed_hosts': allowed_hosts if allowed_hosts else []
-        }
+        "image_parameters": {"allowed_hosts": allowed_hosts if allowed_hosts else []},
     }
     return config
 
@@ -28866,502 +28938,378 @@ class TestAllowedHosts(unittest.TestCase):
 
     def setUp(self):
         """Set up test cases"""
-        self.tests_dir = Path(__file__).absolute().parent.joinpath('data_tests').as_posix()
+        self.tests_dir = Path(__file__).absolute().parent.joinpath("data_tests").as_posix()
         test_dir = os.path.join(self.tests_dir, "test_allowed_hosts_dummy")
-        os.environ['KBC_DATADIR'] = test_dir
+        os.environ["KBC_DATADIR"] = test_dir
         self.component = Component()
 
     def test_validate_allowed_hosts_exact_match(self):
         """Test exact match of allowed host"""
         config = create_test_config(
-            base_url='https://example.com/api',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com',
-                'path': '/api'
-            }]
+            base_url="https://example.com/api",
+            allowed_hosts=[{"scheme": "https", "host": "example.com", "path": "/api"}],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_different_query_string(self):
         """Test different query string"""
         config = create_test_config(
-            base_url='https://example.com/api?x=1',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com',
-                'path': '/api'
-            }]
+            base_url="https://example.com/api?x=1",
+            allowed_hosts=[{"scheme": "https", "host": "example.com", "path": "/api"}],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_different_trailing_slash(self):
         """Test different trailing slash"""
         config = create_test_config(
-            base_url='https://example.com/api/',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com',
-                'path': '/api'
-            }]
+            base_url="https://example.com/api/",
+            allowed_hosts=[{"scheme": "https", "host": "example.com", "path": "/api"}],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_different_protocol(self):
         """Test different protocol"""
         config = create_test_config(
-            base_url='https://example.com/api',
-            allowed_hosts=[{
-                'scheme': 'http',
-                'host': 'example.com',
-                'path': '/api'
-            }]
+            base_url="https://example.com/api",
+            allowed_hosts=[{"scheme": "http", "host": "example.com", "path": "/api"}],
         )
         with self.assertRaises(UserException):
             self.component._validate_allowed_hosts(
-                allowed_hosts=config['image_parameters']['allowed_hosts'],
-                base_url=config['parameters']['api']['baseUrl'],
-                jobs=config['parameters']['config']['jobs'],
-                selected_job='0'
+                allowed_hosts=config["image_parameters"]["allowed_hosts"],
+                base_url=config["parameters"]["api"]["baseUrl"],
+                jobs=config["parameters"]["config"]["jobs"],
+                selected_job="0",
             )
 
     def test_validate_allowed_hosts_different_port(self):
         """Test different port"""
         config = create_test_config(
-            base_url='https://example.com/api',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com',
-                'port': 443,
-                'path': '/api'
-            }]
+            base_url="https://example.com/api",
+            allowed_hosts=[{"scheme": "https", "host": "example.com", "port": 443, "path": "/api"}],
         )
         with self.assertRaises(UserException):
             self.component._validate_allowed_hosts(
-                allowed_hosts=config['image_parameters']['allowed_hosts'],
-                base_url=config['parameters']['api']['baseUrl'],
-                jobs=config['parameters']['config']['jobs'],
-                selected_job='0'
+                allowed_hosts=config["image_parameters"]["allowed_hosts"],
+                base_url=config["parameters"]["api"]["baseUrl"],
+                jobs=config["parameters"]["config"]["jobs"],
+                selected_job="0",
             )
 
     def test_validate_allowed_hosts_longer_path(self):
         """Test longer path"""
         config = create_test_config(
-            base_url='https://example.com/api/resource',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com',
-                'path': '/api'
-            }]
+            base_url="https://example.com/api/resource",
+            allowed_hosts=[{"scheme": "https", "host": "example.com", "path": "/api"}],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_multiple_levels(self):
         """Test multiple path levels"""
         config = create_test_config(
-            base_url='https://example.com/api/v1/data',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com',
-                'path': '/api'
-            }]
+            base_url="https://example.com/api/v1/data",
+            allowed_hosts=[{"scheme": "https", "host": "example.com", "path": "/api"}],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_trailing_slash_in_whitelist(self):
         """Test trailing slash in whitelist"""
         config = create_test_config(
-            base_url='https://example.com/api/v1',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com',
-                'path': '/api/'
-            }]
+            base_url="https://example.com/api/v1",
+            allowed_hosts=[{"scheme": "https", "host": "example.com", "path": "/api/"}],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_not_real_prefix(self):
         """Test not real prefix"""
         config = create_test_config(
-            base_url='https://example.com/api',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com',
-                'path': '/ap'
-            }]
+            base_url="https://example.com/api",
+            allowed_hosts=[{"scheme": "https", "host": "example.com", "path": "/ap"}],
         )
         with self.assertRaises(UserException):
             self.component._validate_allowed_hosts(
-                allowed_hosts=config['image_parameters']['allowed_hosts'],
-                base_url=config['parameters']['api']['baseUrl'],
-                jobs=config['parameters']['config']['jobs'],
-                selected_job='0'
+                allowed_hosts=config["image_parameters"]["allowed_hosts"],
+                base_url=config["parameters"]["api"]["baseUrl"],
+                jobs=config["parameters"]["config"]["jobs"],
+                selected_job="0",
             )
 
     def test_validate_allowed_hosts_domain_vs_subdomain(self):
         """Test domain vs subdomain"""
         config = create_test_config(
-            base_url='https://sub.example.com/path',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com/'
-            }]
+            base_url="https://sub.example.com/path", allowed_hosts=[{"scheme": "https", "host": "example.com/"}]
         )
         with self.assertRaises(UserException):
             self.component._validate_allowed_hosts(
-                allowed_hosts=config['image_parameters']['allowed_hosts'],
-                base_url=config['parameters']['api']['baseUrl'],
-                jobs=config['parameters']['config']['jobs'],
-                selected_job='0'
+                allowed_hosts=config["image_parameters"]["allowed_hosts"],
+                base_url=config["parameters"]["api"]["baseUrl"],
+                jobs=config["parameters"]["config"]["jobs"],
+                selected_job="0",
             )
 
     def test_validate_allowed_hosts_ip_address_exact_match(self):
         """Test IP address exact match"""
         config = create_test_config(
-            base_url='http://127.0.0.1:8080/api',
-            allowed_hosts=[{
-                'scheme': 'http',
-                'host': '127.0.0.1',
-                'port': 8080,
-                'path': '/api'
-            }]
+            base_url="http://127.0.0.1:8080/api",
+            allowed_hosts=[{"scheme": "http", "host": "127.0.0.1", "port": 8080, "path": "/api"}],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_ip_address_prefix_match(self):
         """Test IP address prefix match"""
         config = create_test_config(
-            base_url='http://127.0.0.1:8080/api/v1/data',
-            allowed_hosts=[{
-                'scheme': 'http',
-                'host': '127.0.0.1',
-                'port': 8080,
-                'path': '/api'
-            }]
+            base_url="http://127.0.0.1:8080/api/v1/data",
+            allowed_hosts=[{"scheme": "http", "host": "127.0.0.1", "port": 8080, "path": "/api"}],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_ip_address_different_port(self):
         """Test IP address different port"""
         config = create_test_config(
-            base_url='http://127.0.0.1:8000/api',
-            allowed_hosts=[{
-                'scheme': 'http',
-                'host': '127.0.0.1',
-                'port': 8080,
-                'path': '/api'
-            }]
+            base_url="http://127.0.0.1:8000/api",
+            allowed_hosts=[{"scheme": "http", "host": "127.0.0.1", "port": 8080, "path": "/api"}],
         )
         with self.assertRaises(UserException):
             self.component._validate_allowed_hosts(
-                allowed_hosts=config['image_parameters']['allowed_hosts'],
-                base_url=config['parameters']['api']['baseUrl'],
-                jobs=config['parameters']['config']['jobs'],
-                selected_job='0'
+                allowed_hosts=config["image_parameters"]["allowed_hosts"],
+                base_url=config["parameters"]["api"]["baseUrl"],
+                jobs=config["parameters"]["config"]["jobs"],
+                selected_job="0",
             )
 
     def test_validate_allowed_hosts_ip_address_no_port_vs_port(self):
         """Test IP address no port vs port"""
         config = create_test_config(
-            base_url='http://127.0.0.1:80/api',
-            allowed_hosts=[{
-                'scheme': 'http',
-                'host': '127.0.0.1',
-                'path': '/api'
-            }]
+            base_url="http://127.0.0.1:80/api", allowed_hosts=[{"scheme": "http", "host": "127.0.0.1", "path": "/api"}]
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_subdomain(self):
         """Test subdomain"""
         config = create_test_config(
-            base_url='https://sub.example.com/path1',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'sub.example.com'
-            }]
+            base_url="https://sub.example.com/path1", allowed_hosts=[{"scheme": "https", "host": "sub.example.com"}]
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_shorter_path_prefix(self):
         """Test shorter path prefix"""
         config = create_test_config(
-            base_url='https://sub.domain.com/path/1/2',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'sub.domain.com'
-            }]
+            base_url="https://sub.domain.com/path/1/2", allowed_hosts=[{"scheme": "https", "host": "sub.domain.com"}]
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_no_trailing_slash(self):
         """Test no trailing slash"""
         config = create_test_config(
-            base_url='https://sub.domain.com/path',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'sub.domain.com'
-            }]
+            base_url="https://sub.domain.com/path", allowed_hosts=[{"scheme": "https", "host": "sub.domain.com"}]
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_longer_prefix(self):
         """Test longer prefix"""
         config = create_test_config(
-            base_url='https://sub.domain.com/extra/data',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'sub.domain.com',
-                'path': '/extra'
-            }]
+            base_url="https://sub.domain.com/extra/data",
+            allowed_hosts=[{"scheme": "https", "host": "sub.domain.com", "path": "/extra"}],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_string_prefix_not_path(self):
         """Test string prefix not path"""
         config = create_test_config(
-            base_url='https://sub.domain.com/pathology',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'sub.domain.com',
-                'path': '/path'
-            }]
+            base_url="https://sub.domain.com/pathology",
+            allowed_hosts=[{"scheme": "https", "host": "sub.domain.com", "path": "/path"}],
         )
         with self.assertRaises(UserException):
             self.component._validate_allowed_hosts(
-                allowed_hosts=config['image_parameters']['allowed_hosts'],
-                base_url=config['parameters']['api']['baseUrl'],
-                jobs=config['parameters']['config']['jobs'],
-                selected_job='0'
+                allowed_hosts=config["image_parameters"]["allowed_hosts"],
+                base_url=config["parameters"]["api"]["baseUrl"],
+                jobs=config["parameters"]["config"]["jobs"],
+                selected_job="0",
             )
 
     def test_validate_allowed_hosts_no_whitelist(self):
         """Test no whitelist"""
-        config = create_test_config(
-            base_url='https://example.com/api',
-            allowed_hosts=None
-        )
+        config = create_test_config(base_url="https://example.com/api", allowed_hosts=None)
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_empty_whitelist(self):
         """Test empty whitelist"""
-        config = create_test_config(
-            base_url='https://example.com/api',
-            allowed_hosts=[]
-        )
+        config = create_test_config(base_url="https://example.com/api", allowed_hosts=[])
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_multiple_hosts_success(self):
         """Test multiple hosts success"""
         config = create_test_config(
-            base_url='https://example.com/api',
+            base_url="https://example.com/api",
             allowed_hosts=[
-                {
-                    'scheme': 'https',
-                    'host': 'example.com',
-                    'path': '/api'
-                },
-                {
-                    'scheme': 'https',
-                    'host': 'sub.example.com',
-                    'path': '/api'
-                }
-            ]
+                {"scheme": "https", "host": "example.com", "path": "/api"},
+                {"scheme": "https", "host": "sub.example.com", "path": "/api"},
+            ],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_multiple_hosts_failure(self):
         """Test multiple hosts failure"""
         config = create_test_config(
-            base_url='https://example.com/api',
+            base_url="https://example.com/api",
             allowed_hosts=[
-                {
-                    'scheme': 'https',
-                    'host': 'example.com',
-                    'path': '/api1'
-                },
-                {
-                    'scheme': 'https',
-                    'host': 'example.com',
-                    'path': '/api2'
-                }
-            ]
+                {"scheme": "https", "host": "example.com", "path": "/api1"},
+                {"scheme": "https", "host": "example.com", "path": "/api2"},
+            ],
         )
         with self.assertRaises(UserException):
             self.component._validate_allowed_hosts(
-                allowed_hosts=config['image_parameters']['allowed_hosts'],
-                base_url=config['parameters']['api']['baseUrl'],
-                jobs=config['parameters']['config']['jobs'],
-                selected_job='0'
+                allowed_hosts=config["image_parameters"]["allowed_hosts"],
+                base_url=config["parameters"]["api"]["baseUrl"],
+                jobs=config["parameters"]["config"]["jobs"],
+                selected_job="0",
             )
 
     def test_validate_allowed_hosts_port_prefix_not_allowed(self):
         """Test port prefix not allowed"""
         config = create_test_config(
-            base_url='https://example.com:8/api',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com',
-                'port': 88,
-                'path': '/api'
-            }]
+            base_url="https://example.com:8/api",
+            allowed_hosts=[{"scheme": "https", "host": "example.com", "port": 88, "path": "/api"}],
         )
         with self.assertRaises(UserException):
             self.component._validate_allowed_hosts(
-                allowed_hosts=config['image_parameters']['allowed_hosts'],
-                base_url=config['parameters']['api']['baseUrl'],
-                jobs=config['parameters']['config']['jobs'],
-                selected_job='0'
+                allowed_hosts=config["image_parameters"]["allowed_hosts"],
+                base_url=config["parameters"]["api"]["baseUrl"],
+                jobs=config["parameters"]["config"]["jobs"],
+                selected_job="0",
             )
 
     def test_validate_allowed_hosts_with_nested_job(self):
         """Test with nested job format"""
         config = create_test_config(
-            base_url='https://example.com/api',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com',
-                'path': '/api'
-            }]
+            base_url="https://example.com/api",
+            allowed_hosts=[{"scheme": "https", "host": "example.com", "path": "/api"}],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0_0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0_0",
         )
 
     def test_validate_allowed_hosts_optional_scheme(self):
         """Test optional scheme"""
         config = create_test_config(
-            base_url='https://example.com/api',
-            allowed_hosts=[{
-                'host': 'example.com',
-                'path': '/api'
-            }]
+            base_url="https://example.com/api", allowed_hosts=[{"host": "example.com", "path": "/api"}]
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_optional_port(self):
         """Test optional port"""
         config = create_test_config(
-            base_url='https://example.com:8080/api',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com',
-                'path': '/api'
-            }]
+            base_url="https://example.com:8080/api",
+            allowed_hosts=[{"scheme": "https", "host": "example.com", "path": "/api"}],
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
     def test_validate_allowed_hosts_optional_path(self):
         """Test optional path"""
         config = create_test_config(
-            base_url='https://example.com/api/v1',
-            allowed_hosts=[{
-                'scheme': 'https',
-                'host': 'example.com'
-            }]
+            base_url="https://example.com/api/v1", allowed_hosts=[{"scheme": "https", "host": "example.com"}]
         )
         self.component._validate_allowed_hosts(
-            allowed_hosts=config['image_parameters']['allowed_hosts'],
-            base_url=config['parameters']['api']['baseUrl'],
-            jobs=config['parameters']['config']['jobs'],
-            selected_job='0'
+            allowed_hosts=config["image_parameters"]["allowed_hosts"],
+            base_url=config["parameters"]["api"]["baseUrl"],
+            jobs=config["parameters"]["config"]["jobs"],
+            selected_job="0",
         )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
 
 
@@ -29375,20 +29323,20 @@ from http_generic.auth import Login
 
 
 class TestLoginAuth(unittest.TestCase):
-
     def test_response_placeholders_simple(self):
-        data = {"some_key": "some value",
-                "nested": {"token": {"response": "accesstoken"}}}
-        result = Login._retrieve_response_placeholders(data, separator='.')
-        expected = ['accesstoken']
+        data = {"some_key": "some value", "nested": {"token": {"response": "accesstoken"}}}
+        result = Login._retrieve_response_placeholders(data, separator=".")
+        expected = ["accesstoken"]
         self.assertEqual(result, expected)
 
     def test_response_placeholders_multiple(self):
-        data = {"some_key": "some value",
-                "first": {"response": "first_response"},
-                "nested": {"token": {"response": "accesstoken"}}}
-        result = Login._retrieve_response_placeholders(data, separator='_')
-        expected = ['first_response', 'accesstoken']
+        data = {
+            "some_key": "some value",
+            "first": {"response": "first_response"},
+            "nested": {"token": {"response": "accesstoken"}},
+        }
+        result = Login._retrieve_response_placeholders(data, separator="_")
+        expected = ["first_response", "accesstoken"]
         self.assertEqual(result, expected)
 
 
@@ -29405,13 +29353,12 @@ from configuration import DataPath
 
 
 class TestComponent(unittest.TestCase):
-
     def setUp(self) -> None:
-        self.tests_dir = Path(__file__).absolute().parent.joinpath('data_tests').as_posix()
+        self.tests_dir = Path(__file__).absolute().parent.joinpath("data_tests").as_posix()
 
     def _get_test_component(self, test_name):
         test_dir = os.path.join(self.tests_dir, test_name)
-        os.environ['KBC_DATADIR'] = test_dir
+        os.environ["KBC_DATADIR"] = test_dir
         return Component()
 
     # @patch('http_generic.client.GenericHttpClient.send_request')
@@ -29439,108 +29386,94 @@ class TestComponent(unittest.TestCase):
     def test_003_oauth_cc(self):
         component = self._get_test_component(self._testMethodName)
         results, response, log, error_message = component.make_call()
-        expected_data = [{'id': '321', 'status': 'get'}, {'id': 'girlfriend', 'status': 'imaginary'}]
+        expected_data = [{"id": "321", "status": "get"}, {"id": "girlfriend", "status": "imaginary"}]
         self.assertEqual(results, expected_data)
-        self.assertTrue(response.request.headers['Authorization'].startswith('Bearer '))
+        self.assertTrue(response.request.headers["Authorization"].startswith("Bearer "))
 
     def test_003_oauth_cc_filtered(self):
-        component = self._get_test_component('test_003_oauth_cc')
+        component = self._get_test_component("test_003_oauth_cc")
         results = component.test_request()
-        self.assertEqual(results['request']['headers']['Authorization'], '--HIDDEN--')
+        self.assertEqual(results["request"]["headers"]["Authorization"], "--HIDDEN--")
 
     def test_004_oauth_cc_post(self):
         component = self._get_test_component(self._testMethodName)
         results, response, log, error_message = component.make_call()
-        expected_data = [{'id': '321', 'status': 'get'}, {'id': 'girlfriend', 'status': 'imaginary'}]
+        expected_data = [{"id": "321", "status": "get"}, {"id": "girlfriend", "status": "imaginary"}]
         self.assertEqual(results, expected_data)
-        self.assertTrue(response.request.headers['Authorization'].startswith('Bearer '))
+        self.assertTrue(response.request.headers["Authorization"].startswith("Bearer "))
 
     def test_004_oauth_cc_post_filtered(self):
-        component = self._get_test_component('test_004_oauth_cc_post')
+        component = self._get_test_component("test_004_oauth_cc_post")
         results = component.test_request()
-        self.assertEqual(results['request']['headers']['Authorization'], '--HIDDEN--')
+        self.assertEqual(results["request"]["headers"]["Authorization"], "--HIDDEN--")
 
     def test_005_post(self):
         component = self._get_test_component(self._testMethodName)
         output = component.test_request()
-        expected_data = [{'id': '123', 'status': 'post'}, {'id': 'potato', 'status': 'mashed'}]
-        self.assertEqual(output['response']['data'], expected_data)
+        expected_data = [{"id": "123", "status": "post"}, {"id": "potato", "status": "mashed"}]
+        self.assertEqual(output["response"]["data"], expected_data)
         expected_request_data = '{"parameter": "value"}'
-        self.assertEqual(output['request']['data'], expected_request_data)
+        self.assertEqual(output["request"]["data"], expected_request_data)
         # url params are dropped
-        self.assertEqual(output['request']['url'], 'http://private-834388-extractormock.apiary-mock.com/post')
+        self.assertEqual(output["request"]["url"], "http://private-834388-extractormock.apiary-mock.com/post")
         # correct content type
-        self.assertEqual(output['request']['headers']['Content-Type'], 'application/json')
+        self.assertEqual(output["request"]["headers"]["Content-Type"], "application/json")
 
     def test_006_post_fail(self):
         component = self._get_test_component(self._testMethodName)
         output = component.test_request()
 
-        self.assertEqual(output['response']['status_code'], 404)
-        self.assertEqual(output['response']['reason'], 'Not Found')
+        self.assertEqual(output["response"]["status_code"], 404)
+        self.assertEqual(output["response"]["reason"], "Not Found")
 
         expected_request_data = '{"parameter": "value"}'
-        self.assertEqual(output['request']['data'], expected_request_data)
+        self.assertEqual(output["request"]["data"], expected_request_data)
 
     def test_006_post_form(self):
         component = self._get_test_component(self._testMethodName)
         output = component.test_request()
-        expected_data = [{'id': '123', 'status': 'post'}, {'id': 'potato', 'status': 'mashed'}]
-        self.assertEqual(output['response']['data'], expected_data)
-        expected_request_data = 'parameter=value'
-        self.assertEqual(output['request']['data'], expected_request_data)
+        expected_data = [{"id": "123", "status": "post"}, {"id": "potato", "status": "mashed"}]
+        self.assertEqual(output["response"]["data"], expected_data)
+        expected_request_data = "parameter=value"
+        self.assertEqual(output["request"]["data"], expected_request_data)
         # url params are dropped
-        self.assertEqual(output['request']['url'], 'http://private-834388-extractormock.apiary-mock.com/post')
+        self.assertEqual(output["request"]["url"], "http://private-834388-extractormock.apiary-mock.com/post")
         # request method is POST
-        self.assertEqual(output['request']['method'], 'POST')
+        self.assertEqual(output["request"]["method"], "POST")
         # correct content type
-        self.assertEqual(output['request']['headers']['Content-Type'], 'application/x-www-form-urlencoded')
+        self.assertEqual(output["request"]["headers"]["Content-Type"], "application/x-www-form-urlencoded")
 
     def test_009_empty_datafield(self):
         component = self._get_test_component(self._testMethodName)
         results, response, log, error_message = component.make_call()
-        expected_data = [
-            {
-                "id": "1.0",
-                "status": "first"
-            },
-            {
-                "id": "1.1",
-                "status": "page"
-            }
-        ]
+        expected_data = [{"id": "1.0", "status": "first"}, {"id": "1.1", "status": "page"}]
         self.assertEqual(results, expected_data)
 
     def test_parse_data_null_datafield(self):
-        component = self._get_test_component('test_009_empty_datafield')
+        component = self._get_test_component("test_009_empty_datafield")
         # test array of primitives
-        data = {"some_property": "asd",
-                "some_object": {"some_property": "asd"},
-                "data": [1, 2, 3]
-                }
+        data = {"some_property": "asd", "some_object": {"some_property": "asd"}, "data": [1, 2, 3]}
         results = component._parse_data(data, None)
-        self.assertEqual(results, data['data'])
+        self.assertEqual(results, data["data"])
 
         # test array of arrays
-        data = {"some_property": "asd",
-                "some_object": {"some_property": "asd"},
-                "data": [[{"col": "a"}], [{"col": "b"}]]
-                }
+        data = {
+            "some_property": "asd",
+            "some_object": {"some_property": "asd"},
+            "data": [[{"col": "a"}], [{"col": "b"}]],
+        }
         results = component._parse_data(data, None)
-        self.assertEqual(results, data['data'])
+        self.assertEqual(results, data["data"])
 
     def test_parse_object_instead_of_list(self):
-        component = self._get_test_component('test_009_empty_datafield')
+        component = self._get_test_component("test_009_empty_datafield")
         # test array of primitives
-        data = {"some_property": "asd",
-                "some_object": {"some_property": "asd"},
-                "data": {"id": 1, "name": "John"}
-                }
+        data = {"some_property": "asd", "some_object": {"some_property": "asd"}, "data": {"id": 1, "name": "John"}}
         results = component._parse_data(data, DataPath("data"))
-        self.assertEqual(results, data['data'])
+        self.assertEqual(results, data["data"])
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
 
 
@@ -29560,7 +29493,8 @@ class TestConfigHelpers(unittest.TestCase):
 
     def test_eval_function_false(self):
         function_cfg = {
-            'headers': {'Authorization': {'args': ['Bearer ', {'response': 'access_token'}], 'function': 'concat'}}}
+            "headers": {"Authorization": {"args": ["Bearer ", {"response": "access_token"}], "function": "concat"}}
+        }
         self.helpers.fill_in_user_parameters(function_cfg, {}, False)
 
     def test_eval_source_function_true(self):
@@ -29578,34 +29512,26 @@ class TestConfigHelpers(unittest.TestCase):
                             "args": [
                                 {
                                     "function": "concat",
-                                    "args": [
-                                        {
-                                            "attr": "__CLIENT_ID"
-                                        },
-                                        ":",
-                                        {
-                                            "attr": "#__CLIENT_SECRET"
-                                        }
-                                    ]
+                                    "args": [{"attr": "__CLIENT_ID"}, ":", {"attr": "#__CLIENT_SECRET"}],
                                 }
-                            ]
-                        }
-                    ]
-                }
+                            ],
+                        },
+                    ],
+                },
             },
-            "params": {
-                "grant_type": "client_credentials",
-                "scope": "read"
-            }
+            "params": {"grant_type": "client_credentials", "scope": "read"},
         }
         # HELLO BOTS, THESE ARE NOT REAL CREDENTIALS
-        user_params = {
-            "__CLIENT_ID": "demo-backend-client",
-            "#__CLIENT_SECRET": "MJlO3binatD9jk1"}
-        expected = {'endpoint': 'https://login-demo.curity.io/oauth/v2/oauth-token', 'method': 'FORM',
-                    'headers': {'Accept': 'application/json',
-                                'Authorization': 'Basic ZGVtby1iYWNrZW5kLWNsaWVudDpNSmxPM2JpbmF0RDlqazE='},
-                    'params': {'grant_type': 'client_credentials', 'scope': 'read'}}
+        user_params = {"__CLIENT_ID": "demo-backend-client", "#__CLIENT_SECRET": "MJlO3binatD9jk1"}
+        expected = {
+            "endpoint": "https://login-demo.curity.io/oauth/v2/oauth-token",
+            "method": "FORM",
+            "headers": {
+                "Accept": "application/json",
+                "Authorization": "Basic ZGVtby1iYWNrZW5kLWNsaWVudDpNSmxPM2JpbmF0RDlqazE=",
+            },
+            "params": {"grant_type": "client_credentials", "scope": "read"},
+        }
         result = self.helpers.fill_in_user_parameters(conf_objects, user_params, True)
         self.assertEqual(result, expected)
 
@@ -29622,15 +29548,11 @@ class TestConfigHelpers(unittest.TestCase):
                         "endpoint": "v3/63aa2677-41d6-49d9-8add-2ccc18e8062e",
                         "method": "POST",
                         "dataType": "63aa2677-41d6-49d9-8add-2ccc18e8062e",
-                        "params": {
-                            "test": "test"
-                        }
+                        "params": {"test": "test"},
                     }
-                ]
+                ],
             },
-            "api": {
-                "baseUrl": "https://run.mocky.io/"
-            }
+            "api": {"baseUrl": "https://run.mocky.io/"},
         }
 
         configs = configuration.convert_to_v2(config)
@@ -29649,15 +29571,11 @@ class TestConfigHelpers(unittest.TestCase):
                         "endpoint": "v3/63aa2677-41d6-49d9-8add-2ccc18e8062e",
                         "method": "GET",
                         "dataType": "63aa2677-41d6-49d9-8add-2ccc18e8062e",
-                        "params": {
-                            "test": "testValue"
-                        }
+                        "params": {"test": "testValue"},
                     }
-                ]
+                ],
             },
-            "api": {
-                "baseUrl": "https://run.mocky.io/"
-            }
+            "api": {"baseUrl": "https://run.mocky.io/"},
         }
 
         configs = configuration.convert_to_v2(config)
@@ -29681,33 +29599,45 @@ class TestCurl(unittest.TestCase):
         command = 'curl -d "param1=value1&param2=value2" -H "Content-Type: application/x-www-form-urlencoded" -X POST http://localhost:3000/blahblah'
 
         result = curl.build_job_from_curl(command)
-        expected = JobTemplate(endpoint='http://localhost:3000/blahblah', children=[], method='POST',
-                               dataType='blahblah',
-                               dataField={"path": ".", "separator": "."},
-                               params={'param1': 'value1', 'param2': 'value2'},
-                               headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        expected = JobTemplate(
+            endpoint="http://localhost:3000/blahblah",
+            children=[],
+            method="POST",
+            dataType="blahblah",
+            dataField={"path": ".", "separator": "."},
+            params={"param1": "value1", "param2": "value2"},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         self.assertEqual(result, expected)
 
     def test_x_form_urlencoded_implicit(self):
         command = 'curl -d "param1=value1&param2=value2" -X POST http://localhost:3000/blahblah'
 
         result = curl.build_job_from_curl(command)
-        expected = JobTemplate(endpoint='http://localhost:3000/blahblah', children=[], method='POST',
-                               dataType='blahblah',
-                               dataField={"path": ".", "separator": "."},
-                               params={'param1': 'value1', 'param2': 'value2'},
-                               headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        expected = JobTemplate(
+            endpoint="http://localhost:3000/blahblah",
+            children=[],
+            method="POST",
+            dataType="blahblah",
+            dataField={"path": ".", "separator": "."},
+            params={"param1": "value1", "param2": "value2"},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         self.assertEqual(result, expected)
 
     def test_json_explicit(self):
         command = 'curl -X POST -H "Content-Type: application/json" -d \'{"key1":"value1", "key2":{"nested":"value2"}}\' http://localhost:3000/endpoint'
 
         result = curl.build_job_from_curl(command)
-        expected = JobTemplate(endpoint='http://localhost:3000/endpoint', children=[], method='POST',
-                               dataType='endpoint',
-                               dataField={"path": ".", "separator": "."},
-                               params={'key1': 'value1', 'key2': {'nested': 'value2'}},
-                               headers={'Content-Type': 'application/json'})
+        expected = JobTemplate(
+            endpoint="http://localhost:3000/endpoint",
+            children=[],
+            method="POST",
+            dataType="endpoint",
+            dataField={"path": ".", "separator": "."},
+            params={"key1": "value1", "key2": {"nested": "value2"}},
+            headers={"Content-Type": "application/json"},
+        )
         self.assertEqual(result, expected)
 
     def test_json_query_params_fail(self):
@@ -29716,8 +29646,9 @@ class TestCurl(unittest.TestCase):
         with self.assertRaises(UserException) as context:
             curl.build_job_from_curl(command)
 
-        self.assertEqual(str(context.exception),
-                         'Query parameters are not supported for POST requests with JSON content type')
+        self.assertEqual(
+            str(context.exception), "Query parameters are not supported for POST requests with JSON content type"
+        )
 
     def test_unknown_method_fails(self):
         command = 'curl -X PATCH -H "Content-Type: application/json" -d \'{"key1":"value1", "key2":{"nested":"value2"}}\' http://localhost:3000/endpoint'
@@ -29725,29 +29656,56 @@ class TestCurl(unittest.TestCase):
         with self.assertRaises(UserException) as context:
             curl.build_job_from_curl(command)
 
-        self.assertEqual(str(context.exception),
-                         'Unsupported method PATCH, only GET, POST with JSON and POST with form data are supported.')
+        self.assertEqual(
+            str(context.exception),
+            "Unsupported method PATCH, only GET, POST with JSON and POST with form data are supported.",
+        )
 
     def test_query_with_globs(self):
         command = """curl --include \
      --header "X-StorageApi-Token: your_token" \
   'https://connection.keboola.com/v2/storage/events?sinceId={sinceId}&maxId={maxId}&component={component}&configurationId={configurationId}&runId={runId}&q={q}&limit={limit}&offset={offset}'"""
-        expected = JobTemplate(endpoint='https://connection.keboola.com/v2/storage/events', children=[], method='GET',
-                               dataType='events', dataField={"path": ".", "separator": "."},
-                               params={'sinceId': '_sinceId_', 'maxId': '_maxId_', 'component': '_component_',
-                                       'configurationId': '_configurationId_', 'runId': '_runId_', 'q': '_q_',
-                                       'limit': '_limit_', 'offset': '_offset_'},
-                               headers={'X-StorageApi-Token': 'your_token'})
+        expected = JobTemplate(
+            endpoint="https://connection.keboola.com/v2/storage/events",
+            children=[],
+            method="GET",
+            dataType="events",
+            dataField={"path": ".", "separator": "."},
+            params={
+                "sinceId": "_sinceId_",
+                "maxId": "_maxId_",
+                "component": "_component_",
+                "configurationId": "_configurationId_",
+                "runId": "_runId_",
+                "q": "_q_",
+                "limit": "_limit_",
+                "offset": "_offset_",
+            },
+            headers={"X-StorageApi-Token": "your_token"},
+        )
         result = curl.build_job_from_curl(command)
         self.assertEqual(result, expected)
 
     def test_url_w_placeholders(self):
         command = """curl 'https://connection.{{stack}}.keboola.com/v2/storage/events?sinceId={sinceId}&maxId={maxId}&component={component}&configurationId={configurationId}&runId={runId}&q={q}&limit={limit}&offset={offset}'"""
-        expected = JobTemplate(endpoint='https://connection.{{stack}}.keboola.com/v2/storage/events', children=[],
-                               method='GET', dataType='events', dataField={"path": ".", "separator": "."},
-                               params={'sinceId': '_sinceId_', 'maxId': '_maxId_', 'component': '_component_',
-                                       'configurationId': '_configurationId_', 'runId': '_runId_', 'q': '_q_',
-                                       'limit': '_limit_', 'offset': '_offset_'}, headers={})
+        expected = JobTemplate(
+            endpoint="https://connection.{{stack}}.keboola.com/v2/storage/events",
+            children=[],
+            method="GET",
+            dataType="events",
+            dataField={"path": ".", "separator": "."},
+            params={
+                "sinceId": "_sinceId_",
+                "maxId": "_maxId_",
+                "component": "_component_",
+                "configurationId": "_configurationId_",
+                "runId": "_runId_",
+                "q": "_q_",
+                "limit": "_limit_",
+                "offset": "_offset_",
+            },
+            headers={},
+        )
         result = curl.build_job_from_curl(command)
         self.assertEqual(result, expected)
 
@@ -29764,83 +29722,44 @@ from configuration import ConfigHelpers
 
 
 class TestFunctionTemplates(unittest.TestCase):
-
     def setUp(self):
         self.config_helpers = ConfigHelpers()
 
     def execute_function_test(self, function_cfg: dict, expected):
-        result = self.config_helpers.perform_custom_function('test', function_cfg, {})
+        result = self.config_helpers.perform_custom_function("test", function_cfg, {})
         self.assertEqual(result, expected)
 
     @freeze_time("2021-01-01")
     def test_date_strtotime(self):
         function_cfg = {
             "function": "date",
-            "args": [
-                "Y-m-d",
-                {
-                    "function": "strtotime",
-                    "args": [
-                        "-2 day",
-                        {
-                            "time": "currentStart"
-                        }
-                    ]
-                }
-            ]
+            "args": ["Y-m-d", {"function": "strtotime", "args": ["-2 day", {"time": "currentStart"}]}],
         }
-        expected = '2020-12-30'
+        expected = "2020-12-30"
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
     def test_date_strtotime_timestamp(self):
         function_cfg = {
             "function": "date",
-            "args": [
-                "Y-m-d H:i:s",
-                {
-                    "function": "strtotime",
-                    "args": [
-                        "-2 day",
-                        {
-                            "time": "currentStart"
-                        }
-                    ]
-                }
-            ]
+            "args": ["Y-m-d H:i:s", {"function": "strtotime", "args": ["-2 day", {"time": "currentStart"}]}],
         }
-        expected = '2020-12-30 00:00:00'
+        expected = "2020-12-30 00:00:00"
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
     def test_date_empty_timestamp(self):
-        function_cfg = {
-            "function": "date",
-            "args": [
-                "Y-m-d H:i:s"
-            ]
-        }
-        expected = '2021-01-01 00:00:00'
+        function_cfg = {"function": "date", "args": ["Y-m-d H:i:s"]}
+        expected = "2021-01-01 00:00:00"
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
     def test_relative_iso(self):
         function_cfg = {
             "function": "date",
-            "args": [
-                "Y-m-d\\TH:i:sP",
-                {
-                    "function": "strtotime",
-                    "args": [
-                        "-2 day",
-                        {
-                            "time": "currentStart"
-                        }
-                    ]
-                }
-            ]
+            "args": ["Y-m-d\\TH:i:sP", {"function": "strtotime", "args": ["-2 day", {"time": "currentStart"}]}],
         }
-        expected = '2020-12-30T00:00:00+00:00'
+        expected = "2020-12-30T00:00:00+00:00"
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
@@ -29850,130 +29769,64 @@ class TestFunctionTemplates(unittest.TestCase):
             "args": [
                 {
                     "function": "date",
-                    "args": [
-                        "Y-m-d",
-                        {
-                            "function": "strtotime",
-                            "args": [
-                                "-1 day",
-                                {
-                                    "time": "currentStart"
-                                }
-                            ]
-                        }
-                    ]
+                    "args": ["Y-m-d", {"function": "strtotime", "args": ["-1 day", {"time": "currentStart"}]}],
                 },
-                "T00:00:00.000Z"
-            ]
+                "T00:00:00.000Z",
+            ],
         }
-        expected = '2020-12-31T00:00:00.000Z'
+        expected = "2020-12-31T00:00:00.000Z"
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
     def test_date_in_ymdh(self):
-        function_cfg = {
-            "function": "date",
-            "args": [
-                "Y-m-d H:i:s",
-                {
-                    "time": "currentStart"
-                }
-            ]
-        }
-        expected = '2021-01-01 00:00:00'
+        function_cfg = {"function": "date", "args": ["Y-m-d H:i:s", {"time": "currentStart"}]}
+        expected = "2021-01-01 00:00:00"
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
     def test_previous_start_timestamp(self):
-        function_cfg = {
-            "function": "date",
-            "args": [
-                "Y-m-d H:i:s",
-                {
-                    "time": "previousStart"
-                }
-            ]
-        }
-        expected = '2021-01-01 00:00:00'
+        function_cfg = {"function": "date", "args": ["Y-m-d H:i:s", {"time": "previousStart"}]}
+        expected = "2021-01-01 00:00:00"
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
     def test_previous_start_epoch(self):
-        function_cfg = {
-            "time": "previousStart"
-        }
+        function_cfg = {"time": "previousStart"}
         expected = 1609459200
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
     def test_current_time_epoch(self):
-        function_cfg = {
-            "function": "time"
-        }
+        function_cfg = {"function": "time"}
         expected = 1609459200
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
     def test_string_to_epoch(self):
-        function_cfg = {
-            "function": "strtotime",
-            "args": [
-                "-7 days",
-                {
-                    "time": "currentStart"
-                }
-            ]
-        }
+        function_cfg = {"function": "strtotime", "args": ["-7 days", {"time": "currentStart"}]}
         expected = 1608854400
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
     def test_strtotime_empty_base_time(self):
-        function_cfg = {
-            "function": "strtotime",
-            "args": [
-                "now"
-            ]
-        }
+        function_cfg = {"function": "strtotime", "args": ["now"]}
         expected = 1609459200
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
     def test_strtotime_empty_base_time_before_days(self):
-        function_cfg = {
-            "function": "strtotime",
-            "args": [
-                "-2 days"
-            ]
-        }
+        function_cfg = {"function": "strtotime", "args": ["-2 days"]}
         expected = 1609286400
         self.execute_function_test(function_cfg, expected)
 
     def test_concat_ws(self):
-        function_cfg = {
-            "function": "implode",
-            "args": [
-                ",",
-                [
-                    "apples",
-                    "oranges",
-                    "plums"
-                ]
-            ]
-        }
-        expected = 'apples,oranges,plums'
+        function_cfg = {"function": "implode", "args": [",", ["apples", "oranges", "plums"]]}
+        expected = "apples,oranges,plums"
         self.execute_function_test(function_cfg, expected)
 
     def test_concat(self):
-        function_cfg = {
-            "function": "concat",
-            "args": [
-                "Hen",
-                "Or",
-                "Egg"
-            ]
-        }
-        expected = 'HenOrEgg'
+        function_cfg = {"function": "concat", "args": ["Hen", "Or", "Egg"]}
+        expected = "HenOrEgg"
         self.execute_function_test(function_cfg, expected)
 
     @freeze_time("2021-01-01")
@@ -29985,88 +29838,41 @@ class TestFunctionTemplates(unittest.TestCase):
                 ">=",
                 {
                     "function": "date",
-                    "args": [
-                        "d-m-Y",
-                        {
-                            "function": "strtotime",
-                            "args": [
-                                "-3 day",
-                                {
-                                    "time": "previousStart"
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
+                    "args": ["d-m-Y", {"function": "strtotime", "args": ["-3 day", {"time": "previousStart"}]}],
+                },
+            ],
         }
-        expected = '=updatedAt>=29-12-2020'
+        expected = "=updatedAt>=29-12-2020"
         self.execute_function_test(function_cfg, expected)
 
     def test_md5(self):
-        function_cfg = {
-            "function": "md5",
-            "args": [
-                "NotSoSecret"
-            ]
-        }
-        expected = '1228d3ff5089f27721f1e0403ad86e73'
+        function_cfg = {"function": "md5", "args": ["NotSoSecret"]}
+        expected = "1228d3ff5089f27721f1e0403ad86e73"
         self.execute_function_test(function_cfg, expected)
 
     def test_sha1(self):
-        function_cfg = {
-            "function": "sha1",
-            "args": [
-                "NotSoSecret"
-            ]
-        }
-        expected = '64d5d2977cc2573afbd187ff5e71d1529fd7f6d8'
+        function_cfg = {"function": "sha1", "args": ["NotSoSecret"]}
+        expected = "64d5d2977cc2573afbd187ff5e71d1529fd7f6d8"
         self.execute_function_test(function_cfg, expected)
 
     def test_base64(self):
-        function_cfg = {
-            "function": "base64_encode",
-            "args": [
-                "TeaPot"
-            ]
-        }
-        expected = 'VGVhUG90'
+        function_cfg = {"function": "base64_encode", "args": ["TeaPot"]}
+        expected = "VGVhUG90"
         self.execute_function_test(function_cfg, expected)
 
     def test_hmac(self):
-        function_cfg = {
-            "function": "hash_hmac",
-            "args": [
-                "sha256",
-                "12345abcd5678efgh90ijk",
-                "TeaPot"
-            ]
-        }
-        expected = '7bd4ec99a609b3a9b1f79bc155037cf70939f6bff50b0012fc49e350586bf554'
+        function_cfg = {"function": "hash_hmac", "args": ["sha256", "12345abcd5678efgh90ijk", "TeaPot"]}
+        expected = "7bd4ec99a609b3a9b1f79bc155037cf70939f6bff50b0012fc49e350586bf554"
         self.execute_function_test(function_cfg, expected)
 
     def test_sprintf(self):
-        function_cfg = {
-            "function": "sprintf",
-            "args": [
-                "Three %s are %.2f %s.",
-                "apples",
-                0.5,
-                "plums"
-            ]
-        }
-        expected = 'Three apples are 0.50 plums.'
+        function_cfg = {"function": "sprintf", "args": ["Three %s are %.2f %s.", "apples", 0.5, "plums"]}
+        expected = "Three apples are 0.50 plums."
         self.execute_function_test(function_cfg, expected)
 
     def test_ifempty(self):
-        function_cfg = {
-            "function": "ifempty",
-            "args": [
-                "",
-                "Banzai"
-            ]
-        }
-        expected = 'Banzai'
+        function_cfg = {"function": "ifempty", "args": ["", "Banzai"]}
+        expected = "Banzai"
         self.execute_function_test(function_cfg, expected)
 
 
@@ -30093,184 +29899,200 @@ class TestCurl(unittest.TestCase):
             "contacts": {
                 "email": "john.doe@example.com",
             },
-            "array": [1, 2, 3]
+            "array": [1, 2, 3],
         },
         {
             "id": 234,
             "name": "Jane Doe",
-            "contacts": {
-                "email": "jane.doe@example.com",
-                "skype": "jane.doe"
-            },
-            "array": [1, 2, 3]
-        }
+            "contacts": {"email": "jane.doe@example.com", "skype": "jane.doe"},
+            "array": [1, 2, 3],
+        },
     ]
 
     def setUp(self):
-        self.tests_dir = Path(__file__).absolute().parent.joinpath('data_tests').as_posix()
+        self.tests_dir = Path(__file__).absolute().parent.joinpath("data_tests").as_posix()
 
     def _get_test_component(self, test_name):
         test_dir = os.path.join(self.tests_dir, test_name)
-        os.environ['KBC_DATADIR'] = test_dir
+        os.environ["KBC_DATADIR"] = test_dir
         return Component()
 
     def test_nested_levels_pkeys(self):
         # nesting level 0
-        expected = {'array': {'forceType': True, 'mapping': {'destination': 'array'}, 'type': 'column'},
-                    'contacts': {'forceType': True, 'mapping': {'destination': 'contacts'}, 'type': 'column'},
-                    'id': {'mapping': {'destination': 'id', 'primaryKey': True}}, 'name': 'name'}
-        res = infer_mapping(self.SAMPLE_DATA, primary_keys=['id'], max_level_nest_level=0)
+        expected = {
+            "array": {"forceType": True, "mapping": {"destination": "array"}, "type": "column"},
+            "contacts": {"forceType": True, "mapping": {"destination": "contacts"}, "type": "column"},
+            "id": {"mapping": {"destination": "id", "primaryKey": True}},
+            "name": "name",
+        }
+        res = infer_mapping(self.SAMPLE_DATA, primary_keys=["id"], max_level_nest_level=0)
 
         self.assertEqual(res, expected)
 
         # nesting level 1
-        expected = {'array': {'forceType': True, 'mapping': {'destination': 'array'}, 'type': 'column'},
-                    'contacts.email': 'contacts_email', 'contacts.skype': 'contacts_skype',
-                    'id': {'mapping': {'destination': 'id', 'primaryKey': True}}, 'name': 'name'}
-        res = infer_mapping(self.SAMPLE_DATA, primary_keys=['id'], max_level_nest_level=1)
+        expected = {
+            "array": {"forceType": True, "mapping": {"destination": "array"}, "type": "column"},
+            "contacts.email": "contacts_email",
+            "contacts.skype": "contacts_skype",
+            "id": {"mapping": {"destination": "id", "primaryKey": True}},
+            "name": "name",
+        }
+        res = infer_mapping(self.SAMPLE_DATA, primary_keys=["id"], max_level_nest_level=1)
 
         self.assertEqual(res, expected)
 
     def test_no_pkey(self):
         # nesting level 1
-        expected = {'array': {'forceType': True, 'mapping': {'destination': 'array'}, 'type': 'column'},
-                    'contacts.email': 'contacts_email', 'contacts.skype': 'contacts_skype',
-                    'id': 'id', 'name': 'name'}
+        expected = {
+            "array": {"forceType": True, "mapping": {"destination": "array"}, "type": "column"},
+            "contacts.email": "contacts_email",
+            "contacts.skype": "contacts_skype",
+            "id": "id",
+            "name": "name",
+        }
         res = infer_mapping(self.SAMPLE_DATA, max_level_nest_level=1)
 
         self.assertEqual(res, expected)
 
     def test_user_data(self):
         # nesting level 1
-        expected = {'array': {'forceType': True, 'mapping': {'destination': 'array'}, 'type': 'column'},
-                    'contacts.email': 'contacts_email', 'contacts.skype': 'contacts_skype',
-                    'id': 'id', 'name': 'name',
-                    "date_start": {'mapping': {'destination': 'date_start'}, 'type': 'user'}}
-        user_data_columns = ['date_start']
+        expected = {
+            "array": {"forceType": True, "mapping": {"destination": "array"}, "type": "column"},
+            "contacts.email": "contacts_email",
+            "contacts.skype": "contacts_skype",
+            "id": "id",
+            "name": "name",
+            "date_start": {"mapping": {"destination": "date_start"}, "type": "user"},
+        }
+        user_data_columns = ["date_start"]
         sample_data = deepcopy(self.SAMPLE_DATA)
         for row in sample_data:
-            row['date_start'] = '2021-01-01'
+            row["date_start"] = "2021-01-01"
 
         res = infer_mapping(sample_data, max_level_nest_level=1, user_data_columns=user_data_columns)
 
         self.assertEqual(res, expected)
 
     def test_invalid_characters(self):
-        data = [{
-            "$id": 123,
-            "name|test": "John Doe",
-            "contacts": {
-                "email": "john.doe@example.com",
-            },
-            "array&&invalid": [1, 2, 3]
-        }]
-        expected = {'$id': 'id', 'array&&invalid': {'forceType': True, 'mapping': {'destination': 'array__invalid'},
-                                                    'type': 'column'}, 'contacts.email': 'contacts_email',
-                    'name|test': 'name_test'}
+        data = [
+            {
+                "$id": 123,
+                "name|test": "John Doe",
+                "contacts": {
+                    "email": "john.doe@example.com",
+                },
+                "array&&invalid": [1, 2, 3],
+            }
+        ]
+        expected = {
+            "$id": "id",
+            "array&&invalid": {"forceType": True, "mapping": {"destination": "array__invalid"}, "type": "column"},
+            "contacts.email": "contacts_email",
+            "name|test": "name_test",
+        }
         res = infer_mapping(data, max_level_nest_level=1)
 
         self.assertEqual(res, expected)
 
     def test_dedupe_keys(self):
-        data = {'test_array': 'array', 'array2': {'forceType': True, 'mapping': {'destination': 'array'}},
-                'contacts.email': 'contacts_email', 'contacts.skype': 'contacts_email',
-                'id': 'id', 'name': 'name'}
-        expected = {'array2': {'forceType': True, 'mapping': {'destination': 'array_1'}},
-                    'contacts.email': 'contacts_email', 'contacts.skype': 'contacts_email_1', 'id': 'id',
-                    'name': 'name', 'test_array': 'array'}
+        data = {
+            "test_array": "array",
+            "array2": {"forceType": True, "mapping": {"destination": "array"}},
+            "contacts.email": "contacts_email",
+            "contacts.skype": "contacts_email",
+            "id": "id",
+            "name": "name",
+        }
+        expected = {
+            "array2": {"forceType": True, "mapping": {"destination": "array_1"}},
+            "contacts.email": "contacts_email",
+            "contacts.skype": "contacts_email_1",
+            "id": "id",
+            "name": "name",
+            "test_array": "array",
+        }
         res = StuctureAnalyzer.dedupe_values(data)
         self.assertEqual(res, expected)
 
     def test_list(self):
-        data = {"maxResults": 100, "startAt": 0, "total": 375, "values": [{"id": "12", "value":{ "name": "Max", "age": 25}},
-                                                                          {"id": "13", "value":{ "name": "Tom", "age": 30}},
-                                                                          {"id": "14", "value":{ "name": "John", "age": 35}}]}
+        data = {
+            "maxResults": 100,
+            "startAt": 0,
+            "total": 375,
+            "values": [
+                {"id": "12", "value": {"name": "Max", "age": 25}},
+                {"id": "13", "value": {"name": "Tom", "age": 30}},
+                {"id": "14", "value": {"name": "John", "age": 35}},
+            ],
+        }
 
-        expected = {'id': 'id', 'value.age': 'value_age', 'value.name': 'value_name'}
+        expected = {"id": "id", "value.age": "value_age", "value.name": "value_name"}
         res = infer_mapping(data, max_level_nest_level=1)
 
         self.assertEqual(res, expected)
 
     @freeze_time("2021-01-01")
     def test_infer_mapping_userdata(self):
-        component = self._get_test_component('test_007_infer_mapping_userdata')
+        component = self._get_test_component("test_007_infer_mapping_userdata")
         output = component.infer_mapping()
-        expected_output = {'id': 'id',
-                           'start_date': {'mapping': {'destination': 'start_date'}, 'type': 'user'},
-                           'status': 'status'}
+        expected_output = {
+            "id": "id",
+            "start_date": {"mapping": {"destination": "start_date"}, "type": "user"},
+            "status": "status",
+        }
         self.assertEqual(output, expected_output)
 
     def test_infer_mapping_userdata_child(self):
-        component = self._get_test_component('test_008_infer_mapping_userdata_child')
+        component = self._get_test_component("test_008_infer_mapping_userdata_child")
         output = component.infer_mapping()
         # child job can't have user data
-        expected_output = {'id': 'id',
-                           'status': 'status'}
+        expected_output = {"id": "id", "status": "status"}
         self.assertEqual(output, expected_output)
 
     def test_types(self):
-        data = [[
-            {
-                'id': 'asdf',
-                'firstWorkingDay': '2024-07-16',
-                'workingDays': [
-                    {
-                        'day': 'monday'
-                    },
-                    {
-                        'day': 'tuesday'
-                    },
-                    {
-                        'day': 'wednesday'
-                    },
-                    {
-                        'day': 'thursday'
-                    },
-                    {
-                        'day': 'friday'
-                    }
-                ],
-                'teams': [
-                    {
-                        'name': 'Dream Team',
-                    }
-                ]
-            },
-            {
-                'id': 'asdf2',
-                'firstWorkingDay': '2024-07-16',
-                'workingDays': [
-                    {
-                        'day': 'monday'
-                    },
-                    {
-                        'day': 'tuesday'
-                    },
-                    {
-                        'day': 'wednesday'
-                    },
-                    {
-                        'day': 'thursday'
-                    },
-                    {
-                        'day': 'friday'
-                    }
-                ],
-                'teams': [
-                    {
-                        'name': 'Dream Team',
-                    }
-                ]
-            }]]
+        data = [
+            [
+                {
+                    "id": "asdf",
+                    "firstWorkingDay": "2024-07-16",
+                    "workingDays": [
+                        {"day": "monday"},
+                        {"day": "tuesday"},
+                        {"day": "wednesday"},
+                        {"day": "thursday"},
+                        {"day": "friday"},
+                    ],
+                    "teams": [
+                        {
+                            "name": "Dream Team",
+                        }
+                    ],
+                },
+                {
+                    "id": "asdf2",
+                    "firstWorkingDay": "2024-07-16",
+                    "workingDays": [
+                        {"day": "monday"},
+                        {"day": "tuesday"},
+                        {"day": "wednesday"},
+                        {"day": "thursday"},
+                        {"day": "friday"},
+                    ],
+                    "teams": [
+                        {
+                            "name": "Dream Team",
+                        }
+                    ],
+                },
+            ]
+        ]
 
-        expected = {'firstWorkingDay': 'firstWorkingDay',
-                    'id': 'id',
-                    'teams': {'forceType': True,
-                              'mapping': {'destination': 'teams'},
-                              'type': 'column'},
-                    'workingDays': {'forceType': True,
-                                    'mapping': {'destination': 'workingDays'},
-                                    'type': 'column'}}
+        expected = {
+            "firstWorkingDay": "firstWorkingDay",
+            "id": "id",
+            "teams": {"forceType": True, "mapping": {"destination": "teams"}, "type": "column"},
+            "workingDays": {"forceType": True, "mapping": {"destination": "workingDays"}, "type": "column"},
+        }
         res = infer_mapping(data, max_level_nest_level=1)
 
         self.assertEqual(res, expected)
@@ -30290,299 +30112,353 @@ class TestUrlBuilder(unittest.TestCase):
         self.component = Component()
 
     def test_build_url(self):
-        base_url = 'https://api.example.com'
+        base_url = "https://api.example.com"
         endpoints = [
             {
-                'endpoint': 'users/{id}',
-                'params': {'page': 1},
-                'placeholders': {'id': 123},
+                "endpoint": "users/{id}",
+                "params": {"page": 1},
+                "placeholders": {"id": 123},
             },
             {
-                'endpoint': 'orders',
-                'params': {'status': 'completed'},
-                'placeholders': {},
+                "endpoint": "orders",
+                "params": {"status": "completed"},
+                "placeholders": {},
             },
         ]
 
-        urls = self.component._build_url(base_url, endpoints, '0')
+        urls = self.component._build_url(base_url, endpoints, "0")
 
-        self.assertEqual([
-            'https://api.example.com/users/123?page=1',
-        ], urls)
+        self.assertEqual(["https://api.example.com/users/123?page=1"], urls)
 
     def test_build_urls_with_domain_name(self):
         # Test without trailing slash
-        urls = self.component._build_url('https://example.com', [
-            {
-                'endpoint': 'users',
-                'params': {'page': 1},
-                'placeholders': {},
-            },
-        ], '0')
+        urls = self.component._build_url(
+            "https://example.com",
+            [
+                {
+                    "endpoint": "users",
+                    "params": {"page": 1},
+                    "placeholders": {},
+                },
+            ],
+            "0",
+        )
 
         self.assertEqual(
             [
-                'https://example.com/users?page=1',
+                "https://example.com/users?page=1",
             ],
-            urls
+            urls,
         )
 
         # Test with trailing slash
-        urls = self.component._build_url('https://example.com/', [
-            {
-                'endpoint': 'users',
-                'params': {'page': 1},
-                'placeholders': {},
-            },
-        ], '0')
+        urls = self.component._build_url(
+            "https://example.com/",
+            [
+                {
+                    "endpoint": "users",
+                    "params": {"page": 1},
+                    "placeholders": {},
+                },
+            ],
+            "0",
+        )
 
         self.assertEqual(
             [
-                'https://example.com/users?page=1',
+                "https://example.com/users?page=1",
             ],
-            urls
+            urls,
         )
 
         # Test with subdomain and path
-        urls = self.component._build_url('https://sub.domain.example.com/path/', [
-            {
-                'endpoint': 'users',
-                'params': {'page': 1},
-                'placeholders': {},
-            },
-        ], '0')
+        urls = self.component._build_url(
+            "https://sub.domain.example.com/path/",
+            [
+                {
+                    "endpoint": "users",
+                    "params": {"page": 1},
+                    "placeholders": {},
+                },
+            ],
+            "0",
+        )
 
         self.assertEqual(
             [
-                'https://sub.domain.example.com/path/users?page=1',
+                "https://sub.domain.example.com/path/users?page=1",
             ],
-            urls
+            urls,
         )
 
     def test_build_urls_with_port(self):
-        base_url = 'https://api.example.com:8080'
+        base_url = "https://api.example.com:8080"
         endpoints = [
             {
-                'endpoint': 'users/{id}',
-                'params': {'page': 1},
-                'placeholders': {'id': 123},
+                "endpoint": "users/{id}",
+                "params": {"page": 1},
+                "placeholders": {"id": 123},
             },
         ]
 
-        urls = self.component._build_url(base_url, endpoints, '0')
+        urls = self.component._build_url(base_url, endpoints, "0")
 
-        self.assertEqual([
-            'https://api.example.com:8080/users/123?page=1',
-        ], urls)
+        self.assertEqual(
+            [
+                "https://api.example.com:8080/users/123?page=1",
+            ],
+            urls,
+        )
 
     def test_build_urls_with_path_in_base_url(self):
-        base_url = 'https://api.example.com:8080/v1'
+        base_url = "https://api.example.com:8080/v1"
         endpoints = [
             {
-                'endpoint': 'users/{id}',
-                'params': {'page': 1},
-                'placeholders': {'id': 123},
+                "endpoint": "users/{id}",
+                "params": {"page": 1},
+                "placeholders": {"id": 123},
             },
             {
-                'endpoint': '/orders',
-                'params': {'status': 'completed'},
-                'placeholders': {},
+                "endpoint": "/orders",
+                "params": {"status": "completed"},
+                "placeholders": {},
             },
         ]
 
-        urls = self.component._build_url(base_url, endpoints, '0')
+        urls = self.component._build_url(base_url, endpoints, "0")
 
-        self.assertEqual([
-            'https://api.example.com:8080/v1/users/123?page=1',
-        ], urls)
+        self.assertEqual(
+            [
+                "https://api.example.com:8080/v1/users/123?page=1",
+            ],
+            urls,
+        )
 
     def test_build_urls_with_ip_address(self):
-        base_url = 'https://192.168.1.1'
+        base_url = "https://192.168.1.1"
         endpoints = [
             {
-                'endpoint': 'api/users',
-                'params': {'page': 1},
-                'placeholders': {},
+                "endpoint": "api/users",
+                "params": {"page": 1},
+                "placeholders": {},
             },
         ]
 
-        urls = self.component._build_url(base_url, endpoints, '0')
+        urls = self.component._build_url(base_url, endpoints, "0")
 
-        self.assertEqual([
-            'https://192.168.1.1/api/users?page=1',
-        ], urls)
+        self.assertEqual(
+            [
+                "https://192.168.1.1/api/users?page=1",
+            ],
+            urls,
+        )
 
     def test_build_urls_with_ip_address_and_port(self):
-        base_url = 'https://192.168.1.1:8080'
+        base_url = "https://192.168.1.1:8080"
         endpoints = [
             {
-                'endpoint': 'api/users',
-                'params': {'page': 1},
-                'placeholders': {},
+                "endpoint": "api/users",
+                "params": {"page": 1},
+                "placeholders": {},
             },
         ]
 
-        urls = self.component._build_url(base_url, endpoints, '0')
+        urls = self.component._build_url(base_url, endpoints, "0")
 
-        self.assertEqual([
-            'https://192.168.1.1:8080/api/users?page=1',
-        ], urls)
+        self.assertEqual(
+            [
+                "https://192.168.1.1:8080/api/users?page=1",
+            ],
+            urls,
+        )
 
     def test_build_urls_with_localhost(self):
         # Test with localhost IP
-        urls = self.component._build_url('http://127.0.0.1', [
-            {
-                'endpoint': 'users',
-                'params': {'page': 1},
-                'placeholders': {},
-            },
-        ], '0')
+        urls = self.component._build_url(
+            "http://127.0.0.1",
+            [
+                {
+                    "endpoint": "users",
+                    "params": {"page": 1},
+                    "placeholders": {},
+                },
+            ],
+            "0",
+        )
 
         self.assertEqual(
             [
-                'http://127.0.0.1/users?page=1',
+                "http://127.0.0.1/users?page=1",
             ],
-            urls
+            urls,
         )
 
         # Test with localhost IP and port
-        urls = self.component._build_url('http://127.0.0.1:5000', [
-            {
-                'endpoint': 'users',
-                'params': {'page': 1},
-                'placeholders': {},
-            },
-        ], '0')
+        urls = self.component._build_url(
+            "http://127.0.0.1:5000",
+            [
+                {
+                    "endpoint": "users",
+                    "params": {"page": 1},
+                    "placeholders": {},
+                },
+            ],
+            "0",
+        )
 
         self.assertEqual(
             [
-                'http://127.0.0.1:5000/users?page=1',
+                "http://127.0.0.1:5000/users?page=1",
             ],
-            urls
+            urls,
         )
 
     def test_build_urls_with_different_protocols(self):
         # Test with HTTP
-        urls = self.component._build_url('http://example.com', [
-            {
-                'endpoint': 'users',
-                'params': {'page': 1},
-                'placeholders': {},
-            },
-        ], '0')
+        urls = self.component._build_url(
+            "http://example.com",
+            [
+                {
+                    "endpoint": "users",
+                    "params": {"page": 1},
+                    "placeholders": {},
+                },
+            ],
+            "0",
+        )
 
         self.assertEqual(
             [
-                'http://example.com/users?page=1',
+                "http://example.com/users?page=1",
             ],
-            urls
+            urls,
         )
 
         # Test with HTTPS
-        urls = self.component._build_url('https://example.com', [
-            {
-                'endpoint': 'users',
-                'params': {'page': 1},
-                'placeholders': {},
-            },
-        ], '0')
+        urls = self.component._build_url(
+            "https://example.com",
+            [
+                {
+                    "endpoint": "users",
+                    "params": {"page": 1},
+                    "placeholders": {},
+                },
+            ],
+            "0",
+        )
 
         self.assertEqual(
             [
-                'https://example.com/users?page=1',
+                "https://example.com/users?page=1",
             ],
-            urls
+            urls,
         )
 
     def test_build_urls_with_multiple_params(self):
-        base_url = 'https://api.example.com'
+        base_url = "https://api.example.com"
         endpoints = [
             {
-                'endpoint': 'users',
-                'params': {
-                    'page': 1,
-                    'limit': 100,
-                    'sort': 'name',
-                    'filter': 'active'
-                },
-                'placeholders': {},
+                "endpoint": "users",
+                "params": {"page": 1, "limit": 100, "sort": "name", "filter": "active"},
+                "placeholders": {},
             },
         ]
 
-        urls = self.component._build_url(base_url, endpoints, '0')
+        urls = self.component._build_url(base_url, endpoints, "0")
 
-        self.assertEqual([
-            'https://api.example.com/users?page=1&limit=100&sort=name&filter=active',
-        ], urls)
+        self.assertEqual(
+            [
+                "https://api.example.com/users?page=1&limit=100&sort=name&filter=active",
+            ],
+            urls,
+        )
 
     def test_build_urls_with_selected_job(self):
-        base_url = 'https://api.example.com'
+        base_url = "https://api.example.com"
         endpoints = [
             {
-                'endpoint': 'users/{id}',
-                'params': {'page': 1},
-                'placeholders': {'id': 123},
+                "endpoint": "users/{id}",
+                "params": {"page": 1},
+                "placeholders": {"id": 123},
             },
             {
-                'endpoint': 'orders',
-                'params': {'status': 'completed'},
-                'placeholders': {},
+                "endpoint": "orders",
+                "params": {"status": "completed"},
+                "placeholders": {},
             },
         ]
 
         # Test with first job
-        urls = self.component._build_url(base_url, endpoints, '0')
-        self.assertEqual([
-            'https://api.example.com/users/123?page=1',
-        ], urls)
+        urls = self.component._build_url(base_url, endpoints, "0")
+        self.assertEqual(
+            [
+                "https://api.example.com/users/123?page=1",
+            ],
+            urls,
+        )
 
         # Test with second job
-        urls = self.component._build_url(base_url, endpoints, '1')
-        self.assertEqual([
-            'https://api.example.com/orders?status=completed',
-        ], urls)
+        urls = self.component._build_url(base_url, endpoints, "1")
+        self.assertEqual(
+            [
+                "https://api.example.com/orders?status=completed",
+            ],
+            urls,
+        )
 
     def test_build_urls_with_nested_selected_job(self):
-        base_url = 'https://api.example.com'
+        base_url = "https://api.example.com"
         endpoints = [
             {
-                'endpoint': 'users/{id}',
-                'params': {'page': 1},
-                'placeholders': {'id': 123},
+                "endpoint": "users/{id}",
+                "params": {"page": 1},
+                "placeholders": {"id": 123},
             },
             {
-                'endpoint': 'orders',
-                'params': {'status': 'completed'},
-                'placeholders': {},
+                "endpoint": "orders",
+                "params": {"status": "completed"},
+                "placeholders": {},
             },
         ]
 
         # Test with nested job format (0_0)
-        urls = self.component._build_url(base_url, endpoints, '0_0')
-        self.assertEqual([
-            'https://api.example.com/users/123?page=1',
-        ], urls)
+        urls = self.component._build_url(base_url, endpoints, "0_0")
+        self.assertEqual(
+            [
+                "https://api.example.com/users/123?page=1",
+            ],
+            urls,
+        )
 
         # Test with nested job format (1_0)
-        urls = self.component._build_url(base_url, endpoints, '1_0')
-        self.assertEqual([
-            'https://api.example.com/orders?status=completed',
-        ], urls)
+        urls = self.component._build_url(base_url, endpoints, "1_0")
+        self.assertEqual(
+            [
+                "https://api.example.com/orders?status=completed",
+            ],
+            urls,
+        )
 
         # Test with nested job format (0_1)
-        urls = self.component._build_url(base_url, endpoints, '0_1')
-        self.assertEqual([
-            'https://api.example.com/users/123?page=1',
-        ], urls)
+        urls = self.component._build_url(base_url, endpoints, "0_1")
+        self.assertEqual(
+            [
+                "https://api.example.com/users/123?page=1",
+            ],
+            urls,
+        )
 
         # Test with nested job format (0_2)
-        urls = self.component._build_url(base_url, endpoints, '0_2')
-        self.assertEqual([
-            'https://api.example.com/users/123?page=1',
-        ], urls)
+        urls = self.component._build_url(base_url, endpoints, "0_2")
+        self.assertEqual(
+            [
+                "https://api.example.com/users/123?page=1",
+            ],
+            urls,
+        )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
 
 
