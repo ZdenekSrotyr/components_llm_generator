@@ -1,45 +1,143 @@
 Directory structure:
 └── keboola-component-custom-python-example-repo-1/
     ├── README.md
+    ├── docker-compose.yml
+    ├── Dockerfile
     ├── main.py
     ├── pyproject.toml
     ├── uv.lock
     ├── data/
-    │   └── config.json
+    │   ├── _create_config_json.sh
+    │   ├── config.json
+    │   └── user_parameters.json
     └── src/
-        └── config.py
+        └── shapes.py
 
 ================================================
 FILE: README.md
 ================================================
+- [Example Repository for Custom Python Component](#example-repository-for-custom-python-component)
+  - [⚙️ Configuration](#️-configuration)
+  - [📦 Managing dependencies](#-managing-dependencies)
+  - [🚀 Running locally…](#-running-locally)
+    - [🐋 …in Docker](#-in-docker)
+    - [💜 …in virtual environment](#-in-virtual-environment)
+    - [💔 …locally without uv](#-locally-without-uv)
+
+
 # Example Repository for Custom Python Component
 
-This is an example repository showing how you can use a custom Git repository for passing your own code into Keboola's Custom Python Component (CPC).
+This is an example repository showing how you can use a custom Git repository for passing your own code into **Keboola's [Custom Python Component](https://github.com/keboola/component-custom-python/) (CPC)**.
 
 As the main source file in this repo is located right in the root directory, importing other source files works as expected both when developing locally and when ran using CPC.
 
-This example uses [Astral's](https://astral.sh/) brilliant [uv tool](https://docs.astral.sh/uv/#installation) for package management, so for running this code locally follow these steps:
+
+## ⚙️ Configuration
+
+For your convenience, the [data/user_parameters.json](data/user_parameters.json) file can have exactly the same contents that you will later be able to place in the **User Parameters** field in CPC configuration, so you can just copy-paste it. Because of that, we prepared a super simple script, which will convert this file to the structure expected by Keboola's [base Python Component](https://github.com/keboola/python-component/) (which is used internally in CPC to handle [Keboola Common Interface](https://developers.keboola.com/extend/common-interface/)) for you.
+
+
+## 📦 Managing dependencies
+
+The `keboola.component` package is listed in the [pyproject.toml](pyproject.toml) file just as a dev dependency, because CPC already includes it. This example uses [Astral's](https://astral.sh/) brilliant [uv tool](https://docs.astral.sh/uv/#installation) for package management, so when adding more dependencies to your project:
+
+- Use `uv add` for adding runtime dependencies (these will be installed when running the project via CPC).
+- Use `uv add --dev` for adding development dependencies (these won't be installed in CPC).
+
+
+## 🚀 Running locally…
+
+
+### 🐋 …in Docker
+
+When you have Docker installed, the easiest way to run this example is using `docker compose`:
 
 ```sh
+docker compose build  # voluntary when running for the 1st time
+docker compose up
+```
+
+This way, the configuration and source files are always updated during the build, which shall be done before you can say blueberry pie.
+
+
+### 💜 …in virtual environment
+
+For running this code locally without Docker, follow these steps:
+
+```sh
+# 🧑‍🔧 prepare the config.json file
+data/_create_config_json.sh data/user_parameters.json data/config.json
 # 💜 create virtual environment and install dependencies
 uv sync
 # 🚀 run
 uv run main.py
 ```
 
-**Note:** The `keboola.component` package is listed in the [pyproject.toml](pyproject.toml) file just as a dev dependency, because CPC already includes it. When  adding more dependencies to your project:
-- Use `uv add` for adding runtime dependencies (these will be installed when running the project via CPC).
-- Use `uv add --dev` for adding development dependencies (these won't be installed in CPC).
+
+### 💔 …locally without uv
+
+*will be added later on*
+
+
+
+================================================
+FILE: docker-compose.yml
+================================================
+services:
+  # for development purposes
+  dev:
+    build: .
+    # uncomment the following lines if you want to modify user parameters
+    # without rebuilding the image every time
+
+    # volumes:
+    #   - ./data:/data
+
+    # note that you have to create config.json yourself in such case using:
+    #   data/_create_config_json.sh data/user_parameters.json data/config.json
+
+    environment:
+      - KBC_DATADIR=/data
+
+
+
+================================================
+FILE: Dockerfile
+================================================
+FROM python:3.10-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /code/
+
+COPY pyproject.toml .
+COPY uv.lock .
+
+ENV UV_PROJECT_ENVIRONMENT="/usr/local/"
+RUN uv sync --all-groups --frozen
+
+COPY src/ src
+COPY main.py .
+
+# prepare config.json based on user_parameters.json
+WORKDIR /data/
+COPY data/ .
+RUN ./_create_config_json.sh user_parameters.json config.json
+
+# run
+WORKDIR /code/
+CMD ["uv", "run", "main.py"]
 
 
 
 ================================================
 FILE: main.py
 ================================================
-import httpx
-from keboola.component import CommonInterface
+import logging
 
-from src import config
+import httpx
+from keboola.component import CommonInterface, UserException
+
+from src import shapes
 
 
 def get_request(url) -> httpx.Response:
@@ -48,21 +146,34 @@ def get_request(url) -> httpx.Response:
         response.raise_for_status()
         return response
     except httpx.HTTPError as e:
-        print(f"Error fetching data from {url}: {e}")
-        return None
+        raise Exception(f"Error fetching data from {url}: {e}")
 
 
 def main():
-    cfg = config.Config()
 
-    if resp := get_request(cfg.endpoint):
-        print(resp.request.url, resp.status_code)
-
+    # accessing Keboola Common Interface
     ci = CommonInterface()
-
-    print("User parameters:", ci.configuration.parameters)
+    params = ci.configuration.parameters
+    print("User parameters:", params)
     print("Data folder path:", ci.data_folder_path)
 
+    # running code from an imported module
+    a = params.get("rectangle_a")
+    b = params.get("rectangle_b")
+    if a is None or b is None:
+        raise UserException("Parameters 'rectangle_a' and 'rectangle_b' must be provided.")
+
+    r = shapes.Rectangle(a=a, b=b)
+    logging.info("Rectangle area: %s", r.area())
+    logging.info("Rectangle perimeter: %s", r.perimeter())
+
+    # making an HTTP request
+    endpoint = params.get("endpoint")
+    if not endpoint:
+        raise UserException("Parameter 'endpoint' must be provided.")
+
+    if resp := get_request(endpoint):
+        print(resp.request.url, resp.status_code)
 
 main()
 
@@ -323,6 +434,28 @@ wheels = [
 
 
 ================================================
+FILE: data/_create_config_json.sh
+================================================
+PARAMS_FILE=$1
+OUTPUT_FILE=$2
+
+if [ -z "$PARAMS_FILE" ] || [ -z "$OUTPUT_FILE" ]; then
+  echo "Usage: $0 <params_file> <output_file>"
+  exit 1
+fi
+
+if [ ! -f "$PARAMS_FILE" ]; then
+  echo "User parameters file '$PARAMS_FILE' does not exist"
+  exit 1
+fi
+
+echo '{"parameters": ' > $OUTPUT_FILE
+cat $PARAMS_FILE >> $OUTPUT_FILE
+echo '}' >> $OUTPUT_FILE
+
+
+
+================================================
 FILE: data/config.json
 ================================================
 {
@@ -333,14 +466,41 @@ FILE: data/config.json
 
 
 ================================================
-FILE: src/config.py
+FILE: data/user_parameters.json
 ================================================
+{
+  "endpoint": "https://www.example.com",
+  "#my_secure_parameter_which_will_get_encrypted_in_keboola": "1a2b@3c4d!",
+
+  "rectangle_a": 3.0,
+  "rectangle_b": 4.0
+}
+
+
+
+================================================
+FILE: src/shapes.py
+================================================
+"""
+Example module nested in a subdirectory.
+"""
+
 from dataclasses import dataclass
 
 
 @dataclass
-class Config:
-    endpoint: str = "https://www.example.com"
-    password: str = "NEVER INCLUDE PASSWORDS OR OTHER SENSITIVE DATA HERE"
+class Rectangle:
+    """An example dataclass representing a rectangle."""
+
+    a: float
+    b: float
+
+    def area(self) -> float:
+        """Calculate the area of the rectangle."""
+        return self.a * self.b
+
+    def perimeter(self) -> float:
+        """Calculate the perimeter of the rectangle."""
+        return 2 * (self.a + self.b)
 
 
