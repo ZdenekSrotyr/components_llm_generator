@@ -887,6 +887,11 @@
 - Repository: https://github.com/keboola/component-shopify-v2
 - Description: None
 
+### component-dropbox
+- [Documentation](github/component-dropbox/llm.txt)
+- Repository: https://github.com/keboola/component-dropbox
+- Description: A Dropbox extractor for Keboola Connection (API v2)
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
