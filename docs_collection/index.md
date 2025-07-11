@@ -892,6 +892,16 @@
 - Repository: https://github.com/keboola/component-dropbox
 - Description: A Dropbox extractor for Keboola Connection (API v2)
 
+### component-iceberg
+- [Documentation](github/component-iceberg/llm.txt)
+- Repository: https://github.com/keboola/component-iceberg
+- Description: None
+
+### component-webdav-writer
+- [Documentation](github/component-webdav-writer/llm.txt)
+- Repository: https://github.com/keboola/component-webdav-writer
+- Description: A WebDAV Writer component for Keboola Connection
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors

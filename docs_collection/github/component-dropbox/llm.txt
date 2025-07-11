@@ -1,11 +1,1290 @@
 Directory structure:
 └── keboola-component-dropbox/
-    └── README.md
+    ├── README.md
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── Dockerfile
+    ├── LICENSE.md
+    ├── pyproject.toml
+    ├── uv.lock
+    ├── .python-version
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── component_short_description.md
+    │   ├── configRowSchema.json
+    │   ├── configSchema.json
+    │   ├── configuration_description.md
+    │   ├── documentationUrl.md
+    │   ├── licenseUrl.md
+    │   ├── logger
+    │   ├── loggerConfiguration.json
+    │   └── sourceCodeUrl.md
+    ├── scripts/
+    │   ├── build_n_run.ps1
+    │   ├── build_n_test.sh
+    │   ├── run_kbc_tests.ps1
+    │   └── developer_portal/
+    │       ├── fn_actions_md_update.sh
+    │       └── update_properties.sh
+    ├── src/
+    │   ├── component.py
+    │   ├── configuration.py
+    │   └── dropbox_client.py
+    ├── tests/
+    │   ├── __init__.py
+    │   ├── test_configuration.py
+    │   └── test_dropbox_client.py
+    └── .github/
+        └── workflows/
+            └── push.yml
 
 ================================================
 FILE: README.md
 ================================================
-# component-dropbox
-A Dropbox extractor for Keboola Connection (API v2)
+# Dropbox Extractor (API v2 using Python)
+
+The Dropbox Extractor automates downloading files from public Dropbox share links directly into Keboola Storage.
+
+## Features
+
+- **Download via Share Links**
+  - Accepts one or multiple Dropbox share URLs.
+
+- **CSV Table Output**
+  - Saves downloaded files as CSV tables in `/data/out/tables/`.
+  - Generates Keboola Storage manifests automatically.
+
+- **Custom Bucket Support**
+  - Users can optionally define a custom bucket name for output tables.
+  - Defaults to `in.c-dropbox-extractor`.
+
+- **Secure Logging**
+  - Logs only safe parts of Dropbox URLs.
+  - Prevents sensitive tokens from appearing in logs.
+
+- **Modern Migration Path**
+  - Designed to replace older Dropbox extractors written in Node.js.
+  - Supports similar configuration structures for easy migration.
+
+
+## Configuration
+
+The extractor requires a JSON configuration file structured like this:
+
+```json
+{
+  "parameters": {
+    "dropbox_links": [
+      {
+        "download_url": "https://www.dropbox.com/scl/fi/xtks1q4d3hfwvy01hhm43/products.csv?dl=0",
+        "table_name": "products"
+      }
+    ]
+  },
+  "action": "run"
+}
+```
+
+### Configuration Parameters
+
+| Parameter       | Required | Description                                                                                                                             |
+| --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `dropbox_links` | Yes      | An array of Dropbox files to download. Each object requires a `download_url` (Dropbox share link) and `table_name` (output table name). |
+
+#### Important:
+
+- Your Dropbox links should be publicly accessible via a share URL.
+- The extractor automatically updates links from `dl=0` to `dl=1` to ensure direct download.
+- Table names can only include letters, numbers, dots, underscores, and hyphens.
+
+## Output
+
+After a successful run:
+
+- The downloaded file will be saved as:
+
+```text
+/data/out/tables/{table_name}.csv
+```
+
+- A manifest file will be generated alongside each table:
+
+
+```json
+{
+  "incremental": false,
+  "destination": "in.c-dropbox-extractor.{table_name}"
+}
+```
+
+## Migration from Node.js Extractor
+
+If migrating from the original Node.js Dropbox Extractor:
+
+- Configuration remains largely the same.
+- Encrypted URL fields (`#download_url`) have been replaced with plaintext `download_url` for a better UX. The sensitive part of links is not logged anywhere.
+- Logging and error handling have been improved.
+- Manifests and file locations are consistent with Keboola best practices.
+
+## Running Locally
+
+For local testing, create a `data/config.json` file in your working directory:
+
+```json
+{
+  "parameters": {
+    "dropbox_links": [
+      {
+        "download_url": "https://www.dropbox.com/scl/fi/xtks1q4d3hfwvy01hhm43/products.csv?dl=0",
+        "table_name": "products"
+      }
+    ]
+  }
+}
+```
+
+Then run:
+
+```bash
+python3 src/component.py
+```
+
+## Development & Testing
+
+Install requirements:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run tests:
+
+```bash
+pytest
+```
+
+## License
+
+MIT License
+
+
+================================================
+FILE: deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+
+================================================
+FILE: docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+
+================================================
+FILE: Dockerfile
+================================================
+FROM python:3.13-slim
+ENV PYTHONIOENCODING=utf-8
+
+RUN pip install uv
+
+COPY pyproject.toml /code/pyproject.toml
+COPY uv.lock /code/uv.lock
+
+WORKDIR /code
+
+RUN uv pip sync --system /code/uv.lock
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY deploy.sh /code/deploy.sh
+
+COPY pyproject.toml /code/
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+
+================================================
+FILE: LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+
+================================================
+FILE: pyproject.toml
+================================================
+[project]
+name = "keboola-ex-dropbox-v2"
+version = "1.0.0"
+requires-python = ">=3.13"
+
+dependencies = [
+  "keboola.component==1.6.10",
+  "keboola.utils==1.1.0",
+  "keboola.http-client==1.0.1",
+  "freezegun==1.5.1",
+  "mock==5.2.0",
+  "pydantic==2.11.4",
+  "dateparser==1.2.1",
+  "pytz==2025.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.4.0",
+  "pytest>=8.0.0",
+]
+
+[tool.ruff]
+line-length = 120
+exclude = [
+    ".git",
+    "__pycache__",
+    "tests",
+    "example",
+    "venv",
+    ".venv",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "W",
+    "I",
+]
+ignore = [
+    "I001",
+]
+
+
+
+================================================
+FILE: uv.lock
+================================================
+# This file was autogenerated by uv via the following command:
+#    uv pip compile pyproject.toml --extra dev
+annotated-types==0.7.0
+    # via pydantic
+certifi==2025.7.9
+    # via requests
+charset-normalizer==3.4.2
+    # via requests
+dateparser==1.2.1
+    # via
+    #   keboola-ex-dropbox-v2 (pyproject.toml)
+    #   keboola-utils
+deprecated==1.2.18
+    # via keboola-component
+freezegun==1.5.1
+    # via keboola-ex-dropbox-v2 (pyproject.toml)
+idna==3.10
+    # via requests
+iniconfig==2.1.0
+    # via pytest
+keboola-component==1.6.10
+    # via keboola-ex-dropbox-v2 (pyproject.toml)
+keboola-http-client==1.0.1
+    # via keboola-ex-dropbox-v2 (pyproject.toml)
+keboola-utils==1.1.0
+    # via keboola-ex-dropbox-v2 (pyproject.toml)
+mock==5.2.0
+    # via keboola-ex-dropbox-v2 (pyproject.toml)
+packaging==25.0
+    # via pytest
+pluggy==1.6.0
+    # via pytest
+pydantic==2.11.4
+    # via keboola-ex-dropbox-v2 (pyproject.toml)
+pydantic-core==2.33.2
+    # via pydantic
+pygelf==0.4.3
+    # via keboola-component
+pygments==2.19.2
+    # via pytest
+pytest==8.4.1
+    # via keboola-ex-dropbox-v2 (pyproject.toml)
+python-dateutil==2.9.0.post0
+    # via
+    #   dateparser
+    #   freezegun
+pytz==2025.2
+    # via
+    #   keboola-ex-dropbox-v2 (pyproject.toml)
+    #   dateparser
+    #   keboola-component
+    #   keboola-utils
+regex==2024.11.6
+    # via dateparser
+requests==2.32.4
+    # via keboola-http-client
+ruff==0.12.2
+    # via keboola-ex-dropbox-v2 (pyproject.toml)
+six==1.17.0
+    # via python-dateutil
+typing-extensions==4.14.1
+    # via
+    #   pydantic
+    #   pydantic-core
+    #   typing-inspection
+typing-inspection==0.4.1
+    # via pydantic
+tzlocal==5.3.1
+    # via dateparser
+urllib3==2.5.0
+    # via requests
+wrapt==1.17.2
+    # via deprecated
+
+
+
+================================================
+FILE: .python-version
+================================================
+3.13.0
+
+
+
+================================================
+FILE: component_config/component_long_description.md
+================================================
+The Dropbox Extractor allows you to easily integrate files stored in Dropbox into your Keboola workflows.
+
+Provide one or more public Dropbox share links, and the component will automatically download each file and save it as a table in Keboola Storage. All downloads are converted into CSV format and come with automatically generated manifest files, ensuring seamless integration into your data pipelines.
+
+You can optionally choose the target bucket where the tables will be stored, giving you flexibility in organizing your datasets. The extractor handles multiple files in one run and safely masks sensitive tokens in logs to protect your data.
+
+This component is designed as a modern replacement for the older Node.js Dropbox Extractor. It preserves compatibility with existing configurations while improving performance, security, and maintainability.
+
+Use the Dropbox Extractor to quickly bring external files from Dropbox into Keboola for further transformation, analysis, or export to downstream systems.
+
+
+
+================================================
+FILE: component_config/component_short_description.md
+================================================
+Downloads files from Dropbox share links into Keboola Storage as CSV tables, with support for multiple links and custom buckets.
+
+
+================================================
+FILE: component_config/configRowSchema.json
+================================================
+{}
+
+
+
+================================================
+FILE: component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Dropbox Extractor Configuration (API v2)",
+  "required": ["dropbox_links"],
+  "properties": {
+    "dropbox_links": {
+      "type": "array",
+      "title": "Dropbox Links",
+      "propertyOrder": 1,
+      "items": {
+        "type": "object",
+        "title": "Dropbox Link",
+        "required": ["download_url", "table_name"],
+        "properties": {
+          "download_url": {
+            "type": "string",
+            "title": "Dropbox Download URL",
+            "description": "Paste the Dropbox share link to download your file.",
+            "propertyOrder": 1
+          },
+          "table_name": {
+            "type": "string",
+            "title": "Table Name",
+            "description": "Name of the output table in Keboola Storage.",
+            "propertyOrder": 2
+          }
+        }
+      }
+    }
+  }
+}
+
+
+
+================================================
+FILE: component_config/configuration_description.md
+================================================
+Configure the Dropbox Extractor by specifying one or more Dropbox share links and how you’d like the resulting files stored in Keboola.
+
+- **Dropbox Links** (Required)  
+  Add one or more entries, each with:
+    - **Download URL**: A public Dropbox share link to the file you want to download.  
+    - **Table Name**: The name for the output table in Keboola Storage. Only letters, numbers, dots, underscores, and hyphens are allowed.
+
+All files are saved as CSV tables in Keboola Storage, with automatically generated manifests. Ensure your Dropbox links are accessible via public sharing and end with `dl=0` or similar. The extractor will automatically adjust the link for download.
+
+
+
+================================================
+FILE: component_config/documentationUrl.md
+================================================
+https://github.com/keboola/component-dropbox/blob/master/README.md
+
+
+================================================
+FILE: component_config/licenseUrl.md
+================================================
+https://github.com/keboola/component-dropbox/blob/master/LICENSE.md
+
+
+================================================
+FILE: component_config/logger
+================================================
+gelf
+
+
+================================================
+FILE: component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+
+================================================
+FILE: component_config/sourceCodeUrl.md
+================================================
+https://github.com/keboola/component-dropbox
+
+
+================================================
+FILE: scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+
+================================================
+FILE: scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+ruff check .
+pytest
+
+
+================================================
+FILE: scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+
+================================================
+FILE: scripts/developer_portal/fn_actions_md_update.sh
+================================================
+#!/bin/bash
+
+# Set the path to the Python script file
+PYTHON_FILE="src/component.py"
+# Set the path to the Markdown file containing actions
+MD_FILE="component_config/actions.md"
+
+# Check if the file exists before creating it
+if [ ! -e "$MD_FILE" ]; then
+    touch "$MD_FILE"
+else
+    echo "File already exists: $MD_FILE"
+    exit 1
+fi
+
+# Get all occurrences of lines containing @sync_action('XXX') from the .py file
+SYNC_ACTIONS=$(grep -o -E "@sync_action\(['\"][^'\"]*['\"]\)" "$PYTHON_FILE" | sed "s/@sync_action(\(['\"]\)\([^'\"]*\)\(['\"]\))/\2/" | sort | uniq)
+
+# Check if any sync actions were found
+if [ -n "$SYNC_ACTIONS" ]; then
+    # Iterate over each occurrence of @sync_action('XXX')
+    for sync_action in $SYNC_ACTIONS; do
+        EXISTING_ACTIONS+=("$sync_action")
+    done
+
+    # Convert the array to JSON format
+    JSON_ACTIONS=$(printf '"%s",' "${EXISTING_ACTIONS[@]}")
+    JSON_ACTIONS="[${JSON_ACTIONS%,}]"
+
+    # Update the content of the actions.md file
+    echo "$JSON_ACTIONS" > "$MD_FILE"
+else
+    echo "No sync actions found. Not creating the file."
+fi
+
+
+================================================
+FILE: scripts/developer_portal/update_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+
+# Check if the KBC_DEVELOPERPORTAL_APP environment variable is set
+if [ -z "$KBC_DEVELOPERPORTAL_APP" ]; then
+    echo "Error: KBC_DEVELOPERPORTAL_APP environment variable is not set."
+    exit 1
+fi
+
+# Pull the latest version of the developer portal CLI Docker image
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+# Function to update a property for the given app ID
+update_property() {
+    local app_id="$1"
+    local prop_name="$2"
+    local file_path="$3"
+
+    if [ ! -f "$file_path" ]; then
+        echo "File '$file_path' not found. Skipping update for property '$prop_name' of application '$app_id'."
+        return
+    fi
+
+    # shellcheck disable=SC2155
+    local value=$(<"$file_path")
+
+    echo "Updating $prop_name for $app_id"
+    echo "$value"
+
+    if [ -n "$value" ]; then
+        docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property "$KBC_DEVELOPERPORTAL_VENDOR" "$app_id" "$prop_name" --value="$value"
+        echo "Property $prop_name updated successfully for $app_id"
+    else
+        echo "$prop_name is empty for $app_id, skipping..."
+    fi
+}
+
+app_id="$KBC_DEVELOPERPORTAL_APP"
+
+update_property "$app_id" "isDeployReady" "component_config/isDeployReady.md"
+update_property "$app_id" "longDescription" "component_config/component_long_description.md"
+update_property "$app_id" "configurationSchema" "component_config/configSchema.json"
+update_property "$app_id" "configurationRowSchema" "component_config/configRowSchema.json"
+update_property "$app_id" "configurationDescription" "component_config/configuration_description.md"
+update_property "$app_id" "shortDescription" "component_config/component_short_description.md"
+update_property "$app_id" "logger" "component_config/logger"
+update_property "$app_id" "loggerConfiguration" "component_config/loggerConfiguration.json"
+update_property "$app_id" "licenseUrl" "component_config/licenseUrl.md"
+update_property "$app_id" "documentationUrl" "component_config/documentationUrl.md"
+update_property "$app_id" "sourceCodeUrl" "component_config/sourceCodeUrl.md"
+update_property "$app_id" "uiOptions" "component_config/uiOptions.md"
+
+# Update the actions.md file
+source "$(dirname "$0")/fn_actions_md_update.sh"
+# update_property actions
+update_property "$app_id" "actions" "component_config/actions.md"
+
+
+================================================
+FILE: src/component.py
+================================================
+"""Dropbox Extractor Component (v2) main class.
+"""
+from datetime import datetime, UTC
+import logging
+from keboola.component.base import ComponentBase
+from keboola.component.exceptions import UserException
+
+from configuration import Configuration
+from dropbox_client import DropboxClient
+
+
+class Component(ComponentBase):
+    def __init__(self):
+        super().__init__()
+
+    def run(self):
+        run_time = datetime.now(UTC)
+        run_time_str = run_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        logging.info("[Dropbox Extractor]: Data processing started")
+
+        raw_config = {
+            "parameters": self.configuration.parameters,
+            "action": getattr(self.configuration, "action", "run")
+        }
+
+        config = Configuration(**raw_config)
+        client = DropboxClient(self, config)
+        client.download_all_files()
+
+        new_state = {
+            "last_successful_run": run_time_str
+        }
+
+        logging.info("[Dropbox Extractor]: Saving component state...")
+        self.write_state_file(new_state)
+        logging.info("[Dropbox Extractor]: Data processing completed")
+
+
+"""
+Main entrypoint
+"""
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    try:
+        comp = Component()
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+
+================================================
+FILE: src/configuration.py
+================================================
+import re
+from typing import List, Optional
+from pydantic import BaseModel, Field, HttpUrl, ValidationError, model_validator
+from keboola.component.exceptions import UserException
+
+
+class DropboxLink(BaseModel):
+    download_url: HttpUrl = Field(
+        ...,
+        title="Dropbox Download URL",
+        description="Paste the Dropbox share link to download your file."
+    )
+    table_name: str = Field(
+        ...,
+        title="Table Name",
+        description="Name of the output table in Keboola Storage."
+    )
+
+    @model_validator(mode="after")
+    def validate_table_name(self) -> "DropboxLink":
+        if not self.table_name.strip():
+            raise ValueError("table_name cannot be empty")
+
+        if not re.match(r"^[a-zA-Z0-9_.-]+$", self.table_name):
+            raise ValueError(
+                f"table_name '{self.table_name}' contains invalid characters. "
+                "Only letters, numbers, underscores, hyphens, and dots are allowed."
+            )
+        return self
+
+
+class Parameters(BaseModel):
+    dropbox_links: List[DropboxLink] = Field(
+        ...,
+        title="Dropbox Links",
+        description="List of Dropbox links to download and corresponding table names."
+    )
+
+class Configuration(BaseModel):
+    parameters: Parameters
+    action: Optional[str] = Field(default="run")
+
+    def __init__(self, **data):
+        try:
+            super().__init__(**data)
+        except ValidationError as e:
+            error_messages = [
+                f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}"
+                for err in e.errors()
+            ]
+            raise UserException(
+                f"Configuration validation error: {', '.join(error_messages)}"
+            )
+
+    @property
+    def links(self) -> List[DropboxLink]:
+        return self.parameters.dropbox_links
+
+
+
+================================================
+FILE: src/dropbox_client.py
+================================================
+import logging
+import requests
+from urllib.parse import urlparse, urlunparse
+from keboola.component import UserException
+
+
+class DropboxClient:
+    """Client for downloading files from Dropbox shared links
+    and writing output tables & manifests using Keboola SDK.
+    """
+
+    def __init__(self, component, config):
+        """:param component: Keboola ComponentBase instance
+        :param config: Configuration object
+        """
+        self.component = component
+        self.config = config
+
+    def download_all_files(self) -> None:
+        """Process all dropbox links from the config:
+        - download each file
+        - save CSV to data/out/tables
+        - write manifest
+        """
+        for dropbox_link in self.config.links:
+            self._download_single_file(dropbox_link)
+
+    def _download_single_file(self, dropbox_link) -> None:
+        download_url = str(dropbox_link.download_url)
+
+        if "dl=0" in download_url:
+            download_url = download_url.replace("dl=0", "dl=1")
+        else:
+            download_url += "&dl=1" if "?" in download_url else "?dl=1"
+
+        parsed = urlparse(download_url)
+        safe_url = urlunparse(parsed._replace(query=""))
+
+        table_name = dropbox_link.table_name
+
+        table_def = self.component.create_out_table_definition(
+            f"{table_name}.csv",
+            primary_key=[],
+            incremental=False
+        )
+
+        logging.info(
+            f"Downloading Dropbox file: {safe_url}"
+        )
+
+        try:
+            response = requests.get(download_url, stream=True, timeout=300)
+            response.raise_for_status()
+
+            with open(table_def.full_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+        except requests.RequestException as e:
+            logging.error(f"Failed to download Dropbox file: {safe_url}")
+            raise UserException(f"Error downloading file: {e}")
+
+        self.component.write_manifest(table_def)
+
+        logging.info(f"Download complete: {table_name}.csv")
+
+
+
+================================================
+FILE: tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+
+================================================
+FILE: tests/test_configuration.py
+================================================
+import pytest
+from configuration import Configuration, UserException
+
+def test_valid_configuration():
+    raw_config = {
+        "parameters": {
+            "dropbox_links": [
+                {
+                    "download_url": "https://www.dropbox.com/scl/fi/abcd/products.csv?dl=0",
+                    "table_name": "products"
+                }
+            ]
+        },
+        "action": "run"
+    }
+
+    config = Configuration(**raw_config)
+    assert config.links[0].table_name == "products"
+    assert str(config.links[0].download_url).startswith("https://www.dropbox.com/")
+
+def test_invalid_table_name():
+    raw_config = {
+        "parameters": {
+            "dropbox_links": [
+                {
+                    "download_url": "https://www.dropbox.com/scl/fi/abcd/products.csv?dl=0",
+                    "table_name": "products@#$"
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(UserException) as exc_info:
+        Configuration(**raw_config)
+
+    assert "contains invalid characters" in str(exc_info.value)
+
+
+
+================================================
+FILE: tests/test_dropbox_client.py
+================================================
+import pytest
+import io
+from unittest.mock import patch, MagicMock
+from configuration import Configuration
+from dropbox_client import DropboxClient
+
+
+@pytest.fixture
+def mock_component(tmp_path):
+    component = MagicMock()
+
+    def create_out_table_definition(filename, primary_key, incremental):
+        class TableDef:
+            full_path = tmp_path / filename
+        return TableDef()
+
+    component.create_out_table_definition.side_effect = create_out_table_definition
+    return component
+
+
+@patch("dropbox_client.requests.get")
+def test_download_single_file(mock_requests_get, mock_component, tmp_path):
+    mock_response = MagicMock()
+    mock_response.iter_content.return_value = [b"some,data\n1,2\n"]
+    mock_response.raise_for_status.return_value = None
+    mock_requests_get.return_value = mock_response
+
+    raw_config = {
+        "parameters": {
+            "dropbox_links": [
+                {
+                    "download_url": "https://www.dropbox.com/scl/fi/abcd/products.csv?dl=0",
+                    "table_name": "products"
+                }
+            ]
+        }
+    }
+
+    config = Configuration(**raw_config)
+    client = DropboxClient(mock_component, config)
+
+    client.download_all_files()
+
+    output_path = tmp_path / "products.csv"
+    assert output_path.exists()
+    assert "some,data" in output_path.read_text()
+
+    assert mock_component.write_manifest.called
+    mock_requests_get.assert_called_once()
+
+
+
+================================================
+FILE: .github/workflows/push.yml
+================================================
+name: Keboola Component Build & Deploy Pipeline
+on: [ push ]
+concurrency: ci-${{ github.ref }} # to avoid tag collisions in the ECR
+env:
+  KBC_DEVELOPERPORTAL_APP: "keboola.ex-dropbox-v2"
+  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+  KBC_DEVELOPERPORTAL_USERNAME: ${{ vars.KBC_DEVELOPERPORTAL_USERNAME }}
+  KBC_DEVELOPERPORTAL_VENDOR: ${{ vars.KBC_DEVELOPERPORTAL_VENDOR }}
+
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }} # recommended for pushing to ECR
+  KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+
+  KBC_TEST_PROJECT_CONFIGS: "" # space separated list of config ids
+  KBC_STORAGE_TOKEN: ${{ secrets.KBC_STORAGE_TOKEN }} # required for running KBC tests
+
+jobs:
+  push_event_info:
+    name: Push Event Info
+    runs-on: ubuntu-latest
+    outputs:
+      app_image_tag: ${{ steps.tag.outputs.app_image_tag }}
+      is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
+      is_default_branch: ${{ steps.default_branch.outputs.is_default_branch }}
+      is_deploy_ready: ${{ steps.deploy_ready.outputs.is_deploy_ready }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Fetch all branches from remote repository
+        run: git fetch --prune --unshallow --tags -f
+
+      - name: Get current branch name
+        id: current_branch
+        run: |
+          if [[ ${{ github.ref }} != "refs/tags/"* ]]; then
+            branch_name=${{ github.ref_name }}
+            echo "branch_name=$branch_name" | tee -a $GITHUB_OUTPUT
+          else
+            raw=$(git branch -r --contains ${{ github.ref }})
+            branch="$(echo ${raw//origin\//} | tr -d '\n')"
+            echo "branch_name=$branch" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Is current branch the default branch
+        id: default_branch
+        run: |
+          echo "default_branch='${{ github.event.repository.default_branch }}'"
+          if [ "${{ github.event.repository.default_branch }}" = "${{ steps.current_branch.outputs.branch_name }}" ]; then
+             echo "is_default_branch=true" | tee -a $GITHUB_OUTPUT
+          else
+             echo "is_default_branch=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Set image tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
+          echo "is_semantic_tag=$IS_SEMANTIC_TAG" | tee -a $GITHUB_OUTPUT
+          echo "app_image_tag=$TAG" | tee -a $GITHUB_OUTPUT
+
+      - name: Deploy-Ready check
+        id: deploy_ready
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* \
+            && "${{ steps.tag.outputs.is_semantic_tag }}" == "true" ]]; then
+              echo "is_deploy_ready=true" | tee -a $GITHUB_OUTPUT
+          else
+              echo "is_deploy_ready=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Docker Image Build
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest
+          outputs: type=docker,dest=/tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - build
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+
+      - name: Run build_n_test.sh
+        run: |
+          docker run --rm \
+            ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest \
+            /bin/sh -e /code/scripts/build_n_test.sh
+
+  tests-kbc:
+    name: Run KBC Tests
+    needs:
+      - push_event_info
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up environment variables
+        run: |
+          echo "KBC_TEST_PROJECT_CONFIGS=${KBC_TEST_PROJECT_CONFIGS}" >> $GITHUB_ENV
+          echo "KBC_STORAGE_TOKEN=${{ secrets.KBC_STORAGE_TOKEN }}" >> $GITHUB_ENV
+
+      - name: Run KBC test jobs
+        if: env.KBC_TEST_PROJECT_CONFIGS != '' && env.KBC_STORAGE_TOKEN != ''
+        uses: keboola/action-run-configs-parallel@master
+        with:
+          token: ${{ secrets.KBC_STORAGE_TOKEN }}
+          componentId: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          configs: ${{ env.KBC_TEST_PROJECT_CONFIGS }}
+
+  push:
+    name: Docker Image Push
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - tests
+      - tests-kbc
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Tests
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+
+      - name: Docker login
+        if: env.DOCKERHUB_TOKEN
+        run: docker login --username "${{ env.DOCKERHUB_USER }}" --password "${{ env.DOCKERHUB_TOKEN }}"
+
+      - name: Push image to ECR
+        uses: keboola/action-push-to-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          push_latest: ${{ needs.push_event_info.outputs.is_deploy_ready }}
+          source_image: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+
+  deploy:
+    name: Deploy to KBC
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Developer Portal Tag
+        uses: keboola/action-set-tag-developer-portal@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+
+  update_developer_portal_properties:
+    name: Developer Portal Properties Update
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    runs-on: ubuntu-latest
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Update developer portal properties
+        run: |
+          chmod +x scripts/developer_portal/*.sh
+          scripts/developer_portal/update_properties.sh
 
 
