@@ -75,6 +75,9 @@ This component lets you run your own Python code directly within Keboola, with s
   - `code`: Custom code entered in a text field (default).
   - `git`: Custom repository.
 - `user_properties`: Object containing custom configuration parameters. The key names prefixed with `#` will be encrypted upon saving.
+- `venv`: String with one of the following values:
+  - `3.12`, `3.13` (default), `3.14` – Run your code in an isolated environment containing just the packages of your choice and the respective Python version.
+  - `base` – Run your code in a shared environment (contains many pre-installed packages in legacy versions)
 - `git`: Object containing configuration of the git repository, which shall be cloned and run (`"source": "git"` only).
 - `code`: JSON encoded Python code to run (`"source": "code"` only).
 - `packages`: Array of extra packages to be installed (`"source": "code"` only). *If you're not sure whether you need to install certain package or not, you can run the command `uv pip list` via subprocess (see the example below).*
@@ -113,6 +116,7 @@ Contents of the `config.json` file:
 {
   "parameters": {
     "source": "git",
+    "venv": "3.13",
     "git": {
       "url": "https://github.com/keboola/component-custom-python-example-repo-1.git",
       "branch": "main",
@@ -146,6 +150,8 @@ The above code in the `config.json` file format for local testing:
 ```json
 {
   "parameters": {
+    "source": "code",
+    "venv": "base",
     "code": "import datetime\nimport subprocess\n\nprint(\"Hello world!\")\nprint(\"Current date and time:\", datetime.datetime.now())\nprint(\"See the full list of preinstalled packages:\")\n\nsubprocess.check_call([\"uv\", \"pip\", \"list\"])\n",
     "packages": []
   }
@@ -170,6 +176,8 @@ The above code in the `config.json` file format for local testing:
 ```json
 {
   "parameters": {
+    "source": "code",
+    "venv": "3.13",
     "code": "from keboola.component import CommonInterface\n\nci = CommonInterface()\n# access user parameters\nprint(ci.configuration.parameters)",
     "packages": [],
     "user_properties": {
@@ -294,21 +302,22 @@ services:
   dev:
     build: .
     volumes:
-        - ./:/code
-        - ./data:/data
-    environment:
-      - KBC_DATADIR=/data
-  test:
-    # Use to run flake8 and unittests checks
-    build: .
-    volumes:
-      - ./:/code
       - ./data:/data
     environment:
-      - KBC_DATADIR=./data
+      - KBC_DATADIR=/data
+
+  # use to run flake8 and unittests checks
+  test:
+    build: .
+    user: 1000:1000
+    volumes:
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=/data
     command:
       - /bin/sh
       - /code/scripts/build_n_test.sh
+
 
 
 ================================================
@@ -763,7 +772,7 @@ FILE: component_config/configSchema.json
       "propertyOrder": 30
     },
     "source": {
-      "type": "radio",
+      "type": "string",
       "title": "Source Code & Dependencies",
       "propertyOrder": 30,
       "enum": [
@@ -867,7 +876,7 @@ FILE: component_config/configSchema.json
           }
         },
         "auth": {
-          "type": "radio",
+          "type": "string",
           "title": "Repository Visibility & Authentication",
           "propertyOrder": 100,
           "enum": [
@@ -2033,7 +2042,7 @@ jobs:
           path: /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
 
   tests:
-    name: Run Tests
+    name: Run Unit Tests
     runs-on: ubuntu-latest
     needs:
       - push_event_info
@@ -2048,13 +2057,51 @@ jobs:
           name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
           path: /tmp
 
-      - name: Load Image & Run Tests
+      - name: Load Image & Run Unit Tests
         run: |
           docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
           docker image ls -a
           docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest uv run --active flake8 . --config=flake8.cfg
-          echo "Running unit-tests..."
+          echo "Running unit tests..."
           docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest uv run --active python -m unittest discover
+
+  tests-integration:
+    name: Run Integration Tests
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - build
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Integration Tests
+        run: |
+          echo "Running integration tests..."
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+
+          cd ${{ github.workspace }}
+          mkdir data
+          chmod 777 data
+
+          for i in {1..8}; do
+            FILENAME=$(ls tests/config-${i}*.json)
+            echo "Running integration test with ${FILENAME}..."
+
+            cp "${FILENAME}" data/config.json
+            chmod 666 data/config.json
+            docker run -v ./data:/data -u 1000:1000 --rm ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest
+          done
 
   tests-kbc:
     name: Run KBC Tests
@@ -2083,6 +2130,7 @@ jobs:
     needs:
       - push_event_info
       - tests
+      - tests-integration
       - tests-kbc
     env:
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
