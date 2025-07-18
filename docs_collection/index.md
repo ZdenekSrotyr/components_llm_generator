@@ -902,6 +902,11 @@
 - Repository: https://github.com/keboola/component-webdav-writer
 - Description: A WebDAV Writer component for Keboola Connection
 
+### component-tripleseat
+- [Documentation](github/component-tripleseat/llm.txt)
+- Repository: https://github.com/keboola/component-tripleseat
+- Description: A Triple Seat API extractor for Keboola Connection
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
