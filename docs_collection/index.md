@@ -207,6 +207,11 @@
 - Repository: https://github.com/keboola/component-adform
 - Description: None
 
+### component-delta-lake-extractor
+- [Documentation](github/component-delta-lake-extractor/llm.txt)
+- Repository: https://github.com/keboola/component-delta-lake-extractor
+- Description: Connect to Delta tables and Iceberg from Keboola
+
 ### component-rosnet
 - [Documentation](github/component-rosnet/llm.txt)
 - Repository: https://github.com/keboola/component-rosnet
@@ -217,9 +222,9 @@
 - Repository: https://github.com/keboola/component-embeddings-v2
 - Description: None
 
-### component-delta-lake
-- [Documentation](github/component-delta-lake/llm.txt)
-- Repository: https://github.com/keboola/component-delta-lake
+### component-delta-lake-writer
+- [Documentation](github/component-delta-lake-writer/llm.txt)
+- Repository: https://github.com/keboola/component-delta-lake-writer
 - Description: None
 
 ### component-csob-ceb
