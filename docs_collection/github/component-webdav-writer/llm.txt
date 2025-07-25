@@ -1,11 +1,1630 @@
 Directory structure:
 └── keboola-component-webdav-writer/
-    └── README.md
+    ├── README.md
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── Dockerfile
+    ├── LICENSE.md
+    ├── pyproject.toml
+    ├── uv.lock
+    ├── .python-version
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── component_short_description.md
+    │   ├── configRowSchema.json
+    │   ├── configSchema.json
+    │   ├── configuration_description.md
+    │   ├── documentationUrl.md
+    │   ├── licenseUrl.md
+    │   ├── logger
+    │   ├── loggerConfiguration.json
+    │   └── sourceCodeUrl.md
+    ├── scripts/
+    │   ├── build_n_run.ps1
+    │   ├── build_n_test.sh
+    │   ├── run_kbc_tests.ps1
+    │   └── developer_portal/
+    │       ├── fn_actions_md_update.sh
+    │       └── update_properties.sh
+    ├── src/
+    │   ├── component.py
+    │   ├── configuration.py
+    │   └── webdav_client.py
+    ├── tests/
+    │   ├── __init__.py
+    │   ├── test_configuration.py
+    │   └── test_webdav_client.py
+    └── .github/
+        └── workflows/
+            └── push.yml
 
 ================================================
 FILE: README.md
 ================================================
-# component-webdav-writer
-A WebDAV Writer component for Keboola Connection
+# WebDAV Writer (Python)
+
+The WebDAV Writer uploads files from Keboola’s input mapping directly to any WebDAV-compatible storage server.
+
+## Features
+
+- **Flexible WebDAV Uploads**
+  - Supports any WebDAV-compatible server (Nextcloud, ownCloud, WebDAV-enabled storage, etc.).
+  
+- **Handles Tables and Files**
+  - Uploads all files found in:
+    - `/data/in/tables/`
+    - `/data/in/files/`
+
+- **Dynamic Filenames with Datetime**
+  - Optional timestamp suffix added to filenames for versioning.
+
+- **Secure Credentials**
+  - Credentials stored securely.
+  - No secrets printed to logs.
+
+- **Manifest-Safe**
+  - Ignores `.manifest` files automatically.
+
+## Configuration
+
+The writer uses a JSON configuration file structured like this:
+
+```json
+{
+  "parameters": {
+    "authorization": {
+      "webdav_hostname": "https://webdav.example.com",
+      "username": "your-username",
+      "#password": "your-password"
+    },
+    "sync_options": {
+      "remote_path": "/backup/files",
+      "append_datetime": true,
+      "datetime_format": "%Y-%m-%d_%H-%M-%S"
+    }
+  },
+  "action": "run"
+}
+```
+
+### Configuration Parameters
+
+| Parameter                       | Required | Description                                                                                                                                                  |
+| ------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `authorization.webdav_hostname` | Yes      | URL of your WebDAV server, e.g. `https://webdav.example.com`.                                                                                                |
+| `authorization.username`        | Yes      | Your WebDAV username.                                                                                                                                        |
+| `authorization.#password`       | Yes      | Your WebDAV password (stored securely in Keboola).                                                                                                           |
+| `sync_options.remote_path`      | Yes      | The remote folder on your WebDAV server where files will be uploaded, e.g. `/backup/files/`.                                                                 |
+| `sync_options.append_datetime`  | No       | Whether to append a datetime suffix to filenames. Defaults to `false`.                                                                                       |
+| `sync_options.datetime_format`  | No       | Datetime format string for suffix if `append_datetime` is enabled. Supported formats: `%Y-%m-%d`, `%Y-%m-%d_%H-%M-%S`, `%Y%m%d`, `%Y%m%d_%H%M%S`, `{epoch}`. |
+
+
+#### Notes:
+
+- `.manifest` files are automatically ignored.
+- If datetime suffixing is enabled, filenames will look like:
+
+```text
+your_file.csv → your_file_2024-07-01_12-30-00.csv
+```
+
+## Upload Process
+
+During execution:
+
+1. All files in `/data/in/tables/` and `/data/in/files/` are scanned.
+2. Each file is uploaded to the configured WebDAV destination path.
+3. Filenames are adjusted if the datetime suffix is enabled.
+
+## Running Locally
+
+To test locally, create a `data/config.json` file:
+
+```json
+{
+  "parameters": {
+    "authorization": {
+      "webdav_hostname": "http://localhost:8080",
+      "username": "admin",
+      "#password": "password"
+    },
+    "sync_options": {
+      "remote_path": "/upload",
+      "append_datetime": true,
+      "datetime_format": "%Y-%m-%d"
+    }
+  }
+}
+```
+
+Run the component:
+
+```bash
+python3 src/component.py
+```
+
+### Example Local WebDAV Server
+
+```bash
+docker run -d \
+  --name webdav \
+  -e AUTH_TYPE=Basic \
+  -e USERNAME=admin \
+  -e PASSWORD=password \
+  -e SERVER_NAMES=localhost \
+  -p 8080:80 \
+  bytemark/webdav
+```
+
+Then access your server at `http://localhost:8080`.
+
+### Development & Testing
+
+Install all dependencies into your virtual environment using `uv`:
+
+```bash
+uv pip sync
+```
+
+This installs everything listed in your `uv.lock` file, ensuring a fully reproducible environment matching your `pyproject.toml` specifications.
+
+To update your lockfile after changing dependencies in `pyproject.toml`, run:
+
+```bash
+uv pip compile pyproject.toml --output-file uv.lock
+```
+
+Run tests with:
+
+```bash
+pytest
+```
+
+## License
+
+MIT License
+
+
+================================================
+FILE: deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+
+================================================
+FILE: docker-compose.yml
+================================================
+version: "2"
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+
+================================================
+FILE: Dockerfile
+================================================
+FROM python:3.13-slim
+ENV PYTHONIOENCODING=utf-8
+
+RUN pip install uv
+
+COPY pyproject.toml /code/pyproject.toml
+COPY uv.lock /code/uv.lock
+
+WORKDIR /code
+
+RUN uv pip sync --system /code/uv.lock
+
+COPY /src /code/src/
+COPY /tests /code/tests/
+COPY /scripts /code/scripts/
+COPY deploy.sh /code/deploy.sh
+
+COPY pyproject.toml /code/
+
+CMD ["python", "-u", "/code/src/component.py"]
+
+
+
+================================================
+FILE: LICENSE.md
+================================================
+The MIT License (MIT)
+
+Copyright (c) 2018 Keboola DS, http://keboola.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+
+================================================
+FILE: pyproject.toml
+================================================
+[project]
+name = "keboola-wr-writer"
+version = "1.0.0"
+requires-python = ">=3.13"
+
+dependencies = [
+  "keboola.component==1.6.10",
+  "keboola.utils==1.1.0",
+  "keboola.http-client==1.0.1",
+  "freezegun==1.5.1",
+  "mock==5.2.0",
+  "pydantic==2.11.4",
+  "dateparser==1.2.1",
+  "pytz==2025.2",
+  "webdavclient3==3.14.6"
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.4.0",
+  "pytest>=8.0.0",
+]
+
+[tool.ruff]
+line-length = 120
+exclude = [
+    ".git",
+    "__pycache__",
+    "tests",
+    "example",
+    "venv",
+    ".venv",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "W",
+    "I",
+]
+ignore = [
+    "I001",
+]
+
+
+
+================================================
+FILE: uv.lock
+================================================
+# This file was autogenerated by uv via the following command:
+#    uv pip compile --all-extras --output-file uv.lock pyproject.toml
+annotated-types==0.7.0
+    # via pydantic
+certifi==2025.7.9
+    # via requests
+charset-normalizer==3.4.2
+    # via requests
+dateparser==1.2.1
+    # via
+    #   keboola-wr-writer (pyproject.toml)
+    #   keboola-utils
+deprecated==1.2.18
+    # via keboola-component
+freezegun==1.5.1
+    # via keboola-wr-writer (pyproject.toml)
+idna==3.10
+    # via requests
+iniconfig==2.1.0
+    # via pytest
+keboola-component==1.6.10
+    # via keboola-wr-writer (pyproject.toml)
+keboola-http-client==1.0.1
+    # via keboola-wr-writer (pyproject.toml)
+keboola-utils==1.1.0
+    # via keboola-wr-writer (pyproject.toml)
+lxml==6.0.0
+    # via webdavclient3
+mock==5.2.0
+    # via keboola-wr-writer (pyproject.toml)
+packaging==25.0
+    # via pytest
+pluggy==1.6.0
+    # via pytest
+pydantic==2.11.4
+    # via keboola-wr-writer (pyproject.toml)
+pydantic-core==2.33.2
+    # via pydantic
+pygelf==0.4.3
+    # via keboola-component
+pygments==2.19.2
+    # via pytest
+pytest==8.4.1
+    # via keboola-wr-writer (pyproject.toml)
+python-dateutil==2.9.0.post0
+    # via
+    #   dateparser
+    #   freezegun
+    #   webdavclient3
+pytz==2025.2
+    # via
+    #   keboola-wr-writer (pyproject.toml)
+    #   dateparser
+    #   keboola-component
+    #   keboola-utils
+regex==2024.11.6
+    # via dateparser
+requests==2.32.4
+    # via
+    #   keboola-http-client
+    #   webdavclient3
+ruff==0.12.2
+    # via keboola-wr-writer (pyproject.toml)
+six==1.17.0
+    # via python-dateutil
+typing-extensions==4.14.1
+    # via
+    #   pydantic
+    #   pydantic-core
+    #   typing-inspection
+typing-inspection==0.4.1
+    # via pydantic
+tzlocal==5.3.1
+    # via dateparser
+urllib3==2.5.0
+    # via requests
+webdavclient3==3.14.6
+    # via keboola-wr-writer (pyproject.toml)
+wrapt==1.17.2
+    # via deprecated
+
+
+
+================================================
+FILE: .python-version
+================================================
+3.13.0
+
+
+
+================================================
+FILE: component_config/component_long_description.md
+================================================
+The WebDAV Writer allows you to seamlessly export data from Keboola Storage to any WebDAV-compatible server.
+
+It scans your component’s input directories and automatically uploads tables and files to your chosen WebDAV destination. Each file’s name and path can be customized, and you can optionally append a timestamp suffix in various formats, enabling easy file versioning and organization on the remote server.
+
+The writer supports flexible configuration of the WebDAV connection, including authentication credentials and remote paths, and ensures robust error handling to safeguard your uploads.
+
+This component is designed as a modern, maintainable replacement for legacy implementations, bringing better performance, clearer configuration validation, and improved logging and security.
+
+Use the WebDAV Writer to integrate Keboola with external systems, backup solutions, or any services supporting the WebDAV protocol, enabling smooth, automated data distribution to your infrastructure or partners.
+
+
+================================================
+FILE: component_config/component_short_description.md
+================================================
+Uploads tables and files from Keboola Storage to a WebDAV server, supporting custom remote paths, optional timestamp suffixes, and flexible datetime formats.
+
+
+================================================
+FILE: component_config/configRowSchema.json
+================================================
+{
+  "type": "object",
+  "title": "WebDAV Sync Options",
+  "required": ["sync_options"],
+  "properties": {
+    "sync_options": {
+      "type": "object",
+      "title": "Synchronization Options",
+      "propertyOrder": 1,
+      "required": [
+        "remote_path",
+        "append_datetime"
+      ],
+      "options": {
+        "section": "Sync Options",
+        "collapsed": false
+      },
+      "properties": {
+        "remote_path": {
+          "type": "string",
+          "title": "Remote Path",
+          "description": "Remote folder where files will be uploaded. E.g. /reports/ or /.",
+          "default": "/",
+          "propertyOrder": 1
+        },
+        "append_datetime": {
+          "type": "boolean",
+          "title": "Append Datetime Suffix",
+          "description": "If enabled, adds a timestamp suffix to each file name on upload.",
+          "default": false,
+          "propertyOrder": 2
+        },
+        "datetime_format": {
+          "type": "string",
+          "title": "Datetime Suffix Format",
+          "description": "Choose how to format timestamps added to filenames.",
+          "enum": [
+            "%Y-%m-%d",
+            "%Y-%m-%d_%H-%M-%S",
+            "%Y%m%d",
+            "%Y%m%d_%H%M%S",
+            "{epoch}"
+          ],
+          "enumNames": [
+            "YYYY-MM-DD",
+            "YYYY-MM-DD_HH-mm-ss",
+            "YYYYMMDD",
+            "YYYYMMDD_HHMMSS",
+            "Timestamp (Epoch)"
+          ],
+          "default": "%Y-%m-%d",
+          "propertyOrder": 3,
+          "options": {
+            "dependencies": {
+              "append_datetime": true
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+
+
+================================================
+FILE: component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "WebDAV Writer Configuration",
+  "required": ["authorization"],
+  "properties": {
+    "authorization": {
+      "type": "object",
+      "title": "Authorization",
+      "propertyOrder": 1,
+      "required": ["webdav_hostname", "username", "#password"],
+      "options": {
+        "section": "Authorization",
+        "collapsed": false
+      },
+      "properties": {
+        "webdav_hostname": {
+          "type": "string",
+          "title": "WebDAV Server URL",
+          "description": "Example: https://myserver.com",
+          "format": "uri",
+          "propertyOrder": 1
+        },
+        "username": {
+          "type": "string",
+          "title": "Username",
+          "propertyOrder": 2
+        },
+        "#password": {
+          "type": "string",
+          "title": "Password",
+          "format": "password",
+          "propertyOrder": 3
+        }
+      }
+    }
+  }
+}
+
+
+
+================================================
+FILE: component_config/configuration_description.md
+================================================
+Configure the WebDAV Writer by specifying your WebDAV connection details and how you'd like your files stored remotely.
+
+- **Authorization** (Required)  
+  Provide your WebDAV server credentials:
+  - **WebDAV Hostname**: The URL of your WebDAV server, e.g. `https://webdav.example.com`.
+  - **Username**: Your WebDAV login username.
+  - **Password**: Your WebDAV login password (stored securely).
+
+- **Synchronization Options** (Required)  
+  Control how your data is organized on the remote server:
+  - **Remote Path**: The base folder on your WebDAV server where files will be uploaded, e.g. `/backup/files/`.
+  - **Append Datetime**: If enabled, a timestamp is added to filenames for easier versioning.
+  - **Datetime Format**: Select the format for the timestamp suffix, such as `YYYY-MM-DD` or `YYYYMMDD_HHMMSS`.
+
+During execution, the WebDAV Writer scans the input directories (`/data/in/tables/` and `/data/in/files/`) and uploads all discovered files to your configured WebDAV destination.
+
+
+
+================================================
+FILE: component_config/documentationUrl.md
+================================================
+https://github.com/keboola/component-webdav-writer/blob/master/README.md
+
+
+================================================
+FILE: component_config/licenseUrl.md
+================================================
+https://github.com/keboola/component-webdav-writer/blob/master/LICENSE.md
+
+
+================================================
+FILE: component_config/logger
+================================================
+gelf
+
+
+================================================
+FILE: component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+
+================================================
+FILE: component_config/sourceCodeUrl.md
+================================================
+https://github.com/keboola/component-webdav-writer
+
+
+================================================
+FILE: scripts/build_n_run.ps1
+================================================
+echo Building component...
+$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
+docker build -rm -t $COMP_TAG ../
+
+echo Running component...
+Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
+       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
+    $Readhost = Read-Host " ( y / n ) " 
+    Switch ($ReadHost) 
+     { 
+       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
+       N {Write-Host "No, execute the app normally"; 
+		    echo $DATA_PATH
+			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
+	   } 
+       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
+     } 
+
+
+
+
+
+================================================
+FILE: scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+ruff check .
+pytest
+
+
+================================================
+FILE: scripts/run_kbc_tests.ps1
+================================================
+echo "Preparing KBC test image"
+# set env vars
+$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
+$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
+$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
+$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
+$BASE_KBC_CONFIG = '455568423'
+$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
+
+
+#build app
+$APP_IMAGE='keboola-comp-test'
+docker build ..\ --tag=$APP_IMAGE
+docker images
+docker -v
+#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
+echo "Running unit-tests..."
+docker run $APP_IMAGE python -m unittest discover
+
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
+
+docker tag $APP_IMAGE`:latest $REPOSITORY`:test
+
+echo 'running login'
+$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
+
+echo 'pushing test image'
+docker push $REPOSITORY`:test
+
+echo 'running test config in KBC'
+docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
+
+
+
+================================================
+FILE: scripts/developer_portal/fn_actions_md_update.sh
+================================================
+#!/bin/bash
+
+# Set the path to the Python script file
+PYTHON_FILE="src/component.py"
+# Set the path to the Markdown file containing actions
+MD_FILE="component_config/actions.md"
+
+# Check if the file exists before creating it
+if [ ! -e "$MD_FILE" ]; then
+    touch "$MD_FILE"
+else
+    echo "File already exists: $MD_FILE"
+    exit 1
+fi
+
+# Get all occurrences of lines containing @sync_action('XXX') from the .py file
+SYNC_ACTIONS=$(grep -o -E "@sync_action\(['\"][^'\"]*['\"]\)" "$PYTHON_FILE" | sed "s/@sync_action(\(['\"]\)\([^'\"]*\)\(['\"]\))/\2/" | sort | uniq)
+
+# Check if any sync actions were found
+if [ -n "$SYNC_ACTIONS" ]; then
+    # Iterate over each occurrence of @sync_action('XXX')
+    for sync_action in $SYNC_ACTIONS; do
+        EXISTING_ACTIONS+=("$sync_action")
+    done
+
+    # Convert the array to JSON format
+    JSON_ACTIONS=$(printf '"%s",' "${EXISTING_ACTIONS[@]}")
+    JSON_ACTIONS="[${JSON_ACTIONS%,}]"
+
+    # Update the content of the actions.md file
+    echo "$JSON_ACTIONS" > "$MD_FILE"
+else
+    echo "No sync actions found. Not creating the file."
+fi
+
+
+================================================
+FILE: scripts/developer_portal/update_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+
+# Check if the KBC_DEVELOPERPORTAL_APP environment variable is set
+if [ -z "$KBC_DEVELOPERPORTAL_APP" ]; then
+    echo "Error: KBC_DEVELOPERPORTAL_APP environment variable is not set."
+    exit 1
+fi
+
+# Pull the latest version of the developer portal CLI Docker image
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+# Function to update a property for the given app ID
+update_property() {
+    local app_id="$1"
+    local prop_name="$2"
+    local file_path="$3"
+
+    if [ ! -f "$file_path" ]; then
+        echo "File '$file_path' not found. Skipping update for property '$prop_name' of application '$app_id'."
+        return
+    fi
+
+    # shellcheck disable=SC2155
+    local value=$(<"$file_path")
+
+    echo "Updating $prop_name for $app_id"
+    echo "$value"
+
+    if [ -n "$value" ]; then
+        docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property "$KBC_DEVELOPERPORTAL_VENDOR" "$app_id" "$prop_name" --value="$value"
+        echo "Property $prop_name updated successfully for $app_id"
+    else
+        echo "$prop_name is empty for $app_id, skipping..."
+    fi
+}
+
+app_id="$KBC_DEVELOPERPORTAL_APP"
+
+update_property "$app_id" "isDeployReady" "component_config/isDeployReady.md"
+update_property "$app_id" "longDescription" "component_config/component_long_description.md"
+update_property "$app_id" "configurationSchema" "component_config/configSchema.json"
+update_property "$app_id" "configurationRowSchema" "component_config/configRowSchema.json"
+update_property "$app_id" "configurationDescription" "component_config/configuration_description.md"
+update_property "$app_id" "shortDescription" "component_config/component_short_description.md"
+update_property "$app_id" "logger" "component_config/logger"
+update_property "$app_id" "loggerConfiguration" "component_config/loggerConfiguration.json"
+update_property "$app_id" "licenseUrl" "component_config/licenseUrl.md"
+update_property "$app_id" "documentationUrl" "component_config/documentationUrl.md"
+update_property "$app_id" "sourceCodeUrl" "component_config/sourceCodeUrl.md"
+update_property "$app_id" "uiOptions" "component_config/uiOptions.md"
+
+# Update the actions.md file
+source "$(dirname "$0")/fn_actions_md_update.sh"
+# update_property actions
+update_property "$app_id" "actions" "component_config/actions.md"
+
+
+================================================
+FILE: src/component.py
+================================================
+"""
+WebDAV Writer Component main class.
+"""
+from datetime import datetime, UTC
+import logging
+from keboola.component.base import ComponentBase
+from keboola.component.exceptions import UserException
+
+from configuration import Configuration
+from webdav_client import WebDAVClient
+
+
+class Component(ComponentBase):
+    def __init__(self):
+        super().__init__()
+
+    def run(self):
+        run_time = datetime.now(UTC)
+        run_time_str = run_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        logging.info("[WebDAV Writer]: Starting upload process...")
+
+        raw_config = {
+            "parameters": self.configuration.parameters,
+            "action": getattr(self.configuration, "action", "run")
+        }
+
+        config = Configuration(**raw_config)
+        client = WebDAVClient(config, self)
+
+        tables = client.scan_table_inputs()
+        if tables:
+            logging.info(f"[WebDAV Writer]: Uploading {len(tables)} table(s)...")
+            client.upload_files(tables)
+
+        files = client.scan_file_inputs()
+        if files:
+            logging.info(f"[WebDAV Writer]: Uploading {len(files)} file(s)...")
+            client.upload_files(files)
+
+        new_state = {
+            "last_successful_run": run_time_str
+        }
+
+        logging.info("[WebDAV Writer]: Saving component state...")
+        self.write_state_file(new_state)
+
+        logging.info("[WebDAV Writer]: Upload process completed successfully.")
+
+"""
+Main entrypoint
+"""
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    try:
+        comp = Component()
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+
+================================================
+FILE: src/configuration.py
+================================================
+from typing import Optional
+from pydantic import BaseModel, Field, ValidationError, model_validator
+from keboola.component.exceptions import UserException
+from datetime import datetime
+
+ALLOWED_DATETIME_FORMATS = [
+    "%Y-%m-%d",
+    "%Y-%m-%d_%H-%M-%S",
+    "%Y%m%d",
+    "%Y%m%d_%H%M%S",
+    "{epoch}",
+]
+
+DATETIME_FORMAT_DISPLAY_NAMES = {
+    "%Y-%m-%d": "YYYY-MM-DD",
+    "%Y-%m-%d_%H-%M-%S": "YYYY-MM-DD_HH-mm-ss",
+    "%Y%m%d": "YYYYMMDD",
+    "%Y%m%d_%H%M%S": "YYYYMMDD_HHMMSS",
+    "{epoch}": "Timestamp (Epoch)"
+}
+
+class Authorization(BaseModel):
+    """
+    Authorization section for WebDAV.
+    """
+    webdav_hostname: str = Field(
+        ...,
+        title="WebDAV Hostname",
+        description="URL of your WebDAV server, e.g. https://webdav.example.com."
+    )
+    username: str = Field(
+        ...,
+        title="WebDAV Username",
+        description="Your WebDAV login username."
+    )
+    password: str = Field(
+        ...,
+        alias="#password",
+        title="WebDAV Password",
+        description="Your WebDAV login password."
+    )
+
+    @model_validator(mode="after")
+    def validate_hostname(self) -> "Authorization":
+        if not self.webdav_hostname.strip():
+            raise ValueError("webdav_hostname cannot be empty.")
+        return self
+
+
+class SyncOptions(BaseModel):
+    remote_path: str = Field(
+        "/",
+        title="Remote Path",
+        description="Path on the WebDAV server where files will be uploaded, e.g. /backup/files/"
+    )
+    append_datetime: bool = Field(
+        False,
+        title="Append Datetime",
+        description="If true, a datetime suffix will be appended to the remote path."
+    )
+    datetime_format: Optional[str] = Field(
+        "%Y-%m-%d",
+        title="Datetime Format",
+        description=(
+            "Datetime format string to append to the remote path. "
+            f"Allowed values: {', '.join(ALLOWED_DATETIME_FORMATS)}"
+        )
+    )
+
+    @model_validator(mode="after")
+    def check_datetime(self) -> "SyncOptions":
+        if self.append_datetime:
+            if not self.datetime_format:
+                raise ValueError(
+                    "datetime_format must be provided if append_datetime is enabled."
+                )
+            if self.datetime_format not in ALLOWED_DATETIME_FORMATS:
+                allowed_str = ", ".join(ALLOWED_DATETIME_FORMATS)
+                raise ValueError(
+                    f"datetime_format '{self.datetime_format}' is invalid. "
+                    f"Allowed values: {allowed_str}"
+                )
+        return self
+
+    @property
+    def datetime_suffix(self) -> str:
+        """
+        Return the datetime suffix string, or empty string if disabled.
+        """
+        if not self.append_datetime:
+            return ""
+        fmt = self.datetime_format
+        if fmt == "{epoch}":
+            return str(int(datetime.now().timestamp()))
+        else:
+            return datetime.now().strftime(fmt)
+
+
+class Parameters(BaseModel):
+    """
+    Root parameters for WebDAV writer.
+    """
+    authorization: Authorization
+    sync_options: SyncOptions
+
+
+class Configuration(BaseModel):
+    parameters: Parameters
+    action: Optional[str] = Field(default="run")
+
+    def __init__(self, **data):
+        try:
+            super().__init__(**data)
+        except ValidationError as e:
+            error_messages = [
+                f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}"
+                for err in e.errors()
+            ]
+            raise UserException(
+                f"Configuration validation error: {', '.join(error_messages)}"
+            )
+
+    @property
+    def auth(self) -> Authorization:
+        return self.parameters.authorization
+
+    @property
+    def sync(self) -> SyncOptions:
+        return self.parameters.sync_options
+
+    @property
+    def datetime_suffix(self) -> str:
+        return self.sync.datetime_suffix
+
+
+
+================================================
+FILE: src/webdav_client.py
+================================================
+import os
+import logging
+from webdav3.client import Client
+from keboola.component import UserException
+
+class WebDAVClient:
+    def __init__(self, config, component):
+        """
+        WebDAV Client for Keboola Writer Component.
+
+        :param config: validated Configuration object
+        :param component: Keboola ComponentBase instance
+        """
+        self.config = config
+        self.component = component
+        self.data_dir = self.component.configuration.data_dir
+
+        # Initialize the webdavclient3 client
+        self.client = Client({
+            "webdav_hostname": self.config.auth.webdav_hostname,
+            "webdav_login": self.config.auth.username,
+            "webdav_password": self.config.auth.password,
+        })
+
+        logging.info(f"[WebDAVClient] Initialized for {self.config.auth.webdav_hostname}")
+
+    def scan_table_inputs(self):
+        """
+        Scan data/in/tables and return file metadata.
+
+        :return: list of dicts:
+            - name
+            - source
+        """
+        return self._scan_directory("in/tables")
+
+    def scan_file_inputs(self):
+        """
+        Scan data/in/files and return file metadata.
+
+        :return: list of dicts:
+            - name
+            - source
+        """
+        return self._scan_directory("in/files")
+
+    def _scan_directory(self, relative_path):
+        """
+        Scan a path relative to the Keboola data_dir and return file info.
+
+        :param relative_path: e.g. "in/tables"
+        :return: list of dicts:
+            - name
+            - source (absolute local path)
+        """
+        dir_path = os.path.join(self.data_dir, relative_path)
+
+        if not os.path.exists(dir_path):
+            logging.info(f"[WebDAVClient] Directory does not exist: {dir_path} → skipping scan.")
+            return []
+
+        logging.info(f"[WebDAVClient] Scanning directory: {dir_path}")
+
+        files = []
+        for filename in os.listdir(dir_path):
+            if filename.endswith(".manifest"):
+                logging.debug(f"[WebDAVClient] Skipping manifest file: {filename}")
+                continue
+
+            full_path = os.path.join(dir_path, filename)
+            if os.path.isfile(full_path):
+                files.append({
+                    "name": filename,
+                    "source": full_path,
+                })
+
+        logging.info(f"[WebDAVClient] Found {len(files)} files in {dir_path}")
+        return files
+
+
+    def upload_files(self, files, remote_path=None):
+        """
+        Upload multiple files to WebDAV.
+
+        :param files: list of dicts:
+            - name
+            - source
+        :param remote_path: override config.sync.remote_path
+        """
+        for file in files:
+            self._upload_single_file(file, remote_path)
+
+    def _upload_single_file(self, file, remote_path_override=None):
+        """
+        Upload a single file to WebDAV.
+
+        :param file: dict
+            - name
+            - source
+        :param remote_path_override: str or None
+        """
+        local_path = file["source"]
+        filename = file["name"]
+
+        remote_path = remote_path_override or self.config.sync.remote_path
+        destination_path = self._build_remote_destination(remote_path, filename)
+
+        logging.info(f"[WebDAVClient] Uploading {local_path} → {destination_path}")
+
+        try:
+            self.client.upload_sync(
+                remote_path=destination_path,
+                local_path=local_path
+            )
+            logging.info(f"[WebDAVClient] Upload succeeded: {destination_path}")
+
+        except Exception as e:
+            logging.error(f"[WebDAVClient] Upload failed for {destination_path}")
+            raise UserException(f"WebDAV upload failed: {str(e)}")
+
+    def _build_remote_destination(self, remote_path, filename):
+        """
+        Generate the remote path (possibly with datetime suffix).
+
+        :param remote_path: base folder on the server
+        :param filename: local filename
+        :return: str full remote path
+        """
+        if not self.config.sync.append_datetime:
+            final_name = filename
+        else:
+            base, ext = os.path.splitext(filename)
+            suffix = self.config.datetime_suffix
+            if ext:
+                final_name = f"{base}_{suffix}{ext}"
+            else:
+                final_name = f"{base}_{suffix}"
+
+        remote_path_clean = remote_path.rstrip("/")
+        destination = f"{remote_path_clean}/{final_name}"
+        return destination.replace("//", "/")
+
+
+
+================================================
+FILE: tests/__init__.py
+================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
+
+================================================
+FILE: tests/test_configuration.py
+================================================
+import pytest
+from configuration import Configuration, UserException, ALLOWED_DATETIME_FORMATS
+
+def test_valid_configuration():
+    raw_config = {
+        "parameters": {
+            "authorization": {
+                "webdav_hostname": "https://example.com",
+                "username": "user",
+                "#password": "secret"
+            },
+            "sync_options": {
+                "remote_path": "/backup",
+                "append_datetime": True,
+                "datetime_format": "%Y-%m-%d_%H-%M-%S"
+            }
+        }
+    }
+
+    config = Configuration(**raw_config)
+    assert config.auth.webdav_hostname == "https://example.com"
+    assert config.sync.remote_path == "/backup"
+    assert config.sync.datetime_format == "%Y-%m-%d_%H-%M-%S"
+    suffix = config.datetime_suffix
+    assert isinstance(suffix, str)
+    assert suffix
+
+def test_invalid_hostname():
+    raw_config = {
+        "parameters": {
+            "authorization": {
+                "webdav_hostname": "   ",
+                "username": "user",
+                "#password": "secret"
+            },
+            "sync_options": {
+                "remote_path": "/backup",
+            }
+        }
+    }
+    with pytest.raises(UserException) as exc_info:
+        Configuration(**raw_config)
+
+    assert "webdav_hostname" in str(exc_info.value)
+
+def test_invalid_datetime_format():
+    raw_config = {
+        "parameters": {
+            "authorization": {
+                "webdav_hostname": "https://example.com",
+                "username": "user",
+                "#password": "secret"
+            },
+            "sync_options": {
+                "remote_path": "/backup",
+                "append_datetime": True,
+                "datetime_format": "invalid_format"
+            }
+        }
+    }
+    with pytest.raises(UserException) as exc_info:
+        Configuration(**raw_config)
+
+    assert "datetime_format" in str(exc_info.value)
+
+@pytest.mark.parametrize("fmt", ALLOWED_DATETIME_FORMATS)
+def test_datetime_suffix_formats(fmt):
+    raw_config = {
+        "parameters": {
+            "authorization": {
+                "webdav_hostname": "https://example.com",
+                "username": "user",
+                "#password": "secret"
+            },
+            "sync_options": {
+                "remote_path": "/backup",
+                "append_datetime": True,
+                "datetime_format": fmt
+            }
+        }
+    }
+    config = Configuration(**raw_config)
+    suffix = config.datetime_suffix
+    assert isinstance(suffix, str)
+    assert suffix
+
+
+
+================================================
+FILE: tests/test_webdav_client.py
+================================================
+import os
+import pytest
+import tempfile
+from unittest import mock
+from webdav_client import WebDAVClient
+from configuration import Configuration
+
+@pytest.fixture
+def temp_dir_with_files(tmp_path):
+    tables_dir = tmp_path / "in" / "tables"
+    files_dir = tmp_path / "in" / "files"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    files_dir.mkdir(parents=True, exist_ok=True)
+
+    (tables_dir / "test_table.csv").write_text("id,name\n1,Alice\n2,Bob\n")
+    (tables_dir / "test_table.csv.manifest").write_text("{}")
+
+    (files_dir / "document.txt").write_text("This is a test file.")
+
+    return tmp_path
+
+@pytest.fixture
+def config_dict():
+    return {
+        "parameters": {
+            "authorization": {
+                "webdav_hostname": "https://example.com",
+                "username": "user",
+                "#password": "secret"
+            },
+            "sync_options": {
+                "remote_path": "/backup",
+                "append_datetime": False
+            }
+        }
+    }
+
+def test_scan_table_inputs(temp_dir_with_files, config_dict):
+    fake_component = mock.MagicMock()
+    fake_component.configuration.data_dir = str(temp_dir_with_files)
+
+    config = Configuration(**config_dict)
+    client = WebDAVClient(config, fake_component)
+
+    tables = client.scan_table_inputs()
+    assert len(tables) == 1
+    assert tables[0]["name"] == "test_table.csv"
+    assert tables[0]["source"].endswith("test_table.csv")
+
+def test_scan_file_inputs(temp_dir_with_files, config_dict):
+    fake_component = mock.MagicMock()
+    fake_component.configuration.data_dir = str(temp_dir_with_files)
+
+    config = Configuration(**config_dict)
+    client = WebDAVClient(config, fake_component)
+
+    files = client.scan_file_inputs()
+    assert len(files) == 1
+    assert files[0]["name"] == "document.txt"
+
+@mock.patch("webdav_client.Client")
+def test_upload_files(mock_webdav_client_class, temp_dir_with_files, config_dict):
+    fake_component = mock.MagicMock()
+    fake_component.configuration.data_dir = str(temp_dir_with_files)
+
+    config = Configuration(**config_dict)
+    client = WebDAVClient(config, fake_component)
+
+    test_file = {
+        "name": "test_upload.csv",
+        "source": os.path.join(str(temp_dir_with_files), "test_upload.csv")
+    }
+    with open(test_file["source"], "w") as f:
+        f.write("data,data,data")
+
+    mock_webdav_client_instance = mock_webdav_client_class.return_value
+    mock_webdav_client_instance.upload_sync.return_value = None
+
+    client.upload_files([test_file])
+
+    mock_webdav_client_instance.upload_sync.assert_called_once()
+
+
+
+================================================
+FILE: .github/workflows/push.yml
+================================================
+name: Keboola Component Build & Deploy Pipeline
+on: [ push ]
+concurrency: ci-${{ github.ref }} # to avoid tag collisions in the ECR
+env:
+  KBC_DEVELOPERPORTAL_APP: "keboola.wr-webdav"
+  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+  KBC_DEVELOPERPORTAL_USERNAME: ${{ vars.KBC_DEVELOPERPORTAL_USERNAME }}
+  KBC_DEVELOPERPORTAL_VENDOR: ${{ vars.KBC_DEVELOPERPORTAL_VENDOR }}
+
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }} # recommended for pushing to ECR
+  KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+
+  KBC_TEST_PROJECT_CONFIGS: "" # space separated list of config ids
+  KBC_STORAGE_TOKEN: ${{ secrets.KBC_STORAGE_TOKEN }} # required for running KBC tests
+
+jobs:
+  push_event_info:
+    name: Push Event Info
+    runs-on: ubuntu-latest
+    outputs:
+      app_image_tag: ${{ steps.tag.outputs.app_image_tag }}
+      is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
+      is_default_branch: ${{ steps.default_branch.outputs.is_default_branch }}
+      is_deploy_ready: ${{ steps.deploy_ready.outputs.is_deploy_ready }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Fetch all branches from remote repository
+        run: git fetch --prune --unshallow --tags -f
+
+      - name: Get current branch name
+        id: current_branch
+        run: |
+          if [[ ${{ github.ref }} != "refs/tags/"* ]]; then
+            branch_name=${{ github.ref_name }}
+            echo "branch_name=$branch_name" | tee -a $GITHUB_OUTPUT
+          else
+            raw=$(git branch -r --contains ${{ github.ref }})
+            branch="$(echo ${raw//origin\//} | tr -d '\n')"
+            echo "branch_name=$branch" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Is current branch the default branch
+        id: default_branch
+        run: |
+          echo "default_branch='${{ github.event.repository.default_branch }}'"
+          if [ "${{ github.event.repository.default_branch }}" = "${{ steps.current_branch.outputs.branch_name }}" ]; then
+             echo "is_default_branch=true" | tee -a $GITHUB_OUTPUT
+          else
+             echo "is_default_branch=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Set image tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
+          echo "is_semantic_tag=$IS_SEMANTIC_TAG" | tee -a $GITHUB_OUTPUT
+          echo "app_image_tag=$TAG" | tee -a $GITHUB_OUTPUT
+
+      - name: Deploy-Ready check
+        id: deploy_ready
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* \
+            && "${{ steps.tag.outputs.is_semantic_tag }}" == "true" ]]; then
+              echo "is_deploy_ready=true" | tee -a $GITHUB_OUTPUT
+          else
+              echo "is_deploy_ready=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Docker Image Build
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest
+          outputs: type=docker,dest=/tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - build
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+
+      - name: Run build_n_test.sh
+        run: |
+          docker run --rm \
+            ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest \
+            /bin/sh -e /code/scripts/build_n_test.sh
+
+  tests-kbc:
+    name: Run KBC Tests
+    needs:
+      - push_event_info
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up environment variables
+        run: |
+          echo "KBC_TEST_PROJECT_CONFIGS=${KBC_TEST_PROJECT_CONFIGS}" >> $GITHUB_ENV
+          echo "KBC_STORAGE_TOKEN=${{ secrets.KBC_STORAGE_TOKEN }}" >> $GITHUB_ENV
+
+      - name: Run KBC test jobs
+        if: env.KBC_TEST_PROJECT_CONFIGS != '' && env.KBC_STORAGE_TOKEN != ''
+        uses: keboola/action-run-configs-parallel@master
+        with:
+          token: ${{ secrets.KBC_STORAGE_TOKEN }}
+          componentId: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          configs: ${{ env.KBC_TEST_PROJECT_CONFIGS }}
+
+  push:
+    name: Docker Image Push
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - tests
+      - tests-kbc
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Tests
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+
+      - name: Docker login
+        if: env.DOCKERHUB_TOKEN
+        run: docker login --username "${{ env.DOCKERHUB_USER }}" --password "${{ env.DOCKERHUB_TOKEN }}"
+
+      - name: Push image to ECR
+        uses: keboola/action-push-to-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          push_latest: ${{ needs.push_event_info.outputs.is_deploy_ready }}
+          source_image: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+
+  deploy:
+    name: Deploy to KBC
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Developer Portal Tag
+        uses: keboola/action-set-tag-developer-portal@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+
+  update_developer_portal_properties:
+    name: Developer Portal Properties Update
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    runs-on: ubuntu-latest
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Update developer portal properties
+        run: |
+          chmod +x scripts/developer_portal/*.sh
+          scripts/developer_portal/update_properties.sh
 
 
