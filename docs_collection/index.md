@@ -917,6 +917,11 @@
 - Repository: https://github.com/keboola/component-google-cloud-storage-extractor
 - Description: None
 
+### component-ftp-writer
+- [Documentation](github/component-ftp-writer/llm.txt)
+- Repository: https://github.com/keboola/component-ftp-writer
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
