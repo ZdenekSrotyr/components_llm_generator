@@ -922,6 +922,16 @@
 - Repository: https://github.com/keboola/component-ftp-writer
 - Description: None
 
+### component-bingads-ex
+- [Documentation](github/component-bingads-ex/llm.txt)
+- Repository: https://github.com/keboola/component-bingads-ex
+- Description: None
+
+### component-monday-writer
+- [Documentation](github/component-monday-writer/llm.txt)
+- Repository: https://github.com/keboola/component-monday-writer
+- Description: A Monday.com Writer component for Keboola Connection
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
