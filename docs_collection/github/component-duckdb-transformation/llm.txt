@@ -1462,8 +1462,8 @@ class Component(ComponentBase):
         finally:
             try:
                 os.chdir(original_cwd)
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning(f"Failed to restore original working directory: {e}")
 
     def _setup_database_path(self):
         """Setup database paths and move existing database if needed."""
@@ -1530,15 +1530,53 @@ class Component(ComponentBase):
     @sync_action("expected_input_tables")
     def expected_input_tables(self):
         """
-        Returns a comma-separated list of required external input tables (filtering out likely CTE aliases).
+        Returns expected input tables with validation.
+        If input tables are available in configuration, validates against them and returns detailed report.
+        Otherwise returns a comma-separated list of required external input tables.
         """
         action = ExpectedInputTablesAction()
-        return action.expected_input_tables(self.params.blocks)
+
+        # Try to get available input tables - if they exist, do validation
+        available_tables = self._get_input_tables_definitions()
+        if available_tables:
+            # Do validation with detailed report
+            return action.expected_input_tables(blocks=self.params.blocks, available_tables=available_tables)
+        else:
+            # Fall back to simple comma-separated list
+            return action.expected_input_tables(self.params.blocks)
+
+    def _get_input_tables_definitions(self):
+        """
+        Override parent method to add destination_table_name attribute from configuration.
+
+        Returns:
+            List of TableDefinition objects with added destination_table_name attribute and updated names
+        """
+        base_definitions = self.get_input_tables_definitions()
+
+        for table_def in base_definitions:
+            # Find mapping from source to destination names from config
+            destination_table_name = None
+            for table in self.configuration.tables_input_mapping:
+                if table_def.id:
+                    if table.source in table_def.id:
+                        destination_table_name = table.destination
+                        break
+
+            # Fallback: use original name without .csv
+            if not destination_table_name:
+                destination_table_name = table_def.name
+
+            # Add attribute and update name
+            table_def.destination = destination_table_name
+
+        return base_definitions
 
     def _create_input_tables(self):
         """Create input tables from detected sources."""
         start_time = time.time()
-        for in_table in self.get_input_tables_definitions():
+
+        for in_table in self._get_input_tables_definitions():
             creator = LocalTableCreator(self._connection, self.params.dtypes_infer)
             result = creator.create_table(in_table)
             logging.info(f"Input table created: {result.name} (is_view={result.is_view})")
@@ -1721,7 +1759,8 @@ DUCK_DB_DIR = os.path.join(os.environ.get("TMPDIR", "/tmp"), "duckdb")
 
 def init_connection(threads, max_memory, db_path) -> DuckDBPyConnection:
     """
-    Returns connection to temporary DuckDB database with advanced optimizations
+    Returns connection to temporary DuckDB database with advanced optimizations.
+    DuckDB supports thread-safe access to a single connection.
     """
     os.makedirs(DUCK_DB_DIR, exist_ok=True)
     # Enhanced configuration with performance optimizations
@@ -1735,6 +1774,7 @@ def init_connection(threads, max_memory, db_path) -> DuckDBPyConnection:
         # Performance optimizations
         "preserve_insertion_order": False,  # Faster inserts
     }
+
     logging.info(f"Initializing DuckDB connection with config: {config}")
     conn = duckdb.connect(database=db_path, config=config)
     return conn
@@ -1855,7 +1895,7 @@ class LocalTableCreator:
         safe_path = path.replace("'", "''")
         rel = self.connection.sql(f"FROM read_parquet('{safe_path}')")
         # Use table name without parquet extension to avoid schema parsing (e.g., 'pq.parquet' -> 'pq')
-        table_name = in_table.name.removesuffix('.parquet').removesuffix('.parq')
+        table_name = in_table.name.removesuffix(".parquet").removesuffix(".parq")
         columns = []
         for col in rel.columns:
             if col in to_cast:
@@ -1872,7 +1912,7 @@ class LocalTableCreator:
     def _create_parquet_table_without_casting(self, in_table: TableDefinition, path) -> CreatedTable:
         """Create Parquet table without type casting."""
         self.logger.debug("Processing Parquet without type casting")
-        table_name = in_table.name.removesuffix('.parquet').removesuffix('.parq')
+        table_name = in_table.destination_table_name.removesuffix(".parquet").removesuffix(".parq")
         safe_path = path.replace("'", "''")
         self.connection.execute(
             f"""
@@ -1888,14 +1928,13 @@ class LocalTableCreator:
     def _create_view_from_csv(self, in_table: TableDefinition, path: str, dtype: dict) -> CreatedTable:
         """Create table from local file with error handling."""
         try:
-            self.logger.debug(f"Dropping existing view if exists: {in_table.name}")
-            self.connection.execute(f'DROP VIEW IF EXISTS "{in_table.name.removesuffix(".csv")}"')
+            # Table name should already be clean (without .csv) from get_input_tables_definitions
+            table_name = in_table.destination.removesuffix(".csv")
             quote_char = in_table.enclosure or '"'
             self.logger.debug(
                 f"Reading CSV file with parameters: delimiter='{in_table.delimiter or ','}',"
                 f" quotechar='{quote_char}', header={self._has_header_in_file(in_table)}"
             )
-            table_name = in_table.name.removesuffix(".csv")
             self.connection.read_csv(
                 path_or_buffer=path,
                 delimiter=in_table.delimiter or ",",
@@ -1903,7 +1942,7 @@ class LocalTableCreator:
                 header=self._has_header_in_file(in_table),
                 names=self._get_column_names(in_table),
                 dtype=dtype,
-            ).to_view(table_name)
+            ).to_view(table_name, replace=True)
             return CreatedTable(
                 name=table_name,
                 is_view=True,
@@ -1971,6 +2010,61 @@ class Query:
 
 
 @dataclass
+class Batch:
+    """A batch of queries that can be executed in parallel."""
+
+    queries: list[Query]
+
+    def __len__(self) -> int:
+        return len(self.queries)
+
+    def __iter__(self):
+        return iter(self.queries)
+
+    def __getitem__(self, index):
+        return self.queries[index]
+
+
+@dataclass
+class Block:
+    """A block containing batches that must be executed sequentially."""
+
+    name: str
+    batches: list[Batch]
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    @property
+    def total_queries(self) -> int:
+        return sum(len(batch) for batch in self.batches)
+
+
+@dataclass
+class ExecutionPlan:
+    """Complete execution plan with blocks that must be executed consecutively."""
+
+    blocks: list[Block]
+
+    def __len__(self) -> int:
+        return len(self.blocks)
+
+    def __iter__(self):
+        return iter(self.blocks)
+
+    @property
+    def total_queries(self) -> int:
+        return sum(block.total_queries for block in self.blocks)
+
+    @property
+    def total_batches(self) -> int:
+        return sum(len(block) for block in self.blocks)
+
+
+@dataclass
 class ExecutionStats:
     """Statistics from query execution."""
 
@@ -1991,7 +2085,7 @@ class ExecutionStats:
         return sum(self.batch_times) / len(self.batch_times) if self.batch_times else 0.0
 
 
-def _create_parallel_batches_for_block(block_queries: list[Query], producers: dict) -> list[list[Query]]:
+def _create_parallel_batches_for_block(block_queries: list[Query], producers: dict) -> list[Batch]:
     """
     Create parallel batches for queries within a single block.
     Uses topological sort to respect SQL dependencies.
@@ -2001,8 +2095,25 @@ def _create_parallel_batches_for_block(block_queries: list[Query], producers: di
     # Create local dependency graph and in-degree for this block only
     local_graph = defaultdict(list)
     local_in_degree = {q.name: 0 for q in block_queries}
+
+    # Build mapping of tables to CREATE queries in this block
+    table_creators = {}
+    for query in block_queries:
+        if "CREATE" in query.sql.upper():
+            for output in query.outputs:
+                table_creators[output] = query
+
     # Build local dependency graph for this block
     for query in block_queries:
+        # Add explicit INSERT → CREATE dependencies within the block
+        if "INSERT" in query.sql.upper():
+            for output in query.outputs:
+                if output in table_creators:
+                    creator = table_creators[output]
+                    # Add dependency: CREATE must run before INSERT for the same table
+                    local_graph[creator.name].append(query.name)
+                    local_in_degree[query.name] += 1
+
         for dep in query.dependencies:
             # Check if dependency is produced by another query in this block
             if dep in producers:
@@ -2011,23 +2122,9 @@ def _create_parallel_batches_for_block(block_queries: list[Query], producers: di
                 if producer.name in remaining:
                     local_graph[producer.name].append(query.name)
                     local_in_degree[query.name] += 1
-                    logging.debug(f"Local dependency: {producer.name} -> {query.name}")
-                else:
-                    logging.debug(
-                        f"External dependency: {query.name} depends on {dep}"
-                        f" (produced by {producer.name} in different block)"
-                    )
-            else:
-                logging.debug(f"Input dependency: {query.name} depends on {dep} (input table)")
-    # Debug: print local in-degree for this block
-    logging.debug("=== Local In-Degree for Block ===")
-    for name, degree in local_in_degree.items():
-        logging.debug(f"  {name}: {degree}")
     while remaining:
         # Find queries with no local dependencies
         ready = [remaining[name] for name in remaining if local_in_degree[name] == 0]
-        logging.debug(f"Ready queries: {[q.name for q in ready]}")
-        logging.debug(f"Remaining queries: {list(remaining.keys())}")
         if not ready:
             # Check for circular dependencies within block
             remaining_names = list(remaining.keys())
@@ -2040,7 +2137,7 @@ def _create_parallel_batches_for_block(block_queries: list[Query], producers: di
                 f"Circular dependency detected among queries in block: {', '.join(remaining_names)}. "
                 f"Check your SQL dependencies."
             )
-        batches.append(ready)
+        batches.append(Batch(queries=ready))
         # Remove processed queries and update local dependencies
         for query in ready:
             del remaining[query.name]
@@ -2097,22 +2194,42 @@ class BlockOrchestrator:
                 code_name=code_name,
             )
 
-    def build_block_execution_plan(self) -> list[list[Query]]:
+    def build_block_execution_plan(self) -> ExecutionPlan:
         """
         Build execution plan that respects block order but allows parallel execution within blocks.
         Creates DAG based on SQL dependencies.
+
+        Returns:
+            ExecutionPlan containing blocks that must be executed consecutively,
+            where each block contains batches that can run in parallel.
         """
         if not self.queries:
-            return []
+            return ExecutionPlan(blocks=[])
         # Group queries by block
         block_queries = defaultdict(list)
         for query in self.queries:
             block_queries[query.block_name].append(query)
         # Build producer mapping across all queries
+        # For tables that have both CREATE and INSERT, INSERT should be the producer
+        # (because reading from table usually needs data, not just empty structure)
         producers = {}
+        create_producers = {}
+        insert_producers = {}
+
         for query in self.queries:
             for output in query.outputs:
+                # Check if this is a CREATE or INSERT query
+                if "CREATE" in query.sql.upper():
+                    create_producers[output] = query
+                elif "INSERT" in query.sql.upper():
+                    insert_producers[output] = query
                 producers[output] = query
+
+        # Override with INSERT producers where available (data is more important than structure)
+        # Note: If multiple INSERTs exist for same table, last one becomes producer
+        # This is acceptable as dependency graph still ensures correct execution order
+        for table, insert_query in insert_producers.items():
+            producers[table] = insert_query
         # Build dependency graph
         graph = defaultdict(list)
         in_degree = {q.name: 0 for q in self.queries}
@@ -2122,22 +2239,15 @@ class BlockOrchestrator:
                     producer = producers[dep]
                     graph[producer.name].append(query.name)
                     in_degree[query.name] += 1
-                else:
-                    # If dependency is not produced by any query in this block,
-                    # it's an external dependency (input table) and doesn't create circular dependency
-                    logging.debug(f"Query '{query.name}' depends on external table '{dep}'")
-        # Debug: print global in-degree
-        logging.debug("=== Global In-Degree ===")
-        for name, degree in in_degree.items():
-            logging.debug(f"  {name}: {degree}")
+                # else: external dependency (input table)
         # Create execution plan: blocks in order, queries within blocks in parallel
-        execution_plan = []
+        blocks = []
         for block_name in block_queries.keys():
             block_queries_list = block_queries[block_name]
             # For each block, create batches of queries that can run in parallel
-            block_batches = _create_parallel_batches_for_block(block_queries_list, producers)
-            execution_plan.extend(block_batches)
-        return execution_plan
+            batches = _create_parallel_batches_for_block(block_queries_list, producers)
+            blocks.append(Block(name=block_name, batches=batches))
+        return ExecutionPlan(blocks=blocks)
 
     def execute(self) -> ExecutionStats:
         """Execute queries with block-based parallelization and return statistics."""
@@ -2145,56 +2255,56 @@ class BlockOrchestrator:
         # Reset statistics
         self.query_times.clear()
         self.batch_times.clear()
-        # Debug: print all detected dependencies
-        logging.debug("=== Detected Dependencies ===")
-        for query in self.queries:
-            logging.debug(f"Query '{query.name}' (Block: {query.block_name}, Code: {query.code_name}):")
-            logging.debug(f"  Dependencies: {query.dependencies}")
-            logging.debug(f"  Outputs: {query.outputs}")
-            logging.debug(f"  SQL: {query.sql[:100]}...")
-        # Debug: print producer mapping
-        logging.debug("=== Producer Mapping ===")
-        producers = {}
-        for query in self.queries:
-            for output in query.outputs:
-                producers[output] = query
-        for output, producer in producers.items():
-            logging.debug(f"  {output} -> {producer.name}")
-        batches = self.build_block_execution_plan()
-        logging.info(f"Executing {len(self.queries)} queries in {len(batches)} batches across blocks")
-        current_block = None
-        block_start_time = None
-        for i, batch in enumerate(batches, 1):
-            # Check if we're starting a new block
-            if batch and batch[0].block_name != current_block:
-                if current_block and block_start_time:
-                    block_time = time.time() - block_start_time
-                    logging.info(f"Block '{current_block}' completed in {block_time:.2f}s")
-                current_block = batch[0].block_name
-                block_start_time = time.time()
-                logging.info(f"Starting block '{current_block}'")
-            logging.info(f"Batch {i}: {[q.name for q in batch]} ({len(batch)} queries)")
-            batch_start = time.time()
-            if len(batch) == 1:
-                # Single query - execute directly
-                logging.info(f"Batch {i}: Executing 1 query sequentially")
-                query_time = self._execute_query(batch[0])
-                self.query_times.append(query_time)
-            else:
-                # Multiple queries - execute in parallel
-                query_times = self._execute_batch_parallel(batch)
-                self.query_times.extend(query_times)
-            batch_time = time.time() - batch_start
-            self.batch_times.append(batch_time)
-        # Handle last block
-        if current_block and block_start_time:
+        execution_plan = self.build_block_execution_plan()
+
+        block_count = len(execution_plan)
+        block_text = "block" if block_count == 1 else "blocks"
+        logging.info(
+            f"Executing {execution_plan.total_queries} queries in "
+            f"{execution_plan.total_batches} batches across {block_count} {block_text}"
+        )
+
+        batch_counter = 0
+        # Execute blocks consecutively
+        for block_index, block in enumerate(execution_plan):
+            if not block.batches:
+                continue
+
+            block_start_time = time.time()
+            logging.info(f"Starting block '{block.name}' ({block_index + 1}/{len(execution_plan)})")
+
+            # Execute all batches within this block
+            for batch in block:
+                batch_counter += 1
+                batch_start = time.time()
+                if len(batch) == 1:
+                    logging.info(
+                        f"Batch {batch_counter}/{execution_plan.total_batches}: Executing 1 query sequentially"
+                    )
+                    try:
+                        query_time = self._execute_query(batch[0])
+                        self.query_times.append(query_time)
+                    except Exception as e:
+                        raise UserException(f"Query '{batch[0].name}' failed: {e}")
+                else:
+                    logging.info(
+                        f"Batch {batch_counter}/{execution_plan.total_batches}: "
+                        f"Executing {len(batch)} queries in parallel"
+                    )
+                    query_times = self._execute_batch_parallel(batch)
+                    self.query_times.extend(query_times)
+                batch_time = time.time() - batch_start
+                self.batch_times.append(batch_time)
+
+            # Block completed
             block_time = time.time() - block_start_time
-            logging.info(f"Block '{current_block}' completed in {block_time:.2f}s")
+            logging.info(f"Block '{block.name}' completed in {block_time:.2f}s")
+
         total_time = time.time() - execution_start
         # Create statistics
         stats = ExecutionStats(
-            total_queries=len(self.queries),
-            total_batches=len(batches),
+            total_queries=execution_plan.total_queries,
+            total_batches=execution_plan.total_batches,
             total_execution_time=total_time,
             batch_times=self.batch_times.copy(),
             query_times=self.query_times.copy(),
@@ -2203,81 +2313,85 @@ class BlockOrchestrator:
         )
         return stats
 
+    @staticmethod
+    def _get_sql_preview(sql: str, max_length: int = 10) -> str:
+        """Get a preview of SQL query for logging purposes."""
+        cleaned_sql = sql.replace("\n", " ").strip()
+        if len(cleaned_sql) <= max_length:
+            return cleaned_sql
+        return cleaned_sql[:max_length] + "..."
+
     def _execute_query(self, query: Query) -> float:
         """Execute single query and return execution time."""
         thread_id = threading.current_thread().ident
         start = time.time()
-        try:
-            logging.info(f"Starting query '{query.name}' (Block: {query.block_name}) [Thread-{thread_id}]")
-            self.connection.execute(query.sql)
-            duration = time.time() - start
-            logging.info(
-                f"Query '{query.name}' (Block: {query.block_name}) completed in {duration:.2f}s [Thread-{thread_id}]"
-            )
-            return duration
-        except Exception as e:
-            # Don't log here - let the caller handle logging
-            raise UserException(f"Query '{query.name}' failed: {e}")
+        # DuckDB supports thread-safe access to a single connection
+        self.connection.execute(query.sql)
+        duration = time.time() - start
+        sql_preview = BlockOrchestrator._get_sql_preview(query.sql)
+        logging.info(f"Query '{query.name}' completed in {duration:.2f}s [Thread {thread_id}] - SQL: {sql_preview}")
+        return duration
 
-    def _execute_batch_parallel(self, batch: list[Query]) -> list[float]:
+    def _execute_batch_parallel(self, batch: Batch) -> list[float]:
         """Execute batch of queries in parallel and return list of execution times."""
         max_workers = min(self.max_workers, len(batch))
+
         if max_workers == 1:
-            logging.info(f"Batch: Executing {len(batch)} queries sequentially (1 thread)")
-            # For single thread, execute sequentially to avoid race conditions
             query_times = []
             for query in batch:
                 try:
                     execution_time = self._execute_query(query)
                     query_times.append(execution_time)
-                except UserException as e:
-                    # Log the error and stop immediately
-                    thread_id = threading.current_thread().ident
-                    logging.error(f"Query '{query.name}' failed: {e} [Thread-{thread_id}]")
-                    logging.error(f"Query '{query.name}' failed, stopping batch execution")
-                    raise UserException(f"Query '{query.name}' failed")
+                except Exception as e:
+                    raise UserException(f"Query '{query.name}' failed: {e}")
             return query_times
         else:
-            logging.info(f"Batch: Executing {len(batch)} queries in parallel using {max_workers} threads")
+            logging.info(f"Using {max_workers} threads")
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all queries
                 future_to_query = {executor.submit(self._execute_query, query): query for query in batch}
                 query_times = []
-                failed_query = None
+                failed_queries = []
+                completed_futures = set()
+
                 # Wait for completion with better error handling
-                try:
-                    for future in as_completed(future_to_query):
-                        try:
-                            execution_time = future.result()  # Get execution time
-                            query_times.append(execution_time)
-                        except UserException as e:
-                            # Get the failed query name and log the error
-                            failed_query = future_to_query[future]
-                            thread_id = threading.current_thread().ident
-                            logging.error(f"Query '{failed_query.name}' failed: {e} [Thread-{thread_id}]")
-                            logging.error(
-                                f"Query '{failed_query.name}' failed, cancelling remaining "
-                                f"{len(future_to_query) - len(query_times)} queries"
-                            )
-                            # Cancel ALL remaining futures immediately
-                            cancelled_count = 0
-                            for f in future_to_query:
-                                if not f.done():
-                                    f.cancel()
-                                    cancelled_count += 1
-                                    logging.debug(f"Cancelled future for query: {future_to_query[f].name}")
-                            logging.info(f"Cancelled {cancelled_count} remaining queries")
-                            # Wait a bit for cancellations to take effect
-                            time.sleep(0.5)
-                            # Re-raise the exception
-                            raise UserException(f"Query '{failed_query.name}' failed")
-                except UserException:
-                    # Make sure all futures are cancelled before re-raising
-                    for f in future_to_query:
-                        if not f.done():
-                            f.cancel()
-                    raise
+                for future in as_completed(future_to_query):
+                    completed_futures.add(future)
+                    try:
+                        execution_time = future.result()
+                        query_times.append(execution_time)
+                    except Exception as e:
+                        failed_query = future_to_query[future]
+                        failed_queries.append(f"{failed_query.name}: {str(e)}")
+
+                if failed_queries:
+                    if len(completed_futures) < len(future_to_query):
+                        self._cancel_remaining_futures(future_to_query, completed_futures)
+                    successful_count = len(query_times)
+                    raise UserException(
+                        f"Query execution failed after {successful_count} successful "
+                        f"quer{'y' if successful_count == 1 else 'ies'}:\n  - {'\n  - '.join(failed_queries)}"
+                    )
+
                 return query_times
+
+    @staticmethod
+    def _cancel_remaining_futures(future_to_query: dict, completed_futures: set) -> int:
+        """Cancel all futures that haven't completed yet. Returns number of cancelled futures."""
+        cancelled_count = 0
+        for future in future_to_query:
+            if future not in completed_futures and not future.done():
+                try:
+                    if future.cancel():
+                        cancelled_count += 1
+                except Exception:
+                    pass
+
+        # Give a brief moment for cancellations to take effect
+        if cancelled_count > 0:
+            time.sleep(0.1)
+
+        return cancelled_count
 
 
 
@@ -2323,13 +2437,39 @@ class SQLParser:
                     continue
 
                 # Find all table references (dependencies)
+                # Exclude INSERT target tables from dependencies by identifying the target table
+                # (see logic below: insert_target is set for INSERT statements, and such tables are skipped in the loop)
+                insert_target = None
+                if isinstance(statement, exp.Insert):
+                    if statement.this and hasattr(statement.this, "name"):
+                        insert_target = statement.this.name
+
                 for table in statement.find_all(exp.Table):
                     table_name = table.name
-                    if table_name:
+                    if table_name and table_name != insert_target:
                         dependencies.add(table_name)
 
                 # Find CREATE statements (outputs)
                 if isinstance(statement, exp.Create):
+                    if statement.this:
+                        # For CREATE TABLE, statement.this is a Schema object
+                        if hasattr(statement.this, "this") and statement.this.this:
+                            outputs.add(str(statement.this.this))
+                        elif hasattr(statement.this, "name") and statement.this.name:
+                            outputs.add(str(statement.this.name))
+
+                # Find INSERT statements (output only)
+                # Note: INSERT table dependencies are handled explicitly in orchestrator
+                if isinstance(statement, exp.Insert):
+                    if statement.this and hasattr(statement.this, "name"):
+                        table_name = statement.this.name
+                        # INSERT modifies the table (output)
+                        outputs.add(table_name)
+                        # Exclude INSERT target table from dependencies to prevent self-dependencies
+                        # (i.e., a table being both an output and a dependency in the same statement)
+
+                # Find other statements that modify tables (UPDATE, DELETE, etc.)
+                if isinstance(statement, (exp.Update, exp.Delete)):
                     if statement.this and hasattr(statement.this, "name"):
                         outputs.add(statement.this.name)
 
@@ -2338,8 +2478,20 @@ class SQLParser:
                     if cte.alias:
                         dependencies.discard(cte.alias)
 
-            # Remove outputs from dependencies (can't depend on what you create)
-            dependencies = dependencies - outputs
+            # Remove CREATE outputs from dependencies (can't depend on what you create)
+            # But keep INSERT dependencies (you need the table to exist before inserting)
+            create_outputs = set()
+            for statement in parsed:
+                if statement is None:
+                    continue
+                if isinstance(statement, exp.Create):
+                    if statement.this:
+                        # For CREATE TABLE, statement.this is a Schema object
+                        if hasattr(statement.this, "this") and statement.this.this:
+                            create_outputs.add(str(statement.this.this))
+                        elif hasattr(statement.this, "name") and statement.this.name:
+                            create_outputs.add(str(statement.this.name))
+            dependencies = dependencies - create_outputs
 
             return dependencies, outputs
 
@@ -2558,37 +2710,35 @@ class ExecutionPlanVisualizationAction:
         """Generate markdown execution plan from orchestrator."""
         markdown = "# 🚀 Execution Plan Visualization\n\n"
         # Build execution plan
-        batches = orchestrator.build_block_execution_plan()
+        execution_plan = orchestrator.build_block_execution_plan()
         markdown += "## 📊 Execution Summary\n\n"
-        markdown += f"- **Total Queries:** {len(orchestrator.queries)}\n"
-        markdown += f"- **Total Batches:** {len(batches)}\n"
+        markdown += f"- **Total Queries:** {execution_plan.total_queries}\n"
+        markdown += f"- **Total Batches:** {execution_plan.total_batches}\n"
+        markdown += f"- **Total Blocks:** {len(execution_plan)}\n"
         markdown += f"- **Max Parallel Workers:** {orchestrator.max_workers}\n\n"
         markdown += "## 🔄 Execution Flow\n\n"
-        # Group queries by block for display
-        block_queries = {}
-        for query in orchestrator.queries:
-            if query.block_name not in block_queries:
-                block_queries[query.block_name] = []
-            block_queries[query.block_name].append(query)
-        for block_name in block_queries.keys():
-            markdown += f"### 🧱 Block: {block_name}\n\n"
-            # Find batches for this block
-            block_batches = []
-            for batch in batches:
-                if any(q.block_name == block_name for q in batch):
-                    block_batches.append(batch)
-            for batch in block_batches:
-                markdown += "#### ⚡ Batch (Parallel Execution)\n\n"
+
+        # Iterate through blocks in execution order
+        for block_index, block in enumerate(execution_plan, 1):
+            markdown += f"### 🧱 Block {block_index}: {block.name}\n\n"
+            markdown += f"**Block contains {len(block)} batches with {block.total_queries} queries total**\n\n"
+
+            # Iterate through batches within this block
+            for batch_index, batch in enumerate(block, 1):
+                if len(batch) == 1:
+                    markdown += f"#### 🔄 Batch {batch_index} (Sequential - 1 query)\n\n"
+                else:
+                    markdown += f"#### ⚡ Batch {batch_index} (Parallel - {len(batch)} queries)\n\n"
+
                 for query in batch:
-                    if query.block_name == block_name:
-                        markdown += f"- **{query.name}** (Code: {query.code_name})\n"
-                        if query.dependencies:
-                            deps = ", ".join(sorted(query.dependencies))
-                            markdown += f"  - Dependencies: `{deps}`\n"
-                        if query.outputs:
-                            outputs = ", ".join(sorted(query.outputs))
-                            markdown += f"  - Outputs: `{outputs}`\n"
-                        markdown += "\n"
+                    markdown += f"- **{query.name}** (Code: {query.code_name})\n"
+                    if query.dependencies:
+                        deps = ", ".join(sorted(query.dependencies))
+                        markdown += f"  - Dependencies: `{deps}`\n"
+                    if query.outputs:
+                        outputs = ", ".join(sorted(query.outputs))
+                        markdown += f"  - Outputs: `{outputs}`\n"
+                    markdown += "\n"
             markdown += "---\n\n"
         markdown += "## 🔍 Dependency Analysis\n\n"
         # Show dependency graph
@@ -2631,29 +2781,103 @@ class ExpectedInputTablesAction:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.sql_parser = SQLParser()
 
-    def expected_input_tables(self, blocks):
+    def expected_input_tables(self, blocks, available_tables=None):
         """
         Returns a comma-separated list of required external input tables (filtering out likely CTE aliases).
+        If available_tables is provided, validates against them and returns detailed report.
         """
         try:
+            # Single-pass analysis: collect both dependencies and outputs
             all_dependencies = set()
             all_outputs = set()
 
-            # Use SQLParser to iterate through blocks and extract dependencies
-            for block, code, script, _ in self.sql_parser.iterate_blocks(blocks):
+            # Single pass: collect both dependencies and outputs from all queries
+            for _, _, script, _ in self.sql_parser.iterate_blocks(blocks):
                 dependencies, outputs = self.sql_parser.extract_dependencies_and_outputs(script)
                 all_dependencies.update(dependencies)
                 all_outputs.update(outputs)
 
-            # External tables are dependencies that are never created anywhere
-            # CTE aliases are already excluded during dependency extraction
+            # External tables are dependencies that are never created anywhere in the entire pipeline
             external_tables = all_dependencies - all_outputs
 
-            message = ", ".join(sorted(external_tables)) if external_tables else ""
-            return ValidationResult(message=message, type=MessageType.SUCCESS)
+            # If no validation requested, return simple comma-separated list
+            if available_tables is None:
+                message = ", ".join(sorted(external_tables)) if external_tables else ""
+                return ValidationResult(message=message, type=MessageType.SUCCESS)
+
+            # Perform validation against available tables
+            return self._validate_against_available_tables(external_tables, available_tables)
+
         except Exception as e:
             error_message = f"Error analyzing expected input tables: {str(e)}"
             return ValidationResult(message=error_message, type=MessageType.DANGER)
+
+    def _validate_against_available_tables(self, expected_tables, available_tables):
+        """Validate expected tables against available input tables."""
+        # Get available table names (remove .csv suffix)
+        available_table_names = {
+            table.destination.removesuffix(".csv").removesuffix(".parquet").removesuffix(".parq")
+            for table in available_tables
+        }
+
+        # Compare expected vs available
+        missing_tables = expected_tables - available_table_names
+        extra_tables = available_table_names - expected_tables
+
+        # Build detailed message
+        message = self._build_validation_message(expected_tables, available_table_names, missing_tables, extra_tables)
+
+        # Determine message type
+        if missing_tables:
+            message_type = MessageType.DANGER
+        elif extra_tables:
+            message_type = MessageType.WARNING
+        else:
+            message_type = MessageType.SUCCESS
+
+        return ValidationResult(message=message, type=message_type)
+
+    def _build_validation_message(self, expected_tables, available_table_names, missing_tables, extra_tables):
+        """Build detailed validation message."""
+        lines = []
+
+        # Header with summary
+        if not expected_tables:
+            lines.append("✅ No input tables required by SQL queries")
+            return "\n".join(lines)
+
+        lines.append("📋 **Input Tables Validation Report**")
+        lines.append("")
+
+        # Expected tables section
+        lines.append(f"**Required tables ({len(expected_tables)}):**")
+        for table in sorted(expected_tables):
+            status = "✅" if table in available_table_names else "❌"
+            lines.append(f"  {status} `{table}`")
+        lines.append("")
+
+        # Available tables section
+        lines.append(f"**Available tables ({len(available_table_names)}):**")
+        for table in sorted(available_table_names):
+            status = "✅" if table in expected_tables else "⚠️"
+            lines.append(f"  {status} `{table}`")
+        lines.append("")
+
+        # Issues section
+        if missing_tables or extra_tables:
+            lines.append("**Issues found:**")
+
+            if missing_tables:
+                missing_table_list = ", ".join(f"`{t}`" for t in sorted(missing_tables))
+                lines.append(f"❌ **Missing tables ({len(missing_tables)}):** {missing_table_list}")
+
+            if extra_tables:
+                extra_table_list = ", ".join(f"`{t}`" for t in sorted(extra_tables))
+                lines.append(f"⚠️ **Extra tables ({len(extra_tables)}):** {extra_table_list}")
+        else:
+            lines.append("✅ **All required tables are available!**")
+
+        return "\n".join(lines)
 
 
 
@@ -3090,10 +3314,12 @@ class TestExecutionPlanVisualizationAction(unittest.TestCase):
             "## 📊 Execution Summary\n\n"
             "- **Total Queries:** 4\n"
             "- **Total Batches:** 4\n"
+            "- **Total Blocks:** 2\n"
             "- **Max Parallel Workers:** 4\n\n"
             "## 🔄 Execution Flow\n\n"
-            "### 🧱 Block: B1\n\n"
-            "#### ⚡ Batch (Parallel Execution)\n\n"
+            "### 🧱 Block 1: B1\n\n"
+            "**Block contains 3 batches with 3 queries total**\n\n"
+            "#### 🔄 Batch 1 (Sequential - 1 query)\n\n"
             "- **C1_0** (Code: C1)\n"
         )
         # Only verify the start to keep the test robust to ordering of later sections
