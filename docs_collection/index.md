@@ -747,11 +747,6 @@
 - Repository: https://github.com/keboola/component-snowflake-procedure-trigger
 - Description: None
 
-### component-pinterest
-- [Documentation](github/component-pinterest/llm.txt)
-- Repository: https://github.com/keboola/component-pinterest
-- Description: None
-
 ### component-hibob
 - [Documentation](github/component-hibob/llm.txt)
 - Repository: https://github.com/keboola/component-hibob
