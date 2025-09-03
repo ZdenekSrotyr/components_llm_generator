@@ -927,6 +927,16 @@
 - Repository: https://github.com/keboola/component-monday-writer
 - Description: A Monday.com Writer component for Keboola Connection
 
+### component-mailkit-writer
+- [Documentation](github/component-mailkit-writer/llm.txt)
+- Repository: https://github.com/keboola/component-mailkit-writer
+- Description: None
+
+### component-pinterest
+- [Documentation](github/component-pinterest/llm.txt)
+- Repository: https://github.com/keboola/component-pinterest
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
