@@ -1488,7 +1488,8 @@ Directory structure:
     │   │   ├── Dockerfile
     │   │   └── JsonTests.pl
     │   ├── keys/
-    │   │   └── genkeys.sh
+    │   │   ├── genkeys.sh
+    │   │   └── keys-to-config-json.py
     │   └── nginx/
     │       └── default.conf
     ├── python-sync-actions/
@@ -1622,7 +1623,12 @@ Directory structure:
     │       │   │   ├── orders.request
     │       │   │   ├── orders.requestHeaders
     │       │   │   └── orders.response
-    │       │   └── 010-default-header/
+    │       │   ├── 010-default-header/
+    │       │   │   ├── config.json
+    │       │   │   ├── orders.request
+    │       │   │   ├── orders.requestHeaders
+    │       │   │   └── orders.response
+    │       │   └── 011-params-func-eval/
     │       │       ├── config.json
     │       │       ├── orders.request
     │       │       ├── orders.requestHeaders
@@ -8769,7 +8775,7 @@ RUN pip install -r /tmp/requirements.txt
 
 # Install Node.js and set up symlinks
 RUN set -eux; \
-    NODE_VERSION="v22.10.0" \
+    NODE_VERSION="v22.19.0" \
     ARCH= && dpkgArch="$(dpkg --print-architecture)"; \
     case "${dpkgArch##*-}" in \
         amd64) ARCH='x64';; \
@@ -25666,6 +25672,38 @@ python3 keys-to-config-json.py
 
 
 ================================================
+FILE: docker/keys/keys-to-config-json.py
+================================================
+#!/usr/bin/env python3
+
+import json
+
+
+with open("rootCA.crt") as f:
+    ca_cert = f.read()
+
+with open("client.crt") as f:
+    client_cert = f.read()
+
+with open("client.key") as f:
+    client_key = f.read()
+
+with open("config.json", "w") as f:
+    json.dump(
+        {
+            "api": {
+                "baseUrl": "https://server.local/",
+                "caCertificate": ca_cert,
+                "#clientCertificate": client_cert + client_key,
+            }
+        },
+        f,
+        indent=4,
+    )
+
+
+
+================================================
 FILE: docker/nginx/default.conf
 ================================================
 server {
@@ -26317,6 +26355,12 @@ class Component(ComponentBase):
         endpoint = ep.get("endpoint", "").lstrip("/")
         placeholders = ep.get("placeholders", {})
         params = ep.get("params", {})
+        user_params = self._configuration.user_parameters if self._configuration else {}
+        params = self._conf_helpers.fill_in_user_parameters(
+            params,
+            user_params,
+            evaluate_conf_objects_functions=True
+        )
 
         try:
             formatted_path = endpoint.format(**placeholders)
@@ -26338,7 +26382,7 @@ class Component(ComponentBase):
         Get values to hide
         Args:
         """
-        user_params = self._configuration.user_parameters
+        user_params = self._configuration.user_parameters if self._configuration else {}
         secrets = [value for key, value in user_params.items() if key.startswith("#") or key.startswith("__")]
 
         # get secrets from the auth method
@@ -27122,7 +27166,12 @@ def build_api_request(configuration: dict) -> List[Tuple[ApiRequest, RequestCont
 
         method = endpoint_config.get("method", "GET")
 
-        request_content = build_request_content(method, endpoint_config.get("params", {}))
+        # evaluate functions inside the params
+        user_parameters = configuration.get("parameters", {}).get("config", {})
+        params = endpoint_config.get("params", {})
+        params = ConfigHelpers().fill_in_user_parameters(params, user_parameters, evaluate_conf_objects_functions=True)
+        request_content = build_request_content(method, params)
+
         # use real method
         if method.upper() == "FORM":
             method = "POST"
@@ -32457,7 +32506,13 @@ FILE: python-sync-actions/tests/calls/010-default-header/config.json
     "http": {
       "headers": {
           "Authorization": {
-            "attr": "#BEARER_TOKEN"
+            "function": "concat",
+            "args": [
+              "Bearer ",
+              {
+                "attr": "#BEARER_TOKEN"
+              }
+            ]
           }
         }
     }
@@ -32500,6 +32555,178 @@ authorization: Bearer token
 
 ================================================
 FILE: python-sync-actions/tests/calls/010-default-header/orders.response
+================================================
+{
+  "nested": {
+    "orders": [
+      {
+        "id": 1,
+        "customer": "John Doe",
+        "address": "123 Main St",
+        "items": [
+          {
+            "id": 1,
+            "name": "Widget",
+            "price": 9.99,
+            "quantity": 2
+          },
+          {
+            "id": 2,
+            "name": "Thing",
+            "price": 5.99,
+            "quantity": 5
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "customer": "Jan Novak",
+        "address": "123 Main St",
+        "items": [
+          {
+            "id": 1,
+            "name": "Widget",
+            "price": 9.99,
+            "quantity": 2
+          },
+          {
+            "id": 2,
+            "name": "Thing",
+            "price": 5.99,
+            "quantity": 5
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "customer": "Jana Novakova",
+        "address": "123 Main St",
+        "items": [
+          {
+            "id": 1,
+            "name": "Widget",
+            "price": 9.99,
+            "quantity": 2
+          },
+          {
+            "id": 2,
+            "name": "Thing",
+            "price": 5.99,
+            "quantity": 5
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "customer": "Bob Smith",
+        "address": "123 Main St",
+        "items": [
+          {
+            "id": 1,
+            "name": "Widget",
+            "price": 9.99,
+            "quantity": 2
+          },
+          {
+            "id": 2,
+            "name": "Thing",
+            "price": 5.99,
+            "quantity": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+
+
+================================================
+FILE: python-sync-actions/tests/calls/011-params-func-eval/config.json
+================================================
+{
+  "storage": {},
+  "parameters": {
+    "__SELECTED_JOB": "0",
+    "config": {
+      "jobs": [
+        {
+          "endpoint": "011-params-func-eval/orders",
+          "dataType": "orders",
+          "method": "POST",
+          "params": {
+            "greeting": {
+              "value":
+                {
+                  "hi": {
+                    "function": "concat",
+                    "args": [
+                      "hello",
+                      "-world"
+                    ]
+                  }
+                }
+
+            }
+          }
+        }
+      ],
+      "debug": false,
+      "outputBucket": "in.c-",
+      "incrementalOutput": false,
+      "#BEARER_TOKEN": "token"
+    },
+    "api": {
+      "baseUrl": "http://mock-server:80/",
+      "http": {
+        "headers": {
+          "Authorization": {
+            "attr": "#BEARER_TOKEN"
+          }
+        }
+      }
+    },
+    "http": {
+      "maxRetries": 10,
+      "codes": [
+        500,
+        502,
+        503,
+        504,
+        408,
+        420,
+        429
+      ]
+    }
+  },
+  "action": "test_request",
+  "image_parameters": {
+  },
+  "authorization": {
+  }
+}
+
+
+
+================================================
+FILE: python-sync-actions/tests/calls/011-params-func-eval/orders.request
+================================================
+POST /011-params-func-eval/orders
+
+{"greeting": {"value": {"hi": "hello-world"}}}
+
+
+================================================
+FILE: python-sync-actions/tests/calls/011-params-func-eval/orders.requestHeaders
+================================================
+accept: */*
+authorization: token
+content-length: 46
+content-type: application/json
+
+
+
+================================================
+FILE: python-sync-actions/tests/calls/011-params-func-eval/orders.response
 ================================================
 {
   "nested": {
