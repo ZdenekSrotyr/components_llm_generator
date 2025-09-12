@@ -197,19 +197,8 @@ exclude =
     .git,
     .venv,
     venv
+ignore = E203,W503
 max-line-length = 120
-
-# F812: list comprehension redefines ...
-# H101: Use TODO(NAME)
-# H202: assertRaises Exception too broad
-# H233: Python 3.x incompatible use of print operator
-# H301: one import per line
-# H306: imports not in alphabetical order (time, os)
-# H401: docstring should not start with a space
-# H403: multi line docstrings should end on a new line
-# H404: multi line docstring should start without a leading new line
-# H405: multi line docstring summary not separated with an empty line
-# H501: Do not use self.__dict__ for string formatting
 
 
 
@@ -243,7 +232,7 @@ THE SOFTWARE.
 FILE: pyproject.toml
 ================================================
 [project]
-name = "cookiecutter"
+name = "mailkit-writer"
 dynamic = ["version"]
 readme = "README.md"
 requires-python = ">=3.13"
@@ -318,7 +307,7 @@ wheels = [
 ]
 
 [[package]]
-name = "cookiecutter"
+name = "mailkit-writer"
 source = { virtual = "." }
 dependencies = [
     { name = "flake8" },
@@ -736,13 +725,15 @@ wheels = [
 ================================================
 FILE: component_config/component_long_description.md
 ================================================
-Mailkit Writer long description
+The component allows you to create and update [Mailkit](https://www.mailkit.eu/en/) mailing lists. Mailkit is the most comprehensive tool for emailing and sms marketing on the market. Providing unrivaled overview of your email campaigns combined with a simple user interface and automated processing of emails. The level of automation in Mailkit allows you to create templates used for regular messaging with content automatically updated from data sources. With this component, you can simply import recipients from your KBC Storage tables.
+
 
 
 ================================================
 FILE: component_config/component_short_description.md
 ================================================
-Mailkit Writer short description
+E-mail and SMS marketing platform with data based automation, dynamic content and personalization
+
 
 
 ================================================
@@ -1041,6 +1032,7 @@ FILE: src/component.py
 ================================================
 import csv
 import logging
+from collections.abc import Iterator
 from typing import Any
 
 from keboola.component import sync_actions
@@ -1050,6 +1042,9 @@ from keboola.component.exceptions import UserException
 
 from configuration import ColumnMappingItem, Configuration
 from mailkit_client import MailkitClient
+
+
+BATCH_SIZE = 5_000
 
 
 class Component(ComponentBase):
@@ -1064,13 +1059,8 @@ class Component(ComponentBase):
 
         for table in tables:
             col_mapping_dict = self._parse_column_mapping(self.params.column_mapping)
-            recipients = self._create_recipients_list(table, col_mapping_dict)
-
-            result = self.mkc.mailinglist_import(self.params.list_id, recipients)
-            if result:
-                # mailkit api currently returns 0 counts in every category (ok, skipped etc.) even in case of successful
-                # import, so we just log success when the import returned valid JSON response with HTTP 200
-                logging.info("Mailing list import result: success")
+            for recipients in self._create_recipients_list_in_batches(table, col_mapping_dict):
+                self.mkc.mailinglist_import(self.params.list_id, recipients)
 
     @sync_action("verifyCredentials")
     def verify_credentials(self):
@@ -1078,18 +1068,26 @@ class Component(ComponentBase):
             return sync_actions.ValidationResult("Verification successful", sync_actions.MessageType.SUCCESS)
         return sync_actions.ValidationResult("Failed to verify credentials", sync_actions.MessageType.ERROR)
 
-    def _create_recipients_list(
+    def _create_recipients_list_in_batches(
         self,
         table: TableDefinition,
         column_mapping: dict[str, str],
-    ):
+    ) -> Iterator[list[dict]]:
+        total = 0
         recipients = []
         with open(table.full_path) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 recipients.append(self._get_renamed_columns(row, column_mapping))
-        logging.info(f"Recipients to be imported: {len(recipients)}")
-        return recipients
+                total += 1
+                if total % BATCH_SIZE == 0:
+                    logging.info(f"Importing {BATCH_SIZE} recipients (total: {total})...")
+                    yield recipients
+                    recipients = []
+
+        if recipients:
+            logging.info(f"Importing {len(recipients)} recipients (total: {total})...")
+            yield recipients
 
     def _get_renamed_columns(
         self,
@@ -1168,13 +1166,17 @@ class MailkitClient:
 
         try:
             resp = requests.post(ENDPOINT, json=payload)
-            logging.info("Mailkit API response: HTTP %i %s", resp.status_code, resp.reason)
+            logging.debug("Mailkit API response: HTTP %i %s", resp.status_code, resp.reason)
             logging.debug("Response body: %s", resp.text)
             if resp.status_code != 200:
-                raise UserException(f"Failed to get list of mailing lists: {resp.text}")
-            return resp.json()
+                raise UserException(resp.text)
+
+            result = resp.json()
+            if result:
+                logging.info("Getting list of mailing lists: OK")
+            return result
         except Exception as e:
-            logging.exception("Error getting list of mailing lists: %s", e)
+            logging.exception("Failed to get list of mailing lists: %s", e)
 
         return None
 
@@ -1191,13 +1193,19 @@ class MailkitClient:
 
         try:
             resp = requests.post(ENDPOINT, json=payload)
-            logging.info("Mailkit API response: HTTP %i %s", resp.status_code, resp.reason)
+            logging.debug("Mailkit API response: HTTP %i %s", resp.status_code, resp.reason)
             logging.debug("Response body: %s", resp.text)
             if resp.status_code != 200:
-                raise UserException(f"Failed to import mailing list: {resp.text}")
-            return resp.json()
+                raise UserException(resp.text)
+
+            result = resp.json()
+            if result:
+                # mailkit api currently returns 0 counts in every category (ok, skipped etc.)
+                # even in case of successful import, so we just log success when the import returned
+                # valid JSON response with HTTP 200
+                logging.info("Importing recipients: OK")
         except Exception as e:
-            raise Exception(f"Error during mailing list import: {e!r}")
+            raise Exception(f"Failed to import recipients: {e!r}")
 
 
 
