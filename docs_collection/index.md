@@ -937,6 +937,11 @@
 - Repository: https://github.com/keboola/component-pinterest
 - Description: None
 
+### ex-tryfi
+- [Documentation](github/ex-tryfi/llm.txt)
+- Repository: https://github.com/keboola/ex-tryfi
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
