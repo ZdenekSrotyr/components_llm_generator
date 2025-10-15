@@ -937,6 +937,11 @@
 - Repository: https://github.com/keboola/component-pinterest
 - Description: None
 
+### component-configuration-migration-tool
+- [Documentation](github/component-configuration-migration-tool/llm.txt)
+- Repository: https://github.com/keboola/component-configuration-migration-tool
+- Description: None
+
 ### ex-tryfi
 - [Documentation](github/ex-tryfi/llm.txt)
 - Repository: https://github.com/keboola/ex-tryfi
