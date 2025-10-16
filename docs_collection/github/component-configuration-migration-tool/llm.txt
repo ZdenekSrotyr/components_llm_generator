@@ -43,7 +43,11 @@ Directory structure:
     │       └── meta_migration.py
     ├── tests/
     │   ├── __init__.py
-    │   └── test_component.py
+    │   ├── test_base_migration.py
+    │   ├── test_component.py
+    │   └── migrations/
+    │       ├── __init__.py
+    │       └── test_meta_migration.py
     └── .github/
         └── workflows/
             └── push.yml
@@ -53,7 +57,7 @@ FILE: README.md
 ================================================
 # Configuration Migration Tool
 
-A Keboola component designed to migrate user configurations between different component versions when components are deprecated or replaced. This tool ensures seamless transitions by automatically copying and transforming configurations from deprecated components to their replacement versions.
+A Keboola component designed to automatically migrate user configurations from one component to another, where the former one is old or even deprecated and the latter one replaces it. This tool ensures seamless transitions in such cases.
 
 ## Overview
 
@@ -63,12 +67,20 @@ The Configuration Migration Tool is primarily used during component deprecation 
 2. **Transforms configuration data** as needed using custom migration logic
 3. **Tracks migration status** to prevent duplicate migrations
 
-## When to Use This Tool
+## How to use this tool
 
-This tool is automatically triggered when:
-- A component is marked as deprecated in the Keboola Developer Portal
-- The deprecated component has the `replacementApp` UI option set to the ID of the new component
-- Users attempt to access configurations of the deprecated component
+### Option 1
+Create the configuration for this tool. Select which component you want to migrate. Run the component. In the log, you can see the state of the migration.
+
+### Option 2
+In the deprecated component detail, click on `PROCEED WITH MIGRATION`. You will see a list of your configurations and the migration state of each one. Clicking the `MIGRATE` button will migrate all configurations whose migration status is N/A or Error.
+
+### Migration Status Tracking
+
+Each configuration tracks its migration status in the `runtime.migrationStatus` field:
+- `"success"` - Successfully migrated
+- `"error: <message>"` - Migration failed with error details
+- `"n/a"` or if `runtime.migrationStatus` does not exist - Not yet migrated
 
 ## Supported Components
 
@@ -84,10 +96,11 @@ Currently supported migrations:
 
 The tool requires the following parameters:
 
-### Required Parameters
+### Parameters
 
 - `origin` - Component ID of the deprecated component (source)
 - `destination` - Component ID of the replacement component (target)
+- `branch_id`- [Optional] Migrate configuration in specific branch
 
 ### Authentication
 
@@ -106,11 +119,12 @@ The tool uses Keboola Storage API credentials:
 }
 ```
 
-## Adding New Migrations
+## Development
+### Adding New Migrations
 
-To add support for migrating a new component, follow these steps:
+To add support for migrating a new component pair, follow these steps:
 
-### 1. Create a Migration Class
+#### 1. Create a Migration Class
 
 Create a new migration class that inherits from `BaseMigration`:
 
@@ -142,7 +156,7 @@ class YourCustomMigration(BaseMigration):
         return configuration
 ```
 
-### 2. Register the Migration
+#### 2. Register the Migration
 
 Add your migration class to the `MIGRATION_REGISTRY` in `src/component.py`:
 
@@ -173,58 +187,19 @@ MIGRATION_REGISTRY = ComponentMigrationList(
 )
 ```
 
-### 3. Migration Class Methods
+#### 3. Migration Class Methods
 
 The `BaseMigration` class provides these key methods you can override:
 
-#### `configuration_update(self, configuration: dict) -> dict`
+##### `configuration_update(self, configuration: dict) -> dict`
 - **Purpose**: Transform configuration data during migration
 - **Default behavior**: Returns configuration unchanged
 - **Override when**: You need to modify parameters, update structure, or transform data
 
-## Component Deprecation Workflow
-
-### 1. Set Replacement App
-
-When deprecating a component, set the `replacementApp` UI option in the Developer Portal:
-
-```json
-{
-  "replacementApp": "new.component.id"
-}
-```
-
-### 2. Migration Process
-
-The migration tool will:
-
-1. **Fetch source configurations** from the deprecated component
-2. **Check migration status** to skip already migrated configurations
-3. **Transform each configuration** using the appropriate migration class
-4. **Create new configurations** in the destination component
-5. **Mark original configurations** as successfully migrated
-6. **Handle errors** and mark failed migrations appropriately
-
-### 3. Migration Status Tracking
-
-Each configuration tracks its migration status in the `runtime.migrationStatus` field:
-- `"success"` - Successfully migrated
-- `"error: <message>"` - Migration failed with error details
-- `"n/a"` - Not yet migrated
-
-## Available Actions
-
-### `run` (default)
-Executes the migration process for all unmigrated configurations.
-
-### `status`
-Returns migration status for all configurations in the origin component.
-
-### `supported-migrations`
-Returns a list of all supported migration pairs with component names and IDs.
-
-
-## Development
+### Show Migration button in deprectaed component
+The button is automatically shown in the old component when:
+- A component is marked as deprecated in the Keboola Developer Portal.
+- The deprecated component has the `replacementApp` UI option set to the ID of the new component.
 
 ### Local Development Setup
 
@@ -255,7 +230,7 @@ src/
 └── migration/
     ├── __init__.py
     ├── base_migration.py     # Base migration class
-    └── meta_migration.py     # Meta platform migration
+    └── meta_migration.py     # Meta Components migration class
 ```
 
 For deployment and integration details, refer to the [Keboola Developer Documentation](https://developers.keboola.com/extend/component/deployment/).
@@ -1299,13 +1274,13 @@ wheels = [
 ================================================
 FILE: component_config/component_long_description.md
 ================================================
-Configuration Migration Tool long description
+The component migrates configurations from one component to another. It is used when users need to move configurations after a completely new component is released to replace an old one. To use it, a migration must be prepared in advance within this tool, so only specific components are allowed for migration.
 
 
 ================================================
 FILE: component_config/component_short_description.md
 ================================================
-Configuration Migration Tool short description
+Migration tool for moving configurations of selected components from one component to another (only for preconfigured components).
 
 
 ================================================
@@ -2255,6 +2230,319 @@ sys.path.append(str((Path(__file__).resolve().parent.parent / "src")))
 
 
 ================================================
+FILE: tests/test_base_migration.py
+================================================
+import unittest
+from unittest.mock import Mock, patch
+
+from src.migration.base_migration import BaseMigration
+
+
+class TestBaseMigration(unittest.TestCase):
+    """Test cases for BaseMigration class."""
+
+    def setUp(self):
+        """Set up test fixtures before each test method."""
+        self.mock_storage_client = Mock()
+        self.migration = BaseMigration(
+            storage_client=self.mock_storage_client,
+            origin="test-origin-component",
+            destination="test-destination-component",
+        )
+
+    def test_is_configuration_migrated_success_status(self):
+        """Test _is_configuration_migrated returns True when migrationStatus is 'success'."""
+        config = {
+            "id": "test-config-1",
+            "name": "Test Configuration",
+            "configuration": {"runtime": {"migrationStatus": "success"}},
+        }
+
+        result = self.migration._is_configuration_migrated(config)
+        self.assertTrue(result)
+
+    def test_is_configuration_migrated_error_status(self):
+        """Test _is_configuration_migrated returns False when migrationStatus is 'error'."""
+        config = {
+            "id": "test-config-2",
+            "name": "Test Configuration",
+            "configuration": {"runtime": {"migrationStatus": "error: Some error message"}},
+        }
+
+        result = self.migration._is_configuration_migrated(config)
+        self.assertFalse(result)
+
+    def test_is_configuration_migrated_empty_status(self):
+        """Test _is_configuration_migrated returns False when migrationStatus is empty string."""
+        config = {
+            "id": "test-config-3",
+            "name": "Test Configuration",
+            "configuration": {"runtime": {"migrationStatus": ""}},
+        }
+
+        result = self.migration._is_configuration_migrated(config)
+        self.assertFalse(result)
+
+    def test_is_configuration_migrated_missing_migration_status(self):
+        """Test _is_configuration_migrated returns False when migrationStatus key is missing."""
+        config = {
+            "id": "test-config-4",
+            "name": "Test Configuration",
+            "configuration": {"runtime": {"otherProperty": "some value"}},
+        }
+
+        result = self.migration._is_configuration_migrated(config)
+        self.assertFalse(result)
+
+    def test_is_configuration_migrated_missing_runtime(self):
+        """Test _is_configuration_migrated returns False when runtime section is missing."""
+        config = {"id": "test-config-5", "name": "Test Configuration", "configuration": {"otherProperty": "some value"}}
+
+        result = self.migration._is_configuration_migrated(config)
+        self.assertFalse(result)
+
+    def test_is_configuration_migrated_missing_configuration(self):
+        """Test _is_configuration_migrated returns False when configuration section is missing."""
+        config = {"id": "test-config-6", "name": "Test Configuration"}
+
+        result = self.migration._is_configuration_migrated(config)
+        self.assertFalse(result)
+
+    def test_is_configuration_migrated_empty_config(self):
+        """Test _is_configuration_migrated returns False when config is empty dict."""
+        config = {}
+
+        result = self.migration._is_configuration_migrated(config)
+        self.assertFalse(result)
+
+    def test_update_configuration_status_with_existing_runtime(self):
+        """Test _update_configuration_status when runtime section already exists."""
+        config = {
+            "id": "test-config-1",
+            "name": "Test Configuration",
+            "description": "Test Description",
+            "configuration": {"runtime": {"otherProperty": "existing value"}, "otherConfig": "some data"},
+        }
+
+        self.migration._update_configuration_status(config, "success")
+
+        self.mock_storage_client.configurations.update.assert_called_once_with(
+            component_id="test-origin-component",
+            configuration_id="test-config-1",
+            configuration={
+                "name": "Test Configuration",
+                "description": "Test Description",
+                "configuration": {
+                    "runtime": {"otherProperty": "existing value", "migrationStatus": "success"},
+                    "otherConfig": "some data",
+                },
+            },
+        )
+
+    def test_update_configuration_status_without_runtime(self):
+        """Test _update_configuration_status when runtime section does not exist."""
+        config = {
+            "id": "test-config-2",
+            "name": "Test Configuration",
+            "description": "Test Description",
+            "configuration": {"otherConfig": "some data"},
+        }
+
+        self.migration._update_configuration_status(config, "error: Test error")
+
+        self.mock_storage_client.configurations.update.assert_called_once_with(
+            component_id="test-origin-component",
+            configuration_id="test-config-2",
+            configuration={
+                "name": "Test Configuration",
+                "description": "Test Description",
+                "configuration": {"otherConfig": "some data", "runtime": {"migrationStatus": "error: Test error"}},
+            },
+        )
+
+    def test_update_configuration_status_without_configuration_section(self):
+        """Test _update_configuration_status when configuration section is missing."""
+        config = {"id": "test-config-3", "name": "Test Configuration", "description": "Test Description"}
+
+        self.migration._update_configuration_status(config, "success")
+
+        self.mock_storage_client.configurations.update.assert_called_once_with(
+            component_id="test-origin-component",
+            configuration_id="test-config-3",
+            configuration={
+                "name": "Test Configuration",
+                "description": "Test Description",
+                "configuration": {"runtime": {"migrationStatus": "success"}},
+            },
+        )
+
+    def test_update_configuration_status_without_description(self):
+        """Test _update_configuration_status when description is missing."""
+        config = {"id": "test-config-4", "name": "Test Configuration", "configuration": {"someConfig": "data"}}
+
+        self.migration._update_configuration_status(config, "pending")
+
+        self.mock_storage_client.configurations.update.assert_called_once_with(
+            component_id="test-origin-component",
+            configuration_id="test-config-4",
+            configuration={
+                "name": "Test Configuration",
+                "description": "",
+                "configuration": {"someConfig": "data", "runtime": {"migrationStatus": "pending"}},
+            },
+        )
+
+    def test_update_configuration_status_preserves_existing_runtime_data(self):
+        """Test _update_configuration_status preserves existing runtime data."""
+        config = {
+            "id": "test-config-5",
+            "name": "Test Configuration",
+            "description": "Test Description",
+            "configuration": {"runtime": {"existingStatus": "old_status", "otherRuntimeData": "preserved"}},
+        }
+
+        self.migration._update_configuration_status(config, "success")
+
+        self.mock_storage_client.configurations.update.assert_called_once_with(
+            component_id="test-origin-component",
+            configuration_id="test-config-5",
+            configuration={
+                "name": "Test Configuration",
+                "description": "Test Description",
+                "configuration": {
+                    "runtime": {
+                        "existingStatus": "old_status",
+                        "otherRuntimeData": "preserved",
+                        "migrationStatus": "success",
+                    }
+                },
+            },
+        )
+
+    def test_update_configuration_status_with_empty_status(self):
+        """Test _update_configuration_status with empty status string."""
+        config = {
+            "id": "test-config-6",
+            "name": "Test Configuration",
+            "description": "Test Description",
+            "configuration": {"someConfig": "data"},
+        }
+
+        self.migration._update_configuration_status(config, "")
+
+        self.mock_storage_client.configurations.update.assert_called_once_with(
+            component_id="test-origin-component",
+            configuration_id="test-config-6",
+            configuration={
+                "name": "Test Configuration",
+                "description": "Test Description",
+                "configuration": {"someConfig": "data", "runtime": {"migrationStatus": ""}},
+            },
+        )
+
+    @patch("src.migration.base_migration.logging")
+    def test_do_execute_successful_migration(self, mock_logging):
+        """Test _do_execute with successful migration scenario."""
+        source_configs = [
+            {
+                "id": "config-1",
+                "name": "Test Config 1",
+                "description": "Test Description 1",
+                "configuration": {"param1": "value1"},
+            },
+            {
+                "id": "config-2",
+                "name": "Test Config 2",
+                "description": "Test Description 2",
+                "configuration": {"param2": "value2"},
+            },
+        ]
+
+        created_config = {"id": "new-config-1", "name": "Test Config 1"}
+
+        self.mock_storage_client.configurations.list.return_value = source_configs
+        self.mock_storage_client.configurations.create.return_value = created_config
+
+        with (
+            patch.object(self.migration, "_is_configuration_migrated", return_value=False),
+            patch.object(self.migration, "_mark_migration_success"),
+        ):
+            result = self.migration._do_execute()
+
+        self.assertEqual(result["summary"]["total"], 2)
+        self.assertEqual(result["summary"]["migrated"], 2)
+        self.assertEqual(result["summary"]["failed"], 0)
+        self.assertEqual(result["summary"]["skipped"], 0)
+        self.assertEqual(len(result["created_configurations"]), 2)
+        self.assertEqual(len(result["failed_configurations"]), 0)
+
+    @patch("src.migration.base_migration.logging")
+    def test_do_execute_with_skipped_configurations(self, mock_logging):
+        """Test _do_execute with some configurations already migrated."""
+        source_configs = [
+            {
+                "id": "config-1",
+                "name": "Test Config 1",
+                "description": "Test Description 1",
+                "configuration": {"runtime": {"migrationStatus": "success"}},
+            },
+            {"id": "config-2", "name": "Test Config 2", "description": "Test Description 2", "configuration": {}},
+        ]
+
+        created_config = {"id": "new-config-2", "name": "Test Config 2"}
+
+        self.mock_storage_client.configurations.list.return_value = source_configs
+        self.mock_storage_client.configurations.create.return_value = created_config
+
+        def mock_is_migrated(config):
+            return config["id"] == "config-1"
+
+        with (
+            patch.object(self.migration, "_is_configuration_migrated", side_effect=mock_is_migrated),
+            patch.object(self.migration, "_mark_migration_success"),
+        ):
+            result = self.migration._do_execute()
+
+        self.assertEqual(result["summary"]["total"], 2)
+        self.assertEqual(result["summary"]["migrated"], 1)
+        self.assertEqual(result["summary"]["failed"], 0)
+        self.assertEqual(result["summary"]["skipped"], 1)
+
+    @patch("src.migration.base_migration.logging")
+    def test_do_execute_removes_authorization(self, mock_logging):
+        """Test _do_execute removes authorization section when remove_authorization is True."""
+        source_configs = [
+            {
+                "id": "config-1",
+                "name": "Test Config",
+                "description": "Test Description",
+                "configuration": {"param1": "value1", "authorization": {"token": "secret"}},
+            }
+        ]
+
+        created_config = {"id": "new-config-1", "name": "Test Config"}
+
+        self.mock_storage_client.configurations.list.return_value = source_configs
+        self.mock_storage_client.configurations.create.return_value = created_config
+
+        with (
+            patch.object(self.migration, "_is_configuration_migrated", return_value=False),
+            patch.object(self.migration, "_mark_migration_success"),
+        ):
+            self.migration._do_execute()
+
+        call_args = self.mock_storage_client.configurations.create.call_args
+        config_data = call_args[1]["configuration"]
+        self.assertNotIn("authorization", config_data)
+        self.assertIn("param1", config_data)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+================================================
 FILE: tests/test_component.py
 ================================================
 import os
@@ -2275,6 +2563,202 @@ class TestComponent(unittest.TestCase):
         with self.assertRaises(ValueError):
             comp = Component()
             comp.run()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+================================================
+FILE: tests/migrations/__init__.py
+================================================
+# Migration tests package
+
+
+
+================================================
+FILE: tests/migrations/test_meta_migration.py
+================================================
+import unittest
+from unittest.mock import Mock
+
+from src.migration.meta_migration import MetaMigration
+
+
+class TestMetaMigration(unittest.TestCase):
+    """Test cases for MetaMigration class."""
+
+    def setUp(self):
+        """Set up test fixtures before each test method."""
+        self.mock_storage_client = Mock()
+        self.migration = MetaMigration(
+            storage_client=self.mock_storage_client,
+            origin="ex-facebook",
+            destination="ex-facebook-ads",
+        )
+
+    def test_configuration_update_with_existing_parameters(self):
+        """Test configuration_update when parameters section already exists."""
+        configuration = {
+            "id": "test-config-1",
+            "name": "Test Configuration",
+            "configuration": {"parameters": {"existing_param": "existing_value", "other_param": "other_value"}},
+        }
+
+        result = self.migration.configuration_update(configuration)
+
+        expected_configuration = {
+            "id": "test-config-1",
+            "name": "Test Configuration",
+            "configuration": {
+                "parameters": {
+                    "existing_param": "existing_value",
+                    "other_param": "other_value",
+                    "bucket-id": "in.c-ex-facebook-test-config-1",
+                }
+            },
+        }
+
+        self.assertEqual(result, expected_configuration)
+
+    def test_configuration_update_without_parameters_section(self):
+        """Test configuration_update when parameters section does not exist."""
+        configuration = {
+            "id": "test-config-2",
+            "name": "Test Configuration",
+            "configuration": {"other_section": "some_value"},
+        }
+
+        result = self.migration.configuration_update(configuration)
+
+        expected_configuration = {
+            "id": "test-config-2",
+            "name": "Test Configuration",
+            "configuration": {
+                "other_section": "some_value",
+                "parameters": {"bucket-id": "in.c-ex-facebook-test-config-2"},
+            },
+        }
+
+        self.assertEqual(result, expected_configuration)
+
+    def test_configuration_update_with_empty_parameters(self):
+        """Test configuration_update when parameters section exists but is empty."""
+        configuration = {"id": "test-config-3", "name": "Test Configuration", "configuration": {"parameters": {}}}
+
+        result = self.migration.configuration_update(configuration)
+
+        expected_configuration = {
+            "id": "test-config-3",
+            "name": "Test Configuration",
+            "configuration": {"parameters": {"bucket-id": "in.c-ex-facebook-test-config-3"}},
+        }
+
+        self.assertEqual(result, expected_configuration)
+
+    def test_configuration_update_with_none_parameters(self):
+        """Test configuration_update when parameters is None."""
+        configuration = {"id": "test-config-4", "name": "Test Configuration", "configuration": {"parameters": None}}
+
+        result = self.migration.configuration_update(configuration)
+
+        expected_configuration = {
+            "id": "test-config-4",
+            "name": "Test Configuration",
+            "configuration": {"parameters": {"bucket-id": "in.c-ex-facebook-test-config-4"}},
+        }
+
+        self.assertEqual(result, expected_configuration)
+
+    def test_bucket_id_generation_with_dots_in_component_id(self):
+        """Test bucket-id generation when component ID contains dots."""
+        migration = MetaMigration(
+            storage_client=self.mock_storage_client,
+            origin="ex.facebook.ads",
+            destination="ex-facebook-ads",
+        )
+
+        configuration = {"id": "test-config-5", "name": "Test Configuration", "configuration": {}}
+
+        result = migration.configuration_update(configuration)
+
+        expected_configuration = {
+            "id": "test-config-5",
+            "name": "Test Configuration",
+            "configuration": {"parameters": {"bucket-id": "in.c-ex-facebook-ads-test-config-5"}},
+        }
+
+        self.assertEqual(result, expected_configuration)
+
+    def test_bucket_id_generation_with_different_component_ids(self):
+        """Test bucket-id generation with various component ID formats."""
+        test_cases = [
+            ("ex-facebook", "in.c-ex-facebook-test-config"),
+            ("ex.facebook", "in.c-ex-facebook-test-config"),
+            ("ex.facebook.ads", "in.c-ex-facebook-ads-test-config"),
+            ("ex-instagram", "in.c-ex-instagram-test-config"),
+            ("ex.instagram", "in.c-ex-instagram-test-config"),
+        ]
+
+        for origin_component, expected_bucket_id in test_cases:
+            with self.subTest(origin_component=origin_component):
+                migration = MetaMigration(
+                    storage_client=self.mock_storage_client,
+                    origin=origin_component,
+                    destination="test-destination",
+                )
+
+                configuration = {"id": "test-config", "name": "Test Configuration", "configuration": {}}
+
+                result = migration.configuration_update(configuration)
+
+                expected_configuration = {
+                    "id": "test-config",
+                    "name": "Test Configuration",
+                    "configuration": {"parameters": {"bucket-id": expected_bucket_id}},
+                }
+
+                self.assertEqual(result, expected_configuration)
+
+    def test_configuration_update_preserves_original_structure(self):
+        """Test that configuration_update preserves the original configuration structure."""
+        original_configuration = {
+            "id": "test-config-6",
+            "name": "Test Configuration",
+            "description": "Test Description",
+            "configuration": {"parameters": {"existing_param": "existing_value"}, "other_section": {"nested": "value"}},
+            "extra_field": "extra_value",
+        }
+
+        result = self.migration.configuration_update(original_configuration)
+
+        expected_configuration = {
+            "id": "test-config-6",
+            "name": "Test Configuration",
+            "description": "Test Description",
+            "configuration": {
+                "parameters": {"existing_param": "existing_value", "bucket-id": "in.c-ex-facebook-test-config-6"},
+                "other_section": {"nested": "value"},
+            },
+            "extra_field": "extra_value",
+        }
+
+        self.assertEqual(result, expected_configuration)
+
+    def test_bucket_id_generation_with_special_characters_in_config_id(self):
+        """Test bucket-id generation with special characters in configuration ID."""
+        configuration = {"id": "test-config-with-special_chars.123", "name": "Test Configuration", "configuration": {}}
+
+        result = self.migration.configuration_update(configuration)
+
+        expected_configuration = {
+            "id": "test-config-with-special_chars.123",
+            "name": "Test Configuration",
+            "configuration": {"parameters": {"bucket-id": "in.c-ex-facebook-test-config-with-special_chars.123"}},
+        }
+
+        self.assertEqual(result, expected_configuration)
 
 
 if __name__ == "__main__":
