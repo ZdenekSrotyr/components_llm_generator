@@ -937,6 +937,11 @@
 - Repository: https://github.com/keboola/component-pinterest
 - Description: None
 
+### component-influxdb-2-ex
+- [Documentation](github/component-influxdb-2-ex/llm.txt)
+- Repository: https://github.com/keboola/component-influxdb-2-ex
+- Description: None
+
 ### component-configuration-migration-tool
 - [Documentation](github/component-configuration-migration-tool/llm.txt)
 - Repository: https://github.com/keboola/component-configuration-migration-tool
