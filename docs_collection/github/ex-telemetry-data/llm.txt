@@ -25,6 +25,7 @@ Directory structure:
     │   ├── run.php
     │   ├── Exception/
     │   │   ├── ApplicationException.php
+    │   │   ├── PrivateKeyIsNotValid.php
     │   │   └── SnowsqlException.php
     │   └── ValueObject/
     │       ├── Column.php
@@ -45,6 +46,10 @@ Directory structure:
     │   │   │   ├── expected-stderr
     │   │   │   └── expected-stdout
     │   │   ├── activitycenter_mode_incremental_fetching_state/
+    │   │   │   ├── expected-code
+    │   │   │   ├── expected-stderr
+    │   │   │   └── expected-stdout
+    │   │   ├── activitycenter_mode_private_key/
     │   │   │   ├── expected-code
     │   │   │   ├── expected-stderr
     │   │   │   └── expected-stdout
@@ -161,13 +166,14 @@ FILE: composer.json
     "require": {
         "php": "^8",
         "ext-json": "*",
+        "ext-openssl": "*",
         "keboola/common-exceptions": "^1.1",
         "keboola/csv": "^2.2",
         "keboola/db-extractor-table-format": "^3.8",
         "keboola/php-component": "^10",
         "keboola/php-datatypes": "^7",
         "keboola/retry": "^0.5.0",
-        "keboola/table-backend-utils": "^2.7",
+        "keboola/table-backend-utils": "^3.0",
         "symfony/config": "^6",
         "symfony/filesystem": "^6"
     },
@@ -235,7 +241,7 @@ FILE: composer.lock
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "bf817aa97eb56c2d5aee6ffabd5234c6",
+    "content-hash": "91852b6fb6f97b56345fd5e8aaf9afbc",
     "packages": [
         {
             "name": "brick/math",
@@ -1917,16 +1923,16 @@ FILE: composer.lock
         },
         {
             "name": "keboola/table-backend-utils",
-            "version": "2.7.0",
+            "version": "3.0.0",
             "source": {
                 "type": "git",
                 "url": "https://github.com/keboola/php-table-backend-utils.git",
-                "reference": "de860af5cb97385d910ab71715b694749b81a0c6"
+                "reference": "1637b8dc666d7a273a5367817feee0e45836fcb1"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/keboola/php-table-backend-utils/zipball/de860af5cb97385d910ab71715b694749b81a0c6",
-                "reference": "de860af5cb97385d910ab71715b694749b81a0c6",
+                "url": "https://api.github.com/repos/keboola/php-table-backend-utils/zipball/1637b8dc666d7a273a5367817feee0e45836fcb1",
+                "reference": "1637b8dc666d7a273a5367817feee0e45836fcb1",
                 "shasum": ""
             },
             "require": {
@@ -1939,7 +1945,7 @@ FILE: composer.lock
                 "keboola/php-datatypes": "^7.6",
                 "keboola/php-utils": "^4.1",
                 "keboola/retry": "^0.5.0",
-                "php": "^8.1"
+                "php": "^8.2"
             },
             "require-dev": {
                 "keboola/coding-standard": "^15",
@@ -1967,9 +1973,9 @@ FILE: composer.lock
             "description": "Package allows to import files to Snowflake from multiple cloud storages",
             "support": {
                 "issues": "https://github.com/keboola/php-table-backend-utils/issues",
-                "source": "https://github.com/keboola/php-table-backend-utils/tree/2.7.0"
+                "source": "https://github.com/keboola/php-table-backend-utils/tree/3.0.0"
             },
-            "time": "2024-05-09T19:59:02+00:00"
+            "time": "2025-04-11T09:54:56+00:00"
         },
         {
             "name": "monolog/monolog",
@@ -6141,7 +6147,8 @@ FILE: composer.lock
     "prefer-lowest": false,
     "platform": {
         "php": "^8",
-        "ext-json": "*"
+        "ext-json": "*",
+        "ext-openssl": "*"
     },
     "platform-dev": [],
     "plugin-api-version": "2.6.0"
@@ -6163,6 +6170,7 @@ services:
       - SNOWFLAKE_DB_HOST
       - SNOWFLAKE_DB_USER
       - SNOWFLAKE_DB_PASSWORD
+      - SNOWFLAKE_DB_PRIVATE_KEY
       - SNOWFLAKE_DB_DATABASE
       - SNOWFLAKE_DB_PORT
       - SNOWFLAKE_DB_SCHEMA
@@ -6511,6 +6519,7 @@ namespace Keboola\TelemetryData;
 
 use Keboola\Component\Config\BaseConfig;
 use Keboola\Component\UserException;
+use Keboola\TelemetryData\Exception\PrivateKeyIsNotValid;
 use Keboola\TelemetryData\ValueObject\Table;
 
 class Config extends BaseConfig
@@ -6571,10 +6580,35 @@ class Config extends BaseConfig
         return $imageParameters['db']['user'];
     }
 
-    public function getDbPassword(): string
+    public function getDbPassword(): ?string
     {
         $imageParameters = $this->getImageParameters();
-        return $imageParameters['db']['#password'];
+        return $imageParameters['db']['#password'] ?? null;
+    }
+
+    public function getPrivateKey(): ?string
+    {
+        $imageParameters = $this->getImageParameters();
+        return $imageParameters['db']['#privateKey'] ?? null;
+    }
+
+    public function getPrivateKeyPath(): ?string
+    {
+        if (is_null($this->getPrivateKey())) {
+            return null;
+        }
+        $privateKeyResource = openssl_pkey_get_private($this->getPrivateKey());
+        if (!$privateKeyResource) {
+            throw new PrivateKeyIsNotValid();
+        }
+
+        $pemPKCS8 = '';
+        openssl_pkey_export($privateKeyResource, $pemPKCS8);
+
+        $privateKeyPath = tempnam(sys_get_temp_dir(), 'snowflake_private_key_' . uniqid()) . '.p8';
+        file_put_contents($privateKeyPath, $pemPKCS8);
+
+        return $privateKeyPath;
     }
 
     public function getDbDatabase(): string
@@ -6714,16 +6748,32 @@ class DbConnector
     private function createConnection(): Connection
     {
         try {
-            $connection = SnowflakeConnectionFactory::getConnection(
-                $this->config->getDbHost(),
-                $this->config->getDbUser(),
-                $this->config->getDbPassword(),
-                [
-                    'port' => $this->config->getDbPort(),
-                    'warehouse' => $this->config->getDbWarehouse(),
-                    'database' => $this->config->getDbDatabase(),
-                ],
-            );
+            if ($this->config->getPrivateKey()) {
+                $connection = SnowflakeConnectionFactory::getConnectionWithCert(
+                    $this->config->getDbHost(),
+                    $this->config->getDbUser(),
+                    $this->config->getPrivateKey(),
+                    [
+                        'port' => $this->config->getDbPort(),
+                        'warehouse' => $this->config->getDbWarehouse(),
+                        'database' => $this->config->getDbDatabase(),
+                    ],
+                );
+            } elseif ($this->config->getDbPassword()) {
+                $connection = SnowflakeConnectionFactory::getConnection(
+                    $this->config->getDbHost(),
+                    $this->config->getDbUser(),
+                    $this->config->getDbPassword(),
+                    [
+                        'port' => $this->config->getDbPort(),
+                        'warehouse' => $this->config->getDbWarehouse(),
+                        'database' => $this->config->getDbDatabase(),
+                    ],
+                );
+            } else {
+                throw new UserException('Either "dbPassword" or "privateKeyPath" must be set.');
+            }
+
             $connection->executeStatement(
                 sprintf(
                     'USE SCHEMA %s',
@@ -6846,7 +6896,11 @@ class DbConnector
         $cliConfig[] = '[connections.downloader]';
         $cliConfig[] = sprintf('accountname = "%s"', $accountName);
         $cliConfig[] = sprintf('username = "%s"', $this->config->getDbUser());
-        $cliConfig[] = sprintf('password = "%s"', $this->config->getDbPassword());
+        if (!is_null($this->config->getPrivateKeyPath())) {
+            $cliConfig[] = sprintf('private_key_path = "%s"', $this->config->getPrivateKeyPath());
+        } elseif ($this->config->getDbPassword()) {
+            $cliConfig[] = sprintf('password = "%s"', $this->config->getDbPassword());
+        }
         $cliConfig[] = sprintf('dbname = "%s"', $this->config->getDbDatabase());
         $cliConfig[] = sprintf('warehousename = "%s"', $this->config->getDbWarehouse());
         $cliConfig[] = sprintf('schemaname = "%s"', $this->config->getDbSchema());
@@ -7401,6 +7455,25 @@ class ApplicationException extends Exception implements ApplicationExceptionInte
 
 
 ================================================
+FILE: src/Exception/PrivateKeyIsNotValid.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\TelemetryData\Exception;
+
+use Exception;
+use Keboola\CommonExceptions\ApplicationExceptionInterface;
+
+class PrivateKeyIsNotValid extends Exception implements ApplicationExceptionInterface
+{
+
+}
+
+
+
+================================================
 FILE: src/Exception/SnowsqlException.php
 ================================================
 <?php
@@ -7667,10 +7740,10 @@ class DatadirTest extends DatadirTestCase
 
     public function setUp(): void
     {
-        $this->connection = SnowflakeConnectionFactory::getConnection(
+        $this->connection = SnowflakeConnectionFactory::getConnectionWithCert(
             (string) getenv('SNOWFLAKE_DB_HOST'),
             (string) getenv('SNOWFLAKE_DB_USER'),
-            (string) getenv('SNOWFLAKE_DB_PASSWORD'),
+            (string) getenv('SNOWFLAKE_DB_PRIVATE_KEY'),
             [
                 'port' => (string) getenv('SNOWFLAKE_DB_PORT'),
                 'warehouse' => (string) getenv('SNOWFLAKE_DB_WAREHOUSE'),
@@ -7944,6 +8017,27 @@ FILE: tests/functional/activitycenter_mode_incremental_fetching_state/expected-s
 ================================================
 Exporting to "data"
 Run query "SELECT * FROM "%s"."data" WHERE "dst_proj_ac" = '2' AND "dst_stack_ac" = 'connection.north-europe.azure.keboola.com' AND "dst_timestamp" >= '2020-12-01 09:09:10' ORDER BY "dst_timestamp""
+Downloading data from Snowflake
+
+
+
+================================================
+FILE: tests/functional/activitycenter_mode_private_key/expected-code
+================================================
+0
+
+
+================================================
+FILE: tests/functional/activitycenter_mode_private_key/expected-stderr
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/functional/activitycenter_mode_private_key/expected-stdout
+================================================
+Exporting to "data"
+Run query "SELECT * FROM "%s"."data" WHERE "dst_proj_ac" = '2' AND "dst_stack_ac" = 'connection.north-europe.azure.keboola.com'"
 Downloading data from Snowflake
 
 
@@ -8527,6 +8621,7 @@ env:
   SNOWFLAKE_DB_WAREHOUSE: "DEV"
   SNOWFLAKE_DB_USER: "telemetry_data_gh_actions"
   SNOWFLAKE_DB_PASSWORD: ${{ secrets.SNOWFLAKE_DB_PASSWORD }}
+  SNOWFLAKE_DB_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DB_PRIVATE_KEY }}
   SNOWFLAKE_DB_PORT: "443"
   SNOWFLAKE_DB_SCHEMA: "telemetry_data_gh_actions"
   KBC_PROJECTID: 2
@@ -8601,6 +8696,7 @@ jobs:
           -e SNOWFLAKE_DB_HOST \
           -e SNOWFLAKE_DB_USER \
           -e SNOWFLAKE_DB_PASSWORD \
+          -e SNOWFLAKE_DB_PRIVATE_KEY \
           -e SNOWFLAKE_DB_DATABASE \
           -e SNOWFLAKE_DB_PORT \
           -e SNOWFLAKE_DB_SCHEMA \
