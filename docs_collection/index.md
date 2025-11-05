@@ -952,6 +952,11 @@
 - Repository: https://github.com/keboola/ex-tryfi
 - Description: None
 
+### component-ms-dynamics365-business-central
+- [Documentation](github/component-ms-dynamics365-business-central/llm.txt)
+- Repository: https://github.com/keboola/component-ms-dynamics365-business-central
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
