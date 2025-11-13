@@ -947,6 +947,11 @@
 - Repository: https://github.com/keboola/component-configuration-migration-tool
 - Description: None
 
+### component-airtable-writer
+- [Documentation](github/component-airtable-writer/llm.txt)
+- Repository: https://github.com/keboola/component-airtable-writer
+- Description: None
+
 ### ex-tryfi
 - [Documentation](github/ex-tryfi/llm.txt)
 - Repository: https://github.com/keboola/ex-tryfi
@@ -955,6 +960,11 @@
 ### component-ms-dynamics365-business-central
 - [Documentation](github/component-ms-dynamics365-business-central/llm.txt)
 - Repository: https://github.com/keboola/component-ms-dynamics365-business-central
+- Description: None
+
+### component-xero-accounting-reports
+- [Documentation](github/component-xero-accounting-reports/llm.txt)
+- Repository: https://github.com/keboola/component-xero-accounting-reports
 - Description: None
 
 ## Bitbucket Repositories
