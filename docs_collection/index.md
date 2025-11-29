@@ -967,6 +967,11 @@
 - Repository: https://github.com/keboola/component-xero-accounting-reports
 - Description: None
 
+### component-ex-daktela
+- [Documentation](github/component-ex-daktela/llm.txt)
+- Repository: https://github.com/keboola/component-ex-daktela
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
