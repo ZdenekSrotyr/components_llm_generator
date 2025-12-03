@@ -972,6 +972,11 @@
 - Repository: https://github.com/keboola/component-ex-daktela
 - Description: None
 
+### component-daktela
+- [Documentation](github/component-daktela/llm.txt)
+- Repository: https://github.com/keboola/component-daktela
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
