@@ -967,11 +967,6 @@
 - Repository: https://github.com/keboola/component-xero-accounting-reports
 - Description: None
 
-### component-ex-daktela
-- [Documentation](github/component-ex-daktela/llm.txt)
-- Repository: https://github.com/keboola/component-ex-daktela
-- Description: None
-
 ### component-daktela
 - [Documentation](github/component-daktela/llm.txt)
 - Repository: https://github.com/keboola/component-daktela
