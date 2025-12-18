@@ -67,6 +67,7 @@ Directory structure:
     │       ├── InvalidAuthDataException.php
     │       ├── InvalidConfigException.php
     │       ├── InvalidFileTypeException.php
+    │       ├── InvalidSessionException.php
     │       ├── ResourceNotFoundException.php
     │       ├── ShareLinkException.php
     │       ├── UnexpectedCountException.php
@@ -4538,6 +4539,7 @@ use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Exception\ConnectException;
 use Keboola\OneDriveWriter\Api\Model\WorkbookSession;
 use Keboola\OneDriveWriter\Exception\GatewayTimeoutException;
+use Keboola\OneDriveWriter\Exception\InvalidSessionException;
 use Keboola\OneDriveWriter\Exception\UserException;
 use Throwable;
 use Iterator;
@@ -4977,6 +4979,12 @@ class Api
                 return true;
             }
 
+            if ($e instanceof InvalidSessionException) {
+                $this->workbookSession = null;
+                $this->logger->info('Session expired, will recreate and retry.');
+                return true;
+            }
+
             if ($e instanceof RequestException
                 || $e instanceof BatchRequestException
                 || $e instanceof GatewayTimeoutException
@@ -5208,6 +5216,7 @@ use InvalidArgumentException;
 use Keboola\OneDriveWriter\Exception\BadRequestException;
 use Keboola\OneDriveWriter\Exception\BatchRequestException;
 use Keboola\OneDriveWriter\Exception\GatewayTimeoutException;
+use Keboola\OneDriveWriter\Exception\InvalidSessionException;
 use Keboola\OneDriveWriter\Exception\UserException;
 use Normalizer;
 use GuzzleHttp\Exception\RequestException;
@@ -5298,6 +5307,14 @@ class Helpers
         } elseif ($error && strpos($error, 'BadRequest: ') === 0) {
             // eg. BadRequest: Tenant does not have a SPO license.
             return new BadRequestException($error, 0, $e);
+        } elseif ($error && strpos($error, 'InvalidSession:') === 0) {
+            return new InvalidSessionException(
+                'OneDrive API session expired or is invalid. ' .
+                'The session will be recreated automatically. ' .
+                'API error: ' . $error,
+                $e->getCode(),
+                $e
+            );
         } elseif ($e->getCode() === 400) {
             // BadRequest, eg. bad fileId, "-1, Microsoft.SharePoint.Client.InvalidClientQueryException"
             return new BadRequestException(sprintf(
@@ -7415,6 +7432,24 @@ class InvalidFileTypeException extends \Exception implements UserExceptionInterf
 
 
 ================================================
+FILE: src/Exception/InvalidSessionException.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\OneDriveWriter\Exception;
+
+use Keboola\CommonExceptions\UserExceptionInterface;
+
+class InvalidSessionException extends \Exception implements UserExceptionInterface
+{
+
+}
+
+
+
+================================================
 FILE: src/Exception/ResourceNotFoundException.php
 ================================================
 <?php
@@ -9140,9 +9175,11 @@ class DatadirTest extends AbstractDatadirTestCase
         }
         if ($specification->getExpectedStdout() !== null) {
             // Match format, not exact same
+            // Filter out InvalidSession retry messages (transient API errors that are automatically retried)
+            $actualOutput = $this->filterInvalidSessionRetryMessages($runProcess->getOutput());
             $this->assertStringMatchesFormat(
                 trim($specification->getExpectedStdout()),
-                trim($runProcess->getOutput()),
+                trim($actualOutput),
                 'Failed asserting stdout output'
             );
         }
@@ -9175,6 +9212,22 @@ class DatadirTest extends AbstractDatadirTestCase
         }
 
         return $localPath;
+    }
+
+    private function filterInvalidSessionRetryMessages(string $output): string
+    {
+        $lines = explode("\n", $output);
+        $filteredLines = array_filter($lines, function (string $line): bool {
+            // Filter out InvalidSession retry messages
+            if (strpos($line, 'Session expired, will recreate and retry.') !== false) {
+                return false;
+            }
+            if (strpos($line, 'InvalidSession:') !== false && strpos($line, 'Retrying...') !== false) {
+                return false;
+            }
+            return true;
+        });
+        return implode("\n", $filteredLines);
     }
 }
 

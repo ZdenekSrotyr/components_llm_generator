@@ -967,6 +967,11 @@
 - Repository: https://github.com/keboola/component-xero-accounting-reports
 - Description: None
 
+### component-acumatica
+- [Documentation](github/component-acumatica/llm.txt)
+- Repository: https://github.com/keboola/component-acumatica
+- Description: None
+
 ### component-daktela
 - [Documentation](github/component-daktela/llm.txt)
 - Repository: https://github.com/keboola/component-daktela
