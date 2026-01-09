@@ -982,6 +982,11 @@
 - Repository: https://github.com/keboola/component-ex-sas
 - Description: None
 
+### component-ex-ftp-v2
+- [Documentation](github/component-ex-ftp-v2/llm.txt)
+- Repository: https://github.com/keboola/component-ex-ftp-v2
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
