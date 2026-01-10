@@ -49,7 +49,7 @@ Directory structure:
 ================================================
 FILE: README.md
 ================================================
-se# Daktela Extractor
+# Daktela Extractor
 
 Keboola component for extracting data from Daktela CRM/Contact Center API v6.
 
@@ -1463,20 +1463,11 @@ FILE: component_config/configSchema.json
         "max_concurrent_requests": {
           "type": "integer",
           "title": "Max Concurrent Requests",
-          "description": "Maximum number of concurrent API requests. Controls how many HTTP calls can run in parallel across all endpoints. Increase for faster extraction, decrease if experiencing rate limiting.",
+          "description": "Maximum number of concurrent API requests. Controls how many HTTP calls can run in parallel. Increase for faster extraction, decrease if experiencing rate limiting.",
           "default": 10,
           "minimum": 1,
           "maximum": 50,
           "propertyOrder": 2
-        },
-        "max_concurrent_endpoints": {
-          "type": "integer",
-          "title": "Max Concurrent Endpoints",
-          "description": "Maximum number of endpoints (rows) to extract simultaneously. Each endpoint holds data in memory, so lower values reduce memory usage. Increase for faster extraction on large backends with more memory.",
-          "default": 3,
-          "minimum": 1,
-          "maximum": 20,
-          "propertyOrder": 3
         }
       },
       "propertyOrder": 200
@@ -1861,7 +1852,7 @@ import keboola.utils
 from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
 
-from configuration import Configuration, RowConfiguration
+from configuration import Configuration
 from daktela_client import DaktelaApiClient
 from extractor import DaktelaExtractor
 
@@ -1876,26 +1867,15 @@ class Component(ComponentBase):
 
     def __init__(self) -> None:
         super().__init__()
-        self.params: Configuration | None = None
-        self.row_configs: list[RowConfiguration] = []
+        self.config: Configuration | None = None
         self._table_definitions: dict[str, Any] = {}
         self._schema_state: dict[str, Any] = {}
 
     def run(self) -> None:
         """Main execution - orchestrates the component workflow."""
         try:
-            # Load and validate global configuration
-            self.params = self._validate_and_get_configuration()
-
-            # Load and validate row configurations
-            self.row_configs = self._load_row_configurations()
-
-            if not self.row_configs:
-                raise UserException(
-                    "No endpoint configurations found. Please add at least one row configuration."
-                )
-
-            logging.info(f"Loaded {len(self.row_configs)} endpoint configurations")
+            # Load and validate merged configuration (root + row merged by platform)
+            self.config = self._load_configuration()
 
             # Load schema state from previous runs
             self._load_schema_state()
@@ -1952,27 +1932,26 @@ class Component(ComponentBase):
         """
         Sync action to list available fields for the current row's endpoint.
 
-        In row config mode, this is called for a specific row.
+        Platform passes merged config (root + row) in configuration.parameters.
         Returns a dictionary with the endpoint name and its available fields.
         """
-        # Load global configuration
-        self.params = self._validate_and_get_configuration()
-
-        # In row config mode, the current row data is in configuration.parameters
-        row_data = self.configuration.parameters
+        # Load merged configuration (root + row fields)
         try:
-            row_config = RowConfiguration.from_dict(row_data)
+            config = Configuration.from_dict(self.configuration.parameters)
         except Exception as e:
-            logging.error(f"Failed to load row configuration for sync action: {e}")
-            return {"error": f"Invalid row configuration: {e}"}
+            logging.error(f"Failed to load configuration for sync action: {e}")
+            return {"error": f"Invalid configuration: {e}"}
 
-        logging.info(f"Running listFields sync action for endpoint: {row_config.endpoint}")
+        # Store for use by API client initialization
+        self.config = config
+
+        logging.info(f"Running listFields sync action for endpoint: {config.endpoint}")
 
         # Run async field discovery for this endpoint
-        result = asyncio.run(self._discover_fields_async(row_config.endpoint))
+        result = asyncio.run(self._discover_fields_async(config.endpoint))
 
-        logging.info(f"Discovered {len(result)} fields for {row_config.endpoint}")
-        return {row_config.endpoint: result}
+        logging.info(f"Discovered {len(result)} fields for {config.endpoint}")
+        return {config.endpoint: result}
 
     async def _discover_fields_async(self, endpoint: str) -> list[str]:
         """Discover available fields for a single endpoint."""
@@ -2003,85 +1982,68 @@ class Component(ComponentBase):
         return []
 
     async def _run_async_extraction(self) -> None:
-        """Run the async extraction process for all row configurations."""
+        """Run the async extraction process."""
+        if not self.config:
+            raise UserException("No configuration available for extraction")
+
         # Use async context manager for API client (auth happens in __init__)
         async with self._initialize_api_client() as api_client:
-            # Process each row configuration
-            for idx, row_config in enumerate(self.row_configs):
-                logging.info(
-                    f"Processing row {idx + 1}/{len(self.row_configs)}: endpoint={row_config.endpoint}"
-                )
-                extractor = self._create_extractor(api_client, row_config)
-                await extractor.extract_all()
+            logging.info(f"Processing endpoint: {self.config.endpoint}")
+            extractor = self._create_extractor(api_client)
+            await extractor.extract_all()
 
-    def _validate_and_get_configuration(self) -> Configuration:
-        """Load and validate global configuration parameters."""
-        params = Configuration.from_dict(self.configuration.parameters)
+    def _load_configuration(self) -> Configuration:
+        """
+        Load and validate merged configuration.
 
-        logging.info(f"Starting Daktela extraction from {params.connection.url}")
+        Platform merges root config (from configSchema.json) with row config
+        (from configRowSchema.json) into self.configuration.parameters before
+        running the component.
+        """
+        config = Configuration.from_dict(self.configuration.parameters)
 
-        return params
+        logging.info(
+            f"Starting Daktela extraction from {config.connection.url}, "
+            f"endpoint={config.endpoint}, "
+            f"date_from={config.date_from}, date_to={config.date_to}, "
+            f"load_type={config.destination.load_type}"
+        )
 
-    def _load_row_configurations(self) -> list[RowConfiguration]:
-        """Load and validate row configurations from image_parameters."""
-        row_configs = []
-
-        # In row config mode, configurations come from image_parameters
-        image_params = getattr(self.configuration, "image_parameters", [])
-
-        if not image_params:
-            logging.warning("No row configurations found in image_parameters")
-            return []
-
-        for idx, row_data in enumerate(image_params):
-            try:
-                row_config = RowConfiguration.from_dict(row_data)
-                row_configs.append(row_config)
-                logging.info(
-                    f"Row {idx + 1}: endpoint={row_config.endpoint}, "
-                    f"date_from={row_config.date_from}, date_to={row_config.date_to}, "
-                    f"incremental={row_config.destination.incremental}"
-                )
-            except Exception as e:
-                logging.error(f"Failed to load row configuration {idx + 1}: {e}")
-                raise UserException(f"Invalid row configuration {idx + 1}: {e}")
-
-        return row_configs
+        return config
 
     def _initialize_api_client(self) -> DaktelaApiClient:
         """Initialize and return configured API client (authenticates during init)."""
-        params = self._require_params()
+        config = self._require_config()
         return DaktelaApiClient(
-            url=params.connection.url,
-            username=params.connection.username,
-            password=params.connection.password,
-            max_concurrent=params.advanced.max_concurrent_requests,
-            verify_ssl=params.connection.verify_ssl,
+            url=config.connection.url,
+            username=config.connection.username,
+            password=config.connection.password,
+            max_concurrent=config.advanced.max_concurrent_requests,
+            verify_ssl=config.connection.verify_ssl,
         )
 
     def _create_extractor(
         self,
         api_client: DaktelaApiClient,
-        row_config: RowConfiguration,
     ) -> DaktelaExtractor:
-        """Create and configure the extractor for a single row configuration."""
-        params = self._require_params()
+        """Create and configure the extractor."""
+        config = self._require_config()
 
         # Parse dates using keboola utils
         from_datetime = keboola.utils.get_past_date(
-            row_config.date_from
+            config.date_from
         ).strftime("%Y-%m-%d %H:%M:%S")
         to_datetime = keboola.utils.get_past_date(
-            row_config.date_to
+            config.date_to
         ).strftime("%Y-%m-%d %H:%M:%S")
 
         # Build table config for this endpoint
-        endpoint = row_config.endpoint
+        endpoint = config.endpoint
         table_configs = {}
 
         # Use primary_key from config if set, otherwise use defaults
-        if row_config.destination.primary_key:
-            primary_keys = row_config.destination.primary_key
+        if config.destination.primary_key:
+            primary_keys = config.destination.primary_key
         elif endpoint == "activitiesCall":
             primary_keys = ["id_call"]
         else:
@@ -2091,20 +2053,19 @@ class Component(ComponentBase):
 
         # Prepare configured fields dict (only for this endpoint)
         configured_fields = {}
-        if row_config.fields:
-            configured_fields[endpoint] = row_config.fields
+        if config.fields:
+            configured_fields[endpoint] = config.fields
 
         return DaktelaExtractor(
             api_client=api_client,
             table_configs=table_configs,
             component=self,
-            url=params.connection.url,
+            url=config.connection.url,
             requested_endpoints=[endpoint],
-            batch_size=params.advanced.batch_size,
+            batch_size=config.advanced.batch_size,
             date_from=from_datetime,
             date_to=to_datetime,
-            incremental=row_config.destination.incremental,
-            max_concurrent_endpoints=params.advanced.max_concurrent_endpoints,
+            incremental=config.destination.incremental,
             configured_fields=configured_fields if configured_fields else None,
         )
 
@@ -2191,11 +2152,11 @@ class Component(ComponentBase):
             self._table_definitions = {}
         return self._table_definitions
 
-    def _require_params(self) -> Configuration:
+    def _require_config(self) -> Configuration:
         """Return initialized configuration or raise if missing."""
-        if not self.params:
-            raise UserException("Component parameters are not initialized.")
-        return self.params
+        if not self.config:
+            raise UserException("Component configuration is not initialized.")
+        return self.config
 
 
 """
@@ -2215,13 +2176,10 @@ FILE: src/configuration.py
 import logging
 
 from keboola.component.exceptions import UserException
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 DEFAULT_MAX_CONCURRENT_REQUESTS = (
     10  # Default maximum number of concurrent API requests
-)
-DEFAULT_MAX_CONCURRENT_ENDPOINTS = (
-    3  # Default maximum number of endpoints to extract concurrently
 )
 DEFAULT_BATCH_SIZE = (
     1000  # Default batch size for processing records before writing to CSV
@@ -2237,11 +2195,16 @@ class Connection(BaseModel):
     verify_ssl: bool = True
 
 
-class RowDestination(BaseModel):
-    """Row-level destination configuration."""
+class Destination(BaseModel):
+    """Destination configuration for load type and primary key."""
 
-    incremental: bool = False
+    load_type: str = "full_load"  # "full_load" or "incremental_load"
     primary_key: list[str] | None = None
+
+    @property
+    def incremental(self) -> bool:
+        """Convert load_type to boolean for backward compatibility."""
+        return self.load_type == "incremental_load"
 
 
 class RowConfiguration(BaseModel):
@@ -2251,7 +2214,7 @@ class RowConfiguration(BaseModel):
     date_from: str
     date_to: str
     fields: list[str] | None = None
-    destination: RowDestination = Field(default_factory=RowDestination)
+    destination: Destination = Field(default_factory=Destination)
 
     @classmethod
     def from_dict(cls, data: dict) -> "RowConfiguration":
@@ -2268,7 +2231,6 @@ class Advanced(BaseModel):
 
     batch_size: int = DEFAULT_BATCH_SIZE
     max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS
-    max_concurrent_endpoints: int = DEFAULT_MAX_CONCURRENT_ENDPOINTS
 
     @field_validator("batch_size")
     @classmethod
@@ -2280,11 +2242,30 @@ class Advanced(BaseModel):
 
 
 class Configuration(BaseModel):
-    """Global configuration (from configSchema.json)."""
+    """
+    Merged configuration combining root config and row config.
 
+    Platform merges root config (from configSchema.json) with row config
+    (from configRowSchema.json) into self.configuration.parameters.
+
+    This class reads from the merged parameters and includes both:
+    - Root config fields: connection, advanced, debug
+    - Row config fields: endpoint, date_from, date_to, fields, destination
+    """
+
+    model_config = ConfigDict(extra="ignore")  # Ignore unknown fields
+
+    # Root config fields (from configSchema.json)
     connection: Connection
     advanced: Advanced = Field(default_factory=Advanced)
     debug: bool = False
+
+    # Row config fields (from configRowSchema.json)
+    endpoint: str
+    date_from: str
+    date_to: str
+    fields: list[str] | None = None
+    destination: Destination = Field(default_factory=Destination)
 
     @model_validator(mode="after")
     def log_debug_mode(self) -> "Configuration":
@@ -2803,13 +2784,12 @@ FILE: src/extractor.py
 ================================================
 """Main extractor module for Daktela data extraction."""
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
 from keboola.component.exceptions import UserException
 
-from configuration import DEFAULT_BATCH_SIZE, DEFAULT_MAX_CONCURRENT_ENDPOINTS
+from configuration import DEFAULT_BATCH_SIZE
 from daktela_client import DaktelaApiClient
 from transformer import DataTransformer
 
@@ -2831,7 +2811,6 @@ class DaktelaExtractor:
         date_from: str | None = None,
         date_to: str | None = None,
         incremental: bool = False,
-        max_concurrent_endpoints: int = DEFAULT_MAX_CONCURRENT_ENDPOINTS,
         configured_fields: dict[str, list[str]] | None = None,
     ):
         """
@@ -2842,12 +2821,11 @@ class DaktelaExtractor:
             table_configs: Dictionary of table configurations
             component: Component instance for writing tables
             url: Base URL (e.g., https://customer.daktela.com)
-            requested_endpoints: List of endpoint names to extract
+            requested_endpoints: List of endpoint names to extract (typically one per job)
             batch_size: Number of records to process in each batch (default: 1000)
             date_from: Start date for filtering (for supported endpoints)
             date_to: End date for filtering (for supported endpoints)
             incremental: Whether to use incremental mode
-            max_concurrent_endpoints: Maximum number of endpoints to extract concurrently
             configured_fields: User-configured fields per endpoint (optional)
         """
         self.api_client = api_client
@@ -2859,7 +2837,6 @@ class DaktelaExtractor:
         self.date_from = date_from
         self.date_to = date_to
         self.incremental = incremental
-        self.max_concurrent_endpoints = max_concurrent_endpoints
         self.configured_fields = configured_fields or {}
         self._table_columns: dict[str, list[str]] = {}
 
@@ -2867,73 +2844,21 @@ class DaktelaExtractor:
         """
         Extract all requested endpoints asynchronously.
 
-        Uses two-phase extraction like the old component:
-        Phase 1: Extract all tables except activities and activities_statuses
-        Phase 2: Extract activities and activities_statuses
-
-        This is done because activities may depend on data from other tables
-        for filtering invalid activities.
+        Note: In row-based configuration mode, typically only one endpoint
+        is requested per job execution (platform executes one row per job).
         """
         logging.info(
-            f"Starting extraction for {len(self.requested_endpoints)} endpoints"
+            f"Starting extraction for {len(self.requested_endpoints)} endpoint(s)"
         )
 
         if not self.requested_endpoints:
             raise UserException("No endpoints specified for extraction")
 
-        # Define activities-related endpoints that need special treatment
-        # These are extracted in phase 2 after all other tables
-        activities_endpoints = {
-            "activities",
-            "activities_statuses",
-            "activitiesCall",
-            "activitiesChat",
-            "activitiesEmail",
-        }
-
-        # Phase 1: Extract all tables except activities-related ones
-        phase1_endpoints = [
-            ep for ep in self.requested_endpoints if ep not in activities_endpoints
-        ]
-        if phase1_endpoints:
-            logging.info(
-                f"Phase 1: Extracting {len(phase1_endpoints)} endpoints "
-                f"(max {self.max_concurrent_endpoints} concurrent)"
-            )
-            await self._run_endpoints_with_limit(phase1_endpoints)
-            logging.info("Phase 1 extraction completed")
-
-        # Phase 2: Extract activities-related tables
-        phase2_endpoints = [
-            ep for ep in self.requested_endpoints if ep in activities_endpoints
-        ]
-        if phase2_endpoints:
-            logging.info(
-                f"Phase 2: Extracting {len(phase2_endpoints)} activities-related endpoints "
-                f"(max {self.max_concurrent_endpoints} concurrent)"
-            )
-            await self._run_endpoints_with_limit(phase2_endpoints)
-            logging.info("Phase 2 extraction completed")
+        # Extract each endpoint (typically just one per job)
+        for endpoint in self.requested_endpoints:
+            await self._extract_table(endpoint)
 
         logging.info("Extraction completed successfully")
-
-    async def _run_endpoints_with_limit(self, endpoints: list[str]) -> None:
-        """
-        Run endpoint extractions with bounded concurrency.
-
-        This limits the number of endpoints being extracted simultaneously
-        to prevent OOM when multiple large tables are extracted at once.
-
-        Args:
-            endpoints: List of endpoint names to extract
-        """
-        sem = asyncio.Semaphore(self.max_concurrent_endpoints)
-
-        async def run_one(endpoint: str) -> None:
-            async with sem:
-                await self._extract_table(endpoint)
-
-        await asyncio.gather(*(run_one(ep) for ep in endpoints))
 
     def _get_table_endpoint(self, table_name: str, table_config: dict[str, Any]) -> str:
         """Return endpoint override for table if configured."""
