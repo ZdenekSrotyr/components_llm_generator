@@ -987,6 +987,11 @@
 - Repository: https://github.com/keboola/component-ex-ftp-v2
 - Description: None
 
+### component-odoo-extractor
+- [Documentation](github/component-odoo-extractor/llm.txt)
+- Repository: https://github.com/keboola/component-odoo-extractor
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
