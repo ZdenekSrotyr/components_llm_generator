@@ -992,6 +992,11 @@
 - Repository: https://github.com/keboola/component-odoo-extractor
 - Description: None
 
+### component-sage-intacct-extractor
+- [Documentation](github/component-sage-intacct-extractor/llm.txt)
+- Repository: https://github.com/keboola/component-sage-intacct-extractor
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
