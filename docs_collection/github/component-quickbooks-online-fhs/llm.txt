@@ -303,7 +303,7 @@ services:
 ================================================
 FILE: Dockerfile
 ================================================
-FROM python:3.8.6-slim
+FROM python:3.11-slim
 ENV PYTHONIOENCODING utf-8
 
 COPY . /code/
@@ -387,7 +387,7 @@ dateparser==1.1.8
 regex
 keboola.csvwriter
 keboola.utils==1.1.0
-pandas==2.0.0
+pandas==2.3.3
 backoff==2.2.1
 kbcstorage==0.7.2
 
@@ -1101,7 +1101,6 @@ import requests
 import dateparser
 import urllib.parse as url_parse
 from requests.auth import HTTPBasicAuth
-from typing import Tuple
 from keboola.component.base import ComponentBase  # noqa
 import backoff
 from requests.exceptions import HTTPError
@@ -1119,7 +1118,7 @@ class QuickbooksClient:
     QuickBooks Requests Handler
     """
 
-    def __init__(self, company_id, access_token, refresh_token, oauth, sandbox):
+    def __init__(self, company_id, refresh_tokens, oauth, sandbox):
         self.count = None
         self.end_date = None
         self.start_date = None
@@ -1137,9 +1136,13 @@ class QuickbooksClient:
         else:
             self.base_url = "https://sandbox-quickbooks.api.intuit.com/v3/company"
 
-        # Parameters for request
-        self.access_token = access_token
-        self.refresh_token = refresh_token
+        # Store list of refresh tokens
+        self.refresh_tokens = refresh_tokens
+        self.current_token_index = 0
+
+        # Initialize with first refresh token
+        self.refresh_token = refresh_tokens[0]
+        self.access_token = None
         self.access_token_refreshed = False
         self.company_id = company_id
         self.reports_required_accounting_type = [
@@ -1147,16 +1150,16 @@ class QuickbooksClient:
             "ProfitAndLossDetail",
             "GeneralLedger",
             "BalanceSheet",
-            "TrialBalance"
+            "TrialBalance",
         ]
 
-    def get_new_refresh_token(self) -> Tuple[str, str]:
+    def get_new_refresh_token(self) -> str:
         try:
             self.refresh_access_token()
         except Exception as e:
             raise QuickBooksClientException(e) from e
 
-        return self.refresh_token, self.access_token
+        return self.refresh_token
 
     def fetch(self, endpoint, report_api_bool, start_date, end_date, query="", params=None):
         """
@@ -1179,7 +1182,7 @@ class QuickbooksClient:
 
         if report_api_bool:
             if self.endpoint == "CustomQuery":
-                if query == '':
+                if query == "":
                     raise QuickBooksClientException("Please enter query for CustomQuery. Exit...")
                 logging.debug("Input Custom Query: {0}".format(self.start_date))
                 self.custom_request(input_query=query)
@@ -1190,8 +1193,7 @@ class QuickbooksClient:
         else:
             self.count = self.get_count()  # total count of records for pagination
             if self.count == 0:
-                logging.info(
-                    "There are no returns for {0}".format(self.endpoint))
+                logging.info("There are no returns for {0}".format(self.endpoint))
                 self.data = []
             else:
                 self.data_request()
@@ -1200,28 +1202,46 @@ class QuickbooksClient:
     def refresh_access_token(self):
         """
         Get a new access token with refresh token.
-        Also saves the new token in statefile.
+        Tries each refresh token until one succeeds.
         """
-        logging.info("Refreshing Access Token")
+        last_error = None
 
-        url = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
-        param = {
-            "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token
-        }
+        # Try all refresh tokens starting from current
+        for index in range(self.current_token_index, len(self.refresh_tokens)):
+            self.refresh_token = self.refresh_tokens[index]
+            logging.info(f"Refreshing Access Token (token {index + 1}/{len(self.refresh_tokens)})")
 
-        r = requests.post(url, auth=HTTPBasicAuth(self.app_key, self.app_secret), data=param)
-        r.raise_for_status()
+            try:
+                url = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+                param = {"grant_type": "refresh_token", "refresh_token": self.refresh_token}
 
-        results = r.json()
+                r = requests.post(url, auth=HTTPBasicAuth(self.app_key, self.app_secret), data=param)
+                r.raise_for_status()
 
-        if "error" in results:
-            raise QuickBooksClientException(f"Failed to refresh access token, please re-authorize credentials:"
-                                            f" {r.text}")
+                results = r.json()
 
-        self.access_token = results["access_token"]
-        self.refresh_token = results["refresh_token"]
-        self.access_token_refreshed = True
+                if "error" in results:
+                    raise QuickBooksClientException(
+                        f"Failed to refresh access token: {results.get('error_description', results['error'])}"
+                    )
+
+                self.access_token = results["access_token"]
+                self.refresh_token = results["refresh_token"]
+                self.access_token_refreshed = True
+                self.current_token_index = index
+                logging.info(f"Successfully refreshed token using token {index + 1}")
+                return
+
+            except Exception as e:
+                last_error = e
+                logging.warning(f"Refresh token {index + 1} failed: {e}")
+                continue
+
+        # All tokens failed
+        raise QuickBooksClientException(
+            f"Failed to refresh access token with all {len(self.refresh_tokens)} refresh tokens. "
+            f"Last error: {last_error}. Please re-authorize credentials."
+        )
 
     def get_count(self):
         """
@@ -1232,15 +1252,13 @@ class QuickbooksClient:
         endpoint = self.endpoint
         url = "select count(*) from {0}".format(endpoint)
         encoded_url = self.url_encode(url)
-        count_url = "{0}/{1}/query?query={2}".format(
-            self.base_url, self.company_id, encoded_url)
+        count_url = "{0}/{1}/query?query={2}".format(self.base_url, self.company_id, encoded_url)
 
         # Request the number of counts
         data = self._request(count_url)
 
         total_counts = data["QueryResponse"]["totalCount"]
-        logging.debug("Total Number of Records for {0}: {1}".format(
-            endpoint, total_counts))
+        logging.debug("Total Number of Records for {0}: {1}".format(endpoint, total_counts))
 
         return total_counts
 
@@ -1264,11 +1282,8 @@ class QuickbooksClient:
         results = None
         request_success = False
         while not request_success:
-            headers = {
-                "Authorization": "Bearer " + self.access_token,
-                "Accept": "application/json"
-            }
-            logging.debug(f'Requesting: {url} with params: {params}')
+            headers = {"Authorization": "Bearer " + self.access_token, "Accept": "application/json"}
+            logging.debug(f"Requesting: {url} with params: {params}")
             data = requesting.get(url, headers=headers, params=params)
 
             try:
@@ -1286,14 +1301,17 @@ class QuickbooksClient:
                         error = data.json().get("fault").get("error")[0]
                         if error:
                             if error.get("message"):
-                                raise QuickBooksClientException(f"Authorization failed. Please check Company ID and/or "
-                                                                f"reauthorize the application: {error.get('message')}")
+                                raise QuickBooksClientException(
+                                    f"Authorization failed. Please check Company ID and/or "
+                                    f"reauthorize the application: {error.get('message')}"
+                                )
                             else:
                                 raise QuickBooksClientException(error)
                         raise QuickBooksClientException(data.text)
                     else:
-                        raise QuickBooksClientException(f"Client cannot fetch data from url {url}, please check "
-                                                        f"defined endpoints and company_id.")
+                        raise QuickBooksClientException(
+                            f"Client cannot fetch data from url {url}, please check defined endpoints and company_id."
+                        )
             else:
                 request_success = True
 
@@ -1311,20 +1329,19 @@ class QuickbooksClient:
         while self.startposition <= self.count:
             # Query Parameters
             # Custom query for Class endpoint
-            if self.endpoint == 'Class':
-
+            if self.endpoint == "Class":
                 query = "SELECT * FROM {0} WHERE Active IN (true, false) STARTPOSITION {1} MAXRESULTS {2}".format(
-                    self.endpoint, self.startposition, self.maxresults)
+                    self.endpoint, self.startposition, self.maxresults
+                )
 
             else:
-
                 query = "SELECT * FROM {0} STARTPOSITION {1} MAXRESULTS {2}".format(
-                    self.endpoint, self.startposition, self.maxresults)
+                    self.endpoint, self.startposition, self.maxresults
+                )
 
             logging.debug("Request Query: {0}".format(query))
             encoded_query = self.url_encode(query)
-            url = "{0}/{1}/query?query={2}".format(
-                self.base_url, self.company_id, encoded_query)
+            url = "{0}/{1}/query?query={2}".format(self.base_url, self.company_id, encoded_query)
 
             # Requests and concatenating results into class's data variable
             results = self._request(url)
@@ -1360,8 +1377,7 @@ class QuickbooksClient:
 
         logging.debug("Request Query: {0}".format(query))
         encoded_query = self.url_encode(query)
-        url = "{0}/{1}/query?query={2}".format(
-            self.base_url, self.company_id, encoded_query)
+        url = "{0}/{1}/query?query={2}".format(self.base_url, self.company_id, encoded_query)
 
         # Requests and concatenating results into class's data variable
         results = self._request(url)
@@ -1385,37 +1401,36 @@ class QuickbooksClient:
 
             # For GeneralLedger ONLY
             if endpoint == "GeneralLedger":
-                date_param = "?columns=klass_name,account_name,account_num,chk_print_state,create_by,create_date," \
-                             "cust_name,doc_num,emp_name,inv_date,is_adj,is_ap_paid,is_ar_paid,is_cleared,item_name," \
-                             "last_mod_by,last_mod_date,memo,name,quantity,rate,split_acc,tx_date,txn_type,vend_name," \
-                             "net_amount,tax_amount,tax_code,dept_name,subt_nat_amount,rbal_nat_amount,debt_amt," \
-                             "credit_amt "
+                date_param = (
+                    "?columns=klass_name,account_name,account_num,chk_print_state,create_by,create_date,"
+                    "cust_name,doc_num,emp_name,inv_date,is_adj,is_ap_paid,is_ar_paid,is_cleared,item_name,"
+                    "last_mod_by,last_mod_date,memo,name,quantity,rate,split_acc,tx_date,txn_type,vend_name,"
+                    "net_amount,tax_amount,tax_code,dept_name,subt_nat_amount,rbal_nat_amount,debt_amt,"
+                    "credit_amt "
+                )
         else:
-
             startdate = (dateparser.parse(start_date)).strftime("%Y-%m-%d")
             enddate = (dateparser.parse(end_date)).strftime("%Y-%m-%d")
 
             if startdate > enddate:
-                raise Exception(
-                    "Please validate your date parameter for {0}".format(endpoint))
+                raise Exception("Please validate your date parameter for {0}".format(endpoint))
 
-            date_param = "?start_date={0}&end_date={1}".format(
-                startdate, enddate)
+            date_param = "?start_date={0}&end_date={1}".format(startdate, enddate)
 
             # For GeneralLedger ONLY
             if endpoint == "GeneralLedger":
-                date_param = date_param + "&columns=dklass_name,account_name,account_num,chk_print_state," \
-                                          "create_by,create_date,cust_name,doc_num,emp_name,inv_date,is_adj," \
-                                          "is_ap_paid,is_ar_paid," \
-                                          "is_cleared,item_name,last_mod_by,last_mod_date,memo,name,quantity,rate," \
-                                          "split_acc,tx_date," \
-                                          "txn_type,vend_name,net_amount,tax_amount,tax_code,dept_name," \
-                                          "subt_nat_amount,rbal_nat_amount,debt_amt,credit_amt"
+                date_param = (
+                    date_param + "&columns=dklass_name,account_name,account_num,chk_print_state,"
+                    "create_by,create_date,cust_name,doc_num,emp_name,inv_date,is_adj,"
+                    "is_ap_paid,is_ar_paid,"
+                    "is_cleared,item_name,last_mod_by,last_mod_date,memo,name,quantity,rate,"
+                    "split_acc,tx_date,"
+                    "txn_type,vend_name,net_amount,tax_amount,tax_code,dept_name,"
+                    "subt_nat_amount,rbal_nat_amount,debt_amt,credit_amt"
+                )
 
-        url = "{0}/{1}/reports/{2}{3}".format(self.base_url,
-                                              self.company_id, endpoint, date_param)
+        url = "{0}/{1}/reports/{2}{3}".format(self.base_url, self.company_id, endpoint, date_param)
         if endpoint in self.reports_required_accounting_type:
-
             accrual_url = url + "&accounting_method=Accrual"
             cash_url = url + "&accounting_method=Cash"
 
@@ -1426,7 +1441,6 @@ class QuickbooksClient:
             self.data_2 = results_2
 
         else:
-
             results = self._request(url)
             self.data = results
 
@@ -1451,22 +1465,19 @@ from report_mapping import ReportMapping
 from keboola.component.base import ComponentBase
 from keboola.component.exceptions import UserException  # noqa
 
-URL_SUFFIXES = {"US": ".keboola.com",
-                "EU": ".eu-central-1.keboola.com",
-                "AZURE-EU": ".north-europe.azure.keboola.com",
-                "CURRENT_STACK": os.environ.get('KBC_STACKID', 'connection.keboola.com').replace('connection', '')}
+URL_SUFFIX = os.environ.get("KBC_STACKID", "connection.keboola.com").replace("connection.", "")
 
 # configuration variables
-KEY_COMPANY_ID = 'companyid'
-KEY_ENDPOINTS = 'endpoints'
-KEY_REPORTS = 'reports'
-GROUP_DATE_SETTINGS = 'date_settings'
-KEY_START_DATE = 'start_date'
-KEY_END_DATE = 'end_date'
-KEY_GROUP_DESTINATION = 'destination'
-KEY_LOAD_TYPE = 'load_type'
-KEY_SUMMARIZE_COLUMN_BY = 'summarize_column_by'
-KEY_SANDBOX = 'sandbox'
+KEY_COMPANY_ID = "companyid"
+KEY_ENDPOINTS = "endpoints"
+KEY_REPORTS = "reports"
+GROUP_DATE_SETTINGS = "date_settings"
+KEY_START_DATE = "start_date"
+KEY_END_DATE = "end_date"
+KEY_GROUP_DESTINATION = "destination"
+KEY_LOAD_TYPE = "load_type"
+KEY_SUMMARIZE_COLUMN_BY = "summarize_column_by"
+KEY_SANDBOX = "sandbox"
 
 # list of mandatory parameters => if some is missing,
 # component will fail with readable message on initialization.
@@ -1475,36 +1486,37 @@ REQUIRED_PARAMETERS = [KEY_COMPANY_ID, KEY_ENDPOINTS, KEY_GROUP_DESTINATION]
 # QuickBooks Parameters
 BASE_URL = "https://quickbooks.api.intuit.com"
 
-ALLOWED_BRANCHES = ["683762", "510379"]
-ALLOWED_PROJECTS = ["9525", "9382"]
+ALLOWED_BRANCHES = ["683762", "510379", "1237323", "198"]
+ALLOWED_PROJECTS = ["9525", "9382", "10405", "96"]
 
 
 class Component(ComponentBase):
-
     def __init__(self):
         super().__init__()
         self.incremental = None
         self.refresh_token = None
-        self.access_token = None
 
         if self.environment_variables.branch_id not in ALLOWED_BRANCHES:
-            raise UserException(f"This component uses Keboola API to store the statefile. "
-                                f"Running is allowed only in branches {ALLOWED_BRANCHES}, "
-                                f"detected branch: {self.environment_variables.branch_id}")
+            raise UserException(
+                f"This component uses Keboola API to store the statefile. "
+                f"Running is allowed only in branches {ALLOWED_BRANCHES}, "
+                f"detected branch: {self.environment_variables.branch_id}"
+            )
 
         if self.environment_variables.project_id not in ALLOWED_PROJECTS:
-            raise UserException(f"This component uses Keboola API to store the statefile. "
-                                f"Running is allowed only in projects {ALLOWED_PROJECTS}, "
-                                f"detected project_id: {self.environment_variables.project_id}")
+            raise UserException(
+                f"This component uses Keboola API to store the statefile. "
+                f"Running is allowed only in projects {ALLOWED_PROJECTS}, "
+                f"detected project_id: {self.environment_variables.project_id}"
+            )
 
     def run(self):
-
         sandbox = self.configuration.parameters.get(KEY_SANDBOX, False)
         start_date = None
         end_date = None
 
         oauth = self.configuration.oauth_credentials
-        self.refresh_token, self.access_token = self.get_tokens(oauth)
+        refresh_tokens = self.get_tokens(oauth)
 
         params_company_id = self.configuration.parameters.get(KEY_COMPANY_ID, None)
 
@@ -1517,39 +1529,43 @@ class Component(ComponentBase):
         if cfg_table:
             self.validate_inputs(cfg_table, params_company_id)
             try:
-                self.input_table_run(cfg_table, oauth, sandbox, params_company_id)
+                self.input_table_run(cfg_table, oauth, sandbox, params_company_id, refresh_tokens)
             except QuickBooksClientException as e:
                 raise UserException(f"Component failed during run: {e}") from e
         else:
             try:
-                self.no_input_table_run(start_date, end_date, self.refresh_token, self.access_token, oauth, sandbox)
+                self.no_input_table_run(start_date, end_date, oauth, sandbox, refresh_tokens)
             except QuickBooksClientException as e:
                 raise UserException(f"Component failed during run: {e}") from e
 
-        self.write_state_file({
-            "tokens":
-                {"ts": datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-                 "#refresh_token": self.refresh_token,
-                 "#access_token": self.access_token}
-        })
+        self.write_state_file(
+            {
+                "tokens": {
+                    "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                    "#refresh_token": self.refresh_token,
+                }
+            }
+        )
 
     @staticmethod
     def validate_company_id(company_id: str) -> None:
-        if ' ' in company_id or '.' in company_id:
+        if " " in company_id or "." in company_id:
             raise UserException("The company_id parameter should not contain any spaces or dots.")
 
     def validate_inputs(self, cfg_table, params_company_id: str) -> None:
         self.validate_company_id(params_company_id)
-        with open(cfg_table.full_path, 'r') as csvfile:
+        with open(cfg_table.full_path, "r") as csvfile:
             reader = csv.DictReader(csvfile)
             rows = list(reader)
             for row in rows:
                 pk = row["PK"]
                 if pk != params_company_id:
-                    raise UserException(f"company_id from params: {params_company_id} does not match "
-                                        f"with company_id provided in input table: {pk}.")
+                    raise UserException(
+                        f"company_id from params: {params_company_id} does not match "
+                        f"with company_id provided in input table: {pk}."
+                    )
 
-    def no_input_table_run(self, start_date, end_date, refresh_token, access_token, oauth, sandbox):
+    def no_input_table_run(self, start_date, end_date, oauth, sandbox, refresh_tokens):
         logging.info("No input table detected. The component will run with parameters set in config.")
         self.validate_configuration_parameters(REQUIRED_PARAMETERS)
         params = self.configuration.parameters
@@ -1568,7 +1584,7 @@ class Component(ComponentBase):
         start_date = self.process_date(start_date)
         end_date = self.process_date(end_date)
 
-        logging.info(f'Processing Company ID: {company_id}')
+        logging.info(f"Processing Company ID: {company_id}")
 
         if params.get("sandbox"):
             sandbox = True
@@ -1581,11 +1597,11 @@ class Component(ComponentBase):
             self.incremental = False
         logging.debug(f"Load type incremental set to: {self.incremental}")
 
-        summarize_column_by = params.get(KEY_SUMMARIZE_COLUMN_BY) if params.get(
-            KEY_SUMMARIZE_COLUMN_BY) else None
+        summarize_column_by = params.get(KEY_SUMMARIZE_COLUMN_BY) if params.get(KEY_SUMMARIZE_COLUMN_BY) else None
 
-        quickbooks_param = QuickbooksClient(company_id=company_id, refresh_token=refresh_token,
-                                            access_token=access_token, oauth=oauth, sandbox=sandbox)
+        quickbooks_param = QuickbooksClient(
+            company_id=company_id, refresh_tokens=refresh_tokens, oauth=oauth, sandbox=sandbox
+        )
         if not sandbox:
             self.process_oauth_tokens(quickbooks_param)
 
@@ -1593,26 +1609,29 @@ class Component(ComponentBase):
         for endpoint in endpoints:
             self.process_endpoint(endpoint, quickbooks_param, start_date, end_date, summarize_column_by)
 
-        self.refresh_token, self.access_token = quickbooks_param.refresh_token, quickbooks_param.access_token
+        # Save working token from client
+        self.refresh_token = quickbooks_param.refresh_token
 
-    def input_table_run(self, cfg_table, oauth, sandbox, params_company_id: str):
+    def input_table_run(self, cfg_table, oauth, sandbox, params_company_id: str, refresh_tokens):
         _endpoints = self.configuration.parameters.get("endpoints", [])
-        with open(cfg_table.full_path, 'r') as csvfile:
+        with open(cfg_table.full_path, "r") as csvfile:
             reader = csv.DictReader(csvfile)
             rows = list(reader)  # not memory efficient, but we are working with small input table
             if len(rows) == 0:
                 logging.info("No rows in input table detected, the component will process selected endpoints only.")
-                quickbooks_param = QuickbooksClient(company_id=params_company_id, refresh_token=self.refresh_token,
-                                                    access_token=self.access_token, oauth=oauth, sandbox=sandbox)
+                quickbooks_client = QuickbooksClient(
+                    company_id=params_company_id,
+                    refresh_tokens=refresh_tokens,
+                    oauth=oauth,
+                    sandbox=sandbox,
+                )
                 if not sandbox:
-                    self.process_oauth_tokens(quickbooks_param)
+                    self.process_oauth_tokens(quickbooks_client)
                 for endpoint in _endpoints:
-                    self.process_endpoint(endpoint, quickbooks_param, start_date=None, end_date=None,
-                                          summarize_column_by=None)
-                    self.refresh_token, self.access_token = (
-                        quickbooks_param.refresh_token,
-                        quickbooks_param.access_token
+                    self.process_endpoint(
+                        endpoint, quickbooks_client, start_date=None, end_date=None, summarize_column_by=None
                     )
+                self.refresh_token = quickbooks_client.refresh_token
 
             else:
                 for row in rows:
@@ -1624,107 +1643,105 @@ class Component(ComponentBase):
                     self.incremental = True
                     summarize_column_by = row["segment_data_by"] or None
 
-                    quickbooks_param = QuickbooksClient(company_id=company_id, refresh_token=self.refresh_token,
-                                                        access_token=self.access_token, oauth=oauth, sandbox=sandbox)
+                    quickbooks_client = QuickbooksClient(
+                        company_id=company_id,
+                        refresh_tokens=refresh_tokens,
+                        oauth=oauth,
+                        sandbox=sandbox,
+                    )
 
                     if not sandbox:
-                        self.process_oauth_tokens(quickbooks_param)
+                        self.process_oauth_tokens(quickbooks_client)
 
                     # Process endpoints defined in the input table
-                    self.process_endpoint(endpoint, quickbooks_param, start_date, end_date, summarize_column_by)
-                    self.refresh_token, self.access_token = (
-                        quickbooks_param.refresh_token,
-                        quickbooks_param.access_token
-                    )
+                    self.process_endpoint(endpoint, quickbooks_client, start_date, end_date, summarize_column_by)
+                    self.refresh_token = quickbooks_client.refresh_token
 
                 # Also process endpoints from configuration
                 for endpoint in _endpoints:
-                    self.process_endpoint(endpoint,
-                                          quickbooks_param,
-                                          start_date=None,
-                                          end_date=None,
-                                          summarize_column_by=None)
-                    self.refresh_token, self.access_token = (
-                        quickbooks_param.refresh_token,
-                        quickbooks_param.access_token
+                    self.process_endpoint(
+                        endpoint, quickbooks_client, start_date=None, end_date=None, summarize_column_by=None
                     )
+                self.refresh_token = quickbooks_client.refresh_token
 
     def process_oauth_tokens(self, client) -> None:
         """Uses Quickbooks client to get new tokens and saves them using API if they have changed since the last run."""
-        new_refresh_token, new_access_token = client.get_new_refresh_token()
+        new_refresh_token = client.get_new_refresh_token()
         if self.refresh_token != new_refresh_token:
-            self.save_new_oauth_tokens(new_refresh_token, new_access_token)
+            self.save_new_oauth_tokens(new_refresh_token)
 
-            # We also save new tokens to class vars, so we can save them unencrypted if case statefile update fails
-            # in update_config_state() method.
-            self.refresh_token = new_refresh_token
-            self.access_token = new_access_token
+        # We also save new token to class var, so we can save it unencrypted if case statefile update fails
+        # in update_config_state() method.
+        self.refresh_token = new_refresh_token
 
-    def save_new_oauth_tokens(self, refresh_token: str, access_token: str) -> None:
-        logging.debug("Saving new tokens to state using Keboola API.")
+    def save_new_oauth_tokens(self, refresh_token: str) -> None:
+        logging.debug("Saving new token to state using Keboola API.")
 
         try:
             encrypted_refresh_token = self.encrypt(refresh_token)
-            encrypted_access_token = self.encrypt(access_token)
         except requests.exceptions.RequestException:
             logging.warning("Encrypt API is unavailable. Skipping token save at the beginning of the run.")
             return
 
         new_state = {
             "component": {
-                "tokens":
-                    {"ts": datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-                     "#refresh_token": encrypted_refresh_token,
-                     "#access_token": encrypted_access_token}
-            }}
+                "tokens": {
+                    "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                    "#refresh_token": encrypted_refresh_token,
+                }
+            }
+        }
         try:
-            self.update_config_state(region="CURRENT_STACK",
-                                     component_id=self.environment_variables.component_id,
-                                     configurationId=self.environment_variables.config_id,
-                                     state=new_state,
-                                     branch_id=self.environment_variables.branch_id)
+            self.update_config_state(
+                component_id=self.environment_variables.component_id,
+                configurationId=self.environment_variables.config_id,
+                state=new_state,
+                branch_id=self.environment_variables.branch_id,
+            )
         except requests.exceptions.RequestException:
-            logging.warning("Storage API (update config state)"
-                            "is unavailable. Skipping token save at the beginning of the run.")
+            logging.warning(
+                "Storage API (update config state) is unavailable. Skipping token save at the beginning of the run."
+            )
             return
 
     @backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=5)
     def encrypt(self, token: str) -> str:
-        url = "https://encryption.keboola.com/encrypt"
+        url = f"https://encryption.{URL_SUFFIX}/encrypt"
         params = {
             "componentId": self.environment_variables.component_id,
             "projectId": self.environment_variables.project_id,
-            "configId": self.environment_variables.config_id
+            "configId": self.environment_variables.config_id,
         }
         headers = {"Content-Type": "text/plain"}
 
-        response = requests.post(url,
-                                 data=token,
-                                 params=params,
-                                 headers=headers)
+        response = requests.post(url, data=token, params=params, headers=headers)
         response.raise_for_status()
         return response.text
 
     @backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=5)
-    def update_config_state(self, region, component_id, configurationId, state, branch_id='default'):
+    def update_config_state(self, component_id, configurationId, state, branch_id="default"):
         if not branch_id:
-            branch_id = 'default'
+            branch_id = "default"
 
-        url = f'https://connection{URL_SUFFIXES[region]}/v2/storage/branch/{branch_id}' \
-              f'/components/{component_id}/configs/' \
-              f'{configurationId}/state'
+        url = (
+            f"https://connection.{URL_SUFFIX}/v2/storage/branch/{branch_id}"
+            f"/components/{component_id}/configs/"
+            f"{configurationId}/state"
+        )
 
-        parameters = {'state': json.dumps(state)}
-        headers = {'Content-Type': 'application/x-www-form-urlencoded', 'X-StorageApi-Token': self._get_storage_token()}
-        response = requests.put(url,
-                                data=parameters,
-                                headers=headers)
+        parameters = {"state": json.dumps(state)}
+        headers = {"Content-Type": "application/x-www-form-urlencoded", "X-StorageApi-Token": self._get_storage_token()}
+        response = requests.put(url, data=parameters, headers=headers)
         response.raise_for_status()
 
     def process_endpoint(self, endpoint, quickbooks_param, start_date, end_date, summarize_column_by):
         if endpoint == "ProfitAndLossQuery":
-            self.process_pnl_report(quickbooks_param=quickbooks_param, start_date=start_date, end_date=end_date,
-                                    summarize_column_by=summarize_column_by)
+            self.process_pnl_report(
+                quickbooks_param=quickbooks_param,
+                start_date=start_date,
+                end_date=end_date,
+                summarize_column_by=summarize_column_by,
+            )
             return
 
         if "**" in endpoint:
@@ -1734,8 +1751,13 @@ class Component(ComponentBase):
             endpoint = endpoint
             report_api_bool = False
 
-        self.fetch(quickbooks_param=quickbooks_param, endpoint=endpoint, report_api_bool=report_api_bool,
-                   start_date=start_date, end_date=end_date)
+        self.fetch(
+            quickbooks_param=quickbooks_param,
+            endpoint=endpoint,
+            report_api_bool=report_api_bool,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         logging.debug("Parsing API results...")
         input_data = quickbooks_param.data
@@ -1743,13 +1765,11 @@ class Component(ComponentBase):
         if len(input_data) == 0:
             pass
         else:
-            logging.debug(
-                "Report API Template Enable: {0}".format(report_api_bool))
+            logging.debug("Report API Template Enable: {0}".format(report_api_bool))
             if report_api_bool:
                 if endpoint == "CustomQuery":
                     # Not implemented
-                    ReportMapping(endpoint=endpoint, data=input_data,
-                                  query=start_date)
+                    ReportMapping(endpoint=endpoint, data=input_data, query=start_date)
                 else:
                     if endpoint in quickbooks_param.reports_required_accounting_type:
                         input_data_2 = quickbooks_param.data_2
@@ -1761,28 +1781,25 @@ class Component(ComponentBase):
                 Mapping(endpoint=endpoint, data=input_data)
 
     def get_tokens(self, oauth):
-
+        """Returns list of refresh tokens: [statefile token, oauth token]"""
         try:
-            refresh_token = oauth["data"]["refresh_token"]
-            access_token = oauth["data"]["access_token"]
-        except TypeError:
+            oauth_refresh = oauth["data"]["refresh_token"]
+        except (TypeError, KeyError):
             raise UserException("OAuth data is not available.")
 
+        refresh_tokens = []
+
+        # Add statefile token first if available
         statefile = self.get_state_file()
-        if statefile.get("tokens", {}).get("ts"):
-            ts_oauth = datetime.datetime.strptime(oauth["created"], "%Y-%m-%dT%H:%M:%S.%fZ")
-            ts_statefile = datetime.datetime.strptime(statefile["tokens"]["ts"], "%Y-%m-%dT%H:%M:%S.%fZ")
+        state_refresh = statefile.get("tokens", {}).get("#refresh_token")
 
-            if ts_statefile > ts_oauth:
-                refresh_token = statefile["tokens"].get("#refresh_token")
-                access_token = statefile["tokens"].get("#access_token")
-                logging.debug("Loaded tokens from statefile.")
-            else:
-                logging.debug("Using tokens from oAuth.")
-        else:
-            logging.warning("No timestamp found in statefile. Using oAuth tokens.")
+        if state_refresh:
+            refresh_tokens.append(state_refresh)
 
-        return refresh_token, access_token
+        # Always add oauth token as fallback
+        refresh_tokens.append(oauth_refresh)
+
+        return refresh_tokens
 
     def process_pnl_report(self, quickbooks_param, start_date, end_date, summarize_column_by):
         results_cash = []
@@ -1796,7 +1813,7 @@ class Component(ComponentBase):
                 "obj_type": obj_type,
                 "obj_group": obj_group,
                 "start_date": start_date,
-                "end_date": end_date
+                "end_date": end_date,
             }
             if method == "cash":
                 results_cash.append(res_dict)
@@ -1839,16 +1856,19 @@ class Component(ComponentBase):
 
         valid_object_summaries = ["Class", "Department", "Total"]
         if summarize_column_by not in valid_object_summaries:
-            raise UserException(f"The component can process ProfitAndLossQuery report only for"
-                                f" {valid_object_summaries}.")
+            raise UserException(
+                f"The component can process ProfitAndLossQuery report only for {valid_object_summaries}."
+            )
 
         if summarize_column_by != "Total":
-            self.fetch(quickbooks_param=quickbooks_param,
-                       endpoint="CustomQuery",
-                       report_api_bool=True,
-                       start_date=start_date,
-                       end_date=end_date,
-                       query=f"select * from {summarize_column_by}")
+            self.fetch(
+                quickbooks_param=quickbooks_param,
+                endpoint="CustomQuery",
+                report_api_bool=True,
+                start_date=start_date,
+                end_date=end_date,
+                query=f"select * from {summarize_column_by}",
+            )
 
             query_result = quickbooks_param.data
 
@@ -1858,8 +1878,10 @@ class Component(ComponentBase):
             logging.debug(f"Found summary categories: {summary_names}")
 
             if not summary_names:
-                raise UserException(f"API returned no {summarize_column_by}. Please make sure you have relevant "
-                                    f"objects set up in your Quickbooks account.")
+                raise UserException(
+                    f"API returned no {summarize_column_by}. Please make sure you have relevant "
+                    f"objects set up in your Quickbooks account."
+                )
             else:
                 logging.debug(f"Summarize is: {summarize_column_by}")
                 if summarize_column_by:
@@ -1880,21 +1902,23 @@ class Component(ComponentBase):
             else:
                 logging.debug("Filtering for pnl report is not set.")
 
-            self.fetch(quickbooks_param=quickbooks_param,
-                       endpoint="ProfitAndLoss",
-                       report_api_bool=True,
-                       start_date=start_date,
-                       end_date=end_date,
-                       query="",
-                       params=params)
+            self.fetch(
+                quickbooks_param=quickbooks_param,
+                endpoint="ProfitAndLoss",
+                report_api_bool=True,
+                start_date=start_date,
+                end_date=end_date,
+                query="",
+                params=params,
+            )
 
-            summarize_by = quickbooks_param.data['Header'].get("SummarizeColumnsBy", False)
+            summarize_by = quickbooks_param.data["Header"].get("SummarizeColumnsBy", False)
 
             if not summarize_by:
                 # This part is currently not used since we always group by Class, Department or Total
 
-                report_accrual = quickbooks_param.data['Rows']['Row']
-                report_cash = quickbooks_param.data_2['Rows']['Row']
+                report_accrual = quickbooks_param.data["Rows"]["Row"]
+                report_cash = quickbooks_param.data_2["Rows"]["Row"]
 
                 for obj in report_cash:
                     process_object(obj, summary_name, method="cash")
@@ -1905,23 +1929,31 @@ class Component(ComponentBase):
                 report_accrual_data = quickbooks_param.data
                 report_cash_data = quickbooks_param.data_2
 
-                header = quickbooks_param.data['Header']
-                summarize_by = header['SummarizeColumnsBy']
-                currency = header['Currency']
+                header = quickbooks_param.data["Header"]
+                summarize_by = header["SummarizeColumnsBy"]
+                currency = header["Currency"]
 
-                results_cash.append(self.preprocess_dict(report_cash_data,
-                                                         summary_name,
-                                                         summarize_by=summarize_by,
-                                                         currency=currency,
-                                                         start_date=start_date,
-                                                         end_date=end_date))
+                results_cash.append(
+                    self.preprocess_dict(
+                        report_cash_data,
+                        summary_name,
+                        summarize_by=summarize_by,
+                        currency=currency,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                )
 
-                results_accrual.append(self.preprocess_dict(report_accrual_data,
-                                                            summary_name,
-                                                            summarize_by=summarize_by,
-                                                            currency=currency,
-                                                            start_date=start_date,
-                                                            end_date=end_date))
+                results_accrual.append(
+                    self.preprocess_dict(
+                        report_accrual_data,
+                        summary_name,
+                        summarize_by=summarize_by,
+                        currency=currency,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                )
 
         """
         # This is here in case we will ever need to do reports that are not summarized
@@ -1938,11 +1970,11 @@ class Component(ComponentBase):
     def preprocess_dict(obj, class_name, summarize_by, currency, start_date, end_date):
         results = []
 
-        rows = obj['Rows']['Row']
-        cols = obj['Columns']['Column']
+        rows = obj["Rows"]["Row"]
+        cols = obj["Columns"]["Column"]
         group_by = []
         for col in cols:
-            group_by.append(col['ColTitle'])
+            group_by.append(col["ColTitle"])
 
         def save_result(_class_name, name, value, obj_type, obj_group, category_name="", category_id=""):
             res_dict = {
@@ -1956,7 +1988,7 @@ class Component(ComponentBase):
                 "start_date": start_date,
                 "end_date": end_date,
                 "summarize_by": summarize_by,
-                "currency": currency
+                "currency": currency,
             }
             results.append(res_dict)
 
@@ -1966,7 +1998,7 @@ class Component(ComponentBase):
             category_id = col_data[0].get("id", "")
             for name, val in zip(group_by, col_data):
                 if name:
-                    save_result(class_name, name, val['value'], obj_type, obj_group, category_name, category_id)
+                    save_result(class_name, name, val["value"], obj_type, obj_group, category_name, category_id)
 
         def process_object(obj, class_name):
             obj_type = obj.get("type", "")
@@ -1996,18 +2028,28 @@ class Component(ComponentBase):
         return results
 
     def save_pnl_report_to_csv(self, table_name: str, results: list):
-
         logging.debug(f"Saving pnl_report results to {table_name}.")
 
         pk = ["class", "name", "obj_type", "category_id", "start_date", "end_date"]
-        columns = ["class", "name", "value", "obj_type", "obj_group", "category_name", "category_id",
-                   "start_date", "end_date", "summarize_by", "currency"]
+        columns = [
+            "class",
+            "name",
+            "value",
+            "obj_type",
+            "obj_group",
+            "category_name",
+            "category_id",
+            "start_date",
+            "end_date",
+            "summarize_by",
+            "currency",
+        ]
 
         table_def = self.create_out_table_definition(table_name, primary_key=pk, incremental=self.incremental)
 
         file_exists = os.path.isfile(table_def.full_path)
 
-        with open(table_def.full_path, 'a', newline='') as csvfile:
+        with open(table_def.full_path, "a", newline="") as csvfile:
             wr = csv.DictWriter(csvfile, fieldnames=columns)
             if not file_exists:
                 wr.writeheader()
@@ -2026,7 +2068,7 @@ class Component(ComponentBase):
                 start_date=start_date,
                 end_date=end_date,
                 query=query if query else "",
-                params=params
+                params=params,
             )
         except QuickBooksClientException as e:
             raise UserException(e) from e
@@ -2037,7 +2079,7 @@ class Component(ComponentBase):
         if not dt:
             return None
 
-        dt_format = '%Y-%m-%d'
+        dt_format = "%Y-%m-%d"
         today = datetime.date.today()
         if dt == "PrevMonthStart":
             result = today.replace(day=1) - relativedelta(months=1)
@@ -2047,13 +2089,14 @@ class Component(ComponentBase):
             try:
                 datetime.date.fromisoformat(dt)
             except ValueError:
-                raise UserException(f"Date {dt} is invalid. Valid types are: "
-                                    f"PrevMonthStart, PrevMonthEnd or YYYY-MM-DD")
+                raise UserException(
+                    f"Date {dt} is invalid. Valid types are: PrevMonthStart, PrevMonthEnd or YYYY-MM-DD"
+                )
             return dt
         return result.strftime(dt_format)
 
     def _get_storage_token(self) -> str:
-        token = self.configuration.parameters.get('#storage_token') or self.environment_variables.token
+        token = self.configuration.parameters.get("#storage_token") or self.environment_variables.token
         if not token:
             raise UserException("Cannot retrieve storage token from env variables and/or config.")
         return token
@@ -2098,7 +2141,6 @@ class Mapping:
     """
 
     def __init__(self, endpoint, data):
-
         self.endpoint = endpoint
         self.mapping = self.mapping_check(self.endpoint)
         self.out_file = {self.endpoint: []}
@@ -2115,7 +2157,7 @@ class Mapping:
         """
         Selecting the Right Mapping for the specified endpoint
         """
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mappings.json"), 'r') as f:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mappings.json"), "r") as f:
             out = json.load(f)
         f.close()
         return out[endpoint]
@@ -2167,7 +2209,6 @@ class Mapping:
                 header = mapping[column]["mapping"]["destination"]
 
             elif mapping[column]["type"] == "table":
-
                 # Setting up table parameters,
                 # mappings and values for parsing the nested table
                 mapping_name = column
@@ -2195,18 +2236,13 @@ class Mapping:
 
                 # Verify if the sub-table exist in the root table
                 if sub_table_exist and sub_table_row_exist:
-
                     # Setting up nested table primary key
                     # Using current table id to create unique pk with md5
                     string_of_pk = ""  # Concat all the PK as a string # noqa
                     # Iterate through all the pk
-                    sub_table_pk = mapping[column]["destination"] + \
-                        "-"+str(uuid.uuid4().hex)
+                    sub_table_pk = mapping[column]["destination"] + "-" + str(uuid.uuid4().hex)
 
-                    mapping_in["parent_table"] = {
-                        "type": "pk",
-                        "value": sub_table_pk
-                    }
+                    mapping_in["parent_table"] = {"type": "pk", "value": sub_table_pk}
 
                     # Loop nested table
                     self._parse_table(sub_table_name, mapping_in, data_in)
@@ -2223,7 +2259,6 @@ class Mapping:
             # Sub table's Primary Key
             # Source: injected new property when new table is found in the mapping
             elif mapping[column]["type"] == "pk":
-
                 header = column
                 value = mapping[column]["value"]
 
@@ -2256,31 +2291,23 @@ class Mapping:
 
         # If table_name does not exist in the PK list
         if table_name not in self.out_file_pk_raw:
-
             self.out_file_pk_raw[table_name] = []
             self.out_file_pk[table_name] = []
 
         for column in mapping:
-
             # Column type is "column"
             if mapping[column]["type"] == "column":
-
                 # Search if the primaryKey property is within the mapping configuration
                 if "primaryKey" in mapping[column]["mapping"]:
-
                     # Confirm if the primary key tab is true
                     if mapping[column]["mapping"]["primaryKey"]:
-
                         self.out_file_pk_raw[table_name].append(column)
-                        self.out_file_pk[table_name].append(
-                            mapping[column]["mapping"]["destination"])
+                        self.out_file_pk[table_name].append(mapping[column]["mapping"]["destination"])
 
             # Column type is "table"
             if mapping[column]["type"] == "table":
-
                 # Recursively run the tableMapping
-                self.get_primary_key(
-                    table_name=mapping[column]["destination"], mapping=mapping[column]["tableMapping"])
+                self.get_primary_key(table_name=mapping[column]["destination"], mapping=mapping[column]["tableMapping"])
 
     @staticmethod
     def produce_manifest(file_name, primary_key, columns):
@@ -2288,14 +2315,10 @@ class Mapping:
         Dummy function to return header per file type.
         """
 
-        file = DEFAULT_FILE_DESTINATION+str(file_name)+".csv.manifest"
+        file = DEFAULT_FILE_DESTINATION + str(file_name) + ".csv.manifest"
         logging.debug("Manifest output: {0}".format(file))
 
-        manifest_template = {
-            "incremental": False,
-            "delimiter": ",",
-            "enclosure": "\""
-        }
+        manifest_template = {"incremental": False, "delimiter": ",", "enclosure": '"'}
 
         column_header = []  # noqa
 
@@ -2304,7 +2327,7 @@ class Mapping:
         manifest["columns"] = columns
 
         try:
-            with open(file, 'w') as file_out:
+            with open(file, "w") as file_out:
                 json.dump(manifest, file_out)
                 # logging.info("Output manifest file ({0}) produced.".format(file_name))
         except Exception as e:
@@ -2323,10 +2346,9 @@ class Mapping:
         out_file = self.out_file
 
         for file in out_file:
-
             out_df = pd.DataFrame(out_file[file])
-            file_dest = DEFAULT_FILE_DESTINATION+file+".csv"
-            out_df.to_csv(file_dest, index=False, mode='a', header=False)
+            file_dest = DEFAULT_FILE_DESTINATION + file + ".csv"
+            out_df.to_csv(file_dest, index=False, mode="a", header=False)
             logging.debug("Table output: {0}...".format(file_dest))
 
             # Outputting manifest file if incremental
@@ -5789,7 +5811,7 @@ class ReportMapping:
     Parser dedicated for Report endpoint
     """
 
-    def __init__(self, endpoint, data, query='', accounting_type=''):
+    def __init__(self, endpoint, data, query="", accounting_type=""):
         # Parameters
         self.endpoint = endpoint
         self.data = data
@@ -5799,7 +5821,7 @@ class ReportMapping:
             "ReportName",
             # "DateMacro",
             "StartPeriod",
-            "EndPeriod"
+            "EndPeriod",
         ]
         self.primary_key = ["ReportName", "StartPeriod", "EndPeriod"]
         self.query = query
@@ -5808,40 +5830,28 @@ class ReportMapping:
         self.data_out = []
 
         # Run
-        report_cant_parse = [
-            "CashFlow",
-            "ProfitAndLossDetail",
-            "TransactionList",
-            "GeneralLedger",
-            "TrialBalance"
-        ]
+        report_cant_parse = ["CashFlow", "ProfitAndLossDetail", "TransactionList", "GeneralLedger", "TrialBalance"]
 
         if endpoint not in report_cant_parse:
-
             self.itr = 1
-            self.data_out = self.parse(
-                data["Rows"]["Row"], self.header, self.itr)
+            self.data_out = self.parse(data["Rows"]["Row"], self.header, self.itr)
             self.columns = self.arrange_header(self.columns)
             self.output(self.endpoint, self.data_out, self.primary_key)
 
         elif endpoint == "CustomQuery":
-
             self.columns = ["query", "value"]
             self.data_out.append(self.columns)
             self.data_out.append("{0}".format(json.dumps(data)))
             self.pk = []
-            self.output_1cell(self.endpoint, self.columns,
-                              self.data_out, self.pk)
+            self.output_1cell(self.endpoint, self.columns, self.data_out, self.pk)
 
         else:  # Outputting tables which cannot parse
-
             for item in self.columns:
                 self.data_out.append(self.header[item])
 
             self.data_out.append("{0}".format(json.dumps(data)))
             self.columns.append("value")
-            self.output_1cell(self.endpoint, self.columns,
-                              self.data_out, self.primary_key)
+            self.output_1cell(self.endpoint, self.columns, self.data_out, self.primary_key)
 
     @staticmethod
     def construct_header(data):
@@ -5851,18 +5861,16 @@ class ReportMapping:
         """
 
         if "Header" not in data:
-
             raise Exception("Header is missing. Unable to parse request.")
 
         else:
-
             temp = data["Header"]
             json_out = {
                 "Time": temp["Time"],
                 "ReportName": temp["ReportName"],
                 # "DateMacro": temp["DateMacro"],
                 "StartPeriod": temp["StartPeriod"],
-                "EndPeriod": temp["EndPeriod"]
+                "EndPeriod": temp["EndPeriod"],
             }
 
         return json_out
@@ -5875,9 +5883,9 @@ class ReportMapping:
 
         if columns.index("value") != (len(columns) - 1):
             # If "value" is not at the end of the row index
-            columns.remove('value')
+            columns.remove("value")
 
-        if 'value' not in columns:
+        if "value" not in columns:
             # append the value back into the column if it does not exist
             columns.append("value")
 
@@ -5898,7 +5906,6 @@ class ReportMapping:
             row_name = "Col_{0}".format(itr)
 
             if ("type" not in i) and ("group" in i):
-
                 if row_name not in self.columns:
                     self.columns.append(row_name)
                     self.primary_key.append(row_name)
@@ -5911,26 +5918,22 @@ class ReportMapping:
                 data_out = data_out + temp_out
 
             elif i["type"] == "Section":
-
                 if row_name not in self.columns:
                     self.columns.append(row_name)
                     self.primary_key.append(row_name)
 
                 # Use Group if Header is not found as column values
                 if "Header" in i:
-
                     row[row_name] = i["Header"]["ColData"][0]["value"]
                     # Recursion when type data is not found
                     temp_out = self.parse(i["Rows"]["Row"], row, itr + 1)
 
                 elif "group" in i:
-
                     # Column name
                     row[row_name] = i["group"]
 
                     # Row value , assuming no more recursion
-                    row["Col_{0}".format(
-                        itr + 1)] = i["Summary"]["ColData"][0]["value"]
+                    row["Col_{0}".format(itr + 1)] = i["Summary"]["ColData"][0]["value"]
                     row["value"] = i["Summary"]["ColData"][1]["value"]
                     temp_out = [row]
 
@@ -5941,7 +5944,6 @@ class ReportMapping:
                 data_out = data_out + temp_out  # Append data back to section
 
             elif (i["type"] == "Data") or ("ColData" in i):
-
                 if row_name not in self.columns:
                     self.columns.append(row_name)
                     self.primary_key.append(row_name)
@@ -5955,8 +5957,7 @@ class ReportMapping:
                 data_out.append(temp_row)
 
             else:
-                raise Exception(
-                    "No type found within the row. Please validate the data.")
+                raise Exception("No type found within the row. Please validate the data.")
 
         return data_out
 
@@ -5985,10 +5986,9 @@ class ReportMapping:
         manifest["primary_key"] = primary_key
 
         try:
-            with open(file, 'w') as file_out:
+            with open(file, "w") as file_out:
                 json.dump(manifest, file_out)
-                logging.info(
-                    "Output manifest file ({0}) produced.".format(file_name))
+                logging.info("Output manifest file ({0}) produced.".format(file_name))
         except Exception as e:
             logging.error("Could not produce output file manifest.")
             logging.error(e)
@@ -5999,7 +5999,7 @@ class ReportMapping:
         """
 
         temp_df = pd.DataFrame(data)
-        if self.accounting_type == '':
+        if self.accounting_type == "":
             filename = endpoint + ".csv"
         else:
             filename = "{0}_{1}.csv".format(endpoint, self.accounting_type)
@@ -6007,8 +6007,7 @@ class ReportMapping:
         logging.info("Outputting {0}...".format(filename))
         file_out_path = DEFAULT_FILE_DESTINATION + filename
         print(f"Saving file to: {file_out_path}")
-        temp_df.to_csv(file_out_path,
-                       index=False, columns=self.columns)
+        temp_df.to_csv(file_out_path, index=False, columns=self.columns)
         self.produce_manifest(filename, pk)
 
     def output_1cell(self, endpoint, columns, data, pk):
@@ -6017,7 +6016,7 @@ class ReportMapping:
         """
 
         # Construct output filename
-        if self.accounting_type == '':
+        if self.accounting_type == "":
             filename = endpoint + ".csv"
         else:
             filename = "{0}_{1}.csv".format(endpoint, self.accounting_type)
