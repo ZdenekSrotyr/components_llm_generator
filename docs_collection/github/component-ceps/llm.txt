@@ -120,6 +120,10 @@ Sample Configuration
             {
                 "endpoint_name": "RegulationEnergyB",
                 "granularity": "MI"
+            },
+            {
+                "endpoint_name": "AktualniSystemovaOdchylkaCR",
+                "granularity": "MI"
             }
         ]
     },
@@ -162,6 +166,7 @@ Integration
 
 For information about deployment and integration with KBC, please refer to the
 [deployment section of developers documentation](https://developers.keboola.com/extend/component/deployment/)
+
 
 
 ================================================
@@ -264,7 +269,7 @@ services:
 ================================================
 FILE: Dockerfile
 ================================================
-FROM python:3.8.6-slim
+FROM python:3.11-slim
 ENV PYTHONIOENCODING utf-8
 
 COPY /src /code/src/
@@ -351,7 +356,7 @@ freezegun==1.1.0
 zeep==4.1.0
 requests==2.27.1
 platformdirs==2.5.0
-pyarrow==7.0.0
+pyarrow>=14.0.0
 pygelf==0.4.2
 python-dateutil==2.8.2
 pytz==2021.3
@@ -647,6 +652,7 @@ FILE: component_config/configSchema.json
             "type": "string",
             "title": "Endpoint name",
             "enum": [
+              "AktualniSystemovaOdchylkaCR",
               "CrossborderPowerFlows",
               "Generation",
               "GenerationPlan",
@@ -704,6 +710,7 @@ FILE: component_config/configSchema.json
     }
   }
 }
+
 
 
 ================================================
@@ -1351,8 +1358,8 @@ class Component(ComponentBase):
 
     @staticmethod
     def get_endpoint_p_keys(endpoint_name):
-        if endpoint_name in ["CrossborderPowerFlows", "Generation", "GenerationPlan", "GenerationPlan", "Load",
-                             "RegulationEnergy", "RegulationEnergyB"]:
+        if endpoint_name in ["CrossborderPowerFlows", "Generation", "GenerationPlan", "Load",
+                             "RegulationEnergy", "RegulationEnergyB", "AktualniSystemovaOdchylkaCR"]:
             return ["date"]
         elif endpoint_name in ["OdhadovanaCenaOdchylky"]:
             return ["hour", "date"]
@@ -1647,6 +1654,12 @@ WSDL_URL = 'https://www.ceps.cz/_layouts/CepsData.asmx?wsdl'
 
 MAX_RETRIES = 10
 
+# Custom column name mappings to override header normalizer output
+# The header normalizer drops diacritics incorrectly (e.g., 'í' -> '' instead of 'i')
+COLUMN_NAME_OVERRIDES = {
+    "aktuln_odchylka_mw": "aktualni_odchylka_mw"
+}
+
 
 class CepsClientException(Exception):
     pass
@@ -1703,13 +1716,12 @@ class CepsClient:
     def get_data(self, endpoint, date_start, date_end, granularity="HR", function="AVG", version="RT"):
         if endpoint == "DataVersion":
             return self.get_data_version(endpoint)
-        elif endpoint in ["RegulationEnergy", "RegulationEnergyB"]:
-            return self.get_timeseries_data(endpoint, date_start, date_end, granularity=granularity, function=function,
-                                            version=version, add_para1=False)
         elif endpoint in ["NepredvidatelneOdmitnuteNabidky", "OdhadovanaCenaOdchylky", "OfferPrices"]:
             return self.get_timeseries_data(endpoint, date_start, date_end, add_para1=False)
-
-        elif endpoint in ["CrossborderPowerFlows", "GenerationPlan", "Load"]:
+        elif endpoint in ["AktualniSystemovaOdchylkaCR"]:
+            return self.get_timeseries_data(endpoint, date_start, date_end, granularity=granularity, function=function,
+                                            add_para1=False)
+        elif endpoint in ["RegulationEnergy", "RegulationEnergyB", "CrossborderPowerFlows", "GenerationPlan", "Load"]:
             return self.get_timeseries_data(endpoint, date_start, date_end, granularity=granularity, function=function,
                                             version=version, add_para1=False)
         else:
@@ -1780,8 +1792,9 @@ class CepsClient:
         if add_date:
             field_names_dict["@date"] = "date"
         for field_name in field_names:
-            field_names_dict[f"@{field_name['@id']}"] = \
-                header_normalizer._normalize_column_name(field_name["@name"]).lower()
+            normalized_name = header_normalizer._normalize_column_name(field_name["@name"]).lower()
+            normalized_name = COLUMN_NAME_OVERRIDES.get(normalized_name, normalized_name)
+            field_names_dict["@" + field_name["@id"]] = normalized_name
         return field_names_dict
 
     @staticmethod
@@ -1894,9 +1907,15 @@ FILE: src/ceps/endpoint_columns.json
       "seps_planned_mw",
       "apg_planned_mw",
       "granularity"
+    ],
+    "AktualniSystemovaOdchylkaCR": [
+      "date",
+      "aktualni_odchylka_mw",
+      "granularity"
     ]
   }
 }
+
 
 
 ================================================
@@ -1946,14 +1965,13 @@ FILE: .github/workflows/push.yml
 ================================================
 name: Keboola Component Build & Deploy Pipeline
 on:
-  push:
-    branches:
-      - 'feature/*'
-      - 'bug/*'
+  push:  # skip the workflow on the main branch without tags
+    branches-ignore:
+      - main
     tags:
-      - '*' # Skip the workflow on the main branch without tags
+      - "*"
 
-concurrency: ci-${{ github.ref }} # to avoid tag collisions in the ECR
+concurrency: ci-${{ github.ref }}  # to avoid tag collisions in the ECR
 env:
   # repository variables:
   KBC_DEVELOPERPORTAL_APP: "kds-team.ex-ceps" # replace with your component id
@@ -1993,7 +2011,7 @@ jobs:
             echo "branch_name=$branch_name" | tee -a $GITHUB_OUTPUT
           else
             raw=$(git branch -r --contains ${{ github.ref }})
-            branch="$(echo ${raw//origin\//} | tr -d '\n')"
+            branch="$(echo ${raw/*origin\//} | tr -d '\n')"
             echo "branch_name=$branch" | tee -a $GITHUB_OUTPUT
           fi
 
@@ -2176,4 +2194,5 @@ jobs:
         run: |
           chmod +x scripts/developer_portal/*.sh
           scripts/developer_portal/update_properties.sh
+
 
