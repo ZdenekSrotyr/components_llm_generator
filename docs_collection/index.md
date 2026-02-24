@@ -997,6 +997,11 @@
 - Repository: https://github.com/keboola/component-sage-intacct-extractor
 - Description: None
 
+### component-xero-accounting-writer
+- [Documentation](github/component-xero-accounting-writer/llm.txt)
+- Repository: https://github.com/keboola/component-xero-accounting-writer
+- Description: Keboola writer component for Xero Accounting API
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors

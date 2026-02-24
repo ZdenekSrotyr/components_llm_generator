@@ -1,0 +1,3439 @@
+Directory structure:
+└── keboola-component-xero-accounting-writer/
+    ├── deploy.sh
+    ├── docker-compose.yml
+    ├── Dockerfile
+    ├── flake8.cfg
+    ├── pyproject.toml
+    ├── uv.lock
+    ├── component_config/
+    │   ├── component_long_description.md
+    │   ├── component_short_description.md
+    │   ├── configRowSchema.json
+    │   ├── configSchema.json
+    │   ├── loggerConfiguration.json
+    │   └── sample-config/
+    │       ├── config.json
+    │       └── in/
+    │           └── tables/
+    │               └── contacts.csv
+    ├── scripts/
+    │   ├── build_n_test.sh
+    │   └── developer_portal/
+    │       ├── fn_actions_md_update.sh
+    │       └── update_properties.sh
+    ├── src/
+    │   ├── __init__.py
+    │   ├── component.py
+    │   ├── configuration.py
+    │   ├── client/
+    │   │   ├── __init__.py
+    │   │   └── xero_client.py
+    │   └── writers/
+    │       ├── __init__.py
+    │       ├── bank_transactions.py
+    │       ├── base_writer.py
+    │       ├── contacts.py
+    │       ├── credit_notes.py
+    │       ├── currencies.py
+    │       ├── employees.py
+    │       ├── invoices.py
+    │       ├── items.py
+    │       ├── manual_journals.py
+    │       ├── payments.py
+    │       ├── purchase_orders.py
+    │       ├── quotes.py
+    │       └── tracking_categories.py
+    ├── tests/
+    │   ├── __init__.py
+    │   └── functional/
+    │       ├── __init__.py
+    │       └── test_component.py
+    └── .github/
+        └── workflows/
+            └── push.yml
+
+================================================
+FILE: deploy.sh
+================================================
+#!/bin/sh
+set -e
+
+env
+
+# compatibility with travis and bitbucket
+if [ ! -z ${BITBUCKET_TAG} ]
+then
+	echo "assigning bitbucket tag"
+	export TAG="$BITBUCKET_TAG"
+elif [ ! -z ${TRAVIS_TAG} ]
+then
+	echo "assigning travis tag"
+	export TAG="$TRAVIS_TAG"
+elif [ ! -z ${GITHUB_TAG} ]
+then
+	echo "assigning github tag"
+	export TAG="$GITHUB_TAG"
+else
+	echo No Tag is set!
+	exit 1
+fi
+
+echo "Tag is '${TAG}'"
+
+#check if deployment is triggered only in master
+if [ ${BITBUCKET_BRANCH} != "master" ]; then
+               echo Deploy on tagged commit can be only executed in master!
+               exit 1
+fi
+
+# Obtain the component repository and log in
+echo "Obtain the component repository and log in"
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+export REPOSITORY=`docker run --rm  \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP}`
+
+echo "Set credentials"
+eval $(docker run --rm \
+    -e KBC_DEVELOPERPORTAL_USERNAME \
+    -e KBC_DEVELOPERPORTAL_PASSWORD \
+    quay.io/keboola/developer-portal-cli-v2:latest \
+    ecr:get-login ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP})
+
+# Push to the repository
+echo "Push to the repository"
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:${TAG}
+docker tag ${APP_IMAGE}:latest ${REPOSITORY}:latest
+docker push ${REPOSITORY}:${TAG}
+docker push ${REPOSITORY}:latest
+
+# Update the tag in Keboola Developer Portal -> Deploy to KBC
+if echo ${TAG} | grep -c '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$'
+then
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-repository ${KBC_DEVELOPERPORTAL_VENDOR} ${KBC_DEVELOPERPORTAL_APP} ${TAG} ecr ${REPOSITORY}
+else
+    echo "Skipping deployment to KBC, tag ${TAG} is not allowed."
+fi
+
+
+
+================================================
+FILE: docker-compose.yml
+================================================
+services:
+  # for development purposes
+  dev:
+    build: .
+    volumes:
+        - ./:/code
+        - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+  test:
+    # Use to run flake8 and unittests checks
+    build: .
+    volumes:
+      - ./:/code
+      - ./data:/data
+    environment:
+      - KBC_DATADIR=./data
+    command:
+      - /bin/sh
+      - /code/scripts/build_n_test.sh
+
+
+
+================================================
+FILE: Dockerfile
+================================================
+FROM python:3.12-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Required for building xero-python, regex, ratelimit (C extensions)
+RUN apt-get update && apt-get install -y build-essential
+
+WORKDIR /code/
+
+COPY pyproject.toml .
+COPY uv.lock .
+
+ENV UV_PROJECT_ENVIRONMENT="/usr/local/"
+RUN uv sync --all-groups --frozen
+
+COPY src/ src
+COPY tests/ tests
+COPY scripts/ scripts
+COPY flake8.cfg .
+COPY deploy.sh .
+
+CMD ["python", "-u", "src/component.py"]
+
+
+
+================================================
+FILE: flake8.cfg
+================================================
+[flake8]
+max-line-length = 120
+exclude =
+    .git,
+    .venv,
+    venv,
+    env,
+    build,
+    dist,
+    data,
+    __pycache__
+
+
+
+================================================
+FILE: pyproject.toml
+================================================
+[project]
+name = "xero-accounting-writer"
+dynamic = ["version"]
+readme = "README.md"
+requires-python = "~=3.12.0"
+dependencies = [
+    "freezegun~=1.5.1",
+    "keboola-component>=1.6.10",
+    "keboola-http-client>=1.0.1",
+    "keboola-utils>=1.1.0",
+    "mock~=5.1.0",
+    "pydantic~=2.0",
+    "xero-python==4.0.0",
+    "dateparser~=1.2.0",
+    "regex==2022.03.02",
+    "tenacity~=9.0.0",
+    "ratelimit==2.2.1",
+    "urllib3~=2.2.3",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.4.0",
+    "pytest>=7.4.0",
+]
+
+[tool.ruff]
+line-length = 120
+exclude = [".git", ".venv", "venv", "env", "build", "dist", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+
+
+================================================
+FILE: uv.lock
+================================================
+version = 1
+revision = 3
+requires-python = "==3.12.*"
+
+[[package]]
+name = "aiolimiter"
+version = "1.2.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f1/23/b52debf471f7a1e42e362d959a3982bdcb4fe13a5d46e63d28868807a79c/aiolimiter-1.2.1.tar.gz", hash = "sha256:e02a37ea1a855d9e832252a105420ad4d15011505512a1a1d814647451b5cca9", size = 7185, upload-time = "2024-12-08T15:31:51.496Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f3/ba/df6e8e1045aebc4778d19b8a3a9bc1808adb1619ba94ca354d9ba17d86c3/aiolimiter-1.2.1-py3-none-any.whl", hash = "sha256:d3f249e9059a20badcb56b61601a83556133655c11d1eb3dd3e04ff069e5f3c7", size = 6711, upload-time = "2024-12-08T15:31:49.874Z" },
+]
+
+[[package]]
+name = "annotated-types"
+version = "0.7.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ee/67/531ea369ba64dcff5ec9c3402f9f51bf748cec26dde048a2f973a4eea7f5/annotated_types-0.7.0.tar.gz", hash = "sha256:aff07c09a53a08bc8cfccb9c85b05f1aa9a2a6f23728d790723543408344ce89", size = 16081, upload-time = "2024-05-20T21:33:25.928Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/78/b6/6307fbef88d9b5ee7421e68d78a9f162e0da4900bc5f5793f6d3d0e34fb8/annotated_types-0.7.0-py3-none-any.whl", hash = "sha256:1f02e8b43a8fbbc3f3e0d4f0f4bfc8131bcb4eebe8849b8e5c773f3a1c582a53", size = 13643, upload-time = "2024-05-20T21:33:24.1Z" },
+]
+
+[[package]]
+name = "anyio"
+version = "4.12.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "idna" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/96/f0/5eb65b2bb0d09ac6776f2eb54adee6abe8228ea05b20a5ad0e4945de8aac/anyio-4.12.1.tar.gz", hash = "sha256:41cfcc3a4c85d3f05c932da7c26d0201ac36f72abd4435ba90d0464a3ffed703", size = 228685, upload-time = "2026-01-06T11:45:21.246Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/0e/27be9fdef66e72d64c0cdc3cc2823101b80585f8119b5c112c2e8f5f7dab/anyio-4.12.1-py3-none-any.whl", hash = "sha256:d405828884fc140aa80a3c667b8beed277f1dfedec42ba031bd6ac3db606ab6c", size = 113592, upload-time = "2026-01-06T11:45:19.497Z" },
+]
+
+[[package]]
+name = "certifi"
+version = "2026.1.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e0/2d/a891ca51311197f6ad14a7ef42e2399f36cf2f9bd44752b3dc4eab60fdc5/certifi-2026.1.4.tar.gz", hash = "sha256:ac726dd470482006e014ad384921ed6438c457018f4b3d204aea4281258b2120", size = 154268, upload-time = "2026-01-04T02:42:41.825Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e6/ad/3cc14f097111b4de0040c83a525973216457bbeeb63739ef1ed275c1c021/certifi-2026.1.4-py3-none-any.whl", hash = "sha256:9943707519e4add1115f44c2bc244f782c0249876bf51b6599fee1ffbedd685c", size = 152900, upload-time = "2026-01-04T02:42:40.15Z" },
+]
+
+[[package]]
+name = "charset-normalizer"
+version = "3.4.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/13/69/33ddede1939fdd074bce5434295f38fae7136463422fe4fd3e0e89b98062/charset_normalizer-3.4.4.tar.gz", hash = "sha256:94537985111c35f28720e43603b8e7b43a6ecfb2ce1d3058bbe955b73404e21a", size = 129418, upload-time = "2025-10-14T04:42:32.879Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f3/85/1637cd4af66fa687396e757dec650f28025f2a2f5a5531a3208dc0ec43f2/charset_normalizer-3.4.4-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:0a98e6759f854bd25a58a73fa88833fba3b7c491169f86ce1180c948ab3fd394", size = 208425, upload-time = "2025-10-14T04:40:53.353Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/6a/04130023fef2a0d9c62d0bae2649b69f7b7d8d24ea5536feef50551029df/charset_normalizer-3.4.4-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b5b290ccc2a263e8d185130284f8501e3e36c5e02750fc6b6bdeb2e9e96f1e25", size = 148162, upload-time = "2025-10-14T04:40:54.558Z" },
+    { url = "https://files.pythonhosted.org/packages/78/29/62328d79aa60da22c9e0b9a66539feae06ca0f5a4171ac4f7dc285b83688/charset_normalizer-3.4.4-cp312-cp312-manylinux2014_armv7l.manylinux_2_17_armv7l.manylinux_2_31_armv7l.whl", hash = "sha256:74bb723680f9f7a6234dcf67aea57e708ec1fbdf5699fb91dfd6f511b0a320ef", size = 144558, upload-time = "2025-10-14T04:40:55.677Z" },
+    { url = "https://files.pythonhosted.org/packages/86/bb/b32194a4bf15b88403537c2e120b817c61cd4ecffa9b6876e941c3ee38fe/charset_normalizer-3.4.4-cp312-cp312-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:f1e34719c6ed0b92f418c7c780480b26b5d9c50349e9a9af7d76bf757530350d", size = 161497, upload-time = "2025-10-14T04:40:57.217Z" },
+    { url = "https://files.pythonhosted.org/packages/19/89/a54c82b253d5b9b111dc74aca196ba5ccfcca8242d0fb64146d4d3183ff1/charset_normalizer-3.4.4-cp312-cp312-manylinux2014_s390x.manylinux_2_17_s390x.manylinux_2_28_s390x.whl", hash = "sha256:2437418e20515acec67d86e12bf70056a33abdacb5cb1655042f6538d6b085a8", size = 159240, upload-time = "2025-10-14T04:40:58.358Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/10/d20b513afe03acc89ec33948320a5544d31f21b05368436d580dec4e234d/charset_normalizer-3.4.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:11d694519d7f29d6cd09f6ac70028dba10f92f6cdd059096db198c283794ac86", size = 153471, upload-time = "2025-10-14T04:40:59.468Z" },
+    { url = "https://files.pythonhosted.org/packages/61/fa/fbf177b55bdd727010f9c0a3c49eefa1d10f960e5f09d1d887bf93c2e698/charset_normalizer-3.4.4-cp312-cp312-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:ac1c4a689edcc530fc9d9aa11f5774b9e2f33f9a0c6a57864e90908f5208d30a", size = 150864, upload-time = "2025-10-14T04:41:00.623Z" },
+    { url = "https://files.pythonhosted.org/packages/05/12/9fbc6a4d39c0198adeebbde20b619790e9236557ca59fc40e0e3cebe6f40/charset_normalizer-3.4.4-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:21d142cc6c0ec30d2efee5068ca36c128a30b0f2c53c1c07bd78cb6bc1d3be5f", size = 150647, upload-time = "2025-10-14T04:41:01.754Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/1f/6a9a593d52e3e8c5d2b167daf8c6b968808efb57ef4c210acb907c365bc4/charset_normalizer-3.4.4-cp312-cp312-musllinux_1_2_armv7l.whl", hash = "sha256:5dbe56a36425d26d6cfb40ce79c314a2e4dd6211d51d6d2191c00bed34f354cc", size = 145110, upload-time = "2025-10-14T04:41:03.231Z" },
+    { url = "https://files.pythonhosted.org/packages/30/42/9a52c609e72471b0fc54386dc63c3781a387bb4fe61c20231a4ebcd58bdd/charset_normalizer-3.4.4-cp312-cp312-musllinux_1_2_ppc64le.whl", hash = "sha256:5bfbb1b9acf3334612667b61bd3002196fe2a1eb4dd74d247e0f2a4d50ec9bbf", size = 162839, upload-time = "2025-10-14T04:41:04.715Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/5b/c0682bbf9f11597073052628ddd38344a3d673fda35a36773f7d19344b23/charset_normalizer-3.4.4-cp312-cp312-musllinux_1_2_riscv64.whl", hash = "sha256:d055ec1e26e441f6187acf818b73564e6e6282709e9bcb5b63f5b23068356a15", size = 150667, upload-time = "2025-10-14T04:41:05.827Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/24/a41afeab6f990cf2daf6cb8c67419b63b48cf518e4f56022230840c9bfb2/charset_normalizer-3.4.4-cp312-cp312-musllinux_1_2_s390x.whl", hash = "sha256:af2d8c67d8e573d6de5bc30cdb27e9b95e49115cd9baad5ddbd1a6207aaa82a9", size = 160535, upload-time = "2025-10-14T04:41:06.938Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/e5/6a4ce77ed243c4a50a1fecca6aaaab419628c818a49434be428fe24c9957/charset_normalizer-3.4.4-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:780236ac706e66881f3b7f2f32dfe90507a09e67d1d454c762cf642e6e1586e0", size = 154816, upload-time = "2025-10-14T04:41:08.101Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/ef/89297262b8092b312d29cdb2517cb1237e51db8ecef2e9af5edbe7b683b1/charset_normalizer-3.4.4-cp312-cp312-win32.whl", hash = "sha256:5833d2c39d8896e4e19b689ffc198f08ea58116bee26dea51e362ecc7cd3ed26", size = 99694, upload-time = "2025-10-14T04:41:09.23Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/2d/1e5ed9dd3b3803994c155cd9aacb60c82c331bad84daf75bcb9c91b3295e/charset_normalizer-3.4.4-cp312-cp312-win_amd64.whl", hash = "sha256:a79cfe37875f822425b89a82333404539ae63dbdddf97f84dcbc3d339aae9525", size = 107131, upload-time = "2025-10-14T04:41:10.467Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/d9/0ed4c7098a861482a7b6a95603edce4c0d9db2311af23da1fb2b75ec26fc/charset_normalizer-3.4.4-cp312-cp312-win_arm64.whl", hash = "sha256:376bec83a63b8021bb5c8ea75e21c4ccb86e7e45ca4eb81146091b56599b80c3", size = 100390, upload-time = "2025-10-14T04:41:11.915Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/4c/925909008ed5a988ccbb72dcc897407e5d6d3bd72410d69e051fc0c14647/charset_normalizer-3.4.4-py3-none-any.whl", hash = "sha256:7a32c560861a02ff789ad905a2fe94e3f840803362c84fecf1851cb4cf3dc37f", size = 53402, upload-time = "2025-10-14T04:42:31.76Z" },
+]
+
+[[package]]
+name = "colorama"
+version = "0.4.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload-time = "2022-10-25T02:36:22.414Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
+]
+
+[[package]]
+name = "dateparser"
+version = "1.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dateutil" },
+    { name = "pytz" },
+    { name = "regex" },
+    { name = "tzlocal" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bd/3f/d3207a05f5b6a78c66d86631e60bfba5af163738a599a5b9aa2c2737a09e/dateparser-1.2.1.tar.gz", hash = "sha256:7e4919aeb48481dbfc01ac9683c8e20bfe95bb715a38c1e9f6af889f4f30ccc3", size = 309924, upload-time = "2025-02-05T12:34:55.593Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/0a/981c438c4cd84147c781e4e96c1d72df03775deb1bc76c5a6ee8afa89c62/dateparser-1.2.1-py3-none-any.whl", hash = "sha256:bdcac262a467e6260030040748ad7c10d6bacd4f3b9cdb4cfd2251939174508c", size = 295658, upload-time = "2025-02-05T12:34:53.1Z" },
+]
+
+[[package]]
+name = "deprecated"
+version = "1.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "wrapt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/49/85/12f0a49a7c4ffb70572b6c2ef13c90c88fd190debda93b23f026b25f9634/deprecated-1.3.1.tar.gz", hash = "sha256:b1b50e0ff0c1fddaa5708a2c6b0a6588bb09b892825ab2b214ac9ea9d92a5223", size = 2932523, upload-time = "2025-10-30T08:19:02.757Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/84/d0/205d54408c08b13550c733c4b85429e7ead111c7f0014309637425520a9a/deprecated-1.3.1-py2.py3-none-any.whl", hash = "sha256:597bfef186b6f60181535a29fbe44865ce137a5079f295b479886c82729d5f3f", size = 11298, upload-time = "2025-10-30T08:19:00.758Z" },
+]
+
+[[package]]
+name = "freezegun"
+version = "1.5.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dateutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/95/dd/23e2f4e357f8fd3bdff613c1fe4466d21bfb00a6177f238079b17f7b1c84/freezegun-1.5.5.tar.gz", hash = "sha256:ac7742a6cc6c25a2c35e9292dfd554b897b517d2dec26891a2e8debf205cb94a", size = 35914, upload-time = "2025-08-09T10:39:08.338Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5e/2e/b41d8a1a917d6581fc27a35d05561037b048e47df50f27f8ac9c7e27a710/freezegun-1.5.5-py3-none-any.whl", hash = "sha256:cd557f4a75cf074e84bc374249b9dd491eaeacd61376b9eb3c423282211619d2", size = 19266, upload-time = "2025-08-09T10:39:06.636Z" },
+]
+
+[[package]]
+name = "h11"
+version = "0.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/01/ee/02a2c011bdab74c6fb3c75474d40b3052059d95df7e73351460c8588d963/h11-0.16.0.tar.gz", hash = "sha256:4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1", size = 101250, upload-time = "2025-04-24T03:35:25.427Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl", hash = "sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86", size = 37515, upload-time = "2025-04-24T03:35:24.344Z" },
+]
+
+[[package]]
+name = "httpcore"
+version = "1.0.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "h11" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/06/94/82699a10bca87a5556c9c59b5963f2d039dbd239f25bc2a63907a05a14cb/httpcore-1.0.9.tar.gz", hash = "sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8", size = 85484, upload-time = "2025-04-24T22:06:22.219Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl", hash = "sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55", size = 78784, upload-time = "2025-04-24T22:06:20.566Z" },
+]
+
+[[package]]
+name = "httpx"
+version = "0.28.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "certifi" },
+    { name = "httpcore" },
+    { name = "idna" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz", hash = "sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc", size = 141406, upload-time = "2024-12-06T15:37:23.222Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad", size = 73517, upload-time = "2024-12-06T15:37:21.509Z" },
+]
+
+[[package]]
+name = "idna"
+version = "3.11"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6f/6d/0703ccc57f3a7233505399edb88de3cbd678da106337b9fcde432b65ed60/idna-3.11.tar.gz", hash = "sha256:795dafcc9c04ed0c1fb032c2aa73654d8e8c5023a7df64a53f39190ada629902", size = 194582, upload-time = "2025-10-12T14:55:20.501Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0e/61/66938bbb5fc52dbdf84594873d5b51fb1f7c7794e9c0f5bd885f30bc507b/idna-3.11-py3-none-any.whl", hash = "sha256:771a87f49d9defaf64091e6e6fe9c18d4833f140bd19464795bc32d966ca37ea", size = 71008, upload-time = "2025-10-12T14:55:18.883Z" },
+]
+
+[[package]]
+name = "iniconfig"
+version = "2.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc35312d08ba8bf51fdd999c576889fc2c24cb97f4f10/iniconfig-2.3.0.tar.gz", hash = "sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730", size = 20503, upload-time = "2025-10-18T21:55:43.219Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
+]
+
+[[package]]
+name = "keboola-component"
+version = "1.6.13"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "deprecated" },
+    { name = "pygelf" },
+    { name = "pytz" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/91/e9/80a83c04bccaad7f5d7b6e8b9c0305085db2bd22838f7323f57aaaefd2f4/keboola.component-1.6.13.tar.gz", hash = "sha256:11b072da1cab39233ff798217a876cdacf17f446decdb89735f295ca20662874", size = 59550, upload-time = "2025-09-15T14:00:47.874Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/35/f4dab3d75a155260b90c72bb37d03a9bfd24dc18f52ccea2d61e587dbef6/keboola.component-1.6.13-py3-none-any.whl", hash = "sha256:eceda4c2d083b3857d6eb98e30d7bfe48a48ed0f8567e6898218cee4d9391318", size = 44151, upload-time = "2025-09-15T14:00:46.291Z" },
+]
+
+[[package]]
+name = "keboola-http-client"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiolimiter" },
+    { name = "httpx" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0f/b9/8e43e2b7c1f2667a9bc40b96a0098dcdd5d77b8d937fa1312ebd99ad9561/keboola_http_client-1.2.0.tar.gz", hash = "sha256:b3a3bcdc096ab84cff19ffa65d2ee303032c73d2d8d8b8aa93a82fb5ba6da484", size = 18369, upload-time = "2025-11-19T13:19:39.454Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/09/7d/1d2b64896f9fff44de82783194a0def1e683dbfe7a8491db6d88d9a403c9/keboola_http_client-1.2.0-py3-none-any.whl", hash = "sha256:de80f5866d4d0aafc3a67492dc3e2d31d6c7e53f79406d7130620c952a4da493", size = 12632, upload-time = "2025-11-19T13:19:38.003Z" },
+]
+
+[[package]]
+name = "keboola-utils"
+version = "1.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "dateparser" },
+    { name = "pytz" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a7/b8/ccfddc2eb510f7a6ab878ab8a6249a23494194780a436676da6c2f5d23c7/keboola.utils-1.1.0.tar.gz", hash = "sha256:e943dbda932d945bcd5edd51283eea8f7035249c9dac769d3e96d2f507b52f60", size = 9830, upload-time = "2021-04-09T11:11:49.828Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f9/f4/6697a0c2ff512baa7b84413972e51d5449a0a145f68dc750f05a8b1da39d/keboola.utils-1.1.0-py3-none-any.whl", hash = "sha256:8c73faa4a81f371a2eecd8465b08a51b3f7608969dd91d38d5b3bcfad7ef0da5", size = 10131, upload-time = "2021-04-09T11:11:48.826Z" },
+]
+
+[[package]]
+name = "mock"
+version = "5.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/66/ab/41d09a46985ead5839d8be987acda54b5bb93f713b3969cc0be4f81c455b/mock-5.1.0.tar.gz", hash = "sha256:5e96aad5ccda4718e0a229ed94b2024df75cc2d55575ba5762d31f5767b8767d", size = 80232, upload-time = "2023-07-11T13:35:03.936Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6b/20/471f41173930550f279ccb65596a5ac19b9ac974a8d93679bcd3e0c31498/mock-5.1.0-py3-none-any.whl", hash = "sha256:18c694e5ae8a208cdb3d2c20a993ca1a7b0efa258c247a1e565150f477f83744", size = 30938, upload-time = "2023-07-11T13:35:02.101Z" },
+]
+
+[[package]]
+name = "packaging"
+version = "26.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/65/ee/299d360cdc32edc7d2cf530f3accf79c4fca01e96ffc950d8a52213bd8e4/packaging-26.0.tar.gz", hash = "sha256:00243ae351a257117b6a241061796684b084ed1c516a08c48a3f7e147a9d80b4", size = 143416, upload-time = "2026-01-21T20:50:39.064Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/b9/c538f279a4e237a006a2c98387d081e9eb060d203d8ed34467cc0f0b9b53/packaging-26.0-py3-none-any.whl", hash = "sha256:b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529", size = 74366, upload-time = "2026-01-21T20:50:37.788Z" },
+]
+
+[[package]]
+name = "pluggy"
+version = "1.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+]
+
+[[package]]
+name = "pydantic"
+version = "2.12.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "annotated-types" },
+    { name = "pydantic-core" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/69/44/36f1a6e523abc58ae5f928898e4aca2e0ea509b5aa6f6f392a5d882be928/pydantic-2.12.5.tar.gz", hash = "sha256:4d351024c75c0f085a9febbb665ce8c0c6ec5d30e903bdb6394b7ede26aebb49", size = 821591, upload-time = "2025-11-26T15:11:46.471Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5a/87/b70ad306ebb6f9b585f114d0ac2137d792b48be34d732d60e597c2f8465a/pydantic-2.12.5-py3-none-any.whl", hash = "sha256:e561593fccf61e8a20fc46dfc2dfe075b8be7d0188df33f221ad1f0139180f9d", size = 463580, upload-time = "2025-11-26T15:11:44.605Z" },
+]
+
+[[package]]
+name = "pydantic-core"
+version = "2.41.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/71/70/23b021c950c2addd24ec408e9ab05d59b035b39d97cdc1130e1bce647bb6/pydantic_core-2.41.5.tar.gz", hash = "sha256:08daa51ea16ad373ffd5e7606252cc32f07bc72b28284b6bc9c6df804816476e", size = 460952, upload-time = "2025-11-04T13:43:49.098Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5f/5d/5f6c63eebb5afee93bcaae4ce9a898f3373ca23df3ccaef086d0233a35a7/pydantic_core-2.41.5-cp312-cp312-macosx_10_12_x86_64.whl", hash = "sha256:f41a7489d32336dbf2199c8c0a215390a751c5b014c2c1c5366e817202e9cdf7", size = 2110990, upload-time = "2025-11-04T13:39:58.079Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/32/9c2e8ccb57c01111e0fd091f236c7b371c1bccea0fa85247ac55b1e2b6b6/pydantic_core-2.41.5-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:070259a8818988b9a84a449a2a7337c7f430a22acc0859c6b110aa7212a6d9c0", size = 1896003, upload-time = "2025-11-04T13:39:59.956Z" },
+    { url = "https://files.pythonhosted.org/packages/68/b8/a01b53cb0e59139fbc9e4fda3e9724ede8de279097179be4ff31f1abb65a/pydantic_core-2.41.5-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e96cea19e34778f8d59fe40775a7a574d95816eb150850a85a7a4c8f4b94ac69", size = 1919200, upload-time = "2025-11-04T13:40:02.241Z" },
+    { url = "https://files.pythonhosted.org/packages/38/de/8c36b5198a29bdaade07b5985e80a233a5ac27137846f3bc2d3b40a47360/pydantic_core-2.41.5-cp312-cp312-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:ed2e99c456e3fadd05c991f8f437ef902e00eedf34320ba2b0842bd1c3ca3a75", size = 2052578, upload-time = "2025-11-04T13:40:04.401Z" },
+    { url = "https://files.pythonhosted.org/packages/00/b5/0e8e4b5b081eac6cb3dbb7e60a65907549a1ce035a724368c330112adfdd/pydantic_core-2.41.5-cp312-cp312-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:65840751b72fbfd82c3c640cff9284545342a4f1eb1586ad0636955b261b0b05", size = 2208504, upload-time = "2025-11-04T13:40:06.072Z" },
+    { url = "https://files.pythonhosted.org/packages/77/56/87a61aad59c7c5b9dc8caad5a41a5545cba3810c3e828708b3d7404f6cef/pydantic_core-2.41.5-cp312-cp312-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:e536c98a7626a98feb2d3eaf75944ef6f3dbee447e1f841eae16f2f0a72d8ddc", size = 2335816, upload-time = "2025-11-04T13:40:07.835Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/76/941cc9f73529988688a665a5c0ecff1112b3d95ab48f81db5f7606f522d3/pydantic_core-2.41.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:eceb81a8d74f9267ef4081e246ffd6d129da5d87e37a77c9bde550cb04870c1c", size = 2075366, upload-time = "2025-11-04T13:40:09.804Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/43/ebef01f69baa07a482844faaa0a591bad1ef129253ffd0cdaa9d8a7f72d3/pydantic_core-2.41.5-cp312-cp312-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:d38548150c39b74aeeb0ce8ee1d8e82696f4a4e16ddc6de7b1d8823f7de4b9b5", size = 2171698, upload-time = "2025-11-04T13:40:12.004Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/87/41f3202e4193e3bacfc2c065fab7706ebe81af46a83d3e27605029c1f5a6/pydantic_core-2.41.5-cp312-cp312-musllinux_1_1_aarch64.whl", hash = "sha256:c23e27686783f60290e36827f9c626e63154b82b116d7fe9adba1fda36da706c", size = 2132603, upload-time = "2025-11-04T13:40:13.868Z" },
+    { url = "https://files.pythonhosted.org/packages/49/7d/4c00df99cb12070b6bccdef4a195255e6020a550d572768d92cc54dba91a/pydantic_core-2.41.5-cp312-cp312-musllinux_1_1_armv7l.whl", hash = "sha256:482c982f814460eabe1d3bb0adfdc583387bd4691ef00b90575ca0d2b6fe2294", size = 2329591, upload-time = "2025-11-04T13:40:15.672Z" },
+    { url = "https://files.pythonhosted.org/packages/cc/6a/ebf4b1d65d458f3cda6a7335d141305dfa19bdc61140a884d165a8a1bbc7/pydantic_core-2.41.5-cp312-cp312-musllinux_1_1_x86_64.whl", hash = "sha256:bfea2a5f0b4d8d43adf9d7b8bf019fb46fdd10a2e5cde477fbcb9d1fa08c68e1", size = 2319068, upload-time = "2025-11-04T13:40:17.532Z" },
+    { url = "https://files.pythonhosted.org/packages/49/3b/774f2b5cd4192d5ab75870ce4381fd89cf218af999515baf07e7206753f0/pydantic_core-2.41.5-cp312-cp312-win32.whl", hash = "sha256:b74557b16e390ec12dca509bce9264c3bbd128f8a2c376eaa68003d7f327276d", size = 1985908, upload-time = "2025-11-04T13:40:19.309Z" },
+    { url = "https://files.pythonhosted.org/packages/86/45/00173a033c801cacf67c190fef088789394feaf88a98a7035b0e40d53dc9/pydantic_core-2.41.5-cp312-cp312-win_amd64.whl", hash = "sha256:1962293292865bca8e54702b08a4f26da73adc83dd1fcf26fbc875b35d81c815", size = 2020145, upload-time = "2025-11-04T13:40:21.548Z" },
+    { url = "https://files.pythonhosted.org/packages/f9/22/91fbc821fa6d261b376a3f73809f907cec5ca6025642c463d3488aad22fb/pydantic_core-2.41.5-cp312-cp312-win_arm64.whl", hash = "sha256:1746d4a3d9a794cacae06a5eaaccb4b8643a131d45fbc9af23e353dc0a5ba5c3", size = 1976179, upload-time = "2025-11-04T13:40:23.393Z" },
+    { url = "https://files.pythonhosted.org/packages/09/32/59b0c7e63e277fa7911c2fc70ccfb45ce4b98991e7ef37110663437005af/pydantic_core-2.41.5-graalpy312-graalpy250_312_native-macosx_10_12_x86_64.whl", hash = "sha256:7da7087d756b19037bc2c06edc6c170eeef3c3bafcb8f532ff17d64dc427adfd", size = 2110495, upload-time = "2025-11-04T13:42:49.689Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/81/05e400037eaf55ad400bcd318c05bb345b57e708887f07ddb2d20e3f0e98/pydantic_core-2.41.5-graalpy312-graalpy250_312_native-macosx_11_0_arm64.whl", hash = "sha256:aabf5777b5c8ca26f7824cb4a120a740c9588ed58df9b2d196ce92fba42ff8dc", size = 1915388, upload-time = "2025-11-04T13:42:52.215Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/0d/e3549b2399f71d56476b77dbf3cf8937cec5cd70536bdc0e374a421d0599/pydantic_core-2.41.5-graalpy312-graalpy250_312_native-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c007fe8a43d43b3969e8469004e9845944f1a80e6acd47c150856bb87f230c56", size = 1942879, upload-time = "2025-11-04T13:42:56.483Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/07/34573da085946b6a313d7c42f82f16e8920bfd730665de2d11c0c37a74b5/pydantic_core-2.41.5-graalpy312-graalpy250_312_native-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:76d0819de158cd855d1cbb8fcafdf6f5cf1eb8e470abe056d5d161106e38062b", size = 2139017, upload-time = "2025-11-04T13:42:59.471Z" },
+]
+
+[[package]]
+name = "pygelf"
+version = "0.4.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/49/91/ac1605bb40092ae41fbb833ee55447f72e19ce5459efa6bd3beecc67e971/pygelf-0.4.3.tar.gz", hash = "sha256:8ed972563be3c8f168483f01dbf522b6bc697959c97a3f4881324b3f79638911", size = 11017, upload-time = "2025-06-14T19:21:19.832Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d4/ee/ebac3de919431912e0be380fafd01059a091a489f6b5d7896c2a04548895/pygelf-0.4.3-py3-none-any.whl", hash = "sha256:0876c99a77f9f021834982c9808205b3239fabf5886788d701f31b495b65c8ae", size = 8750, upload-time = "2025-06-14T19:21:16.953Z" },
+]
+
+[[package]]
+name = "pygments"
+version = "2.19.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b0/77/a5b8c569bf593b0140bde72ea885a803b82086995367bf2037de0159d924/pygments-2.19.2.tar.gz", hash = "sha256:636cb2477cec7f8952536970bc533bc43743542f70392ae026374600add5b887", size = 4968631, upload-time = "2025-06-21T13:39:12.283Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/21/705964c7812476f378728bdf590ca4b771ec72385c533964653c68e86bdc/pygments-2.19.2-py3-none-any.whl", hash = "sha256:86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b", size = 1225217, upload-time = "2025-06-21T13:39:07.939Z" },
+]
+
+[[package]]
+name = "pytest"
+version = "9.0.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "iniconfig" },
+    { name = "packaging" },
+    { name = "pluggy" },
+    { name = "pygments" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d1/db/7ef3487e0fb0049ddb5ce41d3a49c235bf9ad299b6a25d5780a89f19230f/pytest-9.0.2.tar.gz", hash = "sha256:75186651a92bd89611d1d9fc20f0b4345fd827c41ccd5c299a868a05d70edf11", size = 1568901, upload-time = "2025-12-06T21:30:51.014Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/ab/b3226f0bd7cdcf710fbede2b3548584366da3b19b5021e74f5bde2a8fa3f/pytest-9.0.2-py3-none-any.whl", hash = "sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b", size = 374801, upload-time = "2025-12-06T21:30:49.154Z" },
+]
+
+[[package]]
+name = "python-dateutil"
+version = "2.9.0.post0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "six" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
+]
+
+[[package]]
+name = "pytz"
+version = "2025.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/bf/abbd3cdfb8fbc7fb3d4d38d320f2441b1e7cbe29be4f23797b4a2b5d8aac/pytz-2025.2.tar.gz", hash = "sha256:360b9e3dbb49a209c21ad61809c7fb453643e048b38924c765813546746e81c3", size = 320884, upload-time = "2025-03-25T02:25:00.538Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/81/c4/34e93fe5f5429d7570ec1fa436f1986fb1f00c3e0f43a589fe2bbcd22c3f/pytz-2025.2-py2.py3-none-any.whl", hash = "sha256:5ddf76296dd8c44c26eb8f4b6f35488f3ccbf6fbbd7adee0b7262d43f0ec2f00", size = 509225, upload-time = "2025-03-25T02:24:58.468Z" },
+]
+
+[[package]]
+name = "ratelimit"
+version = "2.2.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ab/38/ff60c8fc9e002d50d48822cc5095deb8ebbc5f91a6b8fdd9731c87a147c9/ratelimit-2.2.1.tar.gz", hash = "sha256:af8a9b64b821529aca09ebaf6d8d279100d766f19e90b5059ac6a718ca6dee42", size = 5251, upload-time = "2018-12-17T18:55:49.675Z" }
+
+[[package]]
+name = "regex"
+version = "2022.3.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/17/21e7195da87bcdbdd4ec32fdfdc87ccd5cf97b0a18e0f08ecacbaefca284/regex-2022.3.2.tar.gz", hash = "sha256:79e5af1ff258bc0fe0bdd6f69bc4ae33935a898e3cbefbbccf22e88a27fa053b", size = 383148, upload-time = "2022-03-02T02:10:13.849Z" }
+
+[[package]]
+name = "requests"
+version = "2.32.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "charset-normalizer" },
+    { name = "idna" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c9/74/b3ff8e6c8446842c3f5c837e9c3dfcfe2018ea6ecef224c710c85ef728f4/requests-2.32.5.tar.gz", hash = "sha256:dbba0bac56e100853db0ea71b82b4dfd5fe2bf6d3754a8893c3af500cec7d7cf", size = 134517, upload-time = "2025-08-18T20:46:02.573Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/db/4254e3eabe8020b458f1a747140d32277ec7a271daf1d235b70dc0b4e6e3/requests-2.32.5-py3-none-any.whl", hash = "sha256:2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6", size = 64738, upload-time = "2025-08-18T20:46:00.542Z" },
+]
+
+[[package]]
+name = "ruff"
+version = "0.15.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/04/eab13a954e763b0606f460443fcbf6bb5a0faf06890ea3754ff16523dce5/ruff-0.15.2.tar.gz", hash = "sha256:14b965afee0969e68bb871eba625343b8673375f457af4abe98553e8bbb98342", size = 4558148, upload-time = "2026-02-19T22:32:20.271Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2f/70/3a4dc6d09b13cb3e695f28307e5d889b2e1a66b7af9c5e257e796695b0e6/ruff-0.15.2-py3-none-linux_armv6l.whl", hash = "sha256:120691a6fdae2f16d65435648160f5b81a9625288f75544dc40637436b5d3c0d", size = 10430565, upload-time = "2026-02-19T22:32:41.824Z" },
+    { url = "https://files.pythonhosted.org/packages/71/0b/bb8457b56185ece1305c666dc895832946d24055be90692381c31d57466d/ruff-0.15.2-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:a89056d831256099658b6bba4037ac6dd06f49d194199215befe2bb10457ea5e", size = 10820354, upload-time = "2026-02-19T22:32:07.366Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/c1/e0532d7f9c9e0b14c46f61b14afd563298b8b83f337b6789ddd987e46121/ruff-0.15.2-py3-none-macosx_11_0_arm64.whl", hash = "sha256:e36dee3a64be0ebd23c86ffa3aa3fd3ac9a712ff295e192243f814a830b6bd87", size = 10170767, upload-time = "2026-02-19T22:32:13.188Z" },
+    { url = "https://files.pythonhosted.org/packages/47/e8/da1aa341d3af017a21c7a62fb5ec31d4e7ad0a93ab80e3a508316efbcb23/ruff-0.15.2-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:a9fb47b6d9764677f8c0a193c0943ce9a05d6763523f132325af8a858eadc2b9", size = 10529591, upload-time = "2026-02-19T22:32:02.547Z" },
+    { url = "https://files.pythonhosted.org/packages/93/74/184fbf38e9f3510231fbc5e437e808f0b48c42d1df9434b208821efcd8d6/ruff-0.15.2-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:f376990f9d0d6442ea9014b19621d8f2aaf2b8e39fdbfc79220b7f0c596c9b80", size = 10260771, upload-time = "2026-02-19T22:32:36.938Z" },
+    { url = "https://files.pythonhosted.org/packages/05/ac/605c20b8e059a0bc4b42360414baa4892ff278cec1c91fff4be0dceedefd/ruff-0.15.2-py3-none-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:2dcc987551952d73cbf5c88d9fdee815618d497e4df86cd4c4824cc59d5dd75f", size = 11045791, upload-time = "2026-02-19T22:32:31.642Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/52/db6e419908f45a894924d410ac77d64bdd98ff86901d833364251bd08e22/ruff-0.15.2-py3-none-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:42a47fd785cbe8c01b9ff45031af875d101b040ad8f4de7bbb716487c74c9a77", size = 11879271, upload-time = "2026-02-19T22:32:29.305Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/d8/7992b18f2008bdc9231d0f10b16df7dda964dbf639e2b8b4c1b4e91b83af/ruff-0.15.2-py3-none-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:cbe9f49354866e575b4c6943856989f966421870e85cd2ac94dccb0a9dcb2fea", size = 11303707, upload-time = "2026-02-19T22:32:22.492Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/02/849b46184bcfdd4b64cde61752cc9a146c54759ed036edd11857e9b8443b/ruff-0.15.2-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:b7a672c82b5f9887576087d97be5ce439f04bbaf548ee987b92d3a7dede41d3a", size = 11149151, upload-time = "2026-02-19T22:32:44.234Z" },
+    { url = "https://files.pythonhosted.org/packages/70/04/f5284e388bab60d1d3b99614a5a9aeb03e0f333847e2429bebd2aaa1feec/ruff-0.15.2-py3-none-manylinux_2_31_riscv64.whl", hash = "sha256:72ecc64f46f7019e2bcc3cdc05d4a7da958b629a5ab7033195e11a438403d956", size = 11091132, upload-time = "2026-02-19T22:32:24.691Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/ae/88d844a21110e14d92cf73d57363fab59b727ebeabe78009b9ccb23500af/ruff-0.15.2-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:8dcf243b15b561c655c1ef2f2b0050e5d50db37fe90115507f6ff37d865dc8b4", size = 10504717, upload-time = "2026-02-19T22:32:26.75Z" },
+    { url = "https://files.pythonhosted.org/packages/64/27/867076a6ada7f2b9c8292884ab44d08fd2ba71bd2b5364d4136f3cd537e1/ruff-0.15.2-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:dab6941c862c05739774677c6273166d2510d254dac0695c0e3f5efa1b5585de", size = 10263122, upload-time = "2026-02-19T22:32:10.036Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/ef/faf9321d550f8ebf0c6373696e70d1758e20ccdc3951ad7af00c0956be7c/ruff-0.15.2-py3-none-musllinux_1_2_i686.whl", hash = "sha256:1b9164f57fc36058e9a6806eb92af185b0697c9fe4c7c52caa431c6554521e5c", size = 10735295, upload-time = "2026-02-19T22:32:39.227Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/55/e8089fec62e050ba84d71b70e7834b97709ca9b7aba10c1a0b196e493f97/ruff-0.15.2-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:80d24fcae24d42659db7e335b9e1531697a7102c19185b8dc4a028b952865fd8", size = 11241641, upload-time = "2026-02-19T22:32:34.617Z" },
+    { url = "https://files.pythonhosted.org/packages/23/01/1c30526460f4d23222d0fabd5888868262fd0e2b71a00570ca26483cd993/ruff-0.15.2-py3-none-win32.whl", hash = "sha256:fd5ff9e5f519a7e1bd99cbe8daa324010a74f5e2ebc97c6242c08f26f3714f6f", size = 10507885, upload-time = "2026-02-19T22:32:15.635Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/10/3d18e3bbdf8fc50bbb4ac3cc45970aa5a9753c5cb51bf9ed9a3cd8b79fa3/ruff-0.15.2-py3-none-win_amd64.whl", hash = "sha256:d20014e3dfa400f3ff84830dfb5755ece2de45ab62ecea4af6b7262d0fb4f7c5", size = 11623725, upload-time = "2026-02-19T22:32:04.947Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/78/097c0798b1dab9f8affe73da9642bb4500e098cb27fd8dc9724816ac747b/ruff-0.15.2-py3-none-win_arm64.whl", hash = "sha256:cabddc5822acdc8f7b5527b36ceac55cc51eec7b1946e60181de8fe83ca8876e", size = 10941649, upload-time = "2026-02-19T22:32:18.108Z" },
+]
+
+[[package]]
+name = "six"
+version = "1.17.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+
+[[package]]
+name = "tenacity"
+version = "9.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/cd/94/91fccdb4b8110642462e653d5dcb27e7b674742ad68efd146367da7bdb10/tenacity-9.0.0.tar.gz", hash = "sha256:807f37ca97d62aa361264d497b0e31e92b8027044942bfa756160d908320d73b", size = 47421, upload-time = "2024-07-29T12:12:27.547Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b6/cb/b86984bed139586d01532a587464b5805f12e397594f19f931c4c2fbfa61/tenacity-9.0.0-py3-none-any.whl", hash = "sha256:93de0c98785b27fcf659856aa9f54bfbd399e29969b0621bc7f762bd441b4539", size = 28169, upload-time = "2024-07-29T12:12:25.825Z" },
+]
+
+[[package]]
+name = "typing-extensions"
+version = "4.15.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/72/94/1a15dd82efb362ac84269196e94cf00f187f7ed21c242792a923cdb1c61f/typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466", size = 109391, upload-time = "2025-08-25T13:49:26.313Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548", size = 44614, upload-time = "2025-08-25T13:49:24.86Z" },
+]
+
+[[package]]
+name = "typing-inspection"
+version = "0.4.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/55/e3/70399cb7dd41c10ac53367ae42139cf4b1ca5f36bb3dc6c9d33acdb43655/typing_inspection-0.4.2.tar.gz", hash = "sha256:ba561c48a67c5958007083d386c3295464928b01faa735ab8547c5692e87f464", size = 75949, upload-time = "2025-10-01T02:14:41.687Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/dc/9b/47798a6c91d8bdb567fe2698fe81e0c6b7cb7ef4d13da4114b41d239f65d/typing_inspection-0.4.2-py3-none-any.whl", hash = "sha256:4ed1cacbdc298c220f1bd249ed5287caa16f34d44ef4e9c3d0cbad5b521545e7", size = 14611, upload-time = "2025-10-01T02:14:40.154Z" },
+]
+
+[[package]]
+name = "tzdata"
+version = "2025.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/a7/c202b344c5ca7daf398f3b8a477eeb205cf3b6f32e7ec3a6bac0629ca975/tzdata-2025.3.tar.gz", hash = "sha256:de39c2ca5dc7b0344f2eba86f49d614019d29f060fc4ebc8a417896a620b56a7", size = 196772, upload-time = "2025-12-13T17:45:35.667Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/b0/003792df09decd6849a5e39c28b513c06e84436a54440380862b5aeff25d/tzdata-2025.3-py2.py3-none-any.whl", hash = "sha256:06a47e5700f3081aab02b2e513160914ff0694bce9947d6b76ebd6bf57cfc5d1", size = 348521, upload-time = "2025-12-13T17:45:33.889Z" },
+]
+
+[[package]]
+name = "tzlocal"
+version = "5.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8b/2e/c14812d3d4d9cd1773c6be938f89e5735a1f11a9f184ac3639b93cef35d5/tzlocal-5.3.1.tar.gz", hash = "sha256:cceffc7edecefea1f595541dbd6e990cb1ea3d19bf01b2809f362a03dd7921fd", size = 30761, upload-time = "2025-03-05T21:17:41.549Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c2/14/e2a54fabd4f08cd7af1c07030603c3356b74da07f7cc056e600436edfa17/tzlocal-5.3.1-py3-none-any.whl", hash = "sha256:eb1a66c3ef5847adf7a834f1be0800581b683b5608e74f86ecbcef8ab91bb85d", size = 18026, upload-time = "2025-03-05T21:17:39.857Z" },
+]
+
+[[package]]
+name = "urllib3"
+version = "2.2.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ed/63/22ba4ebfe7430b76388e7cd448d5478814d3032121827c12a2cc287e2260/urllib3-2.2.3.tar.gz", hash = "sha256:e7d814a81dad81e6caf2ec9fdedb284ecc9c73076b62654547cc64ccdcae26e9", size = 300677, upload-time = "2024-09-12T10:52:18.401Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ce/d9/5f4c13cecde62396b0d3fe530a50ccea91e7dfc1ccf0e09c228841bb5ba8/urllib3-2.2.3-py3-none-any.whl", hash = "sha256:ca899ca043dcb1bafa3e262d73aa25c465bfb49e0bd9dd5d59f1d0acba2f8fac", size = 126338, upload-time = "2024-09-12T10:52:16.589Z" },
+]
+
+[[package]]
+name = "wrapt"
+version = "2.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f7/37/ae31f40bec90de2f88d9597d0b5281e23ffe85b893a47ca5d9c05c63a4f6/wrapt-2.1.1.tar.gz", hash = "sha256:5fdcb09bf6db023d88f312bd0767594b414655d58090fc1c46b3414415f67fac", size = 81329, upload-time = "2026-02-03T02:12:13.786Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/df/cb/4d5255d19bbd12be7f8ee2c1fb4269dddec9cef777ef17174d357468efaa/wrapt-2.1.1-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:ab8e3793b239db021a18782a5823fcdea63b9fe75d0e340957f5828ef55fcc02", size = 61143, upload-time = "2026-02-03T02:11:46.313Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/07/7ed02daa35542023464e3c8b7cb937fa61f6c61c0361ecf8f5fecf8ad8da/wrapt-2.1.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:7c0300007836373d1c2df105b40777986accb738053a92fe09b615a7a4547e9f", size = 61740, upload-time = "2026-02-03T02:12:51.966Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/60/a237a4e4a36f6d966061ccc9b017627d448161b19e0a3ab80a7c7c97f859/wrapt-2.1.1-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:2b27c070fd1132ab23957bcd4ee3ba707a91e653a9268dc1afbd39b77b2799f7", size = 121327, upload-time = "2026-02-03T02:11:06.796Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/fe/9139058a3daa8818fc67e6460a2340e8bbcf3aef8b15d0301338bbe181ca/wrapt-2.1.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8b0e36d845e8b6f50949b6b65fc6cd279f47a1944582ed4ec8258cd136d89a64", size = 122903, upload-time = "2026-02-03T02:12:48.657Z" },
+    { url = "https://files.pythonhosted.org/packages/91/10/b8479202b4164649675846a531763531f0a6608339558b5a0a718fc49a8d/wrapt-2.1.1-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:4aeea04a9889370fcfb1ef828c4cc583f36a875061505cd6cd9ba24d8b43cc36", size = 121333, upload-time = "2026-02-03T02:11:32.148Z" },
+    { url = "https://files.pythonhosted.org/packages/5f/75/75fc793b791d79444aca2c03ccde64e8b99eda321b003f267d570b7b0985/wrapt-2.1.1-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:d88b46bb0dce9f74b6817bc1758ff2125e1ca9e1377d62ea35b6896142ab6825", size = 120458, upload-time = "2026-02-03T02:11:16.039Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/8f/c3f30d511082ca6d947c405f9d8f6c8eaf83cfde527c439ec2c9a30eb5ea/wrapt-2.1.1-cp312-cp312-win32.whl", hash = "sha256:63decff76ca685b5c557082dfbea865f3f5f6d45766a89bff8dc61d336348833", size = 58086, upload-time = "2026-02-03T02:12:35.041Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/c8/37625b643eea2849f10c3b90f69c7462faa4134448d4443234adaf122ae5/wrapt-2.1.1-cp312-cp312-win_amd64.whl", hash = "sha256:b828235d26c1e35aca4107039802ae4b1411be0fe0367dd5b7e4d90e562fcbcd", size = 60328, upload-time = "2026-02-03T02:12:45.808Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/79/56242f07572d5682ba8065a9d4d9c2218313f576e3c3471873c2a5355ffd/wrapt-2.1.1-cp312-cp312-win_arm64.whl", hash = "sha256:75128507413a9f1bcbe2db88fd18fbdbf80f264b82fa33a6996cdeaf01c52352", size = 58722, upload-time = "2026-02-03T02:12:27.949Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/da/5a086bf4c22a41995312db104ec2ffeee2cf6accca9faaee5315c790377d/wrapt-2.1.1-py3-none-any.whl", hash = "sha256:3b0f4629eb954394a3d7c7a1c8cca25f0b07cefe6aa8545e862e9778152de5b7", size = 43886, upload-time = "2026-02-03T02:11:45.048Z" },
+]
+
+[[package]]
+name = "xero-accounting-writer"
+source = { virtual = "." }
+dependencies = [
+    { name = "dateparser" },
+    { name = "freezegun" },
+    { name = "keboola-component" },
+    { name = "keboola-http-client" },
+    { name = "keboola-utils" },
+    { name = "mock" },
+    { name = "pydantic" },
+    { name = "ratelimit" },
+    { name = "regex" },
+    { name = "tenacity" },
+    { name = "urllib3" },
+    { name = "xero-python" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "dateparser", specifier = "~=1.2.0" },
+    { name = "freezegun", specifier = "~=1.5.1" },
+    { name = "keboola-component", specifier = ">=1.6.10" },
+    { name = "keboola-http-client", specifier = ">=1.0.1" },
+    { name = "keboola-utils", specifier = ">=1.1.0" },
+    { name = "mock", specifier = "~=5.1.0" },
+    { name = "pydantic", specifier = "~=2.0" },
+    { name = "ratelimit", specifier = "==2.2.1" },
+    { name = "regex", specifier = "==2022.3.2" },
+    { name = "tenacity", specifier = "~=9.0.0" },
+    { name = "urllib3", specifier = "~=2.2.3" },
+    { name = "xero-python", specifier = "==4.0.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=7.4.0" },
+    { name = "ruff", specifier = ">=0.4.0" },
+]
+
+[[package]]
+name = "xero-python"
+version = "4.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "python-dateutil" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/73/b1/b08fdb4df8354553a6aa49a59ec33cd8c940d1b7033cc9502249b809bbd5/xero_python-4.0.0.tar.gz", hash = "sha256:e71df479b4c7987a2d6d5d251bbbef011d5138f323e7fdc9b52a7b801d74c986", size = 609604, upload-time = "2024-06-21T20:03:34.756Z" }
+
+
+
+================================================
+FILE: component_config/component_long_description.md
+================================================
+# Xero Accounting Writer
+
+Write data from Keboola Connection Storage back to [Xero Accounting](https://www.xero.com/) via the Xero API.
+
+## Supported entities
+
+| Entity | Create | Upsert |
+|--------|--------|--------|
+| Contacts | ✓ | ✓ |
+| Invoices | ✓ | ✓ |
+| Payments | ✓ | ✓ |
+| Purchase Orders | ✓ | ✓ |
+| Manual Journals | ✓ | ✓ |
+| Items | ✓ | ✓ |
+| Credit Notes | ✓ | ✓ |
+| Currencies | ✓ | — |
+| Employees | ✓ | ✓ |
+| Quotes | ✓ | ✓ |
+| Tracking Categories | ✓ | ✓ |
+| Bank Transactions | ✓ | ✓ |
+
+## Write modes
+
+- **Create** — POST new records; fails if the record already exists.
+- **Upsert** — POST or PUT; creates new records or updates existing ones using Xero's native ID or reference number (e.g. `ContactNumber`, `InvoiceNumber`).
+
+## Authentication
+
+Uses Xero OAuth 2.0. Authorize once via the Keboola OAuth proxy; tokens are automatically refreshed.
+
+## Notes
+
+- Budget writes are **not supported** by the Xero API (`/Budgets` is read-only).
+- Rate limit: 50 requests per 60 seconds (handled automatically).
+- Records are sent in batches of up to 100 per API call.
+
+
+
+================================================
+FILE: component_config/component_short_description.md
+================================================
+Write data from Keboola Storage to Xero Accounting — sync contacts, invoices, payments, purchase orders, journals, and more.
+
+
+
+================================================
+FILE: component_config/configRowSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Entity Configuration",
+  "required": ["entity_type", "write_mode"],
+  "properties": {
+    "entity_type": {
+      "title": "Entity Type",
+      "description": "The Xero entity type to write.",
+      "type": "string",
+      "enum": [
+        "Contacts",
+        "Invoices",
+        "Payments",
+        "PurchaseOrders",
+        "ManualJournals",
+        "Items",
+        "CreditNotes",
+        "Currencies",
+        "Employees",
+        "Quotes",
+        "TrackingCategories",
+        "BankTransactions"
+      ],
+      "options": {
+        "enum_titles": [
+          "Contacts",
+          "Invoices",
+          "Payments",
+          "Purchase Orders",
+          "Manual Journals",
+          "Items",
+          "Credit Notes",
+          "Currencies",
+          "Employees",
+          "Quotes",
+          "Tracking Categories",
+          "Bank Transactions"
+        ]
+      },
+      "propertyOrder": 10
+    },
+    "write_mode": {
+      "title": "Write Mode",
+      "description": "Create: add new records only (fails on duplicates). Upsert: create or update existing records by their Xero ID or external reference number.",
+      "type": "string",
+      "enum": ["create", "upsert"],
+      "options": {
+        "enum_titles": ["Create (POST)", "Upsert (POST + PUT)"]
+      },
+      "default": "upsert",
+      "propertyOrder": 20
+    }
+  }
+}
+
+
+
+================================================
+FILE: component_config/configSchema.json
+================================================
+{
+  "type": "object",
+  "title": "Xero Accounting Writer",
+  "properties": {
+    "tenant_id": {
+      "title": "Tenant ID",
+      "description": "Xero organisation (tenant) ID to write data to. Leave blank to use the first available tenant.",
+      "type": "string",
+      "propertyOrder": 10
+    }
+  }
+}
+
+
+
+================================================
+FILE: component_config/loggerConfiguration.json
+================================================
+{
+  "verbosity": {
+    "100": "normal",
+    "200": "normal",
+    "250": "normal",
+    "300": "verbose",
+    "400": "verbose",
+    "500": "camouflage",
+    "550": "camouflage",
+    "600": "camouflage"
+  },
+  "gelf_server_type": "tcp"
+}
+
+
+
+================================================
+FILE: component_config/sample-config/config.json
+================================================
+{
+  "parameters": {
+    "entity_type": "Contacts",
+    "write_mode": "upsert"
+  },
+  "storage": {
+    "input": {
+      "tables": [
+        {
+          "source": "in.c-crm.contacts",
+          "destination": "contacts.csv"
+        }
+      ]
+    }
+  }
+}
+
+
+
+================================================
+FILE: component_config/sample-config/in/tables/contacts.csv
+================================================
+ContactNumber,Name,EmailAddress,IsSupplier,IsCustomer
+C001,Acme Corp,acme@example.com,false,true
+C002,Bob Supplier,bob@supplier.com,true,false
+
+
+
+================================================
+FILE: scripts/build_n_test.sh
+================================================
+#!/bin/sh
+set -e
+
+flake8 --config=flake8.cfg
+python -m pytest tests/ -v
+
+
+
+================================================
+FILE: scripts/developer_portal/fn_actions_md_update.sh
+================================================
+#!/bin/bash
+
+# Set the path to the Python script file
+PYTHON_FILE="src/component.py"
+# Set the path to the Markdown file containing actions
+MD_FILE="component_config/actions.md"
+
+# Check if the file exists before creating it
+if [ ! -e "$MD_FILE" ]; then
+    touch "$MD_FILE"
+else
+    echo "File already exists: $MD_FILE"
+    exit 1
+fi
+
+# Get all occurrences of lines containing @sync_action('XXX') from the .py file
+SYNC_ACTIONS=$(grep -o -E "@sync_action\(['\"][^'\"]*['\"]\)" "$PYTHON_FILE" | sed "s/@sync_action(\(['\"]\)\([^'\"]*\)\(['\"]\))/\2/" | sort | uniq)
+
+# Check if any sync actions were found
+if [ -n "$SYNC_ACTIONS" ]; then
+    # Iterate over each occurrence of @sync_action('XXX')
+    for sync_action in $SYNC_ACTIONS; do
+        EXISTING_ACTIONS+=("$sync_action")
+    done
+
+    # Convert the array to JSON format
+    JSON_ACTIONS=$(printf '"%s",' "${EXISTING_ACTIONS[@]}")
+    JSON_ACTIONS="[${JSON_ACTIONS%,}]"
+
+    # Update the content of the actions.md file
+    echo "$JSON_ACTIONS" > "$MD_FILE"
+else
+    echo "No sync actions found. Not creating the file."
+fi
+
+
+================================================
+FILE: scripts/developer_portal/update_properties.sh
+================================================
+#!/usr/bin/env bash
+
+set -e
+
+# Check if the KBC_DEVELOPERPORTAL_APP environment variable is set
+if [ -z "$KBC_DEVELOPERPORTAL_APP" ]; then
+    echo "Error: KBC_DEVELOPERPORTAL_APP environment variable is not set."
+    exit 1
+fi
+
+# Pull the latest version of the developer portal CLI Docker image
+docker pull quay.io/keboola/developer-portal-cli-v2:latest
+
+# Function to update a property for the given app ID
+update_property() {
+    local app_id="$1"
+    local prop_name="$2"
+    local file_path="$3"
+
+    if [ ! -f "$file_path" ]; then
+        echo "File '$file_path' not found. Skipping update for property '$prop_name' of application '$app_id'."
+        return
+    fi
+
+    # shellcheck disable=SC2155
+    local value=$(<"$file_path")
+
+    echo "Updating $prop_name for $app_id"
+    echo "$value"
+
+    if [ -n "$value" ]; then
+        docker run --rm \
+            -e KBC_DEVELOPERPORTAL_USERNAME \
+            -e KBC_DEVELOPERPORTAL_PASSWORD \
+            quay.io/keboola/developer-portal-cli-v2:latest \
+            update-app-property "$KBC_DEVELOPERPORTAL_VENDOR" "$app_id" "$prop_name" --value="$value"
+        echo "Property $prop_name updated successfully for $app_id"
+    else
+        echo "$prop_name is empty for $app_id, skipping..."
+    fi
+}
+
+app_id="$KBC_DEVELOPERPORTAL_APP"
+
+update_property "$app_id" "isDeployReady" "component_config/isDeployReady.md"
+update_property "$app_id" "longDescription" "component_config/component_long_description.md"
+update_property "$app_id" "configurationSchema" "component_config/configSchema.json"
+update_property "$app_id" "configurationRowSchema" "component_config/configRowSchema.json"
+update_property "$app_id" "configurationDescription" "component_config/configuration_description.md"
+update_property "$app_id" "shortDescription" "component_config/component_short_description.md"
+update_property "$app_id" "logger" "component_config/logger"
+update_property "$app_id" "loggerConfiguration" "component_config/loggerConfiguration.json"
+update_property "$app_id" "licenseUrl" "component_config/licenseUrl.md"
+update_property "$app_id" "documentationUrl" "component_config/documentationUrl.md"
+update_property "$app_id" "sourceCodeUrl" "component_config/sourceCodeUrl.md"
+update_property "$app_id" "uiOptions" "component_config/uiOptions.md"
+
+# Update the actions.md file
+source "$(dirname "$0")/fn_actions_md_update.sh"
+# update_property actions
+update_property "$app_id" "actions" "component_config/actions.md"
+
+
+================================================
+FILE: src/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: src/component.py
+================================================
+import csv
+import json
+import logging
+from typing import Dict, List, Union
+
+from keboola.component.base import ComponentBase, sync_action
+from keboola.component.exceptions import UserException
+from keboola.component.sync_actions import SelectElement
+
+from client import XeroClient, XeroException
+from configuration import EntityType, RootConfiguration, RowConfiguration
+from writers import (
+    BankTransactionsWriter,
+    BaseWriter,
+    ContactsWriter,
+    CreditNotesWriter,
+    CurrenciesWriter,
+    EmployeesWriter,
+    InvoicesWriter,
+    ItemsWriter,
+    ManualJournalsWriter,
+    PaymentsWriter,
+    PurchaseOrdersWriter,
+    QuotesWriter,
+    TrackingCategoriesWriter,
+)
+
+KEY_STATE_OAUTH_TOKEN_DICT = "#oauth_token_dict"
+
+WRITER_MAP: Dict[EntityType, type] = {
+    EntityType.contacts: ContactsWriter,
+    EntityType.invoices: InvoicesWriter,
+    EntityType.payments: PaymentsWriter,
+    EntityType.purchase_orders: PurchaseOrdersWriter,
+    EntityType.manual_journals: ManualJournalsWriter,
+    EntityType.items: ItemsWriter,
+    EntityType.credit_notes: CreditNotesWriter,
+    EntityType.currencies: CurrenciesWriter,
+    EntityType.employees: EmployeesWriter,
+    EntityType.quotes: QuotesWriter,
+    EntityType.tracking_categories: TrackingCategoriesWriter,
+    EntityType.bank_transactions: BankTransactionsWriter,
+}
+
+
+class Component(ComponentBase):
+    def __init__(self, data_path_override: str = None) -> None:
+        self.client: XeroClient = None  # type: ignore[assignment]
+        super().__init__(data_path_override=data_path_override)
+
+    def run(self) -> None:
+        self._init_client()
+
+        row_config = RowConfiguration(**self.configuration.parameters)
+        entity_type = row_config.entity_type
+        write_mode = row_config.write_mode.value
+        tenant_id = self._resolve_tenant_id()
+
+        input_tables = self.get_input_tables_definitions()
+        if not input_tables:
+            raise UserException(
+                "No input table configured. Please add an input table mapping in the configuration."
+            )
+
+        rows = self._read_csv(input_tables[0].full_path)
+        logging.info(f"Loaded {len(rows)} row(s) from input table")
+
+        writer = self._build_writer(entity_type, write_mode, tenant_id)
+        writer.write(rows)
+
+        self._refresh_token_and_save_state()
+
+    # ------------------------------------------------------------------ #
+    # Auth helpers                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _init_client(self) -> None:
+        logging.info("Initializing Xero client")
+        state = self.get_state_file()
+        state_token = state.get(KEY_STATE_OAUTH_TOKEN_DICT)
+
+        if self._state_has_valid_token(state_token):
+            logging.info("Restoring client from saved state token")
+            self._init_client_from_state(state_token)
+        else:
+            logging.info("Initializing client from OAuth credentials")
+            self._init_client_from_config()
+
+    def _init_client_from_state(self, state_token: Union[str, Dict]) -> None:
+        oauth_credentials = self.configuration.oauth_credentials
+        oauth_credentials.data = self._parse_state_token(state_token)
+        self.client = XeroClient(oauth_credentials)
+        try:
+            self._refresh_token_and_save_state()
+            self.client.get_available_tenant_ids()
+        except (UserException, XeroException):
+            logging.warning("State token init failed, falling back to OAuth credentials")
+            self._init_client_from_config()
+
+    def _init_client_from_config(self) -> None:
+        oauth_credentials = self.configuration.oauth_credentials
+        if isinstance(oauth_credentials.data.get("scope"), str):
+            oauth_credentials.data["scope"] = oauth_credentials.data["scope"].split(" ")
+        self.client = XeroClient(oauth_credentials)
+        try:
+            self._refresh_token_and_save_state()
+            self.client.get_available_tenant_ids()
+        except (UserException, XeroException) as exc:
+            raise UserException(
+                "Failed to authorize the component. Please reauthorize."
+                "\nNote: if a Xero component fails, you must reauthorize before retrying."
+            ) from exc
+
+    def _refresh_token_and_save_state(self) -> None:
+        try:
+            self.client.force_refresh_token()
+        except XeroException as exc:
+            raise UserException(
+                "Failed to refresh the Xero token. Please reauthorize the component."
+            ) from exc
+        new_state = self.get_state_file()
+        new_state[KEY_STATE_OAUTH_TOKEN_DICT] = json.dumps(self.client.get_xero_oauth2_token_dict())
+        self.write_state_file(new_state)
+
+    @staticmethod
+    def _state_has_valid_token(state_token) -> bool:
+        if not state_token:
+            return False
+        if isinstance(state_token, str):
+            try:
+                token = json.loads(state_token)
+            except json.JSONDecodeError:
+                return False
+        else:
+            token = state_token
+        return all(k in token for k in ("access_token", "scope", "expires_in", "token_type"))
+
+    @staticmethod
+    def _parse_state_token(state_token: Union[str, Dict]) -> Dict:
+        if isinstance(state_token, str):
+            return json.loads(state_token)
+        if isinstance(state_token, dict):
+            return state_token
+        raise UserException("Invalid state token format")
+
+    # ------------------------------------------------------------------ #
+    # Tenant resolution                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _resolve_tenant_id(self) -> str:
+        root_config = RootConfiguration(**self.configuration.parameters)
+        explicit_tenant = root_config.tenant_id
+        if explicit_tenant:
+            return explicit_tenant
+
+        try:
+            available = self.client.get_available_tenant_ids()
+        except XeroException as exc:
+            raise UserException(f"Failed to retrieve tenant list: {exc}") from exc
+
+        if not available:
+            raise UserException(
+                "No Xero tenants accessible with the current credentials. "
+                "Please check your authorization."
+            )
+        if len(available) > 1:
+            logging.warning(
+                f"Multiple tenants available ({available}). "
+                f"Using first: {available[0]}. "
+                "Set 'tenant_id' in root configuration to be explicit."
+            )
+        return available[0]
+
+    # ------------------------------------------------------------------ #
+    # Input helpers                                                         #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _read_csv(file_path: str) -> List[Dict]:
+        rows = []
+        with open(file_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(dict(row))
+        return rows
+
+    # ------------------------------------------------------------------ #
+    # Writer factory                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _build_writer(self, entity_type: EntityType, write_mode: str, tenant_id: str) -> BaseWriter:
+        writer_class = WRITER_MAP.get(entity_type)
+        if not writer_class:
+            raise UserException(f"Unsupported entity type: '{entity_type.value}'")
+        return writer_class(self.client.api_client, tenant_id, write_mode)
+
+    # ------------------------------------------------------------------ #
+    # Sync actions                                                          #
+    # ------------------------------------------------------------------ #
+
+    @sync_action("listTenants")
+    def list_tenants(self):
+        """Return available Xero tenants for the dropdown in root config."""
+        self._init_client()
+        try:
+            tenant_ids = self.client.get_available_tenant_ids()
+        except XeroException as exc:
+            raise UserException(f"Failed to list tenants: {exc}") from exc
+        return [SelectElement(t, t) for t in tenant_ids]
+
+
+if __name__ == "__main__":
+    try:
+        comp = Component()
+        comp.execute_action()
+    except UserException as exc:
+        logging.exception(exc)
+        exit(1)
+    except Exception as exc:
+        logging.exception(exc)
+        exit(2)
+
+
+
+================================================
+FILE: src/configuration.py
+================================================
+from enum import Enum
+from typing import Optional
+
+from keboola.component.exceptions import UserException
+from pydantic import BaseModel, Field, ValidationError
+
+
+class WriteMode(str, Enum):
+    create = "create"
+    upsert = "upsert"
+
+
+class EntityType(str, Enum):
+    contacts = "Contacts"
+    invoices = "Invoices"
+    payments = "Payments"
+    purchase_orders = "PurchaseOrders"
+    manual_journals = "ManualJournals"
+    items = "Items"
+    credit_notes = "CreditNotes"
+    currencies = "Currencies"
+    employees = "Employees"
+    quotes = "Quotes"
+    tracking_categories = "TrackingCategories"
+    bank_transactions = "BankTransactions"
+
+
+class RootConfiguration(BaseModel):
+    """Root-level configuration (shared across all rows)."""
+
+    tenant_id: Optional[str] = Field(default=None)
+
+    def __init__(self, **data):
+        try:
+            super().__init__(**data)
+        except ValidationError as e:
+            error_messages = [f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}" for err in e.errors()]
+            raise UserException(f"Configuration validation error: {', '.join(error_messages)}") from e
+
+
+class RowConfiguration(BaseModel):
+    """Per-row configuration (one entity type to write)."""
+
+    entity_type: EntityType
+    write_mode: WriteMode = WriteMode.upsert
+
+    def __init__(self, **data):
+        try:
+            super().__init__(**data)
+        except ValidationError as e:
+            error_messages = [f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}" for err in e.errors()]
+            raise UserException(f"Row configuration validation error: {', '.join(error_messages)}") from e
+
+
+
+================================================
+FILE: src/client/__init__.py
+================================================
+from .xero_client import XeroClient, XeroException
+
+__all__ = ["XeroClient", "XeroException"]
+
+
+
+================================================
+FILE: src/client/xero_client.py
+================================================
+import logging
+from http.client import RemoteDisconnected
+from typing import Dict, List, Optional
+
+from keboola.component.dao import OauthCredentials
+from ratelimit import limits, sleep_and_retry
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from urllib3.exceptions import ProtocolError
+from xero_python.api_client import ApiClient
+from xero_python.api_client.configuration import Configuration
+from xero_python.api_client.oauth2 import OAuth2Token
+from xero_python.api_client.serializer import serialize
+from xero_python.exceptions.http_status_exceptions import HTTPStatusException, OAuth2InvalidGrantError
+from xero_python.identity import IdentityApi
+
+CALLS_PER_MINUTE = 50
+ONE_MINUTE = 60
+
+
+class XeroException(Exception):
+    pass
+
+
+class XeroClient:
+    def __init__(self, oauth_credentials: OauthCredentials) -> None:
+        self._oauth_token_dict: Dict = oauth_credentials.data
+
+        oauth2_token_obj = OAuth2Token(
+            client_id=oauth_credentials.appKey,
+            client_secret=oauth_credentials.appSecret,
+        )
+        oauth2_token_obj.update_token(**self._oauth_token_dict)
+
+        self._api_client = ApiClient(
+            Configuration(oauth2_token=oauth2_token_obj),
+            oauth2_token_getter=self.get_xero_oauth2_token_dict,
+            oauth2_token_saver=self._set_xero_oauth2_token_dict,
+        )
+        self._available_tenant_ids: Optional[List[str]] = None
+
+    def get_xero_oauth2_token_dict(self) -> Dict:
+        return self._oauth_token_dict
+
+    def _set_xero_oauth2_token_dict(self, new_token: Dict) -> None:
+        self._oauth_token_dict = new_token
+
+    @property
+    def api_client(self) -> ApiClient:
+        return self._api_client
+
+    @retry(
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type((HTTPStatusException, ProtocolError, RemoteDisconnected)),
+    )
+    def force_refresh_token(self) -> None:
+        try:
+            logging.info("Refreshing OAuth2 token")
+            self._api_client.refresh_oauth2_token()
+        except (HTTPStatusException, ProtocolError) as error:
+            raise XeroException(
+                "Failed to authenticate the client, please reauthorize the component"
+            ) from error
+
+    def get_available_tenant_ids(self) -> List[str]:
+        if not self._available_tenant_ids:
+            self._refresh_available_tenant_ids()
+        return self._available_tenant_ids  # type: ignore[return-value]
+
+    def _refresh_available_tenant_ids(self) -> None:
+        identity_api = IdentityApi(self._api_client)
+        available_tenants: List[str] = []
+        try:
+            for connection in identity_api.get_connections():
+                tenant = serialize(connection)
+                available_tenants.append(tenant.get("tenantId"))
+        except (OAuth2InvalidGrantError, HTTPStatusException) as oauth_err:
+            raise XeroException(oauth_err) from oauth_err
+        self._available_tenant_ids = available_tenants
+        logging.info(f"Available tenant IDs: {self._available_tenant_ids}")
+
+    @sleep_and_retry
+    @limits(calls=CALLS_PER_MINUTE, period=ONE_MINUTE)
+    def rate_limited_api_call(self, fn, *args, **kwargs):
+        """Execute any AccountingApi call subject to rate limiting."""
+        return fn(*args, **kwargs)
+
+
+
+================================================
+FILE: src/writers/__init__.py
+================================================
+from .bank_transactions import BankTransactionsWriter
+from .base_writer import BaseWriter
+from .contacts import ContactsWriter
+from .credit_notes import CreditNotesWriter
+from .currencies import CurrenciesWriter
+from .employees import EmployeesWriter
+from .invoices import InvoicesWriter
+from .items import ItemsWriter
+from .manual_journals import ManualJournalsWriter
+from .payments import PaymentsWriter
+from .purchase_orders import PurchaseOrdersWriter
+from .quotes import QuotesWriter
+from .tracking_categories import TrackingCategoriesWriter
+
+__all__ = [
+    "BaseWriter",
+    "ContactsWriter",
+    "InvoicesWriter",
+    "PaymentsWriter",
+    "PurchaseOrdersWriter",
+    "ManualJournalsWriter",
+    "ItemsWriter",
+    "CreditNotesWriter",
+    "CurrenciesWriter",
+    "EmployeesWriter",
+    "QuotesWriter",
+    "TrackingCategoriesWriter",
+    "BankTransactionsWriter",
+]
+
+
+
+================================================
+FILE: src/writers/bank_transactions.py
+================================================
+import logging
+from typing import Any, Dict, List, Optional
+
+from xero_python.accounting.models import Account, BankTransaction, BankTransactions, Contact, LineItem
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter, _is_empty, _to_bool, _to_float
+
+
+class BankTransactionsWriter(BaseWriter):
+    """Writes BankTransaction (spend/receive money) records to Xero.
+
+    Supported CSV columns:
+      BankTransactionID, Type, Status, Reference, CurrencyCode, CurrencyRate,
+      Url, IsReconciled, DateString,
+      Contact_ContactID, Contact_Name,
+      BankAccount_AccountID, BankAccount_Code,
+      LineItem_Description, LineItem_Quantity, LineItem_UnitAmount, LineItem_AccountCode,
+      LineItem_TaxType, LineItem_ItemCode, LineItem_LineItemID
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} bank transaction(s) to Xero (mode={self.write_mode})")
+        self._process_in_batches(rows, self._write_batch)
+
+    def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
+        txns = [self._row_to_bank_transaction(row) for row in batch]
+        txns_obj = BankTransactions(bank_transactions=txns)
+        try:
+            if self.write_mode == "upsert":
+                result = self.accounting_api.update_or_create_bank_transactions(
+                    self.tenant_id,
+                    txns_obj,
+                    summarize_errors=False,
+                )
+            else:
+                result = self.accounting_api.create_bank_transactions(
+                    self.tenant_id,
+                    txns_obj,
+                    summarize_errors=False,
+                )
+            self._log_result(result)
+        except Exception as exc:
+            logging.error(f"Failed to write bank transactions batch: {exc}")
+            raise
+
+    def _row_to_bank_transaction(self, row: Dict[str, Any]) -> BankTransaction:
+        txn = BankTransaction()
+
+        if v := self._get(row, "BankTransactionID"):
+            txn.bank_transaction_id = v
+        if v := self._get(row, "Type"):
+            txn.type = v
+        if v := self._get(row, "Status"):
+            txn.status = v
+        if v := self._get(row, "Reference"):
+            txn.reference = v
+        if v := self._get(row, "CurrencyCode"):
+            txn.currency_code = v
+        if v := self._get(row, "Url"):
+            txn.url = v
+        if v := self._get(row, "DateString"):
+            txn.date_string = v
+
+        currency_rate = _to_float(row.get("CurrencyRate"))
+        if currency_rate is not None:
+            txn.currency_rate = currency_rate
+
+        is_reconciled = _to_bool(row.get("IsReconciled"))
+        if is_reconciled is not None:
+            txn.is_reconciled = is_reconciled
+
+        contact = self._build_contact(row)
+        if contact:
+            txn.contact = contact
+
+        bank_account = self._build_bank_account(row)
+        if bank_account:
+            txn.bank_account = bank_account
+
+        line_item = self._build_line_item(row)
+        if line_item:
+            txn.line_items = [line_item]
+
+        return txn
+
+    @staticmethod
+    def _build_contact(row: Dict[str, Any]) -> Optional[Contact]:
+        contact_id = row.get("Contact_ContactID")
+        contact_name = row.get("Contact_Name")
+        if _is_empty(contact_id) and _is_empty(contact_name):
+            return None
+        contact = Contact()
+        if not _is_empty(contact_id):
+            contact.contact_id = str(contact_id).strip()
+        if not _is_empty(contact_name):
+            contact.name = str(contact_name).strip()
+        return contact
+
+    @staticmethod
+    def _build_bank_account(row: Dict[str, Any]) -> Optional[Account]:
+        account_id = row.get("BankAccount_AccountID")
+        account_code = row.get("BankAccount_Code")
+        if _is_empty(account_id) and _is_empty(account_code):
+            return None
+        account = Account()
+        if not _is_empty(account_id):
+            account.account_id = str(account_id).strip()
+        if not _is_empty(account_code):
+            account.code = str(account_code).strip()
+        return account
+
+    @staticmethod
+    def _build_line_item(row: Dict[str, Any]) -> Optional[LineItem]:
+        description = row.get("LineItem_Description")
+        if _is_empty(description):
+            return None
+        line_item = LineItem(description=str(description).strip())
+        if v := row.get("LineItem_Quantity"):
+            q = _to_float(v)
+            if q is not None:
+                line_item.quantity = q
+        if v := row.get("LineItem_UnitAmount"):
+            a = _to_float(v)
+            if a is not None:
+                line_item.unit_amount = a
+        if v := row.get("LineItem_AccountCode"):
+            if not _is_empty(v):
+                line_item.account_code = str(v).strip()
+        if v := row.get("LineItem_TaxType"):
+            if not _is_empty(v):
+                line_item.tax_type = str(v).strip()
+        if v := row.get("LineItem_ItemCode"):
+            if not _is_empty(v):
+                line_item.item_code = str(v).strip()
+        return line_item
+
+    @staticmethod
+    def _log_result(result) -> None:
+        if hasattr(result, "bank_transactions") and result.bank_transactions:
+            ok = sum(1 for t in result.bank_transactions if not t.has_validation_errors)
+            errors = [t for t in result.bank_transactions if t.has_validation_errors]
+            logging.info(f"BankTransactions batch: {ok} ok, {len(errors)} with validation errors")
+            for t in errors:
+                logging.warning(f"  BankTransaction '{t.bank_transaction_id}' validation errors: {t.validation_errors}")
+
+
+
+================================================
+FILE: src/writers/base_writer.py
+================================================
+import logging
+from abc import ABC, abstractmethod
+from typing import Any, Callable, Dict, List, Optional
+
+from xero_python.accounting import AccountingApi
+from xero_python.api_client import ApiClient
+
+BATCH_SIZE = 100
+
+
+def _is_empty(value: Any) -> bool:
+    """Return True if value should be treated as absent (None, empty string)."""
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+
+def _to_bool(value: Any) -> Optional[bool]:
+    """Convert a CSV string value to bool, or None if empty."""
+    if _is_empty(value):
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes")
+
+
+def _to_float(value: Any) -> Optional[float]:
+    """Convert a CSV string value to float, or None if empty."""
+    if _is_empty(value):
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        logging.warning(f"Cannot convert '{value}' to float, skipping field")
+        return None
+
+
+def _to_int(value: Any) -> Optional[int]:
+    """Convert a CSV string value to int, or None if empty."""
+    if _is_empty(value):
+        return None
+    try:
+        return int(float(value))
+    except (ValueError, TypeError):
+        logging.warning(f"Cannot convert '{value}' to int, skipping field")
+        return None
+
+
+class BaseWriter(ABC):
+    """Abstract base class for all Xero entity writers."""
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        self.accounting_api = AccountingApi(api_client)
+        self._raw_api_client = api_client
+        self.tenant_id = tenant_id
+        self.write_mode = write_mode
+
+    @abstractmethod
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        """Write rows to Xero. Must be implemented by subclasses."""
+        pass
+
+    def _process_in_batches(
+        self,
+        rows: List[Dict[str, Any]],
+        batch_fn: Callable[[List[Dict[str, Any]]], None],
+    ) -> None:
+        """Process rows in batches of BATCH_SIZE."""
+        total = len(rows)
+        for i in range(0, total, BATCH_SIZE):
+            batch = rows[i : i + BATCH_SIZE]
+            end = min(i + BATCH_SIZE, total)
+            logging.info(f"Processing batch {i // BATCH_SIZE + 1}: records {i + 1}-{end} of {total}")
+            batch_fn(batch)
+
+    @staticmethod
+    def _get(row: Dict[str, Any], key: str) -> Optional[str]:
+        """Get a string field from a CSV row, returning None if empty."""
+        value = row.get(key)
+        return None if _is_empty(value) else str(value).strip()
+
+
+
+================================================
+FILE: src/writers/contacts.py
+================================================
+import logging
+from typing import Any, Dict, List, Optional
+
+from xero_python.accounting.models import Address, Contact, Contacts, Phone
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter, _is_empty, _to_bool
+
+
+class ContactsWriter(BaseWriter):
+    """Writes Contact records to Xero.
+
+    Supported CSV columns (maps directly to Xero Contact fields):
+      ContactID, ContactNumber, AccountNumber, ContactStatus, Name, FirstName, LastName,
+      EmailAddress, BankAccountDetails, TaxNumber, AccountsReceivableTaxType,
+      AccountsPayableTaxType, IsSupplier, IsCustomer, DefaultCurrency,
+      Website, BatchPayments, Discount, HasAttachments, HasValidationErrors,
+      Phone_PhoneType, Phone_PhoneNumber, Phone_PhoneAreaCode, Phone_PhoneCountryCode,
+      Address_AddressType, Address_AddressLine1, Address_AddressLine2, Address_AddressLine3,
+      Address_AddressLine4, Address_City, Address_Region, Address_PostalCode, Address_Country,
+      Address_AttentionTo
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} contact(s) to Xero (mode={self.write_mode})")
+        self._process_in_batches(rows, self._write_batch)
+
+    def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
+        contacts = [self._row_to_contact(row) for row in batch]
+        contacts_obj = Contacts(contacts=contacts)
+        try:
+            if self.write_mode == "upsert":
+                result = self.accounting_api.update_or_create_contacts(
+                    self.tenant_id,
+                    contacts_obj,
+                    summarize_errors=False,
+                )
+            else:
+                result = self.accounting_api.create_contacts(
+                    self.tenant_id,
+                    contacts_obj,
+                    summarize_errors=False,
+                )
+            self._log_result(result)
+        except Exception as exc:
+            logging.error(f"Failed to write contacts batch: {exc}")
+            raise
+
+    def _row_to_contact(self, row: Dict[str, Any]) -> Contact:
+        contact = Contact()
+
+        if v := self._get(row, "ContactID"):
+            contact.contact_id = v
+        if v := self._get(row, "ContactNumber"):
+            contact.contact_number = v
+        if v := self._get(row, "AccountNumber"):
+            contact.account_number = v
+        if v := self._get(row, "ContactStatus"):
+            contact.contact_status = v
+        if v := self._get(row, "Name"):
+            contact.name = v
+        if v := self._get(row, "FirstName"):
+            contact.first_name = v
+        if v := self._get(row, "LastName"):
+            contact.last_name = v
+        if v := self._get(row, "EmailAddress"):
+            contact.email_address = v
+        if v := self._get(row, "BankAccountDetails"):
+            contact.bank_account_details = v
+        if v := self._get(row, "TaxNumber"):
+            contact.tax_number = v
+        if v := self._get(row, "AccountsReceivableTaxType"):
+            contact.accounts_receivable_tax_type = v
+        if v := self._get(row, "AccountsPayableTaxType"):
+            contact.accounts_payable_tax_type = v
+        if v := self._get(row, "DefaultCurrency"):
+            contact.default_currency = v
+        if v := self._get(row, "Website"):
+            contact.website = v
+
+        is_supplier = _to_bool(row.get("IsSupplier"))
+        if is_supplier is not None:
+            contact.is_supplier = is_supplier
+
+        is_customer = _to_bool(row.get("IsCustomer"))
+        if is_customer is not None:
+            contact.is_customer = is_customer
+
+        phone = self._build_phone(row)
+        if phone:
+            contact.phones = [phone]
+
+        address = self._build_address(row)
+        if address:
+            contact.addresses = [address]
+
+        return contact
+
+    @staticmethod
+    def _build_phone(row: Dict[str, Any]) -> Optional[Phone]:
+        phone_number = row.get("Phone_PhoneNumber")
+        if _is_empty(phone_number):
+            return None
+        phone = Phone(phone_number=str(phone_number).strip())
+        if v := row.get("Phone_PhoneType"):
+            if not _is_empty(v):
+                phone.phone_type = str(v).strip()
+        if v := row.get("Phone_PhoneAreaCode"):
+            if not _is_empty(v):
+                phone.phone_area_code = str(v).strip()
+        if v := row.get("Phone_PhoneCountryCode"):
+            if not _is_empty(v):
+                phone.phone_country_code = str(v).strip()
+        return phone
+
+    @staticmethod
+    def _build_address(row: Dict[str, Any]) -> Optional[Address]:
+        has_address = any(
+            not _is_empty(row.get(k))
+            for k in (
+                "Address_AddressLine1",
+                "Address_City",
+                "Address_PostalCode",
+                "Address_Country",
+            )
+        )
+        if not has_address:
+            return None
+        address = Address()
+        if v := row.get("Address_AddressType"):
+            if not _is_empty(v):
+                address.address_type = str(v).strip()
+        for field, attr in [
+            ("Address_AddressLine1", "address_line1"),
+            ("Address_AddressLine2", "address_line2"),
+            ("Address_AddressLine3", "address_line3"),
+            ("Address_AddressLine4", "address_line4"),
+            ("Address_City", "city"),
+            ("Address_Region", "region"),
+            ("Address_PostalCode", "postal_code"),
+            ("Address_Country", "country"),
+            ("Address_AttentionTo", "attention_to"),
+        ]:
+            v = row.get(field)
+            if not _is_empty(v):
+                setattr(address, attr, str(v).strip())
+        return address
+
+    @staticmethod
+    def _log_result(result) -> None:
+        if hasattr(result, "contacts") and result.contacts:
+            ok = sum(1 for c in result.contacts if not c.has_validation_errors)
+            errors = [c for c in result.contacts if c.has_validation_errors]
+            logging.info(f"Contacts batch: {ok} ok, {len(errors)} with validation errors")
+            for c in errors:
+                logging.warning(f"  Contact '{c.name}' validation errors: {c.validation_errors}")
+
+
+
+================================================
+FILE: src/writers/credit_notes.py
+================================================
+import logging
+from typing import Any, Dict, List, Optional
+
+from xero_python.accounting.models import Contact, CreditNote, CreditNotes, LineItem
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter, _is_empty, _to_float
+
+
+class CreditNotesWriter(BaseWriter):
+    """Writes CreditNote records to Xero.
+
+    Supported CSV columns:
+      CreditNoteID, CreditNoteNumber, Type, Status, Reference, CurrencyCode, CurrencyRate,
+      DateString, FullyPaidOnDate, SentToContact, BrandingThemeID,
+      Contact_ContactID, Contact_Name,
+      LineItem_Description, LineItem_Quantity, LineItem_UnitAmount, LineItem_AccountCode,
+      LineItem_TaxType, LineItem_ItemCode, LineItem_LineItemID
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} credit note(s) to Xero (mode={self.write_mode})")
+        self._process_in_batches(rows, self._write_batch)
+
+    def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
+        notes = [self._row_to_credit_note(row) for row in batch]
+        notes_obj = CreditNotes(credit_notes=notes)
+        try:
+            if self.write_mode == "upsert":
+                result = self.accounting_api.update_or_create_credit_notes(
+                    self.tenant_id,
+                    notes_obj,
+                    summarize_errors=False,
+                )
+            else:
+                result = self.accounting_api.create_credit_notes(
+                    self.tenant_id,
+                    notes_obj,
+                    summarize_errors=False,
+                )
+            self._log_result(result)
+        except Exception as exc:
+            logging.error(f"Failed to write credit notes batch: {exc}")
+            raise
+
+    def _row_to_credit_note(self, row: Dict[str, Any]) -> CreditNote:
+        note = CreditNote()
+
+        if v := self._get(row, "CreditNoteID"):
+            note.credit_note_id = v
+        if v := self._get(row, "CreditNoteNumber"):
+            note.credit_note_number = v
+        if v := self._get(row, "Type"):
+            note.type = v
+        if v := self._get(row, "Status"):
+            note.status = v
+        if v := self._get(row, "Reference"):
+            note.reference = v
+        if v := self._get(row, "CurrencyCode"):
+            note.currency_code = v
+        if v := self._get(row, "DateString"):
+            note.date_string = v
+        if v := self._get(row, "BrandingThemeID"):
+            note.branding_theme_id = v
+
+        currency_rate = _to_float(row.get("CurrencyRate"))
+        if currency_rate is not None:
+            note.currency_rate = currency_rate
+
+        contact = self._build_contact(row)
+        if contact:
+            note.contact = contact
+
+        line_item = self._build_line_item(row)
+        if line_item:
+            note.line_items = [line_item]
+
+        return note
+
+    @staticmethod
+    def _build_contact(row: Dict[str, Any]) -> Optional[Contact]:
+        contact_id = row.get("Contact_ContactID")
+        contact_name = row.get("Contact_Name")
+        if _is_empty(contact_id) and _is_empty(contact_name):
+            return None
+        contact = Contact()
+        if not _is_empty(contact_id):
+            contact.contact_id = str(contact_id).strip()
+        if not _is_empty(contact_name):
+            contact.name = str(contact_name).strip()
+        return contact
+
+    @staticmethod
+    def _build_line_item(row: Dict[str, Any]) -> Optional[LineItem]:
+        description = row.get("LineItem_Description")
+        if _is_empty(description):
+            return None
+        line_item = LineItem(description=str(description).strip())
+        if v := row.get("LineItem_Quantity"):
+            q = _to_float(v)
+            if q is not None:
+                line_item.quantity = q
+        if v := row.get("LineItem_UnitAmount"):
+            a = _to_float(v)
+            if a is not None:
+                line_item.unit_amount = a
+        if v := row.get("LineItem_AccountCode"):
+            if not _is_empty(v):
+                line_item.account_code = str(v).strip()
+        if v := row.get("LineItem_TaxType"):
+            if not _is_empty(v):
+                line_item.tax_type = str(v).strip()
+        if v := row.get("LineItem_ItemCode"):
+            if not _is_empty(v):
+                line_item.item_code = str(v).strip()
+        return line_item
+
+    @staticmethod
+    def _log_result(result) -> None:
+        if hasattr(result, "credit_notes") and result.credit_notes:
+            ok = sum(1 for cn in result.credit_notes if not cn.has_validation_errors)
+            errors = [cn for cn in result.credit_notes if cn.has_validation_errors]
+            logging.info(f"CreditNotes batch: {ok} ok, {len(errors)} with validation errors")
+            for cn in errors:
+                logging.warning(f"  CreditNote '{cn.credit_note_number}' validation errors: {cn.validation_errors}")
+
+
+
+================================================
+FILE: src/writers/currencies.py
+================================================
+import logging
+from typing import Any, Dict, List
+
+from xero_python.accounting.models import Currency
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter, _is_empty
+
+
+class CurrenciesWriter(BaseWriter):
+    """Writes Currency records to Xero (PUT only — create or confirm).
+
+    Supported CSV columns:
+      Code, Description
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} currency/currencies to Xero")
+        # Currencies endpoint only supports one at a time via create_currency
+        for row in rows:
+            self._write_single(row)
+
+    def _write_single(self, row: Dict[str, Any]) -> None:
+        currency = self._row_to_currency(row)
+        if not currency.code:
+            logging.warning("Skipping currency row with no Code")
+            return
+        try:
+            result = self.accounting_api.create_currency(self.tenant_id, currency)
+            if hasattr(result, "currencies") and result.currencies:
+                logging.info(f"Currency '{currency.code}' written successfully")
+            else:
+                logging.info(f"Currency '{currency.code}' processed (may already exist)")
+        except Exception as exc:
+            logging.error(f"Failed to write currency '{currency.code}': {exc}")
+            raise
+
+    @staticmethod
+    def _row_to_currency(row: Dict[str, Any]) -> Currency:
+        currency = Currency()
+        code = row.get("Code")
+        if not _is_empty(code):
+            currency.code = str(code).strip()
+        description = row.get("Description")
+        if not _is_empty(description):
+            currency.description = str(description).strip()
+        return currency
+
+
+
+================================================
+FILE: src/writers/employees.py
+================================================
+import logging
+from typing import Any, Dict, List
+
+from xero_python.accounting.models import Employee, Employees
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter
+
+
+class EmployeesWriter(BaseWriter):
+    """Writes Employee records to Xero (basic payrun employees).
+
+    Supported CSV columns:
+      EmployeeID, FirstName, LastName, ExternalLink_Url, ExternalLink_Description,
+      Status
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} employee(s) to Xero (mode={self.write_mode})")
+        self._process_in_batches(rows, self._write_batch)
+
+    def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
+        employees = [self._row_to_employee(row) for row in batch]
+        employees_obj = Employees(employees=employees)
+        try:
+            if self.write_mode == "upsert":
+                result = self.accounting_api.update_employees(
+                    self.tenant_id,
+                    employees_obj,
+                )
+            else:
+                result = self.accounting_api.create_employees(
+                    self.tenant_id,
+                    employees_obj,
+                    summarize_errors=False,
+                )
+            self._log_result(result)
+        except Exception as exc:
+            logging.error(f"Failed to write employees batch: {exc}")
+            raise
+
+    def _row_to_employee(self, row: Dict[str, Any]) -> Employee:
+        employee = Employee()
+
+        if v := self._get(row, "EmployeeID"):
+            employee.employee_id = v
+        if v := self._get(row, "FirstName"):
+            employee.first_name = v
+        if v := self._get(row, "LastName"):
+            employee.last_name = v
+        if v := self._get(row, "Status"):
+            employee.status = v
+
+        return employee
+
+    @staticmethod
+    def _log_result(result) -> None:
+        if hasattr(result, "employees") and result.employees:
+            logging.info(f"Employees batch: {len(result.employees)} processed")
+
+
+
+================================================
+FILE: src/writers/invoices.py
+================================================
+import logging
+from typing import Any, Dict, List, Optional
+
+from xero_python.accounting.models import Contact, Invoice, Invoices, LineItem
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter, _is_empty, _to_float
+
+
+class InvoicesWriter(BaseWriter):
+    """Writes Invoice records to Xero.
+
+    Supported CSV columns:
+      InvoiceID, InvoiceNumber, Type, Status, Reference, CurrencyCode, CurrencyRate,
+      Url, SentToContact, DateString, DueDateString, ExpectedPaymentDate, PlannedPaymentDate,
+      BrandingThemeID, SubTotal, TotalTax, Total, TotalDiscount, HasAttachments,
+      Contact_ContactID, Contact_Name,
+      LineItem_Description, LineItem_Quantity, LineItem_UnitAmount, LineItem_AccountCode,
+      LineItem_TaxType, LineItem_TaxAmount, LineItem_LineAmount, LineItem_DiscountRate,
+      LineItem_DiscountAmount, LineItem_ItemCode, LineItem_LineItemID
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} invoice(s) to Xero (mode={self.write_mode})")
+        self._process_in_batches(rows, self._write_batch)
+
+    def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
+        invoices = [self._row_to_invoice(row) for row in batch]
+        invoices_obj = Invoices(invoices=invoices)
+        try:
+            if self.write_mode == "upsert":
+                result = self.accounting_api.update_or_create_invoices(
+                    self.tenant_id,
+                    invoices_obj,
+                    summarize_errors=False,
+                )
+            else:
+                result = self.accounting_api.create_invoices(
+                    self.tenant_id,
+                    invoices_obj,
+                    summarize_errors=False,
+                )
+            self._log_result(result)
+        except Exception as exc:
+            logging.error(f"Failed to write invoices batch: {exc}")
+            raise
+
+    def _row_to_invoice(self, row: Dict[str, Any]) -> Invoice:
+        invoice = Invoice()
+
+        if v := self._get(row, "InvoiceID"):
+            invoice.invoice_id = v
+        if v := self._get(row, "InvoiceNumber"):
+            invoice.invoice_number = v
+        if v := self._get(row, "Type"):
+            invoice.type = v
+        if v := self._get(row, "Status"):
+            invoice.status = v
+        if v := self._get(row, "Reference"):
+            invoice.reference = v
+        if v := self._get(row, "CurrencyCode"):
+            invoice.currency_code = v
+        if v := self._get(row, "Url"):
+            invoice.url = v
+        if v := self._get(row, "DateString"):
+            invoice.date_string = v
+        if v := self._get(row, "DueDateString"):
+            invoice.due_date_string = v
+        if v := self._get(row, "BrandingThemeID"):
+            invoice.branding_theme_id = v
+
+        currency_rate = _to_float(row.get("CurrencyRate"))
+        if currency_rate is not None:
+            invoice.currency_rate = currency_rate
+
+        contact = self._build_contact(row)
+        if contact:
+            invoice.contact = contact
+
+        line_item = self._build_line_item(row)
+        if line_item:
+            invoice.line_items = [line_item]
+
+        return invoice
+
+    @staticmethod
+    def _build_contact(row: Dict[str, Any]) -> Optional[Contact]:
+        contact_id = row.get("Contact_ContactID")
+        contact_name = row.get("Contact_Name")
+        if _is_empty(contact_id) and _is_empty(contact_name):
+            return None
+        contact = Contact()
+        if not _is_empty(contact_id):
+            contact.contact_id = str(contact_id).strip()
+        if not _is_empty(contact_name):
+            contact.name = str(contact_name).strip()
+        return contact
+
+    @staticmethod
+    def _build_line_item(row: Dict[str, Any]) -> Optional[LineItem]:
+        description = row.get("LineItem_Description")
+        if _is_empty(description):
+            return None
+        line_item = LineItem(description=str(description).strip())
+        if v := row.get("LineItem_Quantity"):
+            q = _to_float(v)
+            if q is not None:
+                line_item.quantity = q
+        if v := row.get("LineItem_UnitAmount"):
+            a = _to_float(v)
+            if a is not None:
+                line_item.unit_amount = a
+        if v := row.get("LineItem_AccountCode"):
+            if not _is_empty(v):
+                line_item.account_code = str(v).strip()
+        if v := row.get("LineItem_TaxType"):
+            if not _is_empty(v):
+                line_item.tax_type = str(v).strip()
+        if v := row.get("LineItem_ItemCode"):
+            if not _is_empty(v):
+                line_item.item_code = str(v).strip()
+        if v := row.get("LineItem_DiscountRate"):
+            d = _to_float(v)
+            if d is not None:
+                line_item.discount_rate = d
+        if v := row.get("LineItem_LineItemID"):
+            if not _is_empty(v):
+                line_item.line_item_id = str(v).strip()
+        return line_item
+
+    @staticmethod
+    def _log_result(result) -> None:
+        if hasattr(result, "invoices") and result.invoices:
+            ok = sum(1 for inv in result.invoices if not inv.has_validation_errors)
+            errors = [inv for inv in result.invoices if inv.has_validation_errors]
+            logging.info(f"Invoices batch: {ok} ok, {len(errors)} with validation errors")
+            for inv in errors:
+                logging.warning(f"  Invoice '{inv.invoice_number}' validation errors: {inv.validation_errors}")
+
+
+
+================================================
+FILE: src/writers/items.py
+================================================
+import logging
+from typing import Any, Dict, List
+
+from xero_python.accounting.models import Item, Items, Purchase
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter, _is_empty, _to_bool, _to_float
+
+
+class ItemsWriter(BaseWriter):
+    """Writes Item (product/service catalog) records to Xero.
+
+    Supported CSV columns:
+      ItemID, Code, Name, Description, PurchaseDescription, IsSold, IsPurchased,
+      PurchaseDetails_UnitPrice, PurchaseDetails_AccountCode, PurchaseDetails_TaxType,
+      SalesDetails_UnitPrice, SalesDetails_AccountCode, SalesDetails_TaxType
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} item(s) to Xero (mode={self.write_mode})")
+        self._process_in_batches(rows, self._write_batch)
+
+    def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
+        items = [self._row_to_item(row) for row in batch]
+        items_obj = Items(items=items)
+        try:
+            if self.write_mode == "upsert":
+                result = self.accounting_api.update_or_create_items(
+                    self.tenant_id,
+                    items_obj,
+                    summarize_errors=False,
+                )
+            else:
+                result = self.accounting_api.create_items(
+                    self.tenant_id,
+                    items_obj,
+                    summarize_errors=False,
+                )
+            self._log_result(result)
+        except Exception as exc:
+            logging.error(f"Failed to write items batch: {exc}")
+            raise
+
+    def _row_to_item(self, row: Dict[str, Any]) -> Item:
+        item = Item()
+
+        if v := self._get(row, "ItemID"):
+            item.item_id = v
+        if v := self._get(row, "Code"):
+            item.code = v
+        if v := self._get(row, "Name"):
+            item.name = v
+        if v := self._get(row, "Description"):
+            item.description = v
+        if v := self._get(row, "PurchaseDescription"):
+            item.purchase_description = v
+
+        is_sold = _to_bool(row.get("IsSold"))
+        if is_sold is not None:
+            item.is_sold = is_sold
+
+        is_purchased = _to_bool(row.get("IsPurchased"))
+        if is_purchased is not None:
+            item.is_purchased = is_purchased
+
+        purchase_details = self._build_purchase_details(row)
+        if purchase_details:
+            item.purchase_details = purchase_details
+
+        sales_details = self._build_sales_details(row)
+        if sales_details:
+            item.sales_details = sales_details
+
+        return item
+
+    @staticmethod
+    def _build_purchase_details(row: Dict[str, Any]):
+        unit_price = _to_float(row.get("PurchaseDetails_UnitPrice"))
+        account_code = row.get("PurchaseDetails_AccountCode")
+        if unit_price is None and _is_empty(account_code):
+            return None
+        purchase = Purchase()
+        if unit_price is not None:
+            purchase.unit_price = unit_price
+        if not _is_empty(account_code):
+            purchase.account_code = str(account_code).strip()
+        if v := row.get("PurchaseDetails_TaxType"):
+            if not _is_empty(v):
+                purchase.tax_type = str(v).strip()
+        return purchase
+
+    @staticmethod
+    def _build_sales_details(row: Dict[str, Any]):
+        unit_price = _to_float(row.get("SalesDetails_UnitPrice"))
+        account_code = row.get("SalesDetails_AccountCode")
+        if unit_price is None and _is_empty(account_code):
+            return None
+        # xero_python uses the Purchase model for both purchase_details and sales_details
+        sales = Purchase()
+        if unit_price is not None:
+            sales.unit_price = unit_price
+        if not _is_empty(account_code):
+            sales.account_code = str(account_code).strip()
+        if v := row.get("SalesDetails_TaxType"):
+            if not _is_empty(v):
+                sales.tax_type = str(v).strip()
+        return sales
+
+    @staticmethod
+    def _log_result(result) -> None:
+        if hasattr(result, "items") and result.items:
+            ok = sum(1 for it in result.items if not it.has_validation_errors)
+            errors = [it for it in result.items if it.has_validation_errors]
+            logging.info(f"Items batch: {ok} ok, {len(errors)} with validation errors")
+            for it in errors:
+                logging.warning(f"  Item '{it.code}' validation errors: {it.validation_errors}")
+
+
+
+================================================
+FILE: src/writers/manual_journals.py
+================================================
+import logging
+from typing import Any, Dict, List
+
+from xero_python.accounting.models import ManualJournal, ManualJournalLine, ManualJournals
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter, _is_empty, _to_bool, _to_float
+
+
+class ManualJournalsWriter(BaseWriter):
+    """Writes ManualJournal records to Xero.
+
+    Supported CSV columns:
+      ManualJournalID, Narration, DateString, Status, Url, ShowOnCashBasisReports,
+      HasAttachments, HasValidationErrors,
+      JournalLine_Description, JournalLine_LineAmount, JournalLine_AccountCode,
+      JournalLine_TaxType, JournalLine_TaxAmount, JournalLine_IsBlank
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} manual journal(s) to Xero (mode={self.write_mode})")
+        self._process_in_batches(rows, self._write_batch)
+
+    def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
+        journals = [self._row_to_journal(row) for row in batch]
+        journals_obj = ManualJournals(manual_journals=journals)
+        try:
+            if self.write_mode == "upsert":
+                result = self.accounting_api.update_or_create_manual_journals(
+                    self.tenant_id,
+                    journals_obj,
+                    summarize_errors=False,
+                )
+            else:
+                result = self.accounting_api.create_manual_journals(
+                    self.tenant_id,
+                    journals_obj,
+                    summarize_errors=False,
+                )
+            self._log_result(result)
+        except Exception as exc:
+            logging.error(f"Failed to write manual journals batch: {exc}")
+            raise
+
+    def _row_to_journal(self, row: Dict[str, Any]) -> ManualJournal:
+        journal = ManualJournal()
+
+        if v := self._get(row, "ManualJournalID"):
+            journal.manual_journal_id = v
+        if v := self._get(row, "Narration"):
+            journal.narration = v
+        if v := self._get(row, "DateString"):
+            journal.date_string = v
+        if v := self._get(row, "Status"):
+            journal.status = v
+        if v := self._get(row, "Url"):
+            journal.url = v
+
+        show_on_cash = _to_bool(row.get("ShowOnCashBasisReports"))
+        if show_on_cash is not None:
+            journal.show_on_cash_basis_reports = show_on_cash
+
+        journal_line = self._build_journal_line(row)
+        if journal_line:
+            journal.journal_lines = [journal_line]
+
+        return journal
+
+    @staticmethod
+    def _build_journal_line(row: Dict[str, Any]):
+        description = row.get("JournalLine_Description")
+        line_amount = _to_float(row.get("JournalLine_LineAmount"))
+        if _is_empty(description) and line_amount is None:
+            return None
+        line = ManualJournalLine()
+        if not _is_empty(description):
+            line.description = str(description).strip()
+        if line_amount is not None:
+            line.line_amount = line_amount
+        if v := row.get("JournalLine_AccountCode"):
+            if not _is_empty(v):
+                line.account_code = str(v).strip()
+        if v := row.get("JournalLine_TaxType"):
+            if not _is_empty(v):
+                line.tax_type = str(v).strip()
+        return line
+
+    @staticmethod
+    def _log_result(result) -> None:
+        if hasattr(result, "manual_journals") and result.manual_journals:
+            ok = sum(1 for j in result.manual_journals if not j.has_validation_errors)
+            errors = [j for j in result.manual_journals if j.has_validation_errors]
+            logging.info(f"ManualJournals batch: {ok} ok, {len(errors)} with validation errors")
+            for j in errors:
+                logging.warning(f"  Journal '{j.narration}' validation errors: {j.validation_errors}")
+
+
+
+================================================
+FILE: src/writers/payments.py
+================================================
+import logging
+from typing import Any, Dict, List, Optional
+
+from xero_python.accounting.models import Account, Invoice, Payment, Payments
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter, _is_empty, _to_bool, _to_float
+
+
+class PaymentsWriter(BaseWriter):
+    """Writes Payment records to Xero.
+
+    Supported CSV columns:
+      PaymentID, Date, Amount, Reference, CurrencyRate, IsReconciled, Status, PaymentType,
+      Invoice_InvoiceID, Invoice_InvoiceNumber,
+      Account_AccountID, Account_Code
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} payment(s) to Xero (mode={self.write_mode})")
+        self._process_in_batches(rows, self._write_batch)
+
+    def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
+        payments = [self._row_to_payment(row) for row in batch]
+        payments_obj = Payments(payments=payments)
+        try:
+            if self.write_mode == "upsert" and any(p.payment_id for p in payments):
+                # Payments API doesn't have update_or_create; update by PaymentID if present
+                for payment in payments:
+                    if payment.payment_id:
+                        self.accounting_api.update_payment(self.tenant_id, payment.payment_id, payment)
+                    else:
+                        self.accounting_api.create_payment(self.tenant_id, payment)
+            else:
+                result = self.accounting_api.create_payments(
+                    self.tenant_id,
+                    payments_obj,
+                    summarize_errors=False,
+                )
+                self._log_result(result)
+        except Exception as exc:
+            logging.error(f"Failed to write payments batch: {exc}")
+            raise
+
+    def _row_to_payment(self, row: Dict[str, Any]) -> Payment:
+        payment = Payment()
+
+        if v := self._get(row, "PaymentID"):
+            payment.payment_id = v
+        if v := self._get(row, "Date"):
+            payment.date = v
+        if v := self._get(row, "Reference"):
+            payment.reference = v
+        if v := self._get(row, "Status"):
+            payment.status = v
+        if v := self._get(row, "PaymentType"):
+            payment.payment_type = v
+
+        amount = _to_float(row.get("Amount"))
+        if amount is not None:
+            payment.amount = amount
+
+        currency_rate = _to_float(row.get("CurrencyRate"))
+        if currency_rate is not None:
+            payment.currency_rate = currency_rate
+
+        is_reconciled = _to_bool(row.get("IsReconciled"))
+        if is_reconciled is not None:
+            payment.is_reconciled = is_reconciled
+
+        invoice = self._build_invoice(row)
+        if invoice:
+            payment.invoice = invoice
+
+        account = self._build_account(row)
+        if account:
+            payment.account = account
+
+        return payment
+
+    @staticmethod
+    def _build_invoice(row: Dict[str, Any]) -> Optional[Invoice]:
+        invoice_id = row.get("Invoice_InvoiceID")
+        invoice_number = row.get("Invoice_InvoiceNumber")
+        if _is_empty(invoice_id) and _is_empty(invoice_number):
+            return None
+        invoice = Invoice()
+        if not _is_empty(invoice_id):
+            invoice.invoice_id = str(invoice_id).strip()
+        if not _is_empty(invoice_number):
+            invoice.invoice_number = str(invoice_number).strip()
+        return invoice
+
+    @staticmethod
+    def _build_account(row: Dict[str, Any]) -> Optional[Account]:
+        account_id = row.get("Account_AccountID")
+        account_code = row.get("Account_Code")
+        if _is_empty(account_id) and _is_empty(account_code):
+            return None
+        account = Account()
+        if not _is_empty(account_id):
+            account.account_id = str(account_id).strip()
+        if not _is_empty(account_code):
+            account.code = str(account_code).strip()
+        return account
+
+    @staticmethod
+    def _log_result(result) -> None:
+        if hasattr(result, "payments") and result.payments:
+            ok = sum(1 for p in result.payments if not p.has_validation_errors)
+            errors = [p for p in result.payments if p.has_validation_errors]
+            logging.info(f"Payments batch: {ok} ok, {len(errors)} with validation errors")
+            for p in errors:
+                logging.warning(f"  Payment '{p.payment_id}' validation errors: {p.validation_errors}")
+
+
+
+================================================
+FILE: src/writers/purchase_orders.py
+================================================
+import logging
+from typing import Any, Dict, List, Optional
+
+from xero_python.accounting.models import Contact, LineItem, PurchaseOrder, PurchaseOrders
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter, _is_empty, _to_float
+
+
+class PurchaseOrdersWriter(BaseWriter):
+    """Writes PurchaseOrder records to Xero.
+
+    Supported CSV columns:
+      PurchaseOrderID, PurchaseOrderNumber, DateString, DeliveryDateString, Status,
+      CurrencyCode, CurrencyRate, Reference, SentToContact, DeliveryAddress,
+      AttentionTo, Telephone, DeliveryInstructions, ExpectedArrivalDate,
+      Contact_ContactID, Contact_Name,
+      LineItem_Description, LineItem_Quantity, LineItem_UnitAmount, LineItem_AccountCode,
+      LineItem_TaxType, LineItem_ItemCode, LineItem_LineItemID
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} purchase order(s) to Xero (mode={self.write_mode})")
+        self._process_in_batches(rows, self._write_batch)
+
+    def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
+        pos = [self._row_to_po(row) for row in batch]
+        pos_obj = PurchaseOrders(purchase_orders=pos)
+        try:
+            if self.write_mode == "upsert":
+                result = self.accounting_api.update_or_create_purchase_orders(
+                    self.tenant_id,
+                    pos_obj,
+                    summarize_errors=False,
+                )
+            else:
+                result = self.accounting_api.create_purchase_orders(
+                    self.tenant_id,
+                    pos_obj,
+                    summarize_errors=False,
+                )
+            self._log_result(result)
+        except Exception as exc:
+            logging.error(f"Failed to write purchase orders batch: {exc}")
+            raise
+
+    def _row_to_po(self, row: Dict[str, Any]) -> PurchaseOrder:
+        po = PurchaseOrder()
+
+        if v := self._get(row, "PurchaseOrderID"):
+            po.purchase_order_id = v
+        if v := self._get(row, "PurchaseOrderNumber"):
+            po.purchase_order_number = v
+        if v := self._get(row, "DateString"):
+            po.date_string = v
+        if v := self._get(row, "DeliveryDateString"):
+            po.delivery_date_string = v
+        if v := self._get(row, "Status"):
+            po.status = v
+        if v := self._get(row, "CurrencyCode"):
+            po.currency_code = v
+        if v := self._get(row, "Reference"):
+            po.reference = v
+        if v := self._get(row, "DeliveryAddress"):
+            po.delivery_address = v
+        if v := self._get(row, "AttentionTo"):
+            po.attention_to = v
+        if v := self._get(row, "Telephone"):
+            po.telephone = v
+        if v := self._get(row, "DeliveryInstructions"):
+            po.delivery_instructions = v
+
+        currency_rate = _to_float(row.get("CurrencyRate"))
+        if currency_rate is not None:
+            po.currency_rate = currency_rate
+
+        contact = self._build_contact(row)
+        if contact:
+            po.contact = contact
+
+        line_item = self._build_line_item(row)
+        if line_item:
+            po.line_items = [line_item]
+
+        return po
+
+    @staticmethod
+    def _build_contact(row: Dict[str, Any]) -> Optional[Contact]:
+        contact_id = row.get("Contact_ContactID")
+        contact_name = row.get("Contact_Name")
+        if _is_empty(contact_id) and _is_empty(contact_name):
+            return None
+        contact = Contact()
+        if not _is_empty(contact_id):
+            contact.contact_id = str(contact_id).strip()
+        if not _is_empty(contact_name):
+            contact.name = str(contact_name).strip()
+        return contact
+
+    @staticmethod
+    def _build_line_item(row: Dict[str, Any]) -> Optional[LineItem]:
+        description = row.get("LineItem_Description")
+        if _is_empty(description):
+            return None
+        line_item = LineItem(description=str(description).strip())
+        if v := row.get("LineItem_Quantity"):
+            q = _to_float(v)
+            if q is not None:
+                line_item.quantity = q
+        if v := row.get("LineItem_UnitAmount"):
+            a = _to_float(v)
+            if a is not None:
+                line_item.unit_amount = a
+        if v := row.get("LineItem_AccountCode"):
+            if not _is_empty(v):
+                line_item.account_code = str(v).strip()
+        if v := row.get("LineItem_TaxType"):
+            if not _is_empty(v):
+                line_item.tax_type = str(v).strip()
+        if v := row.get("LineItem_ItemCode"):
+            if not _is_empty(v):
+                line_item.item_code = str(v).strip()
+        return line_item
+
+    @staticmethod
+    def _log_result(result) -> None:
+        if hasattr(result, "purchase_orders") and result.purchase_orders:
+            ok = sum(1 for po in result.purchase_orders if not po.has_validation_errors)
+            errors = [po for po in result.purchase_orders if po.has_validation_errors]
+            logging.info(f"PurchaseOrders batch: {ok} ok, {len(errors)} with validation errors")
+            for po in errors:
+                logging.warning(f"  PO '{po.purchase_order_number}' validation errors: {po.validation_errors}")
+
+
+
+================================================
+FILE: src/writers/quotes.py
+================================================
+import logging
+from typing import Any, Dict, List, Optional
+
+from xero_python.accounting.models import Contact, LineItem, Quote, Quotes
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter, _is_empty, _to_float
+
+
+class QuotesWriter(BaseWriter):
+    """Writes Quote records to Xero.
+
+    Supported CSV columns:
+      QuoteID, QuoteNumber, Reference, CurrencyCode, CurrencyRate, Status,
+      Title, Summary, Terms, DateString, ExpiryDateString,
+      Contact_ContactID, Contact_Name,
+      LineItem_Description, LineItem_Quantity, LineItem_UnitAmount, LineItem_AccountCode,
+      LineItem_TaxType, LineItem_ItemCode, LineItem_LineItemID
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} quote(s) to Xero (mode={self.write_mode})")
+        self._process_in_batches(rows, self._write_batch)
+
+    def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
+        quotes = [self._row_to_quote(row) for row in batch]
+        quotes_obj = Quotes(quotes=quotes)
+        try:
+            if self.write_mode == "upsert":
+                result = self.accounting_api.update_or_create_quotes(
+                    self.tenant_id,
+                    quotes_obj,
+                    summarize_errors=False,
+                )
+            else:
+                result = self.accounting_api.create_quotes(
+                    self.tenant_id,
+                    quotes_obj,
+                    summarize_errors=False,
+                )
+            self._log_result(result)
+        except Exception as exc:
+            logging.error(f"Failed to write quotes batch: {exc}")
+            raise
+
+    def _row_to_quote(self, row: Dict[str, Any]) -> Quote:
+        quote = Quote()
+
+        if v := self._get(row, "QuoteID"):
+            quote.quote_id = v
+        if v := self._get(row, "QuoteNumber"):
+            quote.quote_number = v
+        if v := self._get(row, "Reference"):
+            quote.reference = v
+        if v := self._get(row, "CurrencyCode"):
+            quote.currency_code = v
+        if v := self._get(row, "Status"):
+            quote.status = v
+        if v := self._get(row, "Title"):
+            quote.title = v
+        if v := self._get(row, "Summary"):
+            quote.summary = v
+        if v := self._get(row, "Terms"):
+            quote.terms = v
+        if v := self._get(row, "DateString"):
+            quote.date_string = v
+        if v := self._get(row, "ExpiryDateString"):
+            quote.expiry_date_string = v
+
+        currency_rate = _to_float(row.get("CurrencyRate"))
+        if currency_rate is not None:
+            quote.currency_rate = currency_rate
+
+        contact = self._build_contact(row)
+        if contact:
+            quote.contact = contact
+
+        line_item = self._build_line_item(row)
+        if line_item:
+            quote.line_items = [line_item]
+
+        return quote
+
+    @staticmethod
+    def _build_contact(row: Dict[str, Any]) -> Optional[Contact]:
+        contact_id = row.get("Contact_ContactID")
+        contact_name = row.get("Contact_Name")
+        if _is_empty(contact_id) and _is_empty(contact_name):
+            return None
+        contact = Contact()
+        if not _is_empty(contact_id):
+            contact.contact_id = str(contact_id).strip()
+        if not _is_empty(contact_name):
+            contact.name = str(contact_name).strip()
+        return contact
+
+    @staticmethod
+    def _build_line_item(row: Dict[str, Any]) -> Optional[LineItem]:
+        description = row.get("LineItem_Description")
+        if _is_empty(description):
+            return None
+        line_item = LineItem(description=str(description).strip())
+        if v := row.get("LineItem_Quantity"):
+            q = _to_float(v)
+            if q is not None:
+                line_item.quantity = q
+        if v := row.get("LineItem_UnitAmount"):
+            a = _to_float(v)
+            if a is not None:
+                line_item.unit_amount = a
+        if v := row.get("LineItem_AccountCode"):
+            if not _is_empty(v):
+                line_item.account_code = str(v).strip()
+        if v := row.get("LineItem_TaxType"):
+            if not _is_empty(v):
+                line_item.tax_type = str(v).strip()
+        if v := row.get("LineItem_ItemCode"):
+            if not _is_empty(v):
+                line_item.item_code = str(v).strip()
+        return line_item
+
+    @staticmethod
+    def _log_result(result) -> None:
+        if hasattr(result, "quotes") and result.quotes:
+            ok = sum(1 for q in result.quotes if not q.has_validation_errors)
+            errors = [q for q in result.quotes if q.has_validation_errors]
+            logging.info(f"Quotes batch: {ok} ok, {len(errors)} with validation errors")
+            for q in errors:
+                logging.warning(f"  Quote '{q.quote_number}' validation errors: {q.validation_errors}")
+
+
+
+================================================
+FILE: src/writers/tracking_categories.py
+================================================
+import logging
+from typing import Any, Dict, List
+
+from xero_python.accounting.models import TrackingCategory
+from xero_python.api_client import ApiClient
+
+from .base_writer import BaseWriter
+
+
+class TrackingCategoriesWriter(BaseWriter):
+    """Writes TrackingCategory records to Xero.
+
+    Supported CSV columns:
+      TrackingCategoryID, Name, Status
+    """
+
+    def __init__(self, api_client: ApiClient, tenant_id: str, write_mode: str) -> None:
+        super().__init__(api_client, tenant_id, write_mode)
+
+    def write(self, rows: List[Dict[str, Any]]) -> None:
+        logging.info(f"Writing {len(rows)} tracking category/categories to Xero (mode={self.write_mode})")
+        # Tracking categories are written one by one (no batch endpoint)
+        for row in rows:
+            self._write_single(row)
+
+    def _write_single(self, row: Dict[str, Any]) -> None:
+        category = self._row_to_tracking_category(row)
+        if not category.name:
+            logging.warning("Skipping tracking category row with no Name")
+            return
+        try:
+            if self.write_mode == "upsert" and category.tracking_category_id:
+                self.accounting_api.update_tracking_category(
+                    self.tenant_id,
+                    category.tracking_category_id,
+                    category,
+                )
+                logging.info(f"Updated tracking category '{category.name}'")
+            else:
+                self.accounting_api.create_tracking_category(
+                    self.tenant_id,
+                    category,
+                )
+                logging.info(f"Created tracking category '{category.name}'")
+        except Exception as exc:
+            logging.error(f"Failed to write tracking category '{category.name}': {exc}")
+            raise
+
+    def _row_to_tracking_category(self, row: Dict[str, Any]) -> TrackingCategory:
+        category = TrackingCategory()
+        if v := self._get(row, "TrackingCategoryID"):
+            category.tracking_category_id = v
+        if v := self._get(row, "Name"):
+            category.name = v
+        if v := self._get(row, "Status"):
+            category.status = v
+        return category
+
+
+
+================================================
+FILE: tests/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/functional/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tests/functional/test_component.py
+================================================
+"""
+Functional tests for the Xero Accounting Writer component.
+
+These tests validate the component's configuration parsing, writer routing,
+and CSV-to-model mapping logic WITHOUT making real Xero API calls.
+"""
+import os
+import sys
+import unittest
+from typing import Any, Dict
+from unittest.mock import MagicMock, patch
+
+# Ensure src/ is on the path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
+
+from configuration import EntityType, RootConfiguration, RowConfiguration, WriteMode
+from writers.base_writer import _is_empty, _to_bool, _to_float, _to_int
+
+
+class TestBaseWriterHelpers(unittest.TestCase):
+    """Unit tests for shared CSV conversion helpers."""
+
+    def test_is_empty_none(self):
+        self.assertTrue(_is_empty(None))
+
+    def test_is_empty_blank_string(self):
+        self.assertTrue(_is_empty(""))
+        self.assertTrue(_is_empty("   "))
+
+    def test_is_empty_valid_value(self):
+        self.assertFalse(_is_empty("hello"))
+        self.assertFalse(_is_empty("0"))
+        self.assertFalse(_is_empty(0))
+
+    def test_to_bool_true_variants(self):
+        for v in ("true", "True", "TRUE", "1", "yes", "YES"):
+            self.assertTrue(_to_bool(v), f"Expected True for '{v}'")
+
+    def test_to_bool_false_variants(self):
+        for v in ("false", "False", "FALSE", "0", "no", "NO"):
+            self.assertFalse(_to_bool(v), f"Expected False for '{v}'")
+
+    def test_to_bool_empty(self):
+        self.assertIsNone(_to_bool(""))
+        self.assertIsNone(_to_bool(None))
+
+    def test_to_float_valid(self):
+        self.assertEqual(_to_float("3.14"), 3.14)
+        self.assertEqual(_to_float("100"), 100.0)
+
+    def test_to_float_empty(self):
+        self.assertIsNone(_to_float(""))
+        self.assertIsNone(_to_float(None))
+
+    def test_to_float_invalid(self):
+        self.assertIsNone(_to_float("not_a_number"))
+
+    def test_to_int_valid(self):
+        self.assertEqual(_to_int("42"), 42)
+        self.assertEqual(_to_int("3.9"), 3)
+
+    def test_to_int_empty(self):
+        self.assertIsNone(_to_int(""))
+        self.assertIsNone(_to_int(None))
+
+
+class TestConfiguration(unittest.TestCase):
+    """Unit tests for configuration models."""
+
+    def test_row_config_defaults(self):
+        config = RowConfiguration(entity_type="Contacts")
+        self.assertEqual(config.entity_type, EntityType.contacts)
+        self.assertEqual(config.write_mode, WriteMode.upsert)
+
+    def test_row_config_create_mode(self):
+        config = RowConfiguration(entity_type="Invoices", write_mode="create")
+        self.assertEqual(config.entity_type, EntityType.invoices)
+        self.assertEqual(config.write_mode, WriteMode.create)
+
+    def test_row_config_all_entity_types(self):
+        entity_types = [
+            "Contacts", "Invoices", "Payments", "PurchaseOrders",
+            "ManualJournals", "Items", "CreditNotes", "Currencies",
+            "Employees", "Quotes", "TrackingCategories", "BankTransactions",
+        ]
+        for et in entity_types:
+            config = RowConfiguration(entity_type=et)
+            self.assertIsNotNone(config.entity_type, f"Failed for entity_type={et}")
+
+    def test_root_config_optional_tenant(self):
+        config = RootConfiguration()
+        self.assertIsNone(config.tenant_id)
+
+    def test_root_config_with_tenant(self):
+        config = RootConfiguration(tenant_id="abc-123")
+        self.assertEqual(config.tenant_id, "abc-123")
+
+
+class TestContactsWriter(unittest.TestCase):
+    """Unit tests for ContactsWriter model mapping."""
+
+    def setUp(self):
+        from writers.contacts import ContactsWriter
+        mock_api_client = MagicMock()
+        with patch("writers.base_writer.AccountingApi"):
+            self.writer = ContactsWriter(mock_api_client, "tenant-123", "upsert")
+
+    def test_row_to_contact_basic(self):
+        row: Dict[str, Any] = {
+            "Name": "Acme Corp",
+            "EmailAddress": "acme@example.com",
+            "ContactNumber": "C001",
+            "IsCustomer": "true",
+            "IsSupplier": "false",
+        }
+        contact = self.writer._row_to_contact(row)
+        self.assertEqual(contact.name, "Acme Corp")
+        self.assertEqual(contact.email_address, "acme@example.com")
+        self.assertEqual(contact.contact_number, "C001")
+        self.assertTrue(contact.is_customer)
+        self.assertFalse(contact.is_supplier)
+
+    def test_row_to_contact_skips_empty(self):
+        row: Dict[str, Any] = {"Name": "Test", "EmailAddress": ""}
+        contact = self.writer._row_to_contact(row)
+        self.assertEqual(contact.name, "Test")
+        self.assertIsNone(contact.email_address)
+
+    def test_row_to_contact_with_phone(self):
+        row: Dict[str, Any] = {
+            "Name": "Phone Corp",
+            "Phone_PhoneNumber": "555-1234",
+            "Phone_PhoneType": "DEFAULT",
+        }
+        contact = self.writer._row_to_contact(row)
+        self.assertIsNotNone(contact.phones)
+        self.assertEqual(len(contact.phones), 1)
+        self.assertEqual(contact.phones[0].phone_number, "555-1234")
+
+    def test_row_to_contact_no_phone_when_empty(self):
+        row: Dict[str, Any] = {"Name": "No Phone Corp", "Phone_PhoneNumber": ""}
+        contact = self.writer._row_to_contact(row)
+        self.assertIsNone(contact.phones)
+
+
+class TestInvoicesWriter(unittest.TestCase):
+    """Unit tests for InvoicesWriter model mapping."""
+
+    def setUp(self):
+        from writers.invoices import InvoicesWriter
+        mock_api_client = MagicMock()
+        with patch("writers.base_writer.AccountingApi"):
+            self.writer = InvoicesWriter(mock_api_client, "tenant-123", "upsert")
+
+    def test_row_to_invoice_basic(self):
+        row: Dict[str, Any] = {
+            "InvoiceNumber": "INV-001",
+            "Type": "ACCREC",
+            "Status": "DRAFT",
+            "Contact_Name": "Customer A",
+            "LineItem_Description": "Consulting services",
+            "LineItem_UnitAmount": "100.00",
+            "LineItem_Quantity": "5",
+            "LineItem_AccountCode": "200",
+        }
+        invoice = self.writer._row_to_invoice(row)
+        self.assertEqual(invoice.invoice_number, "INV-001")
+        self.assertEqual(invoice.type, "ACCREC")
+        self.assertIsNotNone(invoice.contact)
+        self.assertEqual(invoice.contact.name, "Customer A")
+        self.assertIsNotNone(invoice.line_items)
+        self.assertEqual(invoice.line_items[0].unit_amount, 100.0)
+        self.assertEqual(invoice.line_items[0].quantity, 5.0)
+
+
+class TestWriterRouting(unittest.TestCase):
+    """Test that component correctly routes to the right writer."""
+
+    def test_writer_map_completeness(self):
+        from component import WRITER_MAP
+        for entity in EntityType:
+            self.assertIn(entity, WRITER_MAP, f"Missing writer for {entity}")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+================================================
+FILE: .github/workflows/push.yml
+================================================
+name: Keboola Component Build & Deploy Pipeline
+on:
+  push:  # skip the workflow on the main branch without tags
+    branches-ignore:
+      - main
+    tags:
+      - "*"
+
+concurrency: ci-${{ github.ref }}  # to avoid tag collisions in the ECR
+env:
+  # repository variables:
+  KBC_DEVELOPERPORTAL_APP: keboola.wr-xero-accounting
+  KBC_DEVELOPERPORTAL_VENDOR: keboola
+  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+  KBC_DEVELOPERPORTAL_USERNAME: ${{ vars.KBC_DEVELOPERPORTAL_USERNAME }}
+
+  # repository secrets:
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}  # recommended for pushing to ECR
+  KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+
+  # (optional) test KBC project: https://connection.keboola.com/admin/projects/0000
+  KBC_TEST_PROJECT_CONFIGS: ""  # space separated list of config ids
+  KBC_STORAGE_TOKEN: ${{ secrets.KBC_STORAGE_TOKEN }}  # required for running KBC tests
+
+jobs:
+  push_event_info:
+    name: Push Event Info
+    runs-on: ubuntu-latest
+    outputs:
+      app_image_tag: ${{ steps.tag.outputs.app_image_tag }}
+      is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
+      is_default_branch: ${{ steps.default_branch.outputs.is_default_branch }}
+      is_deploy_ready: ${{ steps.deploy_ready.outputs.is_deploy_ready }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Fetch all branches from remote repository
+        run: git fetch --prune --unshallow --tags -f
+
+      - name: Get current branch name
+        id: current_branch
+        run: |
+          if [[ ${{ github.ref }} != "refs/tags/"* ]]; then
+            branch_name=${{ github.ref_name }}
+            echo "branch_name=$branch_name" | tee -a $GITHUB_OUTPUT
+          else
+            raw=$(git branch -r --contains ${{ github.ref }})
+            branch="$(echo ${raw/*origin\//} | tr -d '\n')"
+            echo "branch_name=$branch" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Is current branch the default branch
+        id: default_branch
+        run: |
+          echo "default_branch='${{ github.event.repository.default_branch }}'"
+          if [ "${{ github.event.repository.default_branch }}" = "${{ steps.current_branch.outputs.branch_name }}" ]; then
+             echo "is_default_branch=true" | tee -a $GITHUB_OUTPUT
+          else
+             echo "is_default_branch=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Set image tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
+          echo "is_semantic_tag=$IS_SEMANTIC_TAG" | tee -a $GITHUB_OUTPUT
+          echo "app_image_tag=$TAG" | tee -a $GITHUB_OUTPUT
+
+      - name: Deploy-Ready check
+        id: deploy_ready
+        run: |
+          if [[ "${{ steps.default_branch.outputs.is_default_branch }}" == "true" \
+            && "${{ github.ref }}" == refs/tags/* \
+            && "${{ steps.tag.outputs.is_semantic_tag }}" == "true" ]]; then
+              echo "is_deploy_ready=true" | tee -a $GITHUB_OUTPUT
+          else
+              echo "is_deploy_ready=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Docker Image Build
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest
+          outputs: type=docker,dest=/tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - build
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load Image & Run Tests
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+          echo "Running flake8..."
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest flake8 . --config=flake8.cfg
+          echo "Running unit tests..."
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest python -m pytest tests/ -v
+
+  tests-kbc:
+    name: Run KBC Tests
+    needs:
+      - push_event_info
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up environment variables
+        run: |
+          echo "KBC_TEST_PROJECT_CONFIGS=${KBC_TEST_PROJECT_CONFIGS}" >> $GITHUB_ENV
+          echo "KBC_STORAGE_TOKEN=${{ secrets.KBC_STORAGE_TOKEN }}" >> $GITHUB_ENV
+
+      - name: Run KBC test jobs
+        if: env.KBC_TEST_PROJECT_CONFIGS != '' && env.KBC_STORAGE_TOKEN != ''
+        uses: keboola/action-run-configs-parallel@master
+        with:
+          token: ${{ secrets.KBC_STORAGE_TOKEN }}
+          componentId: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          configs: ${{ env.KBC_TEST_PROJECT_CONFIGS }}
+
+  push:
+    name: Docker Image Push
+    runs-on: ubuntu-latest
+    needs:
+      - push_event_info
+      - tests
+      - tests-kbc
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          path: /tmp
+
+      - name: Load image
+        run: |
+          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
+          docker image ls -a
+
+      - name: Docker login
+        if: env.DOCKERHUB_TOKEN
+        run: docker login --username "${{ env.DOCKERHUB_USER }}" --password "${{ env.DOCKERHUB_TOKEN }}"
+
+      - name: Push image to ECR
+        uses: keboola/action-push-to-ecr@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+          push_latest: ${{ needs.push_event_info.outputs.is_deploy_ready }}
+          source_image: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+
+  deploy:
+    name: Deploy to KBC
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Developer Portal Tag
+        uses: keboola/action-set-tag-developer-portal@master
+        with:
+          vendor: ${{ env.KBC_DEVELOPERPORTAL_VENDOR }}
+          app_id: ${{ env.KBC_DEVELOPERPORTAL_APP }}
+          username: ${{ env.KBC_DEVELOPERPORTAL_USERNAME }}
+          password: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+          tag: ${{ needs.push_event_info.outputs.app_image_tag }}
+
+  update_developer_portal_properties:
+    name: Developer Portal Properties Update
+    env:
+      KBC_DEVELOPERPORTAL_PASSWORD: ${{ secrets.KBC_DEVELOPERPORTAL_PASSWORD }}
+    needs:
+      - push_event_info
+      - build
+      - push
+    runs-on: ubuntu-latest
+    if: needs.push_event_info.outputs.is_deploy_ready == 'true'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Update developer portal properties
+        run: |
+          chmod +x scripts/developer_portal/*.sh
+          scripts/developer_portal/update_properties.sh
+
+
