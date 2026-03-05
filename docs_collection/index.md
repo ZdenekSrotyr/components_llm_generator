@@ -932,6 +932,11 @@
 - Repository: https://github.com/keboola/component-mailkit-writer
 - Description: None
 
+### component-mailkit-extractor
+- [Documentation](github/component-mailkit-extractor/llm.txt)
+- Repository: https://github.com/keboola/component-mailkit-extractor
+- Description: None
+
 ### component-pinterest
 - [Documentation](github/component-pinterest/llm.txt)
 - Repository: https://github.com/keboola/component-pinterest
