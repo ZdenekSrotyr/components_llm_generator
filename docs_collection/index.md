@@ -992,9 +992,9 @@
 - Repository: https://github.com/keboola/component-ex-ftp-v2
 - Description: None
 
-### component-odoo-extractor
-- [Documentation](github/component-odoo-extractor/llm.txt)
-- Repository: https://github.com/keboola/component-odoo-extractor
+### component-odoo
+- [Documentation](github/component-odoo/llm.txt)
+- Repository: https://github.com/keboola/component-odoo
 - Description: None
 
 ### component-sage-intacct-extractor
