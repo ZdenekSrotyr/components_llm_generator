@@ -4,12 +4,10 @@ Directory structure:
     ├── deploy.sh
     ├── docker-compose.yml
     ├── Dockerfile
-    ├── flake8.cfg
     ├── LICENSE.md
     ├── pyproject.toml
     ├── uv.lock
-    ├── VCR_TESTING.md
-    ├── .flake8
+    ├── .pre-commit-config.yaml
     ├── component_config/
     │   ├── configRowSchema.json
     │   ├── configSchema.json
@@ -28,9 +26,6 @@ Directory structure:
     │               ├── test.csv
     │               └── test.csv.manifest
     ├── scripts/
-    │   ├── build_n_run.ps1
-    │   ├── build_n_test.sh
-    │   ├── run_kbc_tests.ps1
     │   └── developer_portal/
     │       ├── fn_actions_md_update.sh
     │       └── update_properties.sh
@@ -66,6 +61,10 @@ This extractor extracts data from [Facebook Graph API](https://developers.facebo
 - [Configuration](#configuration)
   - [Basic Structure](#basic-structure)
   - [Nested Query](#nested-query)
+    - [The Insights DSL](#the-insights-dsl)
+    - [DSL Keywords Reference](#dsl-keywords-reference)
+    - [Time Expressions](#time-expressions)
+    - [Common Paths](#common-paths)
   - [Async Insights Query](#async-insights-query)
 - [Output](#output)
   - [Output Bucket](#output-bucket)
@@ -79,11 +78,12 @@ Supported Endpoints
 
 The component supports all Facebook Graph API endpoints available through nested queries:
 - **feed** - page posts including comments and likes
-- **insights** - page and post metrics
-- **accounts** - account information
-- **adaccounts** - advertising accounts
-- **posts** - specific posts
-- And others based on your configuration needs
+- **posts** / **published_posts** - published posts
+- **insights** - page-level metrics
+- **video** / **video_reels** / **videos** - video content and metrics
+- **ratings** - page ratings and reviews
+- **conversations** - page inbox conversations
+- And any other Graph API edge you can access with your token
 
 
 Configuration
@@ -95,22 +95,28 @@ Basic Structure
 The configuration consists of three main parts:
 
 ### api-version
-Facebook Graph API version (default: "v23.0")
+Facebook Graph API version (default: `"v23.0"`). It is recommended to keep this up to date as Meta deprecates older versions.
 
 ### accounts
 Dictionary of accounts from which data will be extracted. Each account contains:
 - **id**: Unique account identifier
 - **name**: Account name
-- **account_id**: Advertising account ID (optional)
+- **account_id**: Advertising account ID (optional, Facebook Ads only)
 - **business_name**: Business name (optional)
 - **currency**: Currency (optional)
 - **category**: Page category (optional)
-- **fb_page_id**: Facebook page ID (optional)
+- **fb_page_id**: Facebook page ID linked to an Instagram account (optional, Instagram only)
 
 ### queries
-List of queries for data extraction. Each query contains:
+List of queries for data extraction. Supports two query types: [Nested Query](#nested-query) and [Async Insights Query](#async-insights-query).
 
-#### Nested Query
+---
+
+Nested Query
+------------
+
+Used for Facebook Pages and Instagram. Fetches data from any Graph API edge.
+
 ```json
 {
   "id": 1,
@@ -120,39 +126,292 @@ List of queries for data extraction. Each query contains:
   "query": {
     "path": "feed",
     "fields": "message,created_time,likes,comments{message,from}",
-    "ids": "page_id1,page_id2",
+    "ids": "",
     "limit": "25",
-    "since": "2024-01-01",
-    "until": "2024-12-31"
+    "since": "30 days ago",
+    "until": "today"
   }
 }
 ```
 
-**Nested query parameters:**
-- **path**: Endpoint URL (e.g., "feed", "posts")
-- **fields**: Fields to extract - supports nested queries
-- **ids**: Comma-separated list of page IDs (if empty, all from accounts will be used)
-- **limit**: Page size (default 25, maximum 100)
-- **since**: "From" date for filtering by created_time
-- **until**: "To" date for filtering by created_time
+**Parameters:**
 
-#### Async Insights Query
+| Parameter | Description |
+|---|---|
+| `path` | Graph API edge to query (e.g., `feed`, `posts`, `insights`). Leave empty to query the account root node. |
+| `fields` | Comma-separated list of fields or a nested [Insights DSL](#the-insights-dsl) expression. |
+| `ids` | Comma-separated account/page IDs to query. If empty, all configured accounts are used. |
+| `limit` | Page size for API pagination (default `25`, max `100`). |
+| `since` | Start of time range. Accepts [time expressions](#time-expressions) or ISO dates. |
+| `until` | End of time range. Accepts [time expressions](#time-expressions) or ISO dates. |
+| `time-based-pagination` | Set to `true` to use time-based pagination instead of cursor-based (useful for large date ranges). |
+| `stop-on-empty-response` | Set to `true` to stop pagination when an empty response is received. |
+| `run-by-id` | Set to `true` to query each account ID individually instead of in batch. |
+
+---
+
+### The Insights DSL
+
+For metrics data, Facebook uses a special dot-notation DSL inside the `fields` parameter. This is supported for both Facebook Pages (`insights`) and Instagram (`insights`), as well as post-level metrics (`insights` on a `feed` or `posts` edge).
+
+The general syntax is:
+
+```
+insights.<modifier1>(<value>).<modifier2>(<value>)...
+```
+
+You can optionally append `{name, period, values}` at the end to control which sub-fields are returned.
+
+**Page-level example (Facebook Pages):**
+```
+insights.since(30 days ago).time_increment(1).metric(page_impressions, page_views_total, page_fans)
+```
+
+**Post-level example (on `feed` path):**
+```
+insights.metric(post_impressions, post_clicks).period(lifetime){name, values}
+```
+
+**With breakdown (new Meta API format):**
+```
+insights.metric(post_media_view).breakdown(is_from_ads).period(lifetime)
+```
+
+**Instagram example:**
+```
+insights.since(30 days ago).period(day).metric_type(total_value).breakdown(media_product_type).metric(reach, total_interactions)
+```
+
+**Mixed fields and insights (on `feed` path):**
+```
+message, created_time, permalink_url, insights.metric(post_impressions).period(lifetime){name, values}
+```
+
+---
+
+### DSL Keywords Reference
+
+#### `metric(...)` — required
+Specifies which metrics to retrieve. Multiple metrics are comma-separated.
+
+- **Where to find valid metric names:**
+  - Facebook Pages: [Page Insights metrics reference](https://developers.facebook.com/docs/graph-api/reference/insights)
+  - Deprecated Page metrics (replaced Nov 2025): [Deprecated metrics](https://developers.facebook.com/docs/platforminsights/page/deprecated-metrics/)
+  - Instagram: [Instagram Insights metrics](https://developers.facebook.com/docs/instagram-platform/reference/ig-user/insights)
+  - Post-level metrics: [Post Insights](https://developers.facebook.com/docs/graph-api/reference/post/insights/)
+
+```
+insights.metric(page_impressions, page_views_total, page_fans)
+insights.metric(post_clicks, post_impressions_unique)
+```
+
+> **Note on deprecated metrics:** As of November 15, 2025, Meta replaced metrics like `post_impressions_fan`, `page_impressions_paid` with new metrics that require explicit `breakdown` parameters. For example, `post_impressions_fan` → `post_media_view` with `breakdown(is_from_followers)`. See [breakdown](#breakdown) below.
+
+---
+
+#### `period(value)` — optional
+Aggregation period for the metric values.
+
+| Value | Description |
+|---|---|
+| `day` | Daily aggregation |
+| `week` | Weekly aggregation |
+| `month` / `days_28` | Monthly aggregation |
+| `lifetime` | Entire lifetime of the object (common for post-level insights) |
+
+```
+insights.metric(page_impressions).period(day)
+insights.metric(post_impressions).period(lifetime)
+```
+
+---
+
+#### `breakdown(value)` — optional
+Splits metric values by a dimension. The breakdown value is returned in the `key1`/`key2` output columns.
+
+Common breakdown values for **Facebook Pages**:
+
+| Breakdown | Description |
+|---|---|
+| `is_from_ads` | Whether the impression came from an ad (`0` or `1`) |
+| `is_from_followers` | Whether the viewer is a follower (`0` or `1`) |
+| `action_type` | Type of action performed |
+
+Common breakdown values for **Instagram**:
+
+| Breakdown | Description |
+|---|---|
+| `country` | Country of the audience |
+| `city` | City of the audience |
+| `age` | Age group |
+| `gender` | Gender |
+| `media_product_type` | Type of media (POST, REEL, STORY, etc.) |
+
+Multiple breakdowns (up to 2 are captured in `key1`/`key2`, sorted alphabetically):
+```
+insights.metric(post_media_view).breakdown(is_from_ads, is_from_followers).period(lifetime)
+```
+
+> **Important:** `breakdown` here is the Pages/Instagram DSL keyword. It is different from the `breakdowns=` URL parameter used in [Async Insights Queries](#async-insights-query) for Facebook Ads. Do not confuse them.
+
+---
+
+#### `since(expr)` / `until(expr)` — optional
+Time range filter within the DSL. Accepts the same [time expressions](#time-expressions) as the top-level `since`/`until` query parameters.
+
+```
+insights.since(30 days ago).until(today).metric(page_impressions)
+insights.since(now).metric(post_impressions_paid)
+```
+
+> **Tip:** `since(now)` is a common pattern meaning "fetch from the most recent data point". The actual date range is controlled by the top-level `since`/`until` query parameters.
+
+---
+
+#### `time_increment(value)` — optional
+Controls the time granularity of the returned data points. Value is in days or a period keyword.
+
+```
+insights.metric(page_impressions).time_increment(1)       # daily data points
+insights.metric(page_impressions).time_increment(monthly)
+```
+
+---
+
+#### `as(name)` — optional
+Renames the output metric. Useful when using the same metric with different breakdowns in separate queries.
+
+```
+insights.metric(post_media_view).breakdown(is_from_ads).as(post_media_view_from_ads).period(lifetime)
+```
+
+---
+
+#### `timeframe(value)` — optional (Instagram only)
+Used for Instagram demographic insights instead of `since`/`until`.
+
+| Value | Description |
+|---|---|
+| `this_month` | Current month |
+| `last_month` | Previous month |
+| `this_year` | Current year |
+
+```
+insights.metric(engaged_audience_demographics).period(lifetime).timeframe(this_month).metric_type(total_value).breakdown(country)
+```
+
+---
+
+#### `metric_type(value)` — optional (Instagram only)
+Controls how metric values are aggregated.
+
+| Value | Description |
+|---|---|
+| `total_value` | Sum of all values |
+| `time_series` | Values over time |
+
+```
+insights.period(day).metric_type(total_value).breakdown(media_product_type).metric(reach, total_interactions)
+```
+
+---
+
+### Time Expressions
+
+Both the top-level `since`/`until` parameters and the DSL `since()`/`until()` modifiers accept flexible time expressions:
+
+| Expression | Meaning |
+|---|---|
+| `today` | Today's date |
+| `yesterday` | Yesterday |
+| `now` | Current timestamp (often used in DSL to mean "most recent") |
+| `30 days ago` | 30 days before today |
+| `3 day ago` | 3 days before today (singular also accepted) |
+| `this month` | Start of the current month |
+| `2025-01-01` | Absolute ISO date |
+| `last_7d` | Last 7 days — Ads API `date_preset` format only |
+| `last_90d` | Last 90 days — Ads API `date_preset` format only |
+
+---
+
+### Common Paths
+
+The `path` parameter specifies which Graph API edge to traverse for each account. Common values:
+
+| Path | Description | Component |
+|---|---|---|
+| *(empty)* | Account root node | Pages, Instagram, Ads |
+| `feed` | Published and scheduled posts | Pages |
+| `posts` | Published posts | Pages |
+| `published_posts` | All published posts (alternative to `posts`) | Pages |
+| `insights` | Page-level insights directly | Pages |
+| `video` | Videos | Pages |
+| `video_reels` | Reels | Pages |
+| `videos` | All video objects | Pages |
+| `ratings` | Page ratings and reviews | Pages |
+| `conversations` | Inbox conversations | Pages |
+| `me/posts` | Posts by the authenticated user | Pages |
+| `ads-action-stats` | Ad action statistics | Ads |
+
+You can also use absolute Graph API URLs as the path:
+```json
+"path": "https://graph.facebook.com/v3.3/SomePage/feed"
+```
+
+---
+
+Async Insights Query
+--------------------
+
+Used exclusively for **Facebook Ads**. Submits an asynchronous job to the Marketing API and waits for results. Required for large ad account reports where synchronous requests would time out.
+
 ```json
 {
-  "id": 2,
-  "name": "ads_insights",
+  "id": 1,
+  "name": "campaign_performance",
   "type": "async-insights-query",
   "disabled": false,
   "query": {
-    "parameters": "fields=ad_id,impressions,clicks&level=ad&date_preset=last_month",
-    "ids": "ad_account_id"
+    "ids": "act_123456789",
+    "parameters": "level=campaign&fields=campaign_id,campaign_name,impressions,clicks,spend&date_preset=last_7d&time_increment=1&action_breakdowns=action_type&breakdowns=impression_device",
+    "limit": "100"
   }
 }
 ```
 
-**Async insights query parameters:**
-- **parameters**: URL query string according to Facebook Marketing API specification
-- **ids**: List of advertising account IDs
+**Parameters:**
+
+| Parameter | Description |
+|---|---|
+| `ids` | Comma-separated ad account IDs (must start with `act_`). |
+| `parameters` | URL query string formatted according to the [Marketing API Insights spec](https://developers.facebook.com/docs/marketing-api/insights). |
+| `limit` | Page size for result pagination. |
+| `since` / `until` | Optional date range override. |
+| `split-query-time-range-by-day` | Set to `true` to split the query into daily requests (useful for large accounts hitting API limits). |
+
+**Key `parameters` options:**
+
+| Option | Description |
+|---|---|
+| `level` | Aggregation level: `account`, `campaign`, `adset`, `ad` |
+| `fields` | Comma-separated metric/dimension fields |
+| `date_preset` | Shorthand date range: `last_7d`, `last_30d`, `last_90d`, `last_month`, `this_month`, etc. |
+| `time_increment` | Granularity in days, or `monthly` |
+| `action_breakdowns` | Break down action metrics by: `action_type`, `action_device`, `action_reaction`, etc. |
+| `breakdowns` | Break down impressions/clicks by: `impression_device`, `publisher_platform`, `product_id`, etc. |
+| `action_attribution_windows` | Attribution windows: `1d_click`, `7d_click`, `1d_view`, `28d_click`, etc. |
+| `filtering` | JSON array of filters, e.g. `[{"field":"action_type","operator":"IN","value":["purchase"]}]` |
+| `use_account_attribution_setting` | Use the account's default attribution setting (`true`/`false`) |
+| `use_unified_attribution_setting` | Use unified attribution setting (`true`/`false`) |
+
+The `parameters` field also supports the DSL format:
+```
+insights.level(campaign).action_attribution_windows(7d_click).action_breakdowns(action_type).date_preset(last_7d).time_increment(1){campaign_name,campaign_id,actions,action_values}
+```
+
+> **Where to find valid fields and breakdowns:** Use the [Marketing API Insights reference](https://developers.facebook.com/docs/marketing-api/insights) and the [Graph API Explorer](https://developers.facebook.com/tools/explorer/) to discover available fields for your account.
+
+---
 
 Output
 ======
@@ -161,44 +420,53 @@ The component generates the following tables:
 
 ### accounts.csv
 Contains information about configured accounts with columns:
-- id, name, account_id, business_name, currency, category
+- `id`, `name`, `account_id`, `business_name`, `currency`, `category`
 
 ### Query-based tables
-For each query, tables are created based on data structure:
-- **{query_name}_{endpoint}** (e.g., "feed_posts", "feed_comments")
-- **{query_name}_insights** for insights data
+For each query, one or more tables are created based on the data structure:
+- **`{query_name}`** — top-level fields
+- **`{query_name}_{nested_edge}`** — nested objects (e.g., `feed_comments`, `feed_likes`)
 
-### Common columns across all tables
-- **id**: Unique row identifier
-- **parent_id**: Parent object ID
-- **ex_account_id**: Account ID from which the data originates
-- **fb_graph_node**: Describes position in hierarchy (e.g., "page_feed_comments")
+### Insights tables
+Insights data is flattened into rows with the following columns:
 
-Insights data is structured into columns:
-- **key1**, **key2**: Dimensions
-- **value**: Metric value
-- **end_time**: Timestamp
-- **metric name**, **title**, **description**: Metric metadata
+| Column | Description |
+|---|---|
+| `id` | Object ID |
+| `parent_id` | Parent object ID |
+| `ex_account_id` | Account ID the data was fetched for |
+| `fb_graph_node` | Describes position in the hierarchy (e.g., `page_feed_insights`) |
+| `key1` | First breakdown dimension value |
+| `key2` | Second breakdown dimension value |
+| `value` | Metric value |
+| `end_time` | Timestamp of the data point |
+| `name` | Metric name |
+| `title` | Metric title |
+| `description` | Metric description |
+| `period` | Aggregation period |
+
+> **Note on `key1`/`key2`:** For newer Meta metrics using `breakdown(...)`, the breakdown dimension **value** (e.g., `"0"`, `"1"`) is placed in `key1`/`key2`. If two breakdowns are used, they are sorted alphabetically and mapped to `key1` and `key2` respectively. For older nested metrics like `post_reactions_by_type_total`, the reaction type name (e.g., `"like"`, `"love"`) is placed in `key1`.
 
 ## Output Bucket
 
-By default, data is stored in a bucket with the format `in.c-{component-id}-{configuration-id}`. 
+By default, data is stored in a bucket with the format `in.c-{component-id}-{configuration-id}`.
 
-If the configuration contains a `bucket-id` parameter, data will be stored in the specified bucket instead. This allows for:
+If the configuration contains a `bucket-id` parameter, data will be stored in the specified bucket instead. This is useful for:
 - **Migration from legacy components**: Redirect data to the original bucket used by previous extractors
-- **Custom bucket organization**: Create your own bucket structure for better data management
+- **Custom bucket organization**: Create your own bucket structure
 
-Example configuration with custom bucket:
 ```json
 {
   "parameters": {
     "bucket-id": "in.c-my-custom-facebook-bucket",
     "api-version": "v23.0",
-    "accounts": {...},
-    "queries": [...]
+    "accounts": {},
+    "queries": []
   }
 }
 ```
+
+---
 
 Development
 -----------
@@ -325,66 +593,39 @@ services:
     environment:
       - KBC_DATADIR=./data
   test:
-    # Use to run flake8 and unittests checks
-    build: .
+    build:
+      context: .
+      target: test
     volumes:
       - ./:/code
       - ./data:/data
     environment:
       - KBC_DATADIR=./data
-    command:
-      - /bin/sh
-      - /code/scripts/build_n_test.sh
 
 
 ================================================
 FILE: Dockerfile
 ================================================
-FROM python:3.13-slim
-# RUN apt-get update \
-#     && apt-get install -y --no-install-recommends git \
-#     && rm -rf /var/lib/apt/lists/*
+FROM python:3.13-slim AS base
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /code/
-COPY pyproject.toml .
-COPY uv.lock .
+COPY pyproject.toml uv.lock ./
 
 ENV UV_PROJECT_ENVIRONMENT="/usr/local/"
+RUN uv sync --no-dev --frozen
+
+COPY src/ src/
+COPY scripts/ scripts/
+
+FROM base AS test
 RUN uv sync --all-groups --frozen
+COPY tests/ tests/
+RUN uv run ruff check
+CMD ["uv", "run", "pytest", "tests/", "-v"]
 
-COPY src/ src
-COPY tests/ tests
-COPY scripts/ scripts
-COPY flake8.cfg .
-
+FROM base AS production
 CMD ["python", "-u", "/code/src/component.py"]
-
-
-================================================
-FILE: flake8.cfg
-================================================
-[flake8]
-exclude =
-    .git,
-    __pycache__,
-    tests,
-    example,
-    venv,
-    .venv
-max-line-length = 120
-
-# F812: list comprehension redefines ...
-# H101: Use TODO(NAME)
-# H202: assertRaises Exception too broad
-# H233: Python 3.x incompatible use of print operator
-# H301: one import per line
-# H306: imports not in alphabetical order (time, os)
-# H401: docstring should not start with a space
-# H403: multi line docstrings should end on a new line
-# H404: multi line docstring should start without a leading new line
-# H405: multi line docstring summary not separated with an empty line
-# H501: Do not use self.__dict__ for string formatting
 
 
 
@@ -1077,517 +1318,15 @@ wheels = [
 
 
 ================================================
-FILE: VCR_TESTING.md
+FILE: .pre-commit-config.yaml
 ================================================
-# VCR Testing with Output Snapshot Validation
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff
+      - id: ruff-format
 
-This component uses VCR (Video Cassette Recorder) to create functional tests using recorded interactions with the Meta API, combined with hash-based snapshot testing to validate component outputs. Tests can be run without hitting the live API by replaying these recordings and validating outputs against snapshots.
-
-## Quick Reference
-
-| Action | Command |
-|--------|---------|
-| Generate cassettes + snapshots | `python scripts/generate_tests.py --csv --capture-outputs` |
-| Run tests with validation | `pytest tests/test_functional.py` |
-| Update sanitized queries | `python scripts/sanitize_queries.py` |
-| Add new API version | Edit `generate_tests.py` line 196, regenerate |
-
-## Overview
-
-The VCR testing workflow combines two validation layers:
-
-### 1. VCR Cassettes (API Interaction Validation)
-- **Sanitizes** customer-specific query data from production configurations
-- **Generates** cassettes by recording real API interactions
-- **Replays** cassettes in CI/CD pipeline tests without requiring live API access
-
-### 2. Output Snapshots (Data Validation)
-- **Captures** metadata about component outputs (CSVs, manifests, files)
-- **Stores** snapshots in a single JSON file
-- **Validates** outputs to catch regressions in:
-  - Data flattening logic
-  - Column names and structure
-  - Manifest configuration
-  - Row counts (with tolerance for API fluctuations)
-  - File content via hashes
-
-This dual validation ensures both API interactions and data processing remain consistent.
-
-## Prerequisites
-
-### Required Files
-
-1. **Secrets File**: `tests/fixtures/config.secrets.json`
-   - Contains valid Meta API credentials for generating cassettes
-   - Structure matches a component configuration with `authorization` and `parameters`
-   - **Get it**: Ask a teammate or extract from a working Keboola configuration
-   - **Git**: This file is ignored by git. **DO NOT COMMIT IT.**
-
-2. **Sanitized Queries File**: `tests/fixtures/queries_sanitized.csv`
-   - Generated from production queries using `sanitize_queries.py`
-   - Contains columns: `kbc_component_id`, `query_type`, `query_json`
-   - Customer-specific IDs and values are replaced with test data
-
-3. **CI Secrets (Optional)**: `tests/fixtures/config.secrets.json.ci`
-   - Minimal config used in CI for cassette replay (no real credentials needed)
-   - Contains placeholder tokens that match sanitized cassettes
-
-## Complete Workflow
-
-### 1. Initial Setup (One Time)
-
-```bash
-# Create secrets file from real credentials
-cp tests/fixtures/config.secrets.json.example tests/fixtures/config.secrets.json
-# Edit with real credentials (DO NOT COMMIT THIS FILE)
-
-# (Optional) If you have production queries
-cp production_queries.csv tests/fixtures/queries.csv
-python scripts/sanitize_queries.py
-# This creates queries_sanitized.csv
-```
-
-### 2. Generate Test Data
-
-#### Step 2a: Sanitize Queries (if updating from production)
-
-If you have customer queries in `queries.csv`, sanitize them first:
-
-```bash
-python scripts/sanitize_queries.py
-```
-
-This script:
-- Replaces customer-specific account IDs with test IDs
-- Maps legacy component names to V2 equivalents
-- Samples representative queries based on structural features
-- Outputs to `queries_sanitized.csv`
-
-#### Step 2b: Generate Cassettes + Snapshots
-
-Generate cassettes and output snapshots for all API versions:
-
-```bash
-python scripts/generate_tests.py --csv --capture-outputs
-```
-
-This script:
-1. Reads `config.secrets.json` for credentials
-2. Reads queries from `queries_sanitized.csv`
-3. Groups queries by component (Ads, Pages, Instagram)
-4. Executes the component against the live Meta API for each version
-5. Records interactions into version-specific cassettes in `tests/fixtures/cassettes/`
-6. **Sanitizes** all tokens and sensitive data from recordings
-7. **Captures** output snapshots (metadata + hashes)
-
-**Output files**:
-```
-tests/fixtures/
-├── cassettes/
-│   ├── gen_facebook_ads_v2_v22_0.json
-│   ├── gen_facebook_ads_v2_v23_0.json
-│   ├── gen_facebook_pages_v2_v22_0.json
-│   ├── gen_facebook_pages_v2_v23_0.json
-│   ├── gen_instagram_v2_v22_0.json
-│   └── gen_instagram_v2_v23_0.json
-└── output_snapshots.json
-```
-
-### 3. Commit Test Artifacts
-
-```bash
-# Review what was generated
-git status
-
-# Commit cassettes and snapshots
-git add tests/fixtures/cassettes/*.json
-git add tests/fixtures/output_snapshots.json
-git commit -m "Update VCR cassettes and output snapshots for v22 and v23"
-```
-
-**Do NOT commit**:
-- ❌ `tests/fixtures/config.secrets.json` (contains real credentials)
-- ❌ `tests/fixtures/queries.csv` (may contain customer data)
-
-### 4. Run Tests Locally
-
-```bash
-# Run all VCR tests
-pytest tests/test_functional.py
-
-# Run specific test
-pytest tests/test_functional.py::test_functional_component[gen_facebook_ads_v2_v22_0]
-
-# Verbose mode
-pytest tests/test_functional.py -v
-```
-
-Tests will:
-- ✅ Replay cassettes (no live API calls)
-- ✅ Run the component and produce CSV outputs
-- ✅ Validate outputs against snapshots (row counts, columns, hashes)
-- ✅ Fail if outputs don't match expected structure or content
-
-### 5. CI/CD Pipeline
-
-The GitHub Actions pipeline automatically runs VCR tests at [.github/workflows/push.yml:131-132](.github/workflows/push.yml#L131-L132):
-
-```yaml
-# .github/workflows/push.yml
-- name: Run Tests
-  run: |
-    docker run $IMAGE pytest tests/test_functional.py
-```
-
-CI uses:
-- `tests/fixtures/config.secrets.json.ci` (placeholder credentials)
-- Pre-recorded cassettes (no live API access needed)
-- Output snapshots for validation
-
-## Output Snapshot Validation
-
-### What Gets Captured
-
-For each test case, the snapshot includes:
-
-#### CSV Tables
-- **Row count**: Number of rows (validated with ±10% tolerance)
-- **Column count**: Number of columns
-- **Columns**: List of column names
-- **Hash**: SHA256 hash of the entire file
-- **Sample rows**: First 3 rows for human inspection
-
-#### Manifests
-- **Hash**: SHA256 hash of manifest file
-- **Incremental**: Whether table is incremental
-- **Primary key**: Primary key columns
-- **Columns**: Column metadata
-
-#### Files
-- **Size**: File size in bytes
-- **Hash**: SHA256 hash of file content
-
-### Example Snapshot
-
-```json
-{
-  "gen_facebook_ads_v2_v22_0": {
-    "tables": {
-      "campaigns.csv": {
-        "row_count": 42,
-        "column_count": 8,
-        "columns": ["campaign_id", "campaign_name", "impressions", "clicks"],
-        "hash": "sha256:abc123...",
-        "sample_rows": [
-          {"campaign_id": "123", "campaign_name": "Test", "impressions": "1000", "clicks": "50"},
-          {"campaign_id": "456", "campaign_name": "Another", "impressions": "2000", "clicks": "100"}
-        ]
-      },
-      "campaigns.csv.manifest": {
-        "hash": "sha256:def456...",
-        "incremental": true,
-        "primary_key": ["campaign_id"],
-        "columns": ["campaign_id", "campaign_name", "impressions", "clicks"]
-      }
-    },
-    "files": {},
-    "metadata": {
-      "test_name": "gen_facebook_ads_v2_v22_0"
-    }
-  }
-}
-```
-
-### Tolerance Settings
-
-The validator allows some variance to handle API data fluctuations:
-
-- **Row counts**: ±10% tolerance
-  - Expected: 100 rows, Actual: 95-110 rows → PASS ✓
-  - Expected: 100 rows, Actual: 85 rows → FAIL ✗
-
-- **Hashes**: Exact match required
-  - Any content change triggers failure
-  - Use this to detect unexpected data changes
-
-- **Columns**: Exact match required
-  - Column names must match exactly
-  - Detects schema drift
-
-## Common Scenarios
-
-### Adding a New API Version
-
-**Example**: Add v24.0 support
-
-1. **Update version list** in `generate_tests.py:196`:
-   ```python
-   for version in ["v22.0", "v23.0", "v24.0"]:
-   ```
-
-2. **Regenerate cassettes**:
-   ```bash
-   python scripts/generate_tests.py --csv --capture-outputs
-   ```
-
-3. **Commit new cassettes**:
-   ```bash
-   git add tests/fixtures/cassettes/gen_*_v24_0.json
-   git add tests/fixtures/output_snapshots.json
-   git commit -m "Add v24.0 API support"
-   ```
-
-### Updating Test Queries
-
-**Example**: Add new query types to test
-
-1. **Add queries** to `queries_sanitized.csv`:
-   ```csv
-   kbc_component_id,query_type,query_json
-   Facebook Ads V2,nested-query,"{\"id\": 1, \"type\": \"nested-query\", ...}"
-   ```
-
-2. **Regenerate everything**:
-   ```bash
-   python scripts/generate_tests.py --csv --capture-outputs
-   ```
-
-3. **Verify and commit**:
-   ```bash
-   pytest tests/test_functional.py
-   git add tests/fixtures/cassettes/*.json tests/fixtures/output_snapshots.json
-   git commit -m "Add new query types to VCR tests"
-   ```
-
-### Fixing Output Validation Failures
-
-**Scenario**: Test fails with snapshot validation error
-
-```
-Output validation failed for gen_facebook_ads_v2_v22_0:
-  - campaigns.csv: Column mismatch (missing: ['campaign_id'], extra: ['id'])
-  - campaigns.csv: Content changed (hash mismatch - use --update-snapshots to update)
-```
-
-**If this is a bug** (unintended change):
-1. Fix the code that generates outputs
-2. Re-run tests: `pytest tests/test_functional.py`
-3. Verify they pass
-
-**If this is intentional** (improved flattening logic):
-1. Verify the new output is correct
-2. Regenerate snapshots: `python scripts/generate_tests.py --csv --capture-outputs`
-3. Commit updated snapshots: `git add tests/fixtures/output_snapshots.json`
-
-### Debugging Cassette Replay Issues
-
-**Scenario**: VCR can't find matching request
-
-```
-VCRError: Could not find matching request for <Request (GET) https://graph.facebook.com/...>
-```
-
-**Solutions**:
-
-1. **Check cassette exists**:
-   ```bash
-   ls tests/fixtures/cassettes/ | grep your_test_name
-   ```
-
-2. **Regenerate cassette**:
-   ```bash
-   python scripts/generate_tests.py --csv --capture-outputs
-   ```
-
-3. **Check query sanitization** (for production queries):
-   - Ensure IDs are replaced consistently
-   - Check [scripts/sanitize_queries.py](scripts/sanitize_queries.py) logic
-
-## File Structure
-
-```
-component-meta/
-├── scripts/
-│   └── generate_tests.py              # Cassette + snapshot generator
-├── tests/
-│   ├── fixtures/
-│   │   ├── cassettes/                 # VCR HTTP recordings
-│   │   │   ├── gen_facebook_ads_v2_v22_0.json
-│   │   │   └── ...
-│   │   ├── output_snapshots.json      # Output validation data
-│   │   ├── queries_sanitized.csv      # Test queries (committed)
-│   │   ├── config.secrets.json        # Real credentials (gitignored)
-│   │   └── config.secrets.json.ci     # Placeholder for CI (committed)
-│   ├── output_validator.py            # Snapshot validation module
-│   ├── test_functional.py             # Main VCR tests
-│   └── test_snapshot_validator.py     # Validator unit tests
-└── VCR_TESTING.md                     # This document
-```
-
-## Implementation Details
-
-### OutputSnapshot Class
-
-Captures and validates snapshots for a single test case.
-
-```python
-from output_validator import OutputSnapshot
-
-snapshot = OutputSnapshot("test_name", output_dir)
-captured = snapshot.capture()  # Returns dict with tables/files/metadata
-errors = snapshot.validate_against(expected)  # Returns list of errors
-```
-
-### SnapshotManager Class
-
-Manages snapshots for all test cases.
-
-```python
-from output_validator import SnapshotManager
-
-manager = SnapshotManager("tests/fixtures/output_snapshots.json")
-manager.capture_snapshot("test_1", output_dir)
-manager.save()
-
-# Later, in tests
-errors = manager.validate_snapshot("test_1", output_dir)
-if errors:
-    print("Validation failed:", errors)
-```
-
-## Key Features
-
-### Automatic Sanitization
-- Access tokens replaced with `"token"`
-- Customer account IDs replaced with test IDs
-- Headers filtered to essential fields only
-- Deterministic output (sorted JSON keys) for clean git diffs
-
-### Component Support
-- **Facebook Ads V2**: Ad campaigns, insights, async queries
-- **Facebook Pages V2**: Page posts, engagement, feed
-- **Instagram V2**: Stories, media, business account insights
-
-### Query Sampling
-The sanitization script samples queries based on structural features to ensure comprehensive coverage without bloating the test suite:
-- Async vs nested queries
-- Breakdowns and action breakdowns
-- Filtering and attribution
-- Time-based pagination
-- Summary fields
-
-## Benefits
-
-### VCR Cassettes
-✅ **No live API calls**: Tests run entirely offline
-✅ **Deterministic**: Same inputs always produce same outputs
-✅ **Fast**: No network latency or rate limits
-✅ **CI reliability**: 99.9% vs 85% with live API
-
-### Output Snapshots
-✅ **No large file commits**: Only one small JSON file instead of thousands of CSVs
-✅ **Regression detection**: Catches unintended changes to output structure
-✅ **Human readable**: Sample rows show actual data for inspection
-✅ **Schema validation**: Ensures column names and types stay consistent
-✅ **Manifest validation**: Verifies incremental settings and primary keys
-✅ **Fast**: Hashing is quick and deterministic
-
-### Combined Benefits
-✅ **End-to-end validation**: API interactions + data processing
-✅ **Size reduction**: 99.7% (50KB vs 15MB)
-✅ **Dual verification**: Both request/response and output consistency
-
-## Best Practices
-
-### ✅ Do
-
-- Generate cassettes and snapshots together
-- Commit both cassettes and snapshots
-- Review snapshot changes in PRs
-- Use sanitized queries for test data
-- Keep API versions up to date
-
-### ❌ Don't
-
-- Commit real credentials (`config.secrets.json`)
-- Commit raw production queries
-- Skip snapshot generation
-- Modify cassettes manually
-- Commit outputs directly (use snapshots)
-
-## Troubleshooting
-
-### Tests pass locally but fail in CI
-
-**Cause**: Using real credentials locally vs placeholders in CI
-
-**Solution**: Ensure cassettes are properly sanitized and committed
-
-### Snapshots keep showing hash mismatches
-
-**Cause**: Non-deterministic data (timestamps, random values)
-
-**Solution**:
-- Use `freeze_time` for timestamps
-- Sanitize random/unique IDs
-- Check API response consistency
-
-### Too many test cases from queries.csv
-
-**Cause**: Not using sampling in [scripts/sanitize_queries.py](scripts/sanitize_queries.py)
-
-**Solution**: The script already samples 2 queries per structural category. Adjust `SAMPLES_PER_CATEGORY` if needed.
-
-## Performance
-
-With VCR + Snapshots:
-
-| Metric | Without VCR | With VCR |
-|--------|-------------|----------|
-| Test execution | ~5 minutes | ~10 seconds |
-| API calls | ~500 | 0 |
-| Rate limits | Often hit | Never |
-| CI reliability | 85% | 99.9% |
-| Repo size impact | +15 MB | +500 KB |
-
-## Next Steps
-
-1. **Generate your first snapshots**:
-   ```bash
-   python scripts/generate_tests.py --csv --capture-outputs
-   ```
-
-2. **Run tests to verify**:
-   ```bash
-   pytest tests/test_functional.py -v
-   ```
-
-3. **Commit everything**:
-   ```bash
-   git add tests/fixtures/cassettes/*.json tests/fixtures/output_snapshots.json
-   git commit -m "Add VCR cassettes and output snapshots"
-   ```
-
-4. **Push and watch CI pass**:
-   ```bash
-   git push
-   ```
-
-Happy testing! 🎉
-
-
-
-================================================
-FILE: .flake8
-================================================
-[flake8]
-exclude =
-    .git,
-    __pycache__,
-    tests,
-    example
-    .venv
-max-line-length = 120
 
 
 ================================================
@@ -1649,57 +1388,82 @@ https://github.com/keboola/component-meta
 FILE: component_config/sample-config/config.json
 ================================================
 {
-  "storage": {
-    "input": {
-      "files": [],
-      "tables": [
-        {
-          "source": "in.c-test.test",
-          "destination": "test.csv",
-          "limit": 50,
-          "columns": [],
-          "where_values": [],
-          "where_operator": "eq"
-        }
-      ]
-    },
-    "output": {
-      "files": [],
-      "tables": []
+  "authorization": {
+    "oauth_api": {
+      "credentials": {
+        "id": "my-oauth-credentials",
+        "authorizedFor": "My Facebook Page",
+        "#data": "{\"access_token\": \"YOUR_ACCESS_TOKEN\"}",
+        "oauthVersion": "facebook",
+        "appKey": "YOUR_APP_ID",
+        "#appSecret": "YOUR_APP_SECRET"
+      }
     }
   },
   "parameters": {
-    "#api_token": "DEMO",
-    "print_hello": true,
-    "period_from": "yesterday",
-    "endpoints": [
-      "deals",
-      "companies"
-    ],
-    "company_properties": "",
-    "deal_properties": "",
-    "debug": true
-  },
-  "image_parameters": {
-    "syrup_url": "https://syrup.keboola.com/"
-  },
-  "authorization": {
-    "oauth_api": {
-      "id": "OAUTH_API_ID",
-      "credentials": {
-        "id": "main",
-        "authorizedFor": "Myself",
-        "creator": {
-          "id": "1234",
-          "description": "me@keboola.com"
-        },
-        "created": "2016-01-31 00:13:30",
-        "#data": "{\"refresh_token\":\"MCWBkfdK9m5YK*Oqahwm6XN6elMAEwcH5kYcK8Ku!bpiOgSDZN9MQIzunpMsh6LyKH0i!7OcwwwajuxPfvm2PrrWYSs*HerDr2ZSJ39pqHJcvwUNIvHdtcgFFr3Em*yhn3GKBwM2p9UrjtgdAriSDny5YgUYGuI3gYJY1ypD*wBaAOzzeeXZx6CdgjruJ7gboTAngbWk3CzO9rORIwXAAlGUH6ZgBQJL3AwkYVMRFV4BvIvDAMF*0DcGDyrcyYDw9X3vYn*Wy!OqgrenKCGowdJk0C0136SUv4PJI383y76UMim6Q7KGDj7Lf!K2N2FDbxsz2iZKZTBr2vHx8pEC1oBc$\"}",
-        "oauthVersion": "2.0",
-        "appKey": "000000004C184A49",
-        "#appSecret": "vBAYak49pVK1zghHAgDH4tCSCNlT-CiN"
+    "accounts": {
+      "123456789": {
+        "id": "123456789",
+        "name": "My Facebook Page",
+        "category": "Company"
       }
-    }
+    },
+    "api-version": "v23.0",
+    "queries": [
+      {
+        "id": 1,
+        "type": "nested-query",
+        "name": "page_insights_daily",
+        "run-by-id": false,
+        "query": {
+          "fields": "insights.since(30 days ago).time_increment(1).metric(page_impressions, page_impressions_unique, page_views_total, page_fans, page_fan_adds, page_fan_removes, page_post_engagements)",
+          "ids": "",
+          "limit": "25",
+          "path": ""
+        }
+      },
+      {
+        "id": 2,
+        "type": "nested-query",
+        "name": "feed_post_insights",
+        "run-by-id": false,
+        "query": {
+          "fields": "message, created_time, permalink_url, insights.metric(post_impressions, post_impressions_unique, post_clicks, post_reactions_like_total).period(lifetime){name, values}",
+          "ids": "",
+          "limit": "25",
+          "path": "feed",
+          "since": "30 days ago",
+          "until": "today"
+        }
+      },
+      {
+        "id": 3,
+        "type": "nested-query",
+        "name": "feed_post_media_view_by_source",
+        "run-by-id": false,
+        "query": {
+          "fields": "insights.metric(post_media_view).breakdown(is_from_ads).period(lifetime)",
+          "ids": "",
+          "limit": "25",
+          "path": "feed",
+          "since": "30 days ago",
+          "until": "today"
+        }
+      },
+      {
+        "id": 4,
+        "type": "nested-query",
+        "name": "page_basic_info",
+        "run-by-id": false,
+        "query": {
+          "fields": "fan_count, followers_count, name",
+          "ids": "",
+          "limit": "25",
+          "path": ""
+        }
+      }
+    ],
+    "bucket-id": "in.c-keboola-ex-facebook-pages"
   }
 }
 
@@ -1841,87 +1605,6 @@ FILE: component_config/sample-config/in/tables/test.csv.manifest
         "Eventbrite_link": []
     }
 }
-
-
-================================================
-FILE: scripts/build_n_run.ps1
-================================================
-echo Building component...
-$COMP_TAG = Read-Host -Prompt 'Input Docker tag name:'
-docker build -rm -t $COMP_TAG ../
-
-echo Running component...
-Write-host "Would you like to use default data folder? (../data)" -ForegroundColor Yellow 
-    $Readhost = Read-Host " ( y / n ) " 
-    Switch ($ReadHost) 
-     { 
-       Y {Write-host "Yes use: " (join-path (Split-Path -Path (Get-Location).Path) "data"); $DATA_PATH = (join-path (Split-Path -Path (Get-Location).Path) "data") } 
-       N {Write-Host "No, I'll specify myself"; $DATA_PATH = Read-Host -Prompt 'Input data folder path:'} 
-       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
-     } 
-
-Write-host "Would you like to execute the container to Bash, skipping the execution?" -ForegroundColor Yellow 
-    $Readhost = Read-Host " ( y / n ) " 
-    Switch ($ReadHost) 
-     { 
-       Y {Write-host "Yes, get me to the bash"; docker run -ti -v $DATA_PATH`:/data --entrypoint=//bin//bash $COMP_TAG} 
-       N {Write-Host "No, execute the app normally"; 
-		    echo $DATA_PATH
-			docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG
-	   } 
-       Default {Write-Host "Default, run app"; docker run -v $DATA_PATH`:/data -e KBC_DATADIR=/data $COMP_TAG} 
-     } 
-
-
-
-
-
-================================================
-FILE: scripts/build_n_test.sh
-================================================
-#!/bin/sh
-set -e
-
-ruff check
-python -m unittest discover
-
-
-================================================
-FILE: scripts/run_kbc_tests.ps1
-================================================
-echo "Preparing KBC test image"
-# set env vars
-$KBC_DEVELOPERPORTAL_USERNAME  = Read-Host -Prompt 'Input your service account user name'
-$KBC_DEVELOPERPORTAL_PASSWORD  = Read-Host -Prompt 'Input your service account pass'
-$KBC_DEVELOPERPORTAL_VENDOR = 'esnerda'
-$KBC_DEVELOPERPORTAL_APP = 'esnerda.ex-gusto-export'
-$BASE_KBC_CONFIG = '455568423'
-$KBC_STORAGE_TOKEN = Read-Host -Prompt 'Input your storage token'
-
-
-#build app
-$APP_IMAGE='keboola-comp-test'
-docker build ..\ --tag=$APP_IMAGE
-docker images
-docker -v
-#docker run $APP_IMAGE flake8 --config=./deployment/flake8.cfg
-echo "Running unit-tests..."
-docker run $APP_IMAGE python -m unittest discover
-
-docker pull quay.io/keboola/developer-portal-cli-v2:latest
-$REPOSITORY= docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD quay.io/keboola/developer-portal-cli-v2:latest ecr:get-repository $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP
-
-docker tag $APP_IMAGE`:latest $REPOSITORY`:test
-
-echo 'running login'
-$(docker run --rm -e KBC_DEVELOPERPORTAL_USERNAME=$KBC_DEVELOPERPORTAL_USERNAME -e KBC_DEVELOPERPORTAL_PASSWORD=$KBC_DEVELOPERPORTAL_PASSWORD -e KBC_DEVELOPERPORTAL_URL quay.io/keboola/developer-portal-cli-v2:latest ecr:get-login $KBC_DEVELOPERPORTAL_VENDOR $KBC_DEVELOPERPORTAL_APP)
-
-echo 'pushing test image'
-docker push $REPOSITORY`:test
-
-echo 'running test config in KBC'
-docker run --rm -e KBC_STORAGE_TOKEN=$KBC_STORAGE_TOKEN quay.io/keboola/syrup-cli:latest run-job $KBC_DEVELOPERPORTAL_APP $BASE_KBC_CONFIG test
-
 
 
 ================================================
@@ -3409,6 +3092,7 @@ DSL_SIMPLE_PARAMS = [
     "action_breakdowns",
     "date_preset",
     "time_increment",
+    "breakdown",
     "breakdowns",
     "action_attribution_windows",
     "action_report_time",
@@ -3715,6 +3399,15 @@ class PageLoader:
                 if match:
                     params[date_param] = get_past_date(match.group(1).strip()).strftime("%Y-%m-%d")
 
+            # Warn about unrecognized DSL parameters
+            known_params = set(DSL_SIMPLE_PARAMS) | {"metric", "since", "until"}
+            for unrecognized in re.findall(r"\.([a-zA-Z_]+)\(", fields):
+                if unrecognized not in known_params:
+                    logger.warning(
+                        f"Unrecognized DSL parameter '.{unrecognized}(...)' in query fields — "
+                        f"it will be ignored. Known parameters: {sorted(known_params)}"
+                    )
+
             # Extract fields from curly braces (e.g., "insights.level(ad){ad_id,ad_name,spend}")
             if "{" in fields and "}" in fields:
                 fields_part = fields.split("{")[1].split("}")[0]
@@ -3880,18 +3573,9 @@ from pathlib import Path
 
 import pytest
 from keboola.datadirtest.vcr import VCRDataDirTester, get_test_cases
-from keboola.vcr import DefaultSanitizer, ResponseUrlSanitizer
 
 FUNCTIONAL_DIR = str(Path(__file__).parent / "functional")
 COMPONENT_SCRIPT = str(Path(__file__).parent.parent / "src" / "component.py")
-
-VCR_SANITIZERS = [
-    DefaultSanitizer(additional_sensitive_fields=["page_token"]),
-    ResponseUrlSanitizer(
-        dynamic_params=["_nc_gid", "_nc_tpa", "_nc_oc", "_nc_ohc", "oh", "oe"],
-        url_domains=["fbcdn.net", "facebook.com", "cdninstagram.com"],
-    ),
-]
 
 
 @pytest.mark.parametrize("test_name", get_test_cases(FUNCTIONAL_DIR))
@@ -3900,7 +3584,6 @@ def test_functional(test_name):
     tester = VCRDataDirTester(
         data_dir=FUNCTIONAL_DIR,
         component_script=COMPONENT_SCRIPT,
-        vcr_sanitizers=VCR_SANITIZERS,
         selected_tests=[test_name],
     )
     tester.run()
@@ -8310,21 +7993,21 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.KBC_DEVELOPERPORTAL_APP }}
-          path: /tmp
-
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Load Image & Run Tests
-        run: |
-          docker load --input /tmp/${{ env.KBC_DEVELOPERPORTAL_APP }}.tar
-          docker image ls -a
-          echo "Running unit-tests..."
-          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}:latest python -m unittest discover
+      # Test image is built independently from production — ruff + pytest run at container start via CMD
+      - name: Build test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          target: test
+          tags: ${{ env.KBC_DEVELOPERPORTAL_APP }}-test:latest
+          load: true
+
+      - name: Run Tests
+        run: docker run ${{ env.KBC_DEVELOPERPORTAL_APP }}-test:latest
 
   tests-kbc:
     name: Run KBC Tests
