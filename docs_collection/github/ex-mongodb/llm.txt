@@ -45,6 +45,7 @@ Directory structure:
     │   ├── Extractor.php
     │   ├── Manifest.php
     │   ├── Parse.php
+    │   ├── RelativeDateParser.php
     │   ├── run.php
     │   ├── Uri.php
     │   ├── UriFactory.php
@@ -374,6 +375,7 @@ Directory structure:
     │   │   ├── ExportCommandFactoryTest.php
     │   │   ├── ExportHelperTest.php
     │   │   ├── HandleMongoExportFailsTest.php
+    │   │   ├── RelativeDateParserTest.php
     │   │   └── UriFactoryTest.php
     │   └── traits/
     │       └── ImportDatasetTrait.php
@@ -7600,7 +7602,6 @@ use MongoExtractor\Config\DbNode;
 
 class ExportCommandFactory
 {
-
     public function __construct(private UriFactory $uriFactory, private bool $quiet)
     {
     }
@@ -7690,6 +7691,8 @@ class ExportCommandFactory
         foreach (['query', 'sort', 'limit', 'skip'] as $option) {
             if (isset($params[$option]) && !empty(trim((string) $params[$option]))) {
                 if ($option === 'query') {
+                    $relativeDateParser = new RelativeDateParser();
+                    $params[$option] = $relativeDateParser->parse($params[$option]);
                     $params[$option] = ExportHelper::addQuotesToJsonKeys($params[$option]);
                     $params[$option] = ExportHelper::convertStringIdToObjectId($params[$option]);
                 }
@@ -8213,6 +8216,115 @@ class Parse
         }
 
         return $parser;
+    }
+}
+
+
+
+================================================
+FILE: src/RelativeDateParser.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace MongoExtractor;
+
+use DateInterval;
+use DateTimeImmutable;
+use DateTimeInterface;
+use DateTimeZone;
+use Keboola\Component\UserException;
+
+class RelativeDateParser
+{
+    // Pattern matches "{{now}}" or "{{now-Nd/w/m/y}}" as a complete JSON string value
+    private const PLACEHOLDER_PATTERN = '/"\{\{(now(?:-(\d+)([dwmy]))?)?\}\}"/i';
+    // Pattern matches any remaining {{...}} form that was not handled by the main pattern
+    private const UNSUPPORTED_PLACEHOLDER_PATTERN = '/\{\{[^}]*\}\}/';
+
+    private DateTimeImmutable $now;
+
+    public function __construct(?DateTimeImmutable $now = null)
+    {
+        $this->now = $now ?? new DateTimeImmutable('now', new DateTimeZone('UTC'));
+    }
+
+    public function parse(string $query): string
+    {
+        $result = preg_replace_callback(
+            self::PLACEHOLDER_PATTERN,
+            fn(array $matches): string => $this->replacePlaceholder($matches),
+            $query,
+        );
+
+        if ($result === null) {
+            throw new UserException(
+                'Failed to process relative date placeholders in query due to a regular expression error.',
+            );
+        }
+
+        // Detect any remaining unsupported {{...}} placeholders
+        if (preg_match(self::UNSUPPORTED_PLACEHOLDER_PATTERN, $result, $matches)) {
+            throw new UserException(sprintf(
+                'Unsupported relative date placeholder: %s.'
+                    . ' Supported formats: {{now}}, {{now-Nd}}, {{now-Nw}}, {{now-Nm}}, {{now-Ny}}.',
+                $matches[0],
+            ));
+        }
+
+        return $result;
+    }
+
+    public function hasPlaceholders(string $query): bool
+    {
+        return (bool) preg_match(self::PLACEHOLDER_PATTERN, $query);
+    }
+
+    /**
+     * @param array<int, string|null> $matches
+     * @throws UserException
+     */
+    private function replacePlaceholder(array $matches): string
+    {
+        $fullMatch = $matches[0];
+        $expression = $matches[1] ?? null;
+
+        if ($expression === null || $expression === '') {
+            throw new UserException(sprintf('Invalid relative date placeholder: %s', $fullMatch));
+        }
+
+        if (strtolower($expression) === 'now') {
+            return $this->formatAsMongoDate($this->now);
+        }
+
+        $amount = isset($matches[2]) ? (int) $matches[2] : null;
+        $unit = isset($matches[3]) ? strtolower($matches[3]) : null;
+
+        if ($amount === null || $unit === null) {
+            throw new UserException(sprintf('Invalid relative date placeholder: %s', $fullMatch));
+        }
+
+        $date = $this->subtractFromNow($amount, $unit);
+        return $this->formatAsMongoDate($date);
+    }
+
+    private function subtractFromNow(int $amount, string $unit): DateTimeImmutable
+    {
+        $intervalSpec = match ($unit) {
+            'd' => "P{$amount}D",
+            'w' => 'P' . ($amount * 7) . 'D',
+            'm' => "P{$amount}M",
+            'y' => "P{$amount}Y",
+            default => throw new UserException(sprintf('Invalid time unit: %s', $unit)),
+        };
+
+        return $this->now->sub(new DateInterval($intervalSpec));
+    }
+
+    private function formatAsMongoDate(DateTimeImmutable $date): string
+    {
+        return sprintf('{"$date": "%s"}', $date->format(DateTimeInterface::ATOM));
     }
 }
 
@@ -17136,7 +17248,7 @@ FILE: tests/functional/test-wrong-uri/expected-code
 ================================================
 FILE: tests/functional/test-wrong-uri/expected-stderr
 ================================================
-Failed to parse MongoDB URI: 'mongodb://mongodb://keboola-test@mongodb/test:27017/test'. Invalid host string in URI.
+Failed to parse MongoDB URI: 'mongodb://mongodb://keboola-test@mongodb/test:27017/test'. %s
 
 
 
@@ -18003,6 +18115,25 @@ BASH;
         $this->assertSame($expectedCommand, $command);
     }
 
+    public function testQueryWithRelativeDatePlaceholder(): void
+    {
+        $options = [
+            'host' => 'localhost',
+            'port' => 27017,
+            'database' => 'myDatabase',
+            'collection' => 'myCollection',
+            'query' => '{"createdAt": {"$gte": "{{now-7d}}"}}',
+            'out' => '/tmp/create-test.json',
+        ];
+
+        $command = $this->commandFactory->create($options);
+
+        // Verify the command contains $date in the query (placeholder was resolved)
+        $this->assertStringContainsString('--query', $command);
+        $this->assertStringContainsString('"$date":', $command);
+        $this->assertStringNotContainsString('{{now', $command);
+    }
+
     public function testQuietTrue(): void
     {
         $options = [
@@ -18422,6 +18553,179 @@ class HandleMongoExportFailsTest extends TestCase
         $mockProcess->method('getErrorOutput')->willReturn($errorOutput);
 
         return $mockProcess;
+    }
+}
+
+
+
+================================================
+FILE: tests/phpunit/RelativeDateParserTest.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace MongoExtractor\Tests\Unit;
+
+use DateTimeImmutable;
+use DateTimeZone;
+use Generator;
+use Keboola\Component\UserException;
+use MongoExtractor\RelativeDateParser;
+use PHPUnit\Framework\Assert;
+use PHPUnit\Framework\TestCase;
+
+class RelativeDateParserTest extends TestCase
+{
+    private DateTimeImmutable $fixedNow;
+    private RelativeDateParser $parser;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        // Fixed date: 2026-01-21T10:00:00+00:00
+        $this->fixedNow = new DateTimeImmutable('2026-01-21T10:00:00+00:00', new DateTimeZone('UTC'));
+        $this->parser = new RelativeDateParser($this->fixedNow);
+    }
+
+    /**
+     * @return Generator<string, array{string, string}>
+     */
+    public function parseDataProvider(): Generator
+    {
+        // {{now}} - current datetime
+        yield 'now' => [
+            '{"createdAt": {"$gte": "{{now}}"}}',
+            '{"createdAt": {"$gte": {"$date": "2026-01-21T10:00:00+00:00"}}}',
+        ];
+
+        // {{NOW}} - case insensitive
+        yield 'now uppercase' => [
+            '{"createdAt": {"$gte": "{{NOW}}"}}',
+            '{"createdAt": {"$gte": {"$date": "2026-01-21T10:00:00+00:00"}}}',
+        ];
+
+        // {{now-7d}} - 7 days ago
+        yield '7 days ago' => [
+            '{"createdAt": {"$gte": "{{now-7d}}"}}',
+            '{"createdAt": {"$gte": {"$date": "2026-01-14T10:00:00+00:00"}}}',
+        ];
+
+        // {{now-2w}} - 2 weeks ago (14 days)
+        yield '2 weeks ago' => [
+            '{"createdAt": {"$gte": "{{now-2w}}"}}',
+            '{"createdAt": {"$gte": {"$date": "2026-01-07T10:00:00+00:00"}}}',
+        ];
+
+        // {{now-1m}} - 1 month ago
+        yield '1 month ago' => [
+            '{"createdAt": {"$gte": "{{now-1m}}"}}',
+            '{"createdAt": {"$gte": {"$date": "2025-12-21T10:00:00+00:00"}}}',
+        ];
+
+        // {{now-1y}} - 1 year ago
+        yield '1 year ago' => [
+            '{"createdAt": {"$gte": "{{now-1y}}"}}',
+            '{"createdAt": {"$gte": {"$date": "2025-01-21T10:00:00+00:00"}}}',
+        ];
+
+        // Multiple placeholders in one query
+        yield 'multiple placeholders' => [
+            '{"createdAt": {"$gte": "{{now-30d}}", "$lte": "{{now}}"}}',
+            '{"createdAt": {"$gte": {"$date": "2025-12-22T10:00:00+00:00"}, ' .
+                '"$lte": {"$date": "2026-01-21T10:00:00+00:00"}}}',
+        ];
+
+        // No placeholders - query passes through unchanged
+        yield 'no placeholders' => [
+            '{"createdAt": {"$gte": {"$date": "2025-01-01T00:00:00Z"}}}',
+            '{"createdAt": {"$gte": {"$date": "2025-01-01T00:00:00Z"}}}',
+        ];
+
+        // {{now-365d}} - 365 days ago (2025 is not a leap year, so 365 days before 2026-01-21 is 2025-01-21)
+        yield '365 days ago' => [
+            '{"createdAt": {"$gte": "{{now-365d}}"}}',
+            '{"createdAt": {"$gte": {"$date": "2025-01-21T10:00:00+00:00"}}}',
+        ];
+
+        // Query with other conditions
+        yield 'with other query conditions' => [
+            '{"status": "active", "createdAt": {"$gte": "{{now-7d}}"}, "type": "order"}',
+            '{"status": "active", "createdAt": {"$gte": {"$date": "2026-01-14T10:00:00+00:00"}}, "type": "order"}',
+        ];
+    }
+
+    /**
+     * @dataProvider parseDataProvider
+     */
+    public function testParse(string $input, string $expected): void
+    {
+        Assert::assertSame($expected, $this->parser->parse($input));
+    }
+
+    /**
+     * @return Generator<string, array{string, bool}>
+     */
+    public function hasPlaceholdersDataProvider(): Generator
+    {
+        yield 'has placeholder' => [
+            '{"createdAt": {"$gte": "{{now-7d}}"}}',
+            true,
+        ];
+
+        yield 'no placeholder' => [
+            '{"createdAt": {"$gte": {"$date": "2025-01-01T00:00:00Z"}}}',
+            false,
+        ];
+    }
+
+    /**
+     * @dataProvider hasPlaceholdersDataProvider
+     */
+    public function testHasPlaceholders(string $query, bool $expected): void
+    {
+        Assert::assertSame($expected, $this->parser->hasPlaceholders($query));
+    }
+
+    public function testParseEmptyPlaceholderThrowsException(): void
+    {
+        $this->expectException(UserException::class);
+        $this->expectExceptionMessage('Invalid relative date placeholder:');
+
+        $this->parser->parse('{"createdAt": {"$gte": "{{}}"}}');
+    }
+
+    public function testParseUnsupportedUnitThrowsException(): void
+    {
+        $this->expectException(UserException::class);
+        $this->expectExceptionMessage('Unsupported relative date placeholder: {{now-1h}}');
+
+        $this->parser->parse('{"createdAt": {"$gte": "{{now-1h}}"}}');
+    }
+
+    public function testParseMissingUnitThrowsException(): void
+    {
+        $this->expectException(UserException::class);
+        $this->expectExceptionMessage('Unsupported relative date placeholder: {{now-7}}');
+
+        $this->parser->parse('{"createdAt": {"$gte": "{{now-7}}"}}');
+    }
+
+    public function testParseUnknownPlaceholderThrowsException(): void
+    {
+        $this->expectException(UserException::class);
+        $this->expectExceptionMessage('Unsupported relative date placeholder: {{foo}}');
+
+        $this->parser->parse('{"createdAt": {"$gte": "{{foo}}"}}');
+    }
+
+    public function testDefaultNowUsesCurrentTime(): void
+    {
+        $parser = new RelativeDateParser();
+        $result = $parser->parse('{"createdAt": {"$gte": "{{now}}"}}');
+
+        Assert::assertStringContainsString('"$date":', $result);
+        Assert::assertStringNotContainsString('{{now}}', $result);
     }
 }
 

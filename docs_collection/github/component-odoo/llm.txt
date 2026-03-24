@@ -22,8 +22,8 @@ Directory structure:
     │   │   ├── loggerConfiguration.json
     │   │   └── sourceCodeUrl.md
     │   └── src/
-    │       ├── component.py
-    │       └── configuration.py
+    │       ├── configuration.py
+    │       └── extractor_component.py
     ├── packages/
     │   └── shared/
     │       ├── pyproject.toml
@@ -31,6 +31,7 @@ Directory structure:
     │           └── shared/
     │               ├── __init__.py
     │               ├── connection.py
+    │               ├── odoo_base.py
     │               └── clients/
     │                   ├── json2_client.py
     │                   └── xmlrpc_client.py
@@ -44,8 +45,8 @@ Directory structure:
     │   ├── conftest.py
     │   ├── extractor/
     │   │   ├── __init__.py
-    │   │   ├── test_component.py
     │   │   ├── test_configuration_extended.py
+    │   │   ├── test_extractor_component.py
     │   │   ├── test_run_e2e.py
     │   │   ├── test_state.py
     │   │   └── test_write_csv.py
@@ -1583,7 +1584,7 @@ COPY scripts/ scripts/
 COPY .flake8 .
 COPY deploy.sh .
 
-CMD ["uv", "run", "--no-sync", "python", "-u", "src/component.py"]
+CMD ["uv", "run", "--no-sync", "python", "-u", "src/extractor_component.py"]
 
 
 
@@ -1750,6 +1751,7 @@ FILE: extractor/component_config/configSchema.json
       "propertyOrder": 20,
       "enum": [],
       "options": {
+        "creatable": true,
         "async": {
           "action": "listDatabases",
           "label": "Load Databases"
@@ -1807,6 +1809,7 @@ FILE: extractor/component_config/configSchema.json
 }
 
 
+
 ================================================
 FILE: extractor/component_config/configuration_description.md
 ================================================
@@ -1859,7 +1862,50 @@ https://github.com/keboola/component-odoo-extractor
 
 
 ================================================
-FILE: extractor/src/component.py
+FILE: extractor/src/configuration.py
+================================================
+"""
+Configuration schema for Odoo Extractor.
+
+Extends shared connection configuration with extraction-specific fields.
+"""
+
+import json
+from typing import Any
+
+from keboola.component.exceptions import UserException
+from pydantic import Field
+
+from shared.connection import OdooConnectionConfig
+
+
+class Configuration(OdooConnectionConfig):
+    """Odoo Extractor configuration — connection + extraction settings."""
+
+    model: str = Field(default="", description="Odoo model name")
+    fields: list[str] | None = Field(default=None, description="Fields to extract")
+    domain: str | None = Field(default=None, description="Odoo domain filter as JSON string")
+    incremental: bool = Field(default=False, description="Enable incremental loading")
+    page_size: int = Field(default=1000, description="Number of records per page")
+
+    @property
+    def table_name(self) -> str:
+        if self.model:
+            return f"{self.model.replace('.', '_')}.csv"
+        return ""
+
+    def get_domain(self) -> list[Any]:
+        if not self.domain:
+            return []
+        try:
+            return json.loads(self.domain)
+        except json.JSONDecodeError:
+            raise UserException(f"Invalid domain JSON: {self.domain}")
+
+
+
+================================================
+FILE: extractor/src/extractor_component.py
 ================================================
 """
 Odoo Extractor Component
@@ -1874,20 +1920,12 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from configuration import Configuration
-from keboola.component.base import ComponentBase, sync_action
+from keboola.component.base import ComponentBase
 from keboola.component.exceptions import UserException
-from keboola.component.sync_actions import SelectElement
-
-from shared.clients.json2_client import Json2Client
-from shared.clients.xmlrpc_client import XmlRpcClient
-
-PROTOCOL_JSON2 = "json2"
-PROTOCOL_XMLRPC = "xmlrpc"
-DISPLAY_JSON2 = "JSON-2"
-DISPLAY_XMLRPC = "XML-RPC"
+from shared.connection import PROTOCOL_XMLRPC
+from shared.odoo_base import OdooSyncActionsMixin, initialize_client
 
 
 @dataclass
@@ -1929,7 +1967,7 @@ class SplitTablesResult:
     bridge_tables: dict[str, BridgeTableMetadata]
 
 
-class Component(ComponentBase):
+class Component(OdooSyncActionsMixin, ComponentBase):
     """
     Odoo Extractor Component.
 
@@ -1942,7 +1980,7 @@ class Component(ComponentBase):
         super().__init__()
         self.state: dict[str, Any] = {}
         self.config = Configuration(**self.configuration.parameters)
-        self.client = self._initialize_client(self.config)
+        self.client = initialize_client(self.config)
 
     def run(self) -> None:
         """Main extraction logic."""
@@ -1960,25 +1998,6 @@ class Component(ComponentBase):
             self.write_state_file(self.state)
 
         logging.info("Extraction completed successfully")
-
-    def _initialize_client(self, params: Configuration) -> XmlRpcClient | Json2Client:
-        """
-        Initialize and return appropriate Odoo client based on api_protocol config.
-
-        Args:
-            params: Configuration object
-
-        Returns:
-            Initialized XmlRpcClient or Json2Client based on api_protocol setting
-        """
-        ClientClass = Json2Client if params.api_protocol == PROTOCOL_JSON2 else XmlRpcClient
-
-        return ClientClass(
-            url=params.odoo_url,
-            database=params.database,
-            username=params.username,
-            api_key=params.api_key,
-        )
 
     def _validate_config_for_run(self) -> None:
         """Validate configuration before data extraction."""
@@ -2407,276 +2426,6 @@ class Component(ComponentBase):
 
     # === Helper Methods ===
 
-    def _extract_short_error(self, exception: Exception) -> str:
-        """Extract concise error message from exception."""
-        error_str = str(exception)
-
-        # Map common errors to short forms
-        if "Invalid apikey" in error_str or "Invalid API key" in error_str:
-            return "invalid API key"
-        elif "401" in error_str:
-            return "invalid API key"
-        elif "403" in error_str or "forbidden" in error_str.lower():
-            return "access forbidden"
-        elif "404" in error_str:
-            return "endpoint not found"
-        elif "invalid credentials" in error_str.lower():
-            return "invalid credentials"
-        elif "authentication failed" in error_str.lower():
-            # Extract the specific reason if present
-            parts = error_str.split(":")
-            if len(parts) > 1:
-                return parts[-1].strip()[:50]
-            return error_str[:50]
-        else:
-            # Keep it short, max 50 chars
-            return error_str[:50] + "..." if len(error_str) > 50 else error_str
-
-    # === Sync Actions (UI buttons) ===
-
-    @sync_action("testConnection")
-    def test_connection_action(self) -> dict[str, str]:
-        """
-        Test connection showing:
-        1. Odoo version
-        2. Protocol availability (✓/✗ for both JSON-2 and XML-RPC)
-        3. Authentication status for selected protocol only
-        4. Model count if authentication succeeds
-
-        Message format:
-        "Odoo {version}. Supports: JSON-2 {✓/✗}, XML-RPC {✓/✗}. Authenticated using {protocol}, {N} models"
-
-        Returns:
-            Success/error response for UI
-        """
-        try:
-            # All validation happens in Configuration __init__
-            # Just extract the values we need
-            odoo_url = self.config.odoo_url
-            database = self.config.database
-            username = self.config.username
-            api_key = self.config.api_key
-            selected_protocol = self.config.api_protocol
-
-            # Step 1: Check protocol availability (no auth required)
-            protocols_available = {}
-            odoo_version = None
-
-            # Initialize clients
-            xmlrpc_client = XmlRpcClient(odoo_url, database, username, api_key)
-            json2_client = Json2Client(odoo_url, database, username, api_key)
-
-            # Check XML-RPC availability
-            try:
-                version = xmlrpc_client.get_version()
-                protocols_available[DISPLAY_XMLRPC] = True
-                odoo_version = version
-            except Exception as e:
-                protocols_available[DISPLAY_XMLRPC] = False
-                logging.debug(f"XML-RPC availability check failed: {e}")
-
-            # Check JSON-2 availability
-            try:
-                version = json2_client.get_version()
-                protocols_available[DISPLAY_JSON2] = True
-                if not odoo_version:
-                    odoo_version = version
-            except Exception as e:
-                protocols_available[DISPLAY_JSON2] = False
-                logging.debug(f"JSON-2 availability check failed: {e}")
-
-            # Fail if no version detected from any protocol
-            if not odoo_version:
-                raise UserException("Cannot connect to Odoo instance at this URL")
-
-            # Step 2: Build "Supports" section
-            supports_parts = []
-            for protocol in [DISPLAY_JSON2, DISPLAY_XMLRPC]:
-                symbol = "✓" if protocols_available.get(protocol, False) else "✗"
-                supports_parts.append(f"{protocol} {symbol}")
-            supports_str = ", ".join(supports_parts)
-
-            # Step 3: Test authentication for selected protocol only
-            selected_client = None
-            auth_message = ""
-
-            if selected_protocol == PROTOCOL_JSON2:
-                if not protocols_available[DISPLAY_JSON2]:
-                    return {
-                        "status": "error",
-                        "message": (
-                            f"Odoo {odoo_version}. Supports: {supports_str}. "
-                            f"{DISPLAY_JSON2} not available on this instance"
-                        ),
-                    }
-                try:
-                    json2_client.test_connection()
-                    selected_client = json2_client
-                    auth_message = f"Authenticated using {DISPLAY_JSON2}"
-                except Exception as e:
-                    short_error = self._extract_short_error(e)
-                    return {
-                        "status": "error",
-                        "message": (
-                            f"Odoo {odoo_version}. Supports: {supports_str}. "
-                            f"Authentication failed using {DISPLAY_JSON2} ({short_error})"
-                        ),
-                    }
-            else:  # xmlrpc (default)
-                if not protocols_available[DISPLAY_XMLRPC]:
-                    return {
-                        "status": "error",
-                        "message": (
-                            f"Odoo {odoo_version}. Supports: {supports_str}. "
-                            f"{DISPLAY_XMLRPC} not available on this instance"
-                        ),
-                    }
-                try:
-                    xmlrpc_client.test_connection()
-                    selected_client = xmlrpc_client
-                    auth_message = f"Authenticated using {DISPLAY_XMLRPC}"
-                except Exception as e:
-                    short_error = self._extract_short_error(e)
-                    return {
-                        "status": "error",
-                        "message": (
-                            f"Odoo {odoo_version}. Supports: {supports_str}. "
-                            f"Authentication failed using {DISPLAY_XMLRPC} ({short_error})"
-                        ),
-                    }
-
-            # Step 4: Get model count
-            model_suffix = ""
-            try:
-                models = selected_client.list_models()
-                model_suffix = f", {len(models)} models"
-            except Exception as e:
-                logging.warning(f"Could not fetch model count: {e}")
-
-            # Step 5: Build final success message
-            message = f"Odoo {odoo_version}. Supports: {supports_str}. {auth_message}{model_suffix}"
-
-            return {"status": "success", "message": message}
-
-        except UserException as e:
-            raise e
-        except Exception as e:
-            raise UserException(f"Connection test failed: {str(e)}")
-
-    @sync_action("listModels")
-    def list_models_action(self) -> list[SelectElement]:
-        """
-        List available Odoo models - sync action for model dropdown.
-
-        Returns:
-            Dropdown data with model names
-        """
-        try:
-            models = self.client.list_models()
-
-            models_sorted = sorted(models, key=lambda m: m["model"])
-
-            dropdown_data = [
-                SelectElement(
-                    value=model["model"],
-                    label=f"{model['model']} - {model['name']}",
-                )
-                for model in models_sorted
-            ]
-
-            return dropdown_data
-
-        except UserException as e:
-            raise e
-        except Exception as e:
-            raise UserException(f"Failed to load models: {str(e)}")
-
-    @sync_action("listFields")
-    def list_fields_action(self) -> list[SelectElement]:
-        """List fields for selected model."""
-        try:
-            model = self.config.model
-            if not model:
-                raise UserException("Please select a model first")
-
-            fields_dict = self.client.get_model_fields(model)
-
-            dropdown_data = []
-            for field_name, field_info in fields_dict.items():
-                if field_name == "_unknown":
-                    continue
-
-                field_label = field_info.get("string", field_name)
-                field_type = field_info.get("type", "unknown")
-                dropdown_data.append(
-                    SelectElement(
-                        value=field_name,
-                        label=f"{field_label} ({field_name}) - {field_type}",
-                    )
-                )
-
-            return dropdown_data
-
-        except UserException as e:
-            raise e
-        except Exception as e:
-            raise UserException(f"Failed to load fields: {str(e)}")
-
-    @sync_action("listDatabases")
-    def list_databases_action(self) -> list[SelectElement]:
-        """
-        List available databases on the Odoo instance.
-
-        For odoo.com instances, database listing is blocked for security.
-        This method detects odoo.com and suggests the database name from the URL.
-
-        Returns:
-            Dropdown data with database names
-
-        Raises:
-            UserException: If listing databases fails
-        """
-        try:
-            odoo_url = self.config.odoo_url
-            is_odoo_com = ".odoo.com" in odoo_url.lower()
-
-            if is_odoo_com:
-                parsed = urlparse(odoo_url)
-                hostname = parsed.hostname or ""
-                subdomain = hostname.replace(".odoo.com", "").replace(".dev", "").replace(".saas", "")
-
-                if subdomain:
-                    logging.info(f"Detected odoo.com instance - suggesting database name from subdomain: {subdomain}")
-                    return [SelectElement(value=subdomain)]
-                else:
-                    raise UserException(
-                        "This is an Odoo.com instance. Database listing is blocked for security. "
-                        "Please enter the database name manually (usually matches your subdomain)."
-                    )
-
-            if self.config.api_protocol == PROTOCOL_JSON2:
-                client = Json2Client(odoo_url, "", None, "")
-                databases = client.list_databases()
-            else:
-                client = XmlRpcClient(odoo_url, "", "", "")
-                databases = client.list_databases()
-
-            logging.info(f"Found {len(databases)} database(s): {databases}")
-
-            # Convert to dropdown format
-            dropdown_data = [SelectElement(value=db) for db in databases]
-            return dropdown_data
-
-        except UserException as e:
-            if "Access Denied" in str(e) and ".odoo.com" in self.config.odoo_url.lower():
-                raise UserException(
-                    "Database listing is blocked on Odoo.com instances. "
-                    "Please enter the database name manually (it usually matches your subdomain)."
-                )
-            raise e
-        except Exception as e:
-            raise UserException(f"Failed to list databases: {str(e)}")
-
 
 if __name__ == "__main__":
     try:
@@ -2688,49 +2437,6 @@ if __name__ == "__main__":
     except Exception as exc:
         logging.exception(exc)
         exit(2)
-
-
-
-================================================
-FILE: extractor/src/configuration.py
-================================================
-"""
-Configuration schema for Odoo Extractor.
-
-Extends shared connection configuration with extraction-specific fields.
-"""
-
-import json
-from typing import Any
-
-from keboola.component.exceptions import UserException
-from pydantic import Field
-
-from shared.connection import OdooConnectionConfig
-
-
-class Configuration(OdooConnectionConfig):
-    """Odoo Extractor configuration — connection + extraction settings."""
-
-    model: str = Field(default="", description="Odoo model name")
-    fields: list[str] | None = Field(default=None, description="Fields to extract")
-    domain: str | None = Field(default=None, description="Odoo domain filter as JSON string")
-    incremental: bool = Field(default=False, description="Enable incremental loading")
-    page_size: int = Field(default=1000, description="Number of records per page")
-
-    @property
-    def table_name(self) -> str:
-        if self.model:
-            return f"{self.model.replace('.', '_')}.csv"
-        return ""
-
-    def get_domain(self) -> list[Any]:
-        if not self.domain:
-            return []
-        try:
-            return json.loads(self.domain)
-        except json.JSONDecodeError:
-            raise UserException(f"Invalid domain JSON: {self.domain}")
 
 
 
@@ -2801,6 +2507,316 @@ class OdooConnectionConfig(BaseModel):
 
     class Config:
         populate_by_name = True
+
+
+
+================================================
+FILE: packages/shared/src/shared/odoo_base.py
+================================================
+"""
+Shared Odoo component base — constants, helpers, and sync action mixin.
+
+Provides everything that is identical between the extractor and writer:
+- Protocol constants and display names
+- Client factory
+- Error message formatting
+- Database discovery (with proper /web/database/list support for Odoo SaaS)
+- Sync action implementations (testConnection, listModels, listFields, listDatabases)
+"""
+
+import logging
+from urllib.parse import urlparse
+
+from keboola.component.base import sync_action
+from keboola.component.exceptions import UserException
+from keboola.component.sync_actions import SelectElement
+
+from shared.clients.json2_client import Json2Client
+from shared.clients.xmlrpc_client import XmlRpcClient
+from shared.connection import PROTOCOL_JSON2
+
+DISPLAY_JSON2 = "JSON-2"
+DISPLAY_XMLRPC = "XML-RPC"
+
+
+def initialize_client(config) -> XmlRpcClient | Json2Client:
+    """
+    Initialize and return the appropriate Odoo client based on api_protocol config.
+
+    Args:
+        config: OdooConnectionConfig (or any subclass) with odoo_url, database,
+                username, api_key, api_protocol fields.
+
+    Returns:
+        Initialized Json2Client or XmlRpcClient.
+    """
+    ClientClass = Json2Client if config.api_protocol == PROTOCOL_JSON2 else XmlRpcClient
+    return ClientClass(
+        url=config.odoo_url,
+        database=config.database,
+        username=config.username,
+        api_key=config.api_key,
+    )
+
+
+def extract_short_error(exception: Exception) -> str:
+    """
+    Extract a concise, user-friendly error message from an exception.
+
+    Maps common Odoo/HTTP error patterns to readable descriptions.
+    For authentication failures, extracts the specific reason from the
+    full error string (e.g. the last line of a server-side traceback).
+    """
+    error_str = str(exception)
+
+    if "Invalid apikey" in error_str or "Invalid API key" in error_str:
+        return "invalid API key"
+    elif "401" in error_str:
+        return "invalid API key"
+    elif "403" in error_str or "forbidden" in error_str.lower():
+        return "access forbidden"
+    elif "404" in error_str:
+        return "endpoint not found"
+    elif "invalid credentials" in error_str.lower():
+        return "invalid credentials"
+    elif "authentication failed" in error_str.lower():
+        parts = error_str.split(":")
+        if len(parts) > 1:
+            return parts[-1].strip()
+        return error_str
+    else:
+        return error_str
+
+
+def discover_databases(url: str) -> list[str]:
+    """
+    Discover available databases on an Odoo instance.
+
+    Strategy (in order):
+    1. POST to /web/database/list — works on Odoo SaaS and most self-hosted instances.
+       This is the only endpoint that returns the real DB name on Odoo SaaS
+       (xmlrpc/2/db returns Access Denied there).
+    2. Fall back to xmlrpc/2/db list() — for self-hosted instances that may not
+       expose /web/database/list.
+    3. For .odoo.com instances, fall back to a subdomain-derived guess as a last resort,
+       clearly labelled so the user knows it may not be exact.
+
+    Args:
+        url: Odoo instance URL (e.g. https://mycompany.odoo.com)
+
+    Returns:
+        List of database name strings.
+
+    Raises:
+        UserException: If all strategies fail and no fallback is available.
+    """
+    # Strategy 1: /web/database/list (JSON-RPC POST, no auth required)
+    try:
+        client = Json2Client(url, "", None, "")
+        databases = client.list_databases()
+        logging.info(f"Found {len(databases)} database(s) via /web/database/list: {databases}")
+        return databases
+    except Exception as e:
+        logging.debug(f"/web/database/list failed: {e}")
+
+    # Strategy 2: xmlrpc/2/db list()
+    try:
+        client = XmlRpcClient(url, "", "", "")
+        databases = client.list_databases()
+        logging.info(f"Found {len(databases)} database(s) via XML-RPC db.list(): {databases}")
+        return databases
+    except Exception as e:
+        logging.debug(f"XML-RPC db.list() failed: {e}")
+
+    # Strategy 3: subdomain guess for .odoo.com instances
+    if ".odoo.com" in url.lower():
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        subdomain = hostname.replace(".odoo.com", "").replace(".dev", "").replace(".saas", "")
+        if subdomain:
+            logging.warning(f"Could not query database list — falling back to subdomain guess: {subdomain}")
+            return [subdomain]
+
+    raise UserException(
+        "Could not retrieve the database list from this Odoo instance. Please enter the database name manually."
+    )
+
+
+class OdooSyncActionsMixin:
+    """
+    Mixin providing shared sync action implementations for Odoo components.
+
+    Expects the inheriting class to have:
+      - self.config  — OdooConnectionConfig (or subclass) with odoo_url, database,
+                       username, api_key, api_protocol, model fields
+      - self.client  — XmlRpcClient | Json2Client (initialized via initialize_client())
+    """
+
+    @sync_action("testConnection")
+    def test_connection_action(self) -> dict[str, str]:
+        """
+        Test connection showing Odoo version, protocol availability, and auth status.
+
+        Message format:
+        "Odoo {version}. Supports: JSON-2 {✓/✗}, XML-RPC {✓/✗}. {auth result}, {N} models"
+        """
+        try:
+            odoo_url = self.config.odoo_url
+            database = self.config.database
+            username = self.config.username
+            api_key = self.config.api_key
+            selected_protocol = self.config.api_protocol
+
+            xmlrpc_client = XmlRpcClient(odoo_url, database, username, api_key)
+            json2_client = Json2Client(odoo_url, database, username, api_key)
+
+            # Step 1: Check protocol availability (no auth required)
+            protocols_available = {}
+            odoo_version = None
+
+            try:
+                odoo_version = xmlrpc_client.get_version()
+                protocols_available[DISPLAY_XMLRPC] = True
+            except Exception as e:
+                protocols_available[DISPLAY_XMLRPC] = False
+                logging.debug(f"XML-RPC availability check failed: {e}")
+
+            try:
+                version = json2_client.get_version()
+                protocols_available[DISPLAY_JSON2] = True
+                if not odoo_version:
+                    odoo_version = version
+            except Exception as e:
+                protocols_available[DISPLAY_JSON2] = False
+                logging.debug(f"JSON-2 availability check failed: {e}")
+
+            if not odoo_version:
+                raise UserException("Cannot connect to Odoo instance at this URL")
+
+            # Step 2: Build supports string
+            supports_parts = []
+            for protocol in [DISPLAY_JSON2, DISPLAY_XMLRPC]:
+                symbol = "✓" if protocols_available.get(protocol, False) else "✗"
+                supports_parts.append(f"{protocol} {symbol}")
+            supports_str = ", ".join(supports_parts)
+
+            # Step 3: Test authentication for the selected protocol
+            selected_client: XmlRpcClient | Json2Client | None = None
+            auth_message = ""
+
+            if selected_protocol == PROTOCOL_JSON2:
+                if not protocols_available[DISPLAY_JSON2]:
+                    return {
+                        "status": "error",
+                        "message": (
+                            f"Odoo {odoo_version}. Supports: {supports_str}. "
+                            f"{DISPLAY_JSON2} not available on this instance"
+                        ),
+                    }
+                try:
+                    json2_client.test_connection()
+                    selected_client = json2_client
+                    auth_message = f"Authenticated using {DISPLAY_JSON2}"
+                except Exception as e:
+                    return {
+                        "status": "error",
+                        "message": (
+                            f"Odoo {odoo_version}. Supports: {supports_str}. "
+                            f"Authentication failed using {DISPLAY_JSON2} ({extract_short_error(e)})"
+                        ),
+                    }
+            else:
+                if not protocols_available[DISPLAY_XMLRPC]:
+                    return {
+                        "status": "error",
+                        "message": (
+                            f"Odoo {odoo_version}. Supports: {supports_str}. "
+                            f"{DISPLAY_XMLRPC} not available on this instance"
+                        ),
+                    }
+                try:
+                    xmlrpc_client.test_connection()
+                    selected_client = xmlrpc_client
+                    auth_message = f"Authenticated using {DISPLAY_XMLRPC}"
+                except Exception as e:
+                    return {
+                        "status": "error",
+                        "message": (
+                            f"Odoo {odoo_version}. Supports: {supports_str}. "
+                            f"Authentication failed using {DISPLAY_XMLRPC} ({extract_short_error(e)})"
+                        ),
+                    }
+
+            # Step 4: Get model count
+            model_suffix = ""
+            try:
+                models = selected_client.list_models()
+                model_suffix = f", {len(models)} models"
+            except Exception as e:
+                logging.warning(f"Could not fetch model count: {e}")
+
+            return {
+                "status": "success",
+                "message": f"Odoo {odoo_version}. Supports: {supports_str}. {auth_message}{model_suffix}",
+            }
+
+        except UserException:
+            raise
+        except Exception as e:
+            raise UserException(f"Connection test failed: {str(e)}")
+
+    @sync_action("listModels")
+    def list_models_action(self) -> list[SelectElement]:
+        """List available Odoo models for the model dropdown."""
+        try:
+            models = self.client.list_models()
+            return [
+                SelectElement(value=m["model"], label=f"{m['model']} - {m['name']}")
+                for m in sorted(models, key=lambda m: m["model"])
+            ]
+        except UserException:
+            raise
+        except Exception as e:
+            raise UserException(f"Failed to load models: {str(e)}")
+
+    @sync_action("listFields")
+    def list_fields_action(self) -> list[SelectElement]:
+        """List fields for the selected Odoo model."""
+        try:
+            model = self.config.model
+            if not model:
+                raise UserException("Please select a model first")
+
+            fields_dict = self.client.get_model_fields(model)
+            return [
+                SelectElement(
+                    value=field_name,
+                    label=f"{info.get('string', field_name)} ({field_name}) - {info.get('type', 'unknown')}",
+                )
+                for field_name, info in fields_dict.items()
+                if field_name != "_unknown"
+            ]
+        except UserException:
+            raise
+        except Exception as e:
+            raise UserException(f"Failed to load fields: {str(e)}")
+
+    @sync_action("listDatabases")
+    def list_databases_action(self) -> list[SelectElement]:
+        """
+        List available databases on the Odoo instance.
+
+        Uses discover_databases() which tries /web/database/list first (works on
+        Odoo SaaS where xmlrpc/2/db returns Access Denied), then falls back to
+        XML-RPC db.list(), then to subdomain guessing for .odoo.com instances.
+        """
+        try:
+            databases = discover_databases(self.config.odoo_url)
+            return [SelectElement(value=db) for db in databases]
+        except UserException:
+            raise
+        except Exception as e:
+            raise UserException(f"Failed to list databases: {str(e)}")
 
 
 
@@ -3698,120 +3714,6 @@ FILE: tests/extractor/__init__.py
 
 
 ================================================
-FILE: tests/extractor/test_component.py
-================================================
-"""
-Tests for Component._split_records() and metadata generation.
-"""
-
-from typing import Any
-from unittest.mock import MagicMock
-
-from component import Component
-from configuration import Configuration
-
-
-class TestSplitRecords:
-    def test_many2one_flattened_to_main_table(self):
-        records: list[dict[str, Any]] = [{"id": 1, "name": "Test", "country_id": [21, "United States"]}]
-        result = Component._split_records(records, "res.partner", "res_partner.csv")
-
-        assert len(result.main_records) == 1
-        assert result.main_records[0]["country_id_id"] == 21
-        assert result.main_records[0]["country_id_name"] == "United States"
-        assert not result.bridge_tables
-
-    def test_many2many_split_to_bridge_table(self):
-        records: list[dict[str, Any]] = [{"id": 1, "name": "Test", "tag_ids": [5, 9, 12]}]
-        result = Component._split_records(records, "res.partner", "res_partner.csv")
-
-        assert "tag_ids" not in result.main_records[0]
-        bridge = result.bridge_tables["res_partner__tag_ids.csv"]
-        assert bridge.primary_key == ["partner_id", "tag_id"]
-        assert bridge.records == [
-            {"partner_id": 1, "tag_id": 5},
-            {"partner_id": 1, "tag_id": 9},
-            {"partner_id": 1, "tag_id": 12},
-        ]
-
-    def test_false_converted_to_none(self):
-        records: list[dict[str, Any]] = [{"id": 1, "email": False}]
-        result = Component._split_records(records, "res.partner", "res_partner.csv")
-
-        assert result.main_records[0]["email"] is None
-
-    def test_empty_relationship_list_skipped(self):
-        records: list[dict[str, Any]] = [{"id": 1, "tag_ids": []}]
-        result = Component._split_records(records, "res.partner", "res_partner.csv")
-
-        assert len(result.main_records) == 1
-        assert not result.bridge_tables
-
-    def test_multiple_relationships_produce_separate_tables(self):
-        records: list[dict[str, Any]] = [{"id": 15, "name": "Azure", "category_id": [5], "child_ids": [27, 34, 28]}]
-        result = Component._split_records(records, "res.partner", "res_partner.csv")
-
-        assert result.main_records[0]["id"] == 15
-        assert len(result.bridge_tables) == 2
-
-        cat = result.bridge_tables["res_partner__category_id.csv"]
-        assert cat.primary_key == ["partner_id", "category_id"]
-        assert len(cat.records) == 1
-
-        child = result.bridge_tables["res_partner__child_ids.csv"]
-        assert child.primary_key == ["partner_id", "child_id"]
-        assert len(child.records) == 3
-
-
-class TestMetadataGeneration:
-    def test_metadata_file_created_during_extraction(self, tmp_path, mocker):
-        out_dir = tmp_path / "out" / "tables"
-        out_dir.mkdir(parents=True)
-
-        mock_client = MagicMock()
-        mock_client.get_model_fields.return_value = {
-            "id": {"type": "integer", "string": "ID"},
-            "name": {"type": "char", "string": "Name"},
-            "country_id": {"type": "many2one", "string": "Country", "relation": "res.country"},
-            "category_id": {"type": "many2many", "string": "Tags", "relation": "res.partner.category"},
-        }
-        mock_client.search_read.return_value = [
-            {"id": 1, "name": "Test", "country_id": [233, "United States"], "category_id": [5]}
-        ]
-
-        def make_table(name, **kwargs):
-            t = MagicMock()
-            t.full_path = str(out_dir / name)
-            return t
-
-        mocker.patch("component.Component.__init__", return_value=None)
-
-        comp = Component()
-        comp.client = mock_client
-        comp.state = {}
-        comp.create_out_table_definition = make_table
-        comp.write_manifest = MagicMock()
-        mocker.patch.object(
-            type(comp),
-            "tables_out_path",
-            new_callable=lambda: property(lambda self: str(out_dir)),
-        )
-        comp.config = Configuration(
-            odoo_url="https://demo.odoo.com",
-            database="demo",
-            username="admin",
-            api_key="test123",
-            model="res.partner",
-            fields=["id", "name", "country_id", "category_id"],
-        )
-
-        comp._extract_with_paging()
-
-        assert any(out_dir.glob("metadata__*"))
-
-
-
-================================================
 FILE: tests/extractor/test_configuration_extended.py
 ================================================
 """
@@ -3942,6 +3844,120 @@ class TestFieldsAndIncremental:
 
 
 ================================================
+FILE: tests/extractor/test_extractor_component.py
+================================================
+"""
+Tests for Component._split_records() and metadata generation.
+"""
+
+from typing import Any
+from unittest.mock import MagicMock
+
+from configuration import Configuration
+from extractor_component import Component
+
+
+class TestSplitRecords:
+    def test_many2one_flattened_to_main_table(self):
+        records: list[dict[str, Any]] = [{"id": 1, "name": "Test", "country_id": [21, "United States"]}]
+        result = Component._split_records(records, "res.partner", "res_partner.csv")
+
+        assert len(result.main_records) == 1
+        assert result.main_records[0]["country_id_id"] == 21
+        assert result.main_records[0]["country_id_name"] == "United States"
+        assert not result.bridge_tables
+
+    def test_many2many_split_to_bridge_table(self):
+        records: list[dict[str, Any]] = [{"id": 1, "name": "Test", "tag_ids": [5, 9, 12]}]
+        result = Component._split_records(records, "res.partner", "res_partner.csv")
+
+        assert "tag_ids" not in result.main_records[0]
+        bridge = result.bridge_tables["res_partner__tag_ids.csv"]
+        assert bridge.primary_key == ["partner_id", "tag_id"]
+        assert bridge.records == [
+            {"partner_id": 1, "tag_id": 5},
+            {"partner_id": 1, "tag_id": 9},
+            {"partner_id": 1, "tag_id": 12},
+        ]
+
+    def test_false_converted_to_none(self):
+        records: list[dict[str, Any]] = [{"id": 1, "email": False}]
+        result = Component._split_records(records, "res.partner", "res_partner.csv")
+
+        assert result.main_records[0]["email"] is None
+
+    def test_empty_relationship_list_skipped(self):
+        records: list[dict[str, Any]] = [{"id": 1, "tag_ids": []}]
+        result = Component._split_records(records, "res.partner", "res_partner.csv")
+
+        assert len(result.main_records) == 1
+        assert not result.bridge_tables
+
+    def test_multiple_relationships_produce_separate_tables(self):
+        records: list[dict[str, Any]] = [{"id": 15, "name": "Azure", "category_id": [5], "child_ids": [27, 34, 28]}]
+        result = Component._split_records(records, "res.partner", "res_partner.csv")
+
+        assert result.main_records[0]["id"] == 15
+        assert len(result.bridge_tables) == 2
+
+        cat = result.bridge_tables["res_partner__category_id.csv"]
+        assert cat.primary_key == ["partner_id", "category_id"]
+        assert len(cat.records) == 1
+
+        child = result.bridge_tables["res_partner__child_ids.csv"]
+        assert child.primary_key == ["partner_id", "child_id"]
+        assert len(child.records) == 3
+
+
+class TestMetadataGeneration:
+    def test_metadata_file_created_during_extraction(self, tmp_path, mocker):
+        out_dir = tmp_path / "out" / "tables"
+        out_dir.mkdir(parents=True)
+
+        mock_client = MagicMock()
+        mock_client.get_model_fields.return_value = {
+            "id": {"type": "integer", "string": "ID"},
+            "name": {"type": "char", "string": "Name"},
+            "country_id": {"type": "many2one", "string": "Country", "relation": "res.country"},
+            "category_id": {"type": "many2many", "string": "Tags", "relation": "res.partner.category"},
+        }
+        mock_client.search_read.return_value = [
+            {"id": 1, "name": "Test", "country_id": [233, "United States"], "category_id": [5]}
+        ]
+
+        def make_table(name, **kwargs):
+            t = MagicMock()
+            t.full_path = str(out_dir / name)
+            return t
+
+        mocker.patch("extractor_component.Component.__init__", return_value=None)
+
+        comp = Component()
+        comp.client = mock_client
+        comp.state = {}
+        comp.create_out_table_definition = make_table
+        comp.write_manifest = MagicMock()
+        mocker.patch.object(
+            type(comp),
+            "tables_out_path",
+            new_callable=lambda: property(lambda self: str(out_dir)),
+        )
+        comp.config = Configuration(
+            odoo_url="https://demo.odoo.com",
+            database="demo",
+            username="admin",
+            api_key="test123",
+            model="res.partner",
+            fields=["id", "name", "country_id", "category_id"],
+        )
+
+        comp._extract_with_paging()
+
+        assert any(out_dir.glob("metadata__*"))
+
+
+
+================================================
 FILE: tests/extractor/test_run_e2e.py
 ================================================
 """
@@ -3954,7 +3970,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from component import Component
+from extractor_component import Component
 
 from ..conftest import read_csv, read_state, write_config
 
@@ -3973,7 +3989,7 @@ def run_component(kbc_datadir, mocker, mock_client):
 
     def _run(parameters: dict, client: MagicMock = mock_client) -> Path:
         write_config(kbc_datadir, parameters)
-        mocker.patch("component.Component._initialize_client", return_value=client)
+        mocker.patch("extractor_component.initialize_client", return_value=client)
         Component().run()
         return kbc_datadir
 
@@ -4105,7 +4121,7 @@ class TestIncrementalExtraction:
 
         mock_client.search_read = capture_search_read
         mock_client.get_model_fields.return_value = {"id": {"type": "integer", "string": "ID"}}
-        mocker.patch("component.Component._initialize_client", return_value=mock_client)
+        mocker.patch("extractor_component.initialize_client", return_value=mock_client)
 
         Component().run()
 
@@ -4132,7 +4148,7 @@ class TestIncrementalExtraction:
 
         mock_client.search_read = capture
         mock_client.get_model_fields.return_value = {"id": {"type": "integer", "string": "ID"}}
-        mocker.patch("component.Component._initialize_client", return_value=mock_client)
+        mocker.patch("extractor_component.initialize_client", return_value=mock_client)
 
         Component().run()
 
@@ -4150,7 +4166,7 @@ Tests for state management: _validate_state(), incremental cursor, and state per
 from unittest.mock import MagicMock
 
 import pytest
-from component import Component
+from extractor_component import Component
 from keboola.component.exceptions import UserException
 
 from ..conftest import read_state, write_config, write_state
@@ -4172,7 +4188,7 @@ def run(kbc_datadir, mocker, mock_client):
 
     def _run(params: dict, client=mock_client):
         write_config(kbc_datadir, params)
-        mocker.patch("component.Component._initialize_client", return_value=client)
+        mocker.patch("extractor_component.initialize_client", return_value=client)
         Component().run()
         return kbc_datadir
 
@@ -4192,7 +4208,7 @@ class TestValidateState:
     def test_model_change_raises(self, kbc_datadir, mocker, mock_client):
         write_state(kbc_datadir, {"model": "sale.order", "domain": "", "last_id": 10})
         write_config(kbc_datadir, {**BASE_PARAMS, "model": "res.partner"})
-        mocker.patch("component.Component._initialize_client", return_value=mock_client)
+        mocker.patch("extractor_component.initialize_client", return_value=mock_client)
 
         with pytest.raises(UserException, match="Model changed"):
             Component().run()
@@ -4213,7 +4229,7 @@ class TestValidateState:
                 "domain": '[["is_company", "=", false]]',
             },
         )
-        mocker.patch("component.Component._initialize_client", return_value=mock_client)
+        mocker.patch("extractor_component.initialize_client", return_value=mock_client)
 
         with pytest.raises(UserException, match="Domain filter changed"):
             Component().run()
@@ -4245,7 +4261,7 @@ class TestIncrementalCursor:
             return []
 
         mock_client.search_read = capture
-        mocker.patch("component.Component._initialize_client", return_value=mock_client)
+        mocker.patch("extractor_component.initialize_client", return_value=mock_client)
         Component().run()
 
         id_filter = [d for d in domains_seen[0] if isinstance(d, tuple) and d[0] == "id"]
@@ -4262,7 +4278,7 @@ class TestIncrementalCursor:
             return [{"id": 1}] if len(domains_seen) == 1 else []
 
         mock_client.search_read = capture
-        mocker.patch("component.Component._initialize_client", return_value=mock_client)
+        mocker.patch("extractor_component.initialize_client", return_value=mock_client)
         Component().run()
 
         id_filters = [d for d in domains_seen[0] if isinstance(d, tuple) and d[0] == "id"]
@@ -4279,7 +4295,7 @@ class TestStatePersistence:
         client.get_model_fields.return_value = {"id": {"type": "integer", "string": "ID"}}
         client.search_read.return_value = [{"id": 50}]
 
-        mocker.patch("component.Component._initialize_client", return_value=client)
+        mocker.patch("extractor_component.initialize_client", return_value=client)
         Component().run()
 
         assert read_state(kbc_datadir)["last_id"] == 50
@@ -4293,7 +4309,7 @@ class TestStatePersistence:
         client.get_model_fields.return_value = {"id": {"type": "integer", "string": "ID"}}
         client.search_read.return_value = [{"id": 999}]
 
-        mocker.patch("component.Component._initialize_client", return_value=client)
+        mocker.patch("extractor_component.initialize_client", return_value=client)
         Component().run()
 
         assert read_state(kbc_datadir)["last_id"] == 0
@@ -4309,7 +4325,7 @@ Tests for Component._write_csv() — real file I/O with pytest's tmp_path.
 
 import csv
 
-from component import Component
+from extractor_component import Component
 
 
 def read_csv(path):
@@ -4792,7 +4808,7 @@ def run_component(kbc_datadir, mocker, mock_client):
     def _run(parameters: dict, rows: list[dict], client: MagicMock = mock_client) -> Path:
         write_config(kbc_datadir, parameters)
         write_input_csv(kbc_datadir, parameters["input_table"], rows)
-        mocker.patch("writer_component.Component._initialize_client", return_value=client)
+        mocker.patch("writer_component.initialize_client", return_value=client)
         Component().run()
         return kbc_datadir
 
@@ -4880,7 +4896,7 @@ class TestErrorHandling:
     def test_missing_input_table_raises(self, kbc_datadir, mocker, mock_client):
         write_config(kbc_datadir, BASE_PARAMS)
         # Do NOT write the input CSV
-        mocker.patch("writer_component.Component._initialize_client", return_value=mock_client)
+        mocker.patch("writer_component.initialize_client", return_value=mock_client)
 
         from keboola.component.exceptions import UserException
 
@@ -5094,6 +5110,7 @@ FILE: writer/component_config/configSchema.json
       "propertyOrder": 20,
       "enum": [],
       "options": {
+        "creatable": true,
         "async": {
           "action": "listDatabases",
           "label": "Load Databases"
@@ -5221,22 +5238,16 @@ import csv
 import logging
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
 from keboola.component.sync_actions import SelectElement
-from shared.clients.json2_client import Json2Client
-from shared.clients.xmlrpc_client import XmlRpcClient
+from shared.connection import PROTOCOL_XMLRPC
+from shared.odoo_base import OdooSyncActionsMixin, initialize_client
 from writer_configuration import Configuration
 
-PROTOCOL_JSON2 = "json2"
-PROTOCOL_XMLRPC = "xmlrpc"
-DISPLAY_JSON2 = "JSON-2"
-DISPLAY_XMLRPC = "XML-RPC"
 
-
-class Component(ComponentBase):
+class Component(OdooSyncActionsMixin, ComponentBase):
     """
     Odoo Writer Component.
 
@@ -5248,7 +5259,7 @@ class Component(ComponentBase):
         """Initialize component."""
         super().__init__()
         self.config = Configuration(**self.configuration.parameters)
-        self.client = self._initialize_client(self.config)
+        self.client = initialize_client(self.config)
 
     def run(self) -> None:
         """Main write logic."""
@@ -5267,16 +5278,6 @@ class Component(ComponentBase):
 
         total_created = self._create_in_batches(records)
         logging.info(f"Successfully created {total_created} record(s) in {self.config.model}")
-
-    def _initialize_client(self, config: Configuration) -> XmlRpcClient | Json2Client:
-        """Initialize and return appropriate Odoo client based on api_protocol config."""
-        ClientClass = Json2Client if config.api_protocol == PROTOCOL_JSON2 else XmlRpcClient
-        return ClientClass(
-            url=config.odoo_url,
-            database=config.database,
-            username=config.username,
-            api_key=config.api_key,
-        )
 
     def _validate_config(self) -> None:
         """Validate configuration before writing."""
@@ -5358,204 +5359,10 @@ class Component(ComponentBase):
 
     # === Sync Actions ===
 
-    @sync_action("testConnection")
-    def test_connection_action(self) -> dict[str, str]:
-        """Test connection to Odoo and return version + protocol info."""
-        try:
-            odoo_url = self.config.odoo_url
-            database = self.config.database
-            username = self.config.username
-            api_key = self.config.api_key
-            selected_protocol = self.config.api_protocol
-
-            xmlrpc_client = XmlRpcClient(odoo_url, database, username, api_key)
-            json2_client = Json2Client(odoo_url, database, username, api_key)
-
-            protocols_available = {}
-            odoo_version = None
-
-            try:
-                odoo_version = xmlrpc_client.get_version()
-                protocols_available[DISPLAY_XMLRPC] = True
-            except Exception as e:
-                protocols_available[DISPLAY_XMLRPC] = False
-                logging.debug(f"XML-RPC availability check failed: {e}")
-
-            try:
-                version = json2_client.get_version()
-                protocols_available[DISPLAY_JSON2] = True
-                if not odoo_version:
-                    odoo_version = version
-            except Exception as e:
-                protocols_available[DISPLAY_JSON2] = False
-                logging.debug(f"JSON-2 availability check failed: {e}")
-
-            if not odoo_version:
-                raise UserException("Cannot connect to Odoo instance at this URL")
-
-            supports_parts = []
-            for protocol in [DISPLAY_JSON2, DISPLAY_XMLRPC]:
-                symbol = "✓" if protocols_available.get(protocol, False) else "✗"
-                supports_parts.append(f"{protocol} {symbol}")
-            supports_str = ", ".join(supports_parts)
-
-            selected_client: XmlRpcClient | Json2Client | None = None
-            auth_message = ""
-
-            if selected_protocol == PROTOCOL_JSON2:
-                if not protocols_available[DISPLAY_JSON2]:
-                    return {
-                        "status": "error",
-                        "message": (
-                            f"Odoo {odoo_version}. Supports: {supports_str}. "
-                            f"{DISPLAY_JSON2} not available on this instance"
-                        ),
-                    }
-                try:
-                    json2_client.test_connection()
-                    selected_client = json2_client
-                    auth_message = f"Authenticated using {DISPLAY_JSON2}"
-                except Exception as e:
-                    return {
-                        "status": "error",
-                        "message": (
-                            f"Odoo {odoo_version}. Supports: {supports_str}. "
-                            f"Authentication failed using {DISPLAY_JSON2} ({e})"
-                        ),
-                    }
-            else:
-                if not protocols_available[DISPLAY_XMLRPC]:
-                    return {
-                        "status": "error",
-                        "message": (
-                            f"Odoo {odoo_version}. Supports: {supports_str}. "
-                            f"{DISPLAY_XMLRPC} not available on this instance"
-                        ),
-                    }
-                try:
-                    xmlrpc_client.test_connection()
-                    selected_client = xmlrpc_client
-                    auth_message = f"Authenticated using {DISPLAY_XMLRPC}"
-                except Exception as e:
-                    return {
-                        "status": "error",
-                        "message": (
-                            f"Odoo {odoo_version}. Supports: {supports_str}. "
-                            f"Authentication failed using {DISPLAY_XMLRPC} ({e})"
-                        ),
-                    }
-
-            model_suffix = ""
-            try:
-                models = selected_client.list_models()
-                model_suffix = f", {len(models)} models"
-            except Exception as e:
-                logging.warning(f"Could not fetch model count: {e}")
-
-            return {
-                "status": "success",
-                "message": f"Odoo {odoo_version}. Supports: {supports_str}. {auth_message}{model_suffix}",
-            }
-
-        except UserException:
-            raise
-        except Exception as e:
-            raise UserException(f"Connection test failed: {str(e)}")
-
-    @sync_action("listModels")
-    def list_models_action(self) -> list[SelectElement]:
-        """List available Odoo models for the model dropdown."""
-        try:
-            models = self.client.list_models()
-            return [
-                SelectElement(value=m["model"], label=f"{m['model']} - {m['name']}")
-                for m in sorted(models, key=lambda m: m["model"])
-            ]
-        except UserException:
-            raise
-        except Exception as e:
-            raise UserException(f"Failed to load models: {str(e)}")
-
-    @sync_action("listFields")
-    def list_fields_action(self) -> list[SelectElement]:
-        """List fields for the selected model — helps user know expected column names."""
-        try:
-            model = self.config.model
-            if not model:
-                raise UserException("Please select a model first")
-
-            fields_dict = self.client.get_model_fields(model)
-            return [
-                SelectElement(
-                    value=field_name,
-                    label=f"{info.get('string', field_name)} ({field_name}) - {info.get('type', 'unknown')}",
-                )
-                for field_name, info in fields_dict.items()
-                if field_name != "_unknown"
-            ]
-        except UserException:
-            raise
-        except Exception as e:
-            raise UserException(f"Failed to load fields: {str(e)}")
-
     @sync_action("listInputTables")
     def list_input_tables_action(self) -> list[SelectElement]:
         """List input tables from the storage input mapping."""
         return [SelectElement(table.destination) for table in self.configuration.tables_input_mapping]
-
-    @sync_action("listDatabases")
-    def list_databases_action(self) -> list[SelectElement]:
-        """
-        List available databases on the Odoo instance.
-
-        For odoo.com instances, database listing is blocked for security.
-        This method detects odoo.com and suggests the database name from the URL.
-
-        Returns:
-            Dropdown data with database names
-
-        Raises:
-            UserException: If listing databases fails
-        """
-        try:
-            odoo_url = self.config.odoo_url
-            is_odoo_com = ".odoo.com" in odoo_url.lower()
-
-            if is_odoo_com:
-                parsed = urlparse(odoo_url)
-                hostname = parsed.hostname or ""
-                subdomain = hostname.replace(".odoo.com", "").replace(".dev", "").replace(".saas", "")
-
-                if subdomain:
-                    logging.info(f"Detected odoo.com instance - suggesting database name from subdomain: {subdomain}")
-                    return [SelectElement(value=subdomain)]
-                else:
-                    raise UserException(
-                        "This is an Odoo.com instance. Database listing is blocked for security. "
-                        "Please enter the database name manually (usually matches your subdomain)."
-                    )
-
-            if self.config.api_protocol == PROTOCOL_JSON2:
-                client = Json2Client(odoo_url, "", None, "")
-                databases = client.list_databases()
-            else:
-                client = XmlRpcClient(odoo_url, "", "", "")
-                databases = client.list_databases()
-
-            logging.info(f"Found {len(databases)} database(s): {databases}")
-
-            dropdown_data = [SelectElement(value=db) for db in databases]
-            return dropdown_data
-
-        except UserException as e:
-            if "Access Denied" in str(e) and ".odoo.com" in self.config.odoo_url.lower():
-                raise UserException(
-                    "Database listing is blocked on Odoo.com instances. "
-                    "Please enter the database name manually (it usually matches your subdomain)."
-                )
-            raise e
-        except Exception as e:
-            raise UserException(f"Failed to list databases: {str(e)}")
 
 
 if __name__ == "__main__":

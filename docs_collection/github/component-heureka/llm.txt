@@ -4,9 +4,8 @@ Directory structure:
     ├── deploy.sh
     ├── docker-compose.yml
     ├── Dockerfile
-    ├── flake8.cfg
     ├── LICENSE.md
-    ├── requirements.txt
+    ├── pyproject.toml
     ├── TEMPLATE_README.md
     ├── component_config/
     │   ├── component_long_description.md
@@ -209,13 +208,12 @@ services:
 FILE: Dockerfile
 ================================================
 FROM python:3.12-slim
-ENV PYTHONIOENCODING utf-8
+ENV PYTHONIOENCODING=utf-8
 
 COPY /src /code/src/
 COPY /tests /code/tests/
 COPY /scripts /code/scripts/
-COPY requirements.txt /code/requirements.txt
-COPY flake8.cfg /code/flake8.cfg
+COPY pyproject.toml /code/pyproject.toml
 COPY deploy.sh /code/deploy.sh
 
 # install gcc to be able to build packages - e.g. required by regex, dateparser, also required for pandas
@@ -223,9 +221,7 @@ RUN apt-get update && apt-get install -y build-essential \
     xvfb \
     xauth
 
-RUN pip install flake8
-
-RUN pip install -r /code/requirements.txt
+RUN pip install uv && cd /code && uv pip install --system .[dev]
 
 RUN playwright install --with-deps chromium
 
@@ -237,31 +233,6 @@ RUN playwright install chromium
 WORKDIR /code/
 
 CMD ["sh", "-c", "Xvfb :99 -nolisten tcp -nolisten unix -screen 0 1024x768x24 & export DISPLAY=:99 && python -u /code/src/component.py"]
-
-
-================================================
-FILE: flake8.cfg
-================================================
-[flake8]
-exclude =
-    .git,
-    __pycache__,
-    tests,
-    example
-    venv
-max-line-length = 120
-
-# F812: list comprehension redefines ...
-# H101: Use TODO(NAME)
-# H202: assertRaises Exception too broad
-# H233: Python 3.x incompatible use of print operator
-# H301: one import per line
-# H306: imports not in alphabetical order (time, os)
-# H401: docstring should not start with a space
-# H403: multi line docstrings should end on a new line
-# H404: multi line docstring should start without a leading new line
-# H405: multi line docstring summary not separated with an empty line
-# H501: Do not use self.__dict__ for string formatting
 
 
 
@@ -292,19 +263,36 @@ THE SOFTWARE.
 
 
 ================================================
-FILE: requirements.txt
+FILE: pyproject.toml
 ================================================
-keboola.component==1.4.4
-keboola.utils==1.1.0
-keboola.http-client==1.0.0
-mock==5.1.0
-freezegun==1.4.0
-dataconf==2.5.0
-requests-html==0.10.0
-keboola.csvwriter==1.0.1
-lxml==5.1.0
-playwright==1.46.0
-backoff==2.2.1
+[project]
+name = "kds-team-ex-heureka"
+version = "0.0.0"
+requires-python = "~=3.12.0"
+dependencies = [
+    "keboola.component==1.4.4",
+    "keboola.utils==1.1.0",
+    "keboola.http-client==1.0.0",
+    "dataconf==2.5.0",
+    "requests-html==0.10.0",
+    "keboola.csvwriter==1.0.1",
+    "lxml==5.1.0",
+    "playwright==1.58.0",
+    "backoff==2.2.1",
+    "kbcstorage==0.9.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mock==5.1.0",
+    "freezegun==1.4.0",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 120
+exclude = ["__pycache__", ".git", ".venv", "venv", "docs"]
+
 
 
 ================================================
@@ -1090,18 +1078,20 @@ FILE: src/component.py
 Template Component main class.
 
 """
+
 import os
-import inspect
-from pathlib import Path
+import tempfile
 import logging
+import datetime
+
+from kbcstorage.files import Files
 from keboola.component.base import ComponentBase
 from keboola.component.exceptions import UserException
 from configuration import Configuration
 from requests_html import HTMLSession
 from keboola.utils import parse_datetime_interval, split_dates_to_chunks
 from keboola.csvwriter import ElasticDictWriter
-import datetime
-from playwright.sync_api import sync_playwright, TimeoutError
+from playwright.sync_api import sync_playwright
 import backoff
 
 
@@ -1110,7 +1100,6 @@ class TableNotFoundException(Exception):
 
 
 class Component(ComponentBase):
-
     def __init__(self):
         super().__init__()
         self.session = HTMLSession()
@@ -1130,8 +1119,9 @@ class Component(ComponentBase):
             raise UserException("Country not supported")
 
         eshop_id = self.cfg.report_settings.eshop_id
-        date_from, date_to = parse_datetime_interval(self.cfg.report_settings.date_from,
-                                                     self.cfg.report_settings.date_to)
+        date_from, date_to = parse_datetime_interval(
+            self.cfg.report_settings.date_from, self.cfg.report_settings.date_to
+        )
 
         if (datetime.datetime.now() - date_from).days > 365:
             print("Cannot get data older than 1 year, downloading data for the last 365 days.")
@@ -1143,13 +1133,27 @@ class Component(ComponentBase):
 
         table_name = self.cfg.destination.table_name or eshop_id
 
-        table_def = self.create_out_table_definition(name=f'{table_name}.csv',
-                                                     incremental=self.cfg.destination.load_type.is_incremental(),
-                                                     primary_key=['eshop_id', 'date'])
+        table_def = self.create_out_table_definition(
+            name=f"{table_name}.csv",
+            incremental=self.cfg.destination.load_type.is_incremental(),
+            primary_key=["eshop_id", "date"],
+        )
 
-        with (ElasticDictWriter(table_def.full_path, fieldnames=['eshop_id', 'date', 'pno', 'conversion_rates',
-                                                                 'spend', 'aov', 'cpc', 'orders',
-                                                                 'visits', 'transaction_revenue']) as writer):
+        with ElasticDictWriter(
+            table_def.full_path,
+            fieldnames=[
+                "eshop_id",
+                "date",
+                "pno",
+                "conversion_rates",
+                "spend",
+                "aov",
+                "cpc",
+                "orders",
+                "visits",
+                "transaction_revenue",
+            ],
+        ) as writer:
             writer.writeheader()
 
             for date in dates:
@@ -1162,94 +1166,108 @@ class Component(ComponentBase):
 
         self.write_manifest(table_def)
 
-    @backoff.on_exception(backoff.expo, Exception, max_tries=3)
+    @backoff.on_exception(backoff.expo, Exception, max_tries=3, giveup=lambda e: isinstance(e, UserException))
     def login(self):
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=False)
+            page = None
             try:
                 context = browser.new_context()
                 page = context.new_page()
                 page.set_default_timeout(20000)
-                headers = page.goto(f'https://heureka.{self.cfg.country}').headers
+                page.goto(f"https://heureka.{self.cfg.country}")
 
                 try:
-                    page.click('#didomi-notice-agree-button')
-                except Exception as e:
-                    logging.info(f"No cookies popup - {e}")
+                    page.click("#didomi-notice-agree-button")
+                except Exception:
+                    logging.info("No cookies popup")
 
                 if self.cfg.country == "cz":
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.get_by_text('Administrace e-shopu').click()
+                    page.get_by_text("Administrace e-shopu").click()
                     page.wait_for_selector('button:has-text("Přihlásit se e-mailem")')
-                    page.fill('#login-email', self.cfg.credentials.email)
-                    page.fill('#login-password', self.cfg.credentials.pswd_password)
+                    page.fill("#login-email", self.cfg.credentials.email)
+                    page.fill("#login-password", self.cfg.credentials.pswd_password)
                     page.click('button:has-text("Přihlásit se e-mailem")')
 
                 elif self.cfg.country == "sk":
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.get_by_text('Administrácia e-shopu').click()
+                    page.get_by_text("Administrácia e-shopu").click()
                     page.wait_for_selector('button:has-text("Prihlásiť sa e-mailom")')
-                    page.fill('#login-email', self.cfg.credentials.email)
-                    page.fill('#login-password', self.cfg.credentials.pswd_password)
+                    page.fill("#login-email", self.cfg.credentials.email)
+                    page.fill("#login-password", self.cfg.credentials.pswd_password)
                     page.click('button:has-text("Prihlásiť sa e-mailom")')
 
-                for cookie in context.cookies():
-                    self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
+                page.wait_for_load_state("networkidle")
+                if page.query_selector("#login-email") or "sluzby.heureka" not in page.url:
+                    raise UserException(f"Login failed - unexpected post-login page: {page.url}")
 
-            except TimeoutError:
-                logging.warning(f"Can't login saving screenshot to artifacts,"
-                                f" Cloudflare Ray ID: {headers.get('cf-ray') if headers else 'headers not found'}")
-                self.screenshot(page)
-                raise UserException("The component was unable to log in due to an unknown error."
-                                    "Please contact our support team for assistance.")
+                for cookie in context.cookies():
+                    self.session.cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"])
+
+            except Exception:
+                if page:
+                    logging.warning(f"Login failed at URL: {page.url}")
+                    self.screenshot(page)
+                raise
             finally:
                 browser.close()
 
     @backoff.on_exception(backoff.expo, TableNotFoundException, max_tries=3)
     def get_stats_for_date(self, session, date, eshop_id):
         if self.cfg.country == "cz":
-            response = session.get('https://sluzby.heureka.cz/obchody/statistiky/'
-                                   f'?from={date["start_date"]}&to={date["start_date"]}&shop={eshop_id}&cat=-4')
+            response = session.get(
+                "https://sluzby.heureka.cz/obchody/statistiky/"
+                f"?from={date['start_date']}&to={date['start_date']}&shop={eshop_id}&cat=-4"
+            )
 
             columns_mapping = {
-                'NÃ¡vÅ¡tÄ\x9bvy': 'visits',
-                'CPC': 'cpc',
-                'NÃ¡klady': 'spend',
-                'KonverznÃ­ pomÄ\x9br': 'conversion_rates',
-                'Obj': 'orders',
-                'PrÅ¯mÄ\x9brnÃ¡ objednÃ¡vka': 'aov',
-                'Obrat': 'transaction_revenue',
-                'NÃ¡klady zÂ obratu': 'pno',
+                "NÃ¡vÅ¡tÄ\x9bvy": "visits",
+                "CPC": "cpc",
+                "NÃ¡klady": "spend",
+                "KonverznÃ­ pomÄ\x9br": "conversion_rates",
+                "Obj": "orders",
+                "PrÅ¯mÄ\x9brnÃ¡ objednÃ¡vka": "aov",
+                "Obrat": "transaction_revenue",
+                "NÃ¡klady zÂ obratu": "pno",
             }
 
         else:
-            response = session.get('https://sluzby.heureka.sk/obchody/statistiky/'
-                                   f'?from={date["start_date"]}&to={date["start_date"]}&shop={eshop_id}&cat=-4')
+            response = session.get(
+                "https://sluzby.heureka.sk/obchody/statistiky/"
+                f"?from={date['start_date']}&to={date['start_date']}&shop={eshop_id}&cat=-4"
+            )
 
             columns_mapping = {
-                'NÃ¡vÅ¡tevy': 'visits',
-                'CPC': 'cpc',
-                'NÃ¡klady': 'spend',
-                'KonverznÃ½ pomer': 'conversion_rates',
-                'Obj': 'orders',
-                'PriemernÃ¡ objednÃ¡vka': 'aov',
-                'Obrat': 'transaction_revenue',
-                'NÃ¡klady zÂ obratu': 'pno',
+                "NÃ¡vÅ¡tevy": "visits",
+                "CPC": "cpc",
+                "NÃ¡klady": "spend",
+                "KonverznÃ½ pomer": "conversion_rates",
+                "Obj": "orders",
+                "PriemernÃ¡ objednÃ¡vka": "aov",
+                "Obrat": "transaction_revenue",
+                "NÃ¡klady zÂ obratu": "pno",
             }
 
         try:
-            column_names = [th.text for th in response.html.find('thead', first=True).find('tr')[1].find('th')]
-            table_body = response.html.find('tbody', first=True)
+            column_names = [th.text for th in response.html.find("thead", first=True).find("tr")[1].find("th")]
+            table_body = response.html.find("tbody", first=True)
 
             if table_body:
+                values = [
+                    value.text.replace("Â\xa0KÄ\x8d", "")
+                    .replace("Â â\x82¬", "")
+                    .replace("%", "")
+                    .replace("Â", "")
+                    .replace(" ", "")
+                    .replace("&nbsp", "")
+                    .replace(" ", "")
+                    for value in table_body.find("tr")[0].find("td")
+                ]
 
-                values = [value.text.replace('Â\xa0KÄ\x8d', '').replace('Â â\x82¬', '').replace('%', '')
-                          .replace('Â', '').replace(' ', '').replace('&nbsp', '').replace(' ', '')
-                          for value in table_body.find('tr')[0].find('td')]
+                row = {"eshop_id": eshop_id, "date": date["start_date"]}
 
-                row = {'eshop_id': eshop_id, 'date': date["start_date"]}
-
-                if values[0] == 'Celkem':
+                if values[0] == "Celkem":
                     logging.warning("No data available for the selected period")
                 else:
                     for column_name, value in zip(column_names, values):
@@ -1259,16 +1277,43 @@ class Component(ComponentBase):
                 return row
 
         except AttributeError as e:
+            logging.warning("Table not found, saving response and logging in again")
+            self._save_response_artifact(response)
             self.login()
-            logging.warning("Table not found, logging in again")
             raise TableNotFoundException(e)
 
+    def _save_response_artifact(self, response):
+        filename = f"heureka-debug-response-{datetime.datetime.now().strftime('%H%M%S')}.html"
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as tmp:
+            tmp.write(response.text)
+            tmp_path = tmp.name
+        try:
+            self._store_sapi_artifact(tmp_path, filename)
+            logging.info(f"Response HTML saved as artifact: {filename}")
+        except Exception as e:
+            logging.warning(f"Failed to save response artifact: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
     def screenshot(self, page):
-        artifact_out_path = Path.joinpath(Path(self.data_folder_path), 'artifacts/out/current/')
-        os.makedirs(artifact_out_path, exist_ok=True)
-        caller_line = inspect.currentframe().f_back.f_lineno
-        file_path = Path.joinpath(artifact_out_path, f"heureka-debug-screen-{caller_line}.png")
-        page.screenshot(path=file_path)
+        filename = f"heureka-debug-screen-{datetime.datetime.now().strftime('%H%M%S')}.png"
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            page.screenshot(path=tmp_path, timeout=5000)
+            self._store_sapi_artifact(tmp_path, filename)
+        except Exception as e:
+            logging.warning(f"Failed to save screenshot artifact: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def _store_sapi_artifact(self, source_file_path: str, filename: str) -> None:
+        tags = ["kds-team.ex-heureka", f"runId:{self.environment_variables.run_id or ''}"]
+        files = Files(self.environment_variables.url, self.environment_variables.token)
+        file_id = files.upload_file(source_file_path, tags=tags, is_permanent=False)
+        logging.info(f"Screenshot uploaded as SAPI artifact, file ID: {file_id}")
 
 
 """
@@ -1332,11 +1377,11 @@ class ConfigurationBase:
         Returns: List[str]
 
         """
-        return [cls._convert_private_value_inv(f.name)
-                for f in dataclasses.fields(cls)
-                if f.default == dataclasses.MISSING
-                and f.default_factory == dataclasses.MISSING
-                ]
+        return [
+            cls._convert_private_value_inv(f.name)
+            for f in dataclasses.fields(cls)
+            if f.default == dataclasses.MISSING and f.default_factory == dataclasses.MISSING
+        ]
 
 
 class LoadType(str, Enum):
@@ -1380,17 +1425,20 @@ FILE: tests/__init__.py
 ================================================
 import sys
 import os
+
 sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../src")
+
 
 
 ================================================
 FILE: tests/test_component.py
 ================================================
-'''
+"""
 Created on 12. 11. 2018
 
 @author: esner
-'''
+"""
+
 import unittest
 import mock
 import os
@@ -1400,11 +1448,10 @@ from component import Component
 
 
 class TestComponent(unittest.TestCase):
-
     # set global time to 2010-10-10 - affects functions like datetime.now()
     @freeze_time("2010-10-10")
     # set KBC_DATADIR env to non-existing dir
-    @mock.patch.dict(os.environ, {'KBC_DATADIR': './non-existing-dir'})
+    @mock.patch.dict(os.environ, {"KBC_DATADIR": "./non-existing-dir"})
     def test_run_no_cfg_fails(self):
         with self.assertRaises(ValueError):
             comp = Component()
@@ -1444,7 +1491,7 @@ jobs:
       is_semantic_tag: ${{ steps.tag.outputs.is_semantic_tag }}
     steps:
     - name: Checkout Repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     - name: Docker login
       if: env.DOCKERHUB_TOKEN
@@ -1456,11 +1503,15 @@ jobs:
     - name: Set image tag
       id: tag
       run: |
-        TAG="${GITHUB_REF##*/}"
-        IS_SEMANTIC_TAG=$(echo "$TAG" | grep -q '^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
-        echo "Tag = '$TAG', is semantic tag = '$IS_SEMANTIC_TAG'"
-        echo "is_semantic_tag=$IS_SEMANTIC_TAG" >> $GITHUB_OUTPUT
-        echo "app_image_tag=$TAG" >> $GITHUB_OUTPUT
+        REF="${GITHUB_REF##*/}"
+        if [ "${{ github.ref_type }}" = "tag" ]; then
+          TAG="$REF"
+        else
+          TAG="$REF-${{ github.run_number }}"
+        fi
+        IS_SEMANTIC_TAG=$(echo "$REF" | grep -q '^[0-9]\+\.[0-9]\+\.[0-9]\+$' && echo true || echo false)
+        echo "is_semantic_tag=$IS_SEMANTIC_TAG" | tee -a $GITHUB_OUTPUT
+        echo "app_image_tag=$TAG" | tee -a $GITHUB_OUTPUT
 
     - name: Push image to ECR
       uses: keboola/action-push-to-ecr@master
@@ -1479,7 +1530,7 @@ jobs:
       - build
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Pull image from ECR
         uses: keboola/action-pull-from-ecr@master
@@ -1494,7 +1545,7 @@ jobs:
 
       - name: Run tests
         run: |
-          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }} flake8 . --config=flake8.cfg
+          docker run ${{ env.KBC_DEVELOPERPORTAL_APP }} ruff check --no-cache .
           echo "Running unit-tests..."
           docker run ${{ env.KBC_DEVELOPERPORTAL_APP }} python -m unittest discover
 
@@ -1535,7 +1586,7 @@ jobs:
           tag: ${{ needs.build.outputs.app_image_tag }}
 
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Update developer portal properties
         run: |
