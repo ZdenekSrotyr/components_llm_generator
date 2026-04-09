@@ -1007,6 +1007,11 @@
 - Repository: https://github.com/keboola/component-xero-accounting-writer
 - Description: Keboola writer component for Xero Accounting API
 
+### component-ci
+- [Documentation](github/component-ci/llm.txt)
+- Repository: https://github.com/keboola/component-ci
+- Description: Shared GitHub Actions and reusable workflows for Keboola component CI/CD pipelines
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
