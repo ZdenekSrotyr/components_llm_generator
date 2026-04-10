@@ -5108,10 +5108,36 @@ class Api
 
     private function doSendOneRequest(Request $request): ResponseInterface
     {
-        try {
-            return $this->client->send($request);
-        } catch (RequestException $e) {
-            throw $this->processException($request, $e);
+        $maxRateLimitRetries = 7;
+        $rateLimitRetries = 0;
+        while (true) {
+            try {
+                return $this->client->send($request);
+            } catch (RequestException $e) {
+                // Handle 429 with Retry-After header specially - don't count against retry limit
+                if ($e->getCode() === 429) {
+                    $retryAfter = $this->extractRetryAfterSeconds($e->getResponse());
+                    if ($retryAfter !== null) {
+                        $rateLimitRetries++;
+                        if ($rateLimitRetries > $maxRateLimitRetries) {
+                            throw $this->processException($request, $e);
+                        }
+                        $rateLimitInfo = $this->formatRateLimitHeaders($e->getResponse());
+                        $this->logger->info(sprintf(
+                            'Rate limit exceeded (429), waiting %d seconds before retry (attempt %d/%d). %s',
+                            $retryAfter,
+                            $rateLimitRetries,
+                            $maxRateLimitRetries,
+                            $rateLimitInfo
+                        ));
+                        sleep($retryAfter);
+                        continue;
+                    }
+                }
+
+                // All other errors go through normal exception processing
+                throw $this->processException($request, $e);
+            }
         }
     }
 
@@ -5147,7 +5173,12 @@ class Api
         }
 
         if ($exception->getCode() === 429) {
-            $this->logger->info('Rate limit exceeded (429), will retry with backoff.');
+            // 429 without Retry-After header - use exponential backoff (counts against maxTries)
+            $rateLimitInfo = $this->formatRateLimitHeaders($exception->getResponse());
+            $this->logger->info(sprintf(
+                'Rate limit exceeded (429) without Retry-After header, will retry with backoff. %s',
+                $rateLimitInfo
+            ));
             return new ExportRequestRetryException($msg, $exception->getCode(), $exception);
         }
 
@@ -5204,6 +5235,41 @@ class Api
         }
 
         return true;
+    }
+
+    private function formatRateLimitHeaders(?ResponseInterface $response): string
+    {
+        if (!$response) {
+            return '';
+        }
+
+        $rateLimitHeaders = [];
+        foreach ($response->getHeaders() as $name => $values) {
+            if (stripos($name, 'x-ms-ratelimit') === 0) {
+                $rateLimitHeaders[] = sprintf('%s: %s', $name, implode(', ', $values));
+            }
+        }
+
+        if (empty($rateLimitHeaders)) {
+            return '';
+        }
+
+        return 'Rate limit headers: ' . implode('; ', $rateLimitHeaders);
+    }
+
+    private function extractRetryAfterSeconds(?ResponseInterface $response): ?int
+    {
+        if (!$response) {
+            return null;
+        }
+
+        // Check for the Azure Cost Management specific retry-after header
+        $header = $response->getHeader('x-ms-ratelimit-microsoft.costmanagement-entity-retry-after');
+        if (!empty($header)) {
+            return (int) $header[0] + 3; // waiting for 3 more seconds for safety
+        }
+
+        return null;
     }
 
     private function createRetryProxy(): RetryProxy
