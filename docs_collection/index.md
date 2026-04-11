@@ -152,11 +152,6 @@
 - Repository: https://github.com/keboola/component-app-flow-trigger-tracker
 - Description: None
 
-### component-heureka
-- [Documentation](github/component-heureka/llm.txt)
-- Repository: https://github.com/keboola/component-heureka
-- Description: None
-
 ### component-toast
 - [Documentation](github/component-toast/llm.txt)
 - Repository: https://github.com/keboola/component-toast
@@ -1011,6 +1006,11 @@
 - [Documentation](github/component-ci/llm.txt)
 - Repository: https://github.com/keboola/component-ci
 - Description: Shared GitHub Actions and reusable workflows for Keboola component CI/CD pipelines
+
+### component-ex-heureka
+- [Documentation](github/component-ex-heureka/llm.txt)
+- Repository: https://github.com/keboola/component-ex-heureka
+- Description: None
 
 ## Bitbucket Repositories
 
