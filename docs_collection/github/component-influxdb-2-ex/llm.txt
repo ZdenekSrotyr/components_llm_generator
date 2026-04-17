@@ -1049,8 +1049,8 @@ FILE: component_config/configRowSchema.json
           "title": "Query",
           "type": "string",
           "format": "textarea",
-          "default": "from(bucket: \"{bucket}\")\n|> range(start: {start})\n|> limit(n: {batch_size}, offset: {offset})",
-          "description": "Flux query for extracting data from InfluxDB with placeholders: {bucket}, {start}, {batch_size}, {offset}.",
+          "default": "from(bucket: \"{bucket}\")\n|> range(start: {start}, stop: {stop})\n|> limit(n: {batch_size}, offset: {offset})",
+          "description": "Flux query for extracting data from InfluxDB with placeholders: {bucket}, {start}, {stop}, {batch_size}, {offset}.",
           "options": {
             "input_height": "100px"
           },
@@ -1072,13 +1072,26 @@ FILE: component_config/configRowSchema.json
           "type": "string",
           "description": "Absolute or relative value in <a href=\"https://docs.influxdata.com/flux/v0/stdlib/universe/range/#start\">supported formats by FluxQL</a> for example: -1h, 2020-05-10T21:00:00Z, 1567029600 or 'last_run' to use the time of the last successful run.",
           "propertyOrder": 3,
-          "default": "last_run"
+          "default": "last_run",
+          "options": {
+            "grid_columns": 6
+          }
+        },
+        "stop": {
+          "title": "Stop Time",
+          "type": "string",
+          "description": "Upper bound for the time range. Use 'now' to automatically use the current time at the start of each run (recommended for incremental loads). Accepts the same formats as Start Time.",
+          "propertyOrder": 4,
+          "default": "now",
+          "options": {
+            "grid_columns": 6
+          }
         },
         "batch_size": {
           "type": "integer",
           "title": "Batch size",
           "default": 10000,
-          "propertyOrder": 4,
+          "propertyOrder": 5,
           "description": "By default, the extractor will load data in batches of 10 000 rows. You can adjust this value to optimize the performance (or solve OOM) of the writer."
         }
       },
@@ -1580,13 +1593,13 @@ class Component(ComponentBase):
         self.last_run = 0
 
     def run(self):
-        start_time = int(time.time())
+        self.stop_time = int(time.time())
         state = self.get_state_file() or {}
         self.columns_cache = state.get("columns_cache") or {}
         self.last_run = state.get("last_run", 0)
         self.download_data_to_tmp_tables()
         self.export_db_tables()
-        self.write_state_file({"last_run": start_time, "columns_cache": self.columns_cache})
+        self.write_state_file({"last_run": self.stop_time, "columns_cache": self.columns_cache})
 
     def init_duckdb(self) -> duckdb.DuckDBPyConnection:
         os.makedirs(DUCK_DB_DIR, exist_ok=True)
@@ -1604,6 +1617,7 @@ class Component(ComponentBase):
 
     def download_data_to_tmp_tables(self):
         start = self.last_run if self.params.source.start == "last_run" else self.params.source.start
+        stop = self.stop_time if self.params.source.stop == "now" else self.params.source.stop
 
         tag_names = self.get_tag_names()
 
@@ -1615,6 +1629,7 @@ class Component(ComponentBase):
             query = self.params.source.query.format(
                 bucket=self.params.source.bucket,
                 start=start,
+                stop=stop,
                 batch_size=self.params.source.batch_size,
                 offset=offset,
             )
@@ -1792,9 +1807,11 @@ class Component(ComponentBase):
     def query_preview(self):
         try:
             start = self.params.source.start if self.params.source.start != "last_run" else "0"
+            stop = int(time.time()) if self.params.source.stop == "now" else self.params.source.stop
             query = self.params.source.query.format(
                 bucket=self.params.source.bucket,
                 start=start,
+                stop=stop,
                 batch_size=self.params.source.batch_size,
                 offset=0,
             )
@@ -1876,8 +1893,13 @@ class LoadType(str, Enum):
 
 class Source(BaseModel):
     bucket: str = ""
-    query: str = 'from(bucket: "{bucket}")|> range(start: {start})|> limit(n: {batch_size}, offset: {offset})'
+    query: str = (
+        'from(bucket: "{bucket}")'
+        "|> range(start: {start}, stop: {stop})"
+        "|> limit(n: {batch_size}, offset: {offset})"
+    )
     start: str = ""
+    stop: str = "now"
     batch_size: int = 10_000
 
 
