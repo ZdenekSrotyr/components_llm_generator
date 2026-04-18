@@ -1,6 +1,7 @@
 Directory structure:
 └── keboola-ex-mongodb/
     ├── README.md
+    ├── CLAUDE.md
     ├── composer.json
     ├── composer.lock
     ├── docker-compose.yml
@@ -374,6 +375,7 @@ Directory structure:
     │   │   ├── ConfigDefinitionTest.php
     │   │   ├── ExportCommandFactoryTest.php
     │   │   ├── ExportHelperTest.php
+    │   │   ├── ExtractorParseMongoshErrorTest.php
     │   │   ├── HandleMongoExportFailsTest.php
     │   │   ├── RelativeDateParserTest.php
     │   │   └── UriFactoryTest.php
@@ -606,6 +608,100 @@ For information about deployment and integration with KBC, please refer to the [
 ## License
 
 MIT licensed, see [LICENSE](./LICENSE) file.
+
+
+
+================================================
+FILE: CLAUDE.md
+================================================
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+PHP-based MongoDB extractor component for the Keboola platform. Exports data from MongoDB collections using the `mongoexport` CLI tool, parses the JSON output, and produces CSV files with manifest metadata. Runs as a Docker container.
+
+**Namespace:** `MongoExtractor\` (PSR-4 from `src/`)
+
+## Development Commands
+
+All commands run inside Docker:
+
+```bash
+# Setup
+cp .env.dist .env
+docker compose build                    # On Apple Silicon: DOCKER_DEFAULT_PLATFORM=linux/amd64
+docker compose run --rm dev composer install --no-scripts
+
+# Full CI (validate + lint + phpcs + phpstan + all tests)
+docker compose run --rm dev composer ci
+
+# Individual checks
+docker compose run --rm dev composer tests          # PHPUnit + functional tests
+docker compose run --rm dev composer tests-phpunit   # Unit tests only
+docker compose run --rm dev composer tests-datadir   # Functional tests only
+docker compose run --rm dev composer phpstan          # Static analysis (level 8)
+docker compose run --rm dev composer phpcs            # Code style check
+docker compose run --rm dev composer phpcbf           # Auto-fix code style
+docker compose run --rm dev composer phplint          # Syntax check
+
+# Run a single test
+docker compose run --rm dev phpunit --filter=TestClassName
+docker compose run --rm dev phpunit --filter=testMethodName
+docker compose run --rm dev phpunit tests/phpunit/ExportCommandFactoryTest.php
+```
+
+The `MONGODB_VERSION` env var (from `.env`) controls which MongoDB image version the test services use. CI runs a matrix across versions: `latest, 8.0, 6.0, 5.0, 4.4`.
+
+## Architecture
+
+### Data Flow
+
+```
+config.json → Component → Extractor → Export (mongoexport CLI) → Parse → CSV + manifest
+```
+
+1. **Component** (`src/Component.php`) — Entry point extending `BaseComponent`. Determines config format (old vs row-based), creates `Extractor`.
+2. **Extractor** (`src/Extractor.php`) — Orchestrates extraction. Handles SSH tunnels, SSL files, connection testing, iterates over exports, manages incremental fetching state.
+3. **Export** (`src/Export.php`) — Runs a single `mongoexport` command via `ExportCommandFactory`, decodes JSON output, handles retries with exponential backoff (5 attempts).
+4. **Parse** (`src/Parse.php`) — Dispatches to the appropriate parser based on export mode.
+5. **Parsers** (`src/Parser/`) — `Mapping` flattens nested MongoDB documents using csvmap; `Raw` exports documents as JSON strings.
+
+### Key Supporting Classes
+
+- **ExportCommandFactory** — Builds `mongoexport` shell commands from config params (URI, collection, query, sort, etc.)
+- **UriFactory / Uri** — Handles MongoDB URI construction including multi-host, `mongodb+srv://`, custom URI, and special character encoding via `league/uri`
+- **ExportOptions** — Value object encapsulating all export parameters (collection, query, mode, mapping, incremental settings)
+- **RelativeDateParser** — Converts relative date expressions (e.g., `"now - 7 days"`) in queries to absolute dates
+- **Config** — Wraps raw JSON config; supports two formats: old (single `exports` array) and new (row-based, single export per row)
+
+### Configuration Formats
+
+The component supports two config shapes detected at runtime in `Component::getConfigDefinitionClass()`:
+- **Old config** (`OldConfigDefinition`) — `parameters.exports[]` array with multiple exports
+- **Row config** (`ConfigRowDefinition`) — Single export per config row (current standard)
+
+### Connection Testing
+
+`Extractor::testConnection()` uses `mongosh` (not `mongoexport`) to verify connectivity. This is because `mongoexport` requires a `--collection` parameter and always tries to export data — it can't just test a connection. The `testConnection` sync action (UI's "Test Connection" button) has no collection context, so it runs `db.runCommand({listCollections: 1})` via `mongosh` which is the canonical way to verify authentication and connectivity. `mongoexport` is the wrong tool here because you'd have to fake a collection name, then distinguish "collection not found" from "can't connect" in the error output.
+
+### Incremental Fetching
+
+Stores `lastFetchedRow` in state file between runs. Automatically builds `$gte` queries on the configured column. Supports date, numeric, and string column types with dot-notation paths for nested fields.
+
+## Testing
+
+- **Unit tests** (`tests/phpunit/`) — Test individual classes (URI factory, command factory, config definitions, date parsing)
+- **Functional tests** (`tests/functional/`) — Data-directory based tests using `keboola/datadir-tests`. Each subdirectory is a test scenario with config input and expected output. `setUp.php` files handle test data setup.
+- **Docker services for tests** — `mongodb` (plain), `mongodb-auth` (with auth), `mongodb-ssl` (with TLS), `node1.mongodb.cluster.local` (replica set for SRV testing), `sshproxy`, `dns.local` (dnsmasq for SRV records)
+
+## Code Standards
+
+- PHP 8.4, `declare(strict_types=1)` everywhere
+- PHPStan level 8
+- `keboola/coding-standard` for code style (phpcs/phpcbf)
+- User-facing errors use `Keboola\Component\UserException`; system errors are uncaught `Throwable`
 
 
 
@@ -7881,15 +7977,13 @@ use Keboola\Component\UserException;
 use Keboola\SSHTunnel\SSH;
 use Keboola\SSHTunnel\SSHException;
 use Keboola\Temp\Temp;
-use MongoDB\Driver\Command;
-use MongoDB\Driver\Exception\Exception;
-use MongoDB\Driver\Manager;
 use MongoExtractor\Config\Config;
 use MongoExtractor\Config\ExportOptions;
 use Psr\Log\LoggerInterface;
 use Retry\BackOff\ExponentialBackOffPolicy;
 use Retry\Policy\SimpleRetryPolicy;
 use Retry\RetryProxy;
+use Symfony\Component\Process\Process;
 
 class Extractor
 {
@@ -7929,26 +8023,105 @@ class Extractor
     }
 
     /**
-     * Sends listCollections command to test connection/credentials
+     * Tests connection using mongosh CLI
      * @throws \Keboola\Component\UserException
      */
     public function testConnection(): void
     {
         $uri = $this->uriFactory->create($this->dbParams);
-        try {
-            $manager = new Manager((string) $uri);
-        } catch (Exception $exception) {
-            throw new UserException($exception->getMessage(), 0, $exception);
+
+        // Add short timeout to avoid long waits on unreachable hosts (only if not already set)
+        $uriString = (string) $uri;
+        if (!$uri->getQuery()->has('serverSelectionTimeoutMS')) {
+            $separator = str_contains($uriString, '?') ? '&' : '?';
+            $uriString .= $separator . 'serverSelectionTimeoutMS=5000';
         }
 
-        $this->retryProxy->call(function () use ($manager, $uri): void {
-            try {
-                $manager->executeCommand($uri->getDatabase(), new Command(['listCollections' => 1]));
-            } catch (Exception $exception) {
+        $command = ['mongosh', $uriString, '--eval', 'db.runCommand({listCollections: 1})', '--quiet', '--norc'];
+
+        // Add TLS cert flags when SSL is enabled and cert files are provided
+        if (($this->dbParams['ssl']['enabled'] ?? false)) {
+            if (isset($this->dbParams['ssl']['caFile'])) {
+                $command[] = '--tlsCAFile=' . $this->dbParams['ssl']['caFile'];
+            }
+            if (isset($this->dbParams['ssl']['certKeyFile'])) {
+                $command[] = '--tlsCertificateKeyFile=' . $this->dbParams['ssl']['certKeyFile'];
+            }
+        }
+
+        $this->retryProxy->call(function () use ($command): void {
+            $process = new Process($command);
+            $process->setTimeout(30);
+            $process->run();
+
+            if (!$process->isSuccessful()) {
                 echo sprintf('Retrying (%sx)...%s', $this->retryProxy->getTryCount(), PHP_EOL);
-                throw new UserException($exception->getMessage(), 0, $exception);
+                $errorMessage = self::parseMongoshError(
+                    $process->getErrorOutput(),
+                    $process->getOutput(),
+                );
+                throw new UserException($errorMessage);
             }
         });
+    }
+
+    /**
+     * Extracts a meaningful error message from mongosh output.
+     * Strips the Mongo*Error class prefix and maps technical errors to user-friendly messages.
+     */
+    public static function parseMongoshError(string $stderr, string $stdout): string
+    {
+        $output = trim($stderr) !== '' ? trim($stderr) : trim($stdout);
+
+        if ($output === '') {
+            return 'Connection test failed';
+        }
+
+        // mongosh errors look like: "MongoServerSelectionError: message"
+        // Extract just the message part for cleaner user output
+        $message = $output;
+        if (preg_match('/^Mongo\w+Error:\s*(.+)$/m', $output, $matches)) {
+            $message = trim($matches[1]);
+        } else {
+            // Use first non-empty line as fallback
+            foreach (explode("\n", $output) as $line) {
+                $line = trim($line);
+                if ($line !== '') {
+                    $message = $line;
+                    break;
+                }
+            }
+        }
+
+        return self::mapMongoshErrorToUserMessage($message);
+    }
+
+    /**
+     * Maps technical mongosh error messages to user-friendly messages.
+     */
+    private static function mapMongoshErrorToUserMessage(string $message): string
+    {
+        // DNS resolution failure: "getaddrinfo ENOTFOUND host" or "getaddrinfo EAI_AGAIN host"
+        if (preg_match('/getaddrinfo \w+\s+(\S+)/', $message, $matches)) {
+            return sprintf("Could not resolve hostname '%s'. Please check the host configuration.", $matches[1]);
+        }
+
+        // Connection refused: "connect ECONNREFUSED 127.0.0.1:27017"
+        if (preg_match('/connect ECONNREFUSED\s+(\S+)/', $message, $matches)) {
+            return sprintf('Connection refused to %s. Please check the host and port configuration.', $matches[1]);
+        }
+
+        // Connection timeout: "connection timed out" or "Server selection timed out"
+        if (str_contains(strtolower($message), 'timed out')) {
+            return 'Connection timed out. Please check the host and port configuration.';
+        }
+
+        // Malformed URI / unescaped characters — mongosh misinterprets bad URIs
+        if (str_contains($message, 'unescaped characters')) {
+            return 'Failed to parse connection URI. Please check the connection parameters.';
+        }
+
+        return $message;
     }
 
     /**
@@ -17149,7 +17322,7 @@ FILE: tests/functional/test-connection-action-fail-wrong-host/expected-code
 ================================================
 FILE: tests/functional/test-connection-action-fail-wrong-host/expected-stderr
 ================================================
-No suitable servers found (`serverSelectionTryOnce` set): [Failed to resolve 'locahost']. Topology type: Single
+Could not resolve hostname 'locahost'. Please check the host configuration.
 
 
 
@@ -17248,7 +17421,7 @@ FILE: tests/functional/test-wrong-uri/expected-code
 ================================================
 FILE: tests/functional/test-wrong-uri/expected-stderr
 ================================================
-Failed to parse MongoDB URI: 'mongodb://mongodb://keboola-test@mongodb/test:27017/test'. %s
+Failed to parse connection URI. Please check the connection parameters.
 
 
 
@@ -18439,6 +18612,105 @@ class ExportHelperTest extends TestCase
                 'binary.$binary.base64' => 'binary',
             ],
         ];
+    }
+}
+
+
+
+================================================
+FILE: tests/phpunit/ExtractorParseMongoshErrorTest.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace MongoExtractor\Tests\Unit;
+
+use MongoExtractor\Extractor;
+use PHPUnit\Framework\TestCase;
+
+class ExtractorParseMongoshErrorTest extends TestCase
+{
+    public function testDnsResolutionErrorNotFound(): void
+    {
+        $stderr = "MongoServerSelectionError: getaddrinfo ENOTFOUND locahost\n";
+        $result = Extractor::parseMongoshError($stderr, '');
+        self::assertSame("Could not resolve hostname 'locahost'. Please check the host configuration.", $result);
+    }
+
+    public function testDnsResolutionErrorTemporaryFailure(): void
+    {
+        $stderr = "MongoServerSelectionError: getaddrinfo EAI_AGAIN locahost\n";
+        $result = Extractor::parseMongoshError($stderr, '');
+        self::assertSame("Could not resolve hostname 'locahost'. Please check the host configuration.", $result);
+    }
+
+    public function testAuthenticationError(): void
+    {
+        $stderr = "MongoServerError: Authentication failed.\n";
+        $result = Extractor::parseMongoshError($stderr, '');
+        self::assertSame('Authentication failed.', $result);
+    }
+
+    public function testConnectionRefusedError(): void
+    {
+        $stderr = "MongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017\n";
+        $result = Extractor::parseMongoshError($stderr, '');
+        self::assertSame(
+            'Connection refused to 127.0.0.1:27017. Please check the host and port configuration.',
+            $result,
+        );
+    }
+
+    public function testConnectionTimeoutError(): void
+    {
+        $stderr = "MongoServerSelectionError: Server selection timed out\n";
+        $result = Extractor::parseMongoshError($stderr, '');
+        self::assertSame('Connection timed out. Please check the host and port configuration.', $result);
+    }
+
+    public function testUnescapedCharactersError(): void
+    {
+        $stderr = "Password contains unescaped characters\n";
+        $result = Extractor::parseMongoshError($stderr, '');
+        self::assertSame('Failed to parse connection URI. Please check the connection parameters.', $result);
+    }
+
+    public function testFallbackToStdoutWhenStderrEmpty(): void
+    {
+        $stdout = "some error output\n";
+        $result = Extractor::parseMongoshError('', $stdout);
+        self::assertSame('some error output', $result);
+    }
+
+    public function testEmptyOutputReturnsDefault(): void
+    {
+        $result = Extractor::parseMongoshError('', '');
+        self::assertSame('Connection test failed', $result);
+    }
+
+    public function testMultiLineStderrExtractsMongoError(): void
+    {
+        $stderr = "Some warning line\nMongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017\nstack trace...\n";
+        $result = Extractor::parseMongoshError($stderr, '');
+        self::assertSame(
+            'Connection refused to 127.0.0.1:27017. Please check the host and port configuration.',
+            $result,
+        );
+    }
+
+    public function testNonMongoErrorReturnsFirstLine(): void
+    {
+        $stderr = "Unexpected error occurred\nMore details\n";
+        $result = Extractor::parseMongoshError($stderr, '');
+        self::assertSame('Unexpected error occurred', $result);
+    }
+
+    public function testUnmappedErrorPassedThrough(): void
+    {
+        $stderr = "MongoServerError: some unknown error\n";
+        $result = Extractor::parseMongoshError($stderr, '');
+        self::assertSame('some unknown error', $result);
     }
 }
 
