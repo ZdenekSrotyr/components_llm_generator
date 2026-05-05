@@ -40,7 +40,8 @@ Directory structure:
     │   │   ├── ColumnValueMapper.php
     │   │   ├── MessageMapper.php
     │   │   ├── MessageMapperFactory.php
-    │   │   └── RowAsJsonMapper.php
+    │   │   ├── RowAsJsonMapper.php
+    │   │   └── RowColumnCountValidator.php
     │   └── NodeJs/
     │       ├── testConnection.js
     │       ├── write.js
@@ -72,6 +73,22 @@ Directory structure:
     │   │   ├── error-hub-name-not-match/
     │   │   │   ├── expected-code
     │   │   │   └── expected-stderr
+    │   │   ├── error-row-column-count-mismatch-column-value/
+    │   │   │   ├── expected-code
+    │   │   │   ├── expected-stderr
+    │   │   │   └── expected-stdout
+    │   │   ├── error-row-column-count-mismatch-extra-columns/
+    │   │   │   ├── expected-code
+    │   │   │   ├── expected-stderr
+    │   │   │   └── expected-stdout
+    │   │   ├── error-row-column-count-mismatch-first-row/
+    │   │   │   ├── expected-code
+    │   │   │   ├── expected-stderr
+    │   │   │   └── expected-stdout
+    │   │   ├── error-row-column-count-mismatch-row-as-json/
+    │   │   │   ├── expected-code
+    │   │   │   ├── expected-stderr
+    │   │   │   └── expected-stdout
     │   │   ├── test-connection-connection-string-img-parameters/
     │   │   │   └── expected-stdout
     │   │   ├── test-connection-ok/
@@ -106,10 +123,12 @@ Directory structure:
     │       ├── ConfigTest.php
     │       ├── MessageWriterTest.php
     │       ├── ProcessFactoryTest.php
-    │       └── fixtures/
-    │           └── process-factory/
-    │               ├── exitCode.js
-    │               └── stdoutAndStderr.js
+    │       ├── fixtures/
+    │       │   └── process-factory/
+    │       │       ├── exitCode.js
+    │       │       └── stdoutAndStderr.js
+    │       └── MessageMapper/
+    │           └── RowColumnCountValidatorTest.php
     └── .github/
         └── workflows/
             └── push.yml
@@ -5726,8 +5745,13 @@ class ColumnValueMapper implements MessageMapper
 
     public function getMessages(): Iterator
     {
+        $rowNumber = 0;
+        $expectedColumnCount = count($this->header);
         while ($this->csvReader->valid()) {
+            $rowNumber++;
             $row = (array) $this->csvReader->current();
+            RowColumnCountValidator::assertMatchesHeader($rowNumber, count($row), $expectedColumnCount);
+
             $rawMessage = $row[$this->columnIndex];
 
             // Try convert to JSON object
@@ -5892,10 +5916,66 @@ class RowAsJsonMapper implements MessageMapper
 
     public function getMessages(): Iterator
     {
+        $rowNumber = 0;
+        $expectedColumnCount = count($this->header);
         while ($this->csvReader->valid()) {
-            yield  ['message' => array_combine($this->header, (array) $this->csvReader->current())];
+            $rowNumber++;
+            $row = (array) $this->csvReader->current();
+            RowColumnCountValidator::assertMatchesHeader($rowNumber, count($row), $expectedColumnCount);
+
+            yield ['message' => array_combine($this->header, $row)];
             $this->csvReader->next();
         }
+    }
+}
+
+
+
+================================================
+FILE: src/MessageMapper/RowColumnCountValidator.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\AzureEventHubWriter\MessageMapper;
+
+use Keboola\AzureEventHubWriter\Exception\UserException;
+
+class RowColumnCountValidator
+{
+    /**
+     * Validates that a CSV row has the same number of columns as the header.
+     *
+     * Throws a UserException with the affected row number and expected/actual
+     * column counts if they do not match. The wording covers both common
+     * causes of a mismatch:
+     * - too few columns: typically an unescaped newline/CR character inside
+     *   a field that breaks CSV parsing,
+     * - too many columns: typically an unquoted delimiter (e.g. an extra comma)
+     *   inside a field.
+     *
+     * @param int $rowNumber 1-based row number (header excluded), used in the
+     *                       error message to point the user to the bad row.
+     */
+    public static function assertMatchesHeader(
+        int $rowNumber,
+        int $rowColumnCount,
+        int $headerColumnCount,
+    ): void {
+        if ($rowColumnCount === $headerColumnCount) {
+            return;
+        }
+
+        throw new UserException(sprintf(
+            'Row #%d has %d columns, but header has %d columns. '
+            . 'This usually happens when a field contains an unescaped newline/CR '
+            . 'or an unquoted delimiter that breaks CSV parsing. '
+            . 'Ensure all fields with special characters are properly quoted in the input table.',
+            $rowNumber,
+            $rowColumnCount,
+            $headerColumnCount,
+        ));
     }
 }
 
@@ -6517,6 +6597,90 @@ FILE: tests/functional/error-hub-name-not-match/expected-code
 FILE: tests/functional/error-hub-name-not-match/expected-stderr
 ================================================
 Connection error: The entity path in connection string doesn't match with the configured event hub name.
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-column-value/expected-code
+================================================
+1
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-column-value/expected-stderr
+================================================
+Row #2 has 2 columns, but header has 3 columns. This usually happens when a field contains an unescaped newline/CR or an unquoted delimiter that breaks CSV parsing. Ensure all fields with special characters are properly quoted in the input table.
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-column-value/expected-stdout
+================================================
+Exporting table "in.c-test.data" in "column_value" mode ...
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-extra-columns/expected-code
+================================================
+1
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-extra-columns/expected-stderr
+================================================
+Row #2 has 4 columns, but header has 3 columns. This usually happens when a field contains an unescaped newline/CR or an unquoted delimiter that breaks CSV parsing. Ensure all fields with special characters are properly quoted in the input table.
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-extra-columns/expected-stdout
+================================================
+Exporting table "in.c-test.data" in "row_as_json" mode ...
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-first-row/expected-code
+================================================
+1
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-first-row/expected-stderr
+================================================
+Row #1 has 2 columns, but header has 3 columns. This usually happens when a field contains an unescaped newline/CR or an unquoted delimiter that breaks CSV parsing. Ensure all fields with special characters are properly quoted in the input table.
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-first-row/expected-stdout
+================================================
+Exporting table "in.c-test.data" in "row_as_json" mode ...
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-row-as-json/expected-code
+================================================
+1
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-row-as-json/expected-stderr
+================================================
+Row #2 has 2 columns, but header has 3 columns. This usually happens when a field contains an unescaped newline/CR or an unquoted delimiter that breaks CSV parsing. Ensure all fields with special characters are properly quoted in the input table.
+
+
+
+================================================
+FILE: tests/functional/error-row-column-count-mismatch-row-as-json/expected-stdout
+================================================
+Exporting table "in.c-test.data" in "row_as_json" mode ...
 
 
 
@@ -7144,6 +7308,105 @@ console.error("stderr1");
 console.log('stdout3');
 console.log('stdout4');
 console.error("stderr2");
+
+
+================================================
+FILE: tests/phpunit/MessageMapper/RowColumnCountValidatorTest.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace Keboola\AzureEventHubWriter\Tests\MessageMapper;
+
+use Generator;
+use Keboola\AzureEventHubWriter\Exception\UserException;
+use Keboola\AzureEventHubWriter\MessageMapper\RowColumnCountValidator;
+use PHPUnit\Framework\TestCase;
+
+class RowColumnCountValidatorTest extends TestCase
+{
+    /**
+     * @dataProvider provideMatchingCounts
+     */
+    public function testNoExceptionWhenCountsMatch(int $rowNumber, int $columnCount): void
+    {
+        RowColumnCountValidator::assertMatchesHeader($rowNumber, $columnCount, $columnCount);
+
+        // No exception thrown.
+        self::assertTrue(true);
+    }
+
+    public static function provideMatchingCounts(): Generator
+    {
+        yield 'first row, single column' => [1, 1];
+        yield 'first row, three columns' => [1, 3];
+        yield 'later row, three columns' => [42, 3];
+        yield 'wide row' => [7, 100];
+    }
+
+    /**
+     * @dataProvider provideMismatches
+     */
+    public function testThrowsOnMismatch(
+        int $rowNumber,
+        int $rowColumnCount,
+        int $headerColumnCount,
+        string $expectedRowLabel,
+    ): void {
+        $this->expectException(UserException::class);
+        $this->expectExceptionMessage(sprintf(
+            '%s has %d columns, but header has %d columns.',
+            $expectedRowLabel,
+            $rowColumnCount,
+            $headerColumnCount,
+        ));
+
+        RowColumnCountValidator::assertMatchesHeader($rowNumber, $rowColumnCount, $headerColumnCount);
+    }
+
+    public static function provideMismatches(): Generator
+    {
+        yield 'first row, fewer columns' => [
+            'rowNumber' => 1,
+            'rowColumnCount' => 2,
+            'headerColumnCount' => 3,
+            'expectedRowLabel' => 'Row #1',
+        ];
+        yield 'later row, fewer columns' => [
+            'rowNumber' => 5,
+            'rowColumnCount' => 1,
+            'headerColumnCount' => 3,
+            'expectedRowLabel' => 'Row #5',
+        ];
+        yield 'first row, more columns' => [
+            'rowNumber' => 1,
+            'rowColumnCount' => 4,
+            'headerColumnCount' => 3,
+            'expectedRowLabel' => 'Row #1',
+        ];
+        yield 'later row, more columns' => [
+            'rowNumber' => 12,
+            'rowColumnCount' => 5,
+            'headerColumnCount' => 3,
+            'expectedRowLabel' => 'Row #12',
+        ];
+    }
+
+    public function testErrorMessageMentionsBothCommonCauses(): void
+    {
+        try {
+            RowColumnCountValidator::assertMatchesHeader(2, 2, 3);
+            self::fail('Expected UserException was not thrown.');
+        } catch (UserException $e) {
+            $message = $e->getMessage();
+            self::assertStringContainsString('newline/CR', $message);
+            self::assertStringContainsString('unquoted delimiter', $message);
+            self::assertStringContainsString('properly quoted', $message);
+        }
+    }
+}
+
 
 
 ================================================
