@@ -66,6 +66,31 @@ jobs:
     secrets: inherit
 ```
 
+### Running tests via Docker Compose
+
+Opt into compose-based testing when the test container needs auxiliary services
+(e.g. an SFTP server, a database). The pipeline runs
+`docker compose up <service> --exit-code-from <service> --build` against the
+compose file in your repo. The production image pushed to ECR is still built
+separately from your `Dockerfile`.
+
+```yaml
+jobs:
+  ci:
+    uses: keboola/component-ci/.github/workflows/component-pipeline.yml@master
+    with:
+      app_id: "kds-team.ex-my-component"
+      vendor: "kds-team"
+      use_docker_compose: true
+      # Optional — defaults shown:
+      # compose_file: "docker-compose.yml"
+      # compose_service: "test"
+    secrets: inherit
+```
+
+In compose mode the `test_command` and `test_build_target` inputs are ignored —
+the test command and build live in the compose service definition.
+
 ## Reusable Workflow Inputs
 
 | Input | Required | Default | Description |
@@ -82,6 +107,9 @@ jobs:
 | `kbc_developerportal_username` | No | `vars.KBC_DEVELOPERPORTAL_USERNAME` | Developer Portal username override |
 | `tag` | No | `""` | Override the computed image tag (e.g. `0.0.1`) for one-off runs |
 | `update_properties` | No | `false` | Force the `update_properties` job regardless of deploy-readiness |
+| `use_docker_compose` | No | `false` | Run tests via `docker compose up` instead of `docker run` (enables test service dependencies like SFTP) |
+| `compose_file` | No | `docker-compose.yml` | Path to compose file (used only when `use_docker_compose` is true) |
+| `compose_service` | No | `test` | Name of the test service in the compose file (used only when `use_docker_compose` is true) |
 
 ## Secrets
 
@@ -750,6 +778,21 @@ on:
         type: boolean
         default: false
         description: Force the update_properties job to run regardless of deploy-readiness
+      use_docker_compose:
+        required: false
+        type: boolean
+        default: false
+        description: Run tests via `docker compose up` instead of `docker run`. Enables test services (e.g. SFTP) declared in a compose file.
+      compose_file:
+        required: false
+        type: string
+        default: docker-compose.yml
+        description: Path to the docker compose file (used only when use_docker_compose is true)
+      compose_service:
+        required: false
+        type: string
+        default: test
+        description: Name of the test service in the compose file (used only when use_docker_compose is true)
 
 jobs:
   push_event_info:
@@ -775,6 +818,7 @@ jobs:
     name: Build Test Image
     runs-on: ubuntu-latest
     needs: push_event_info
+    if: ${{ ! inputs.use_docker_compose }}
     outputs:
       test_image_id: ${{ steps.set_ids.outputs.test_image_id }}
     steps:
@@ -805,6 +849,7 @@ jobs:
     needs:
       - push_event_info
       - build_test
+    if: ${{ ! inputs.use_docker_compose }}
     steps:
       - name: Load Docker image
         uses: keboola/component-ci/actions/docker-load@master
@@ -817,14 +862,36 @@ jobs:
           app_id: ${{ needs.build_test.outputs.test_image_id }}
           test_command: ${{ inputs.test_command }}
 
-  # Only runs in multi-stage mode: builds the production image after tests pass
+  tests_compose:
+    name: Run Tests (docker compose)
+    runs-on: ubuntu-latest
+    needs: push_event_info
+    if: ${{ inputs.use_docker_compose }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run tests (docker compose)
+        env:
+          COMPOSE_FILE: ${{ inputs.compose_file }}
+          SERVICE: ${{ inputs.compose_service }}
+        run: |
+          docker compose -f "$COMPOSE_FILE" up "$SERVICE" \
+            --exit-code-from "$SERVICE" --build
+
+  # Runs when a multi-stage prod target is set, OR when compose mode is on
+  # (since compose mode produces no pushable image of its own).
   build_production:
     name: Build Production Image
     runs-on: ubuntu-latest
     needs:
       - push_event_info
       - tests
-    if: inputs.test_build_target != ''
+      - tests_compose
+    if: ${{ always() && !failure() && !cancelled() && (inputs.test_build_target != '' || inputs.use_docker_compose) }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -844,6 +911,7 @@ jobs:
     needs:
       - push_event_info
       - tests
+      - tests_compose
       - build_production
     if: ${{ always() && !failure() && !cancelled() }}
     steps:
