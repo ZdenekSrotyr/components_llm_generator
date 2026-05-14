@@ -375,6 +375,7 @@ Directory structure:
     │   │   ├── ConfigDefinitionTest.php
     │   │   ├── ExportCommandFactoryTest.php
     │   │   ├── ExportHelperTest.php
+    │   │   ├── ExtractorAppendMongoshTimeoutsTest.php
     │   │   ├── ExtractorParseMongoshErrorTest.php
     │   │   ├── HandleMongoExportFailsTest.php
     │   │   ├── RelativeDateParserTest.php
@@ -8023,19 +8024,23 @@ class Extractor
     }
 
     /**
+     * connectTimeoutMS bounds the underlying TCP connect (slow VPN routes hung
+     * here previously). serverSelectionTimeoutMS bounds post-handshake driver
+     * selection. The Process wall-clock must comfortably exceed both so mongosh
+     * can emit a clean error instead of being SIGKILLed.
+     */
+    private const MONGOSH_CONNECT_TIMEOUT_MS = 10000;
+    private const MONGOSH_SERVER_SELECTION_TIMEOUT_MS = 5000;
+    private const MONGOSH_PROCESS_TIMEOUT_SECONDS = 60;
+
+    /**
      * Tests connection using mongosh CLI
      * @throws \Keboola\Component\UserException
      */
     public function testConnection(): void
     {
         $uri = $this->uriFactory->create($this->dbParams);
-
-        // Add short timeout to avoid long waits on unreachable hosts (only if not already set)
-        $uriString = (string) $uri;
-        if (!$uri->getQuery()->has('serverSelectionTimeoutMS')) {
-            $separator = str_contains($uriString, '?') ? '&' : '?';
-            $uriString .= $separator . 'serverSelectionTimeoutMS=5000';
-        }
+        $uriString = self::appendMongoshTimeouts($uri);
 
         $command = ['mongosh', $uriString, '--eval', 'db.runCommand({listCollections: 1})', '--quiet', '--norc'];
 
@@ -8051,7 +8056,7 @@ class Extractor
 
         $this->retryProxy->call(function () use ($command): void {
             $process = new Process($command);
-            $process->setTimeout(30);
+            $process->setTimeout(self::MONGOSH_PROCESS_TIMEOUT_SECONDS);
             $process->run();
 
             if (!$process->isSuccessful()) {
@@ -8063,6 +8068,32 @@ class Extractor
                 throw new UserException($errorMessage);
             }
         });
+    }
+
+    /**
+     * Appends connectTimeoutMS and serverSelectionTimeoutMS to a mongosh URI so
+     * a connect failure surfaces as a clean MongoNetworkError instead of being
+     * killed by the wrapping Process timeout. User-supplied values take
+     * precedence — caller-provided timeouts are never overridden.
+     */
+    public static function appendMongoshTimeouts(Uri $uri): string
+    {
+        $defaults = [
+            'connectTimeoutMS' => self::MONGOSH_CONNECT_TIMEOUT_MS,
+            'serverSelectionTimeoutMS' => self::MONGOSH_SERVER_SELECTION_TIMEOUT_MS,
+        ];
+
+        $uriString = (string) $uri;
+        $query = $uri->getQuery();
+
+        foreach ($defaults as $key => $value) {
+            if (!$query->has($key)) {
+                $separator = str_contains($uriString, '?') ? '&' : '?';
+                $uriString .= $separator . $key . '=' . $value;
+            }
+        }
+
+        return $uriString;
     }
 
     /**
@@ -18612,6 +18643,116 @@ class ExportHelperTest extends TestCase
                 'binary.$binary.base64' => 'binary',
             ],
         ];
+    }
+}
+
+
+
+================================================
+FILE: tests/phpunit/ExtractorAppendMongoshTimeoutsTest.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+namespace MongoExtractor\Tests\Unit;
+
+use MongoExtractor\Extractor;
+use MongoExtractor\UriFactory;
+use PHPUnit\Framework\TestCase;
+
+class ExtractorAppendMongoshTimeoutsTest extends TestCase
+{
+    private UriFactory $uriFactory;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->uriFactory = new UriFactory();
+    }
+
+    public function testAddsBothTimeoutsToCleanUri(): void
+    {
+        $uri = $this->uriFactory->create([
+            'host' => 'localhost',
+            'port' => 27017,
+            'database' => 'myDatabase',
+        ]);
+
+        $result = Extractor::appendMongoshTimeouts($uri);
+
+        self::assertStringContainsString('connectTimeoutMS=10000', $result);
+        self::assertStringContainsString('serverSelectionTimeoutMS=5000', $result);
+        // Original URI is preserved
+        self::assertStringStartsWith('mongodb://localhost:27017/myDatabase?', $result);
+    }
+
+    public function testAddsTimeoutsAfterExistingQueryParams(): void
+    {
+        $uri = $this->uriFactory->create([
+            'host' => 'localhost',
+            'port' => 27017,
+            'database' => 'myDatabase',
+            'user' => 'user',
+            'password' => 'pass',
+            'authenticationDatabase' => 'authDb',
+        ]);
+
+        $result = Extractor::appendMongoshTimeouts($uri);
+
+        // Existing authSource preserved, both timeouts appended
+        self::assertStringContainsString('authSource=authDb', $result);
+        self::assertStringContainsString('connectTimeoutMS=10000', $result);
+        self::assertStringContainsString('serverSelectionTimeoutMS=5000', $result);
+    }
+
+    public function testDoesNotOverrideUserSuppliedServerSelectionTimeout(): void
+    {
+        // custom_uri with a user-supplied serverSelectionTimeoutMS
+        $uri = $this->uriFactory->create([
+            'protocol' => 'custom_uri',
+            'uri' => 'mongodb://user@localhost:27017/db?serverSelectionTimeoutMS=20000',
+            'password' => 'pass',
+        ]);
+
+        $result = Extractor::appendMongoshTimeouts($uri);
+
+        // Existing value preserved (not duplicated)
+        self::assertStringContainsString('serverSelectionTimeoutMS=20000', $result);
+        self::assertStringNotContainsString('serverSelectionTimeoutMS=5000', $result);
+        // connectTimeoutMS still added since user did not provide it
+        self::assertStringContainsString('connectTimeoutMS=10000', $result);
+    }
+
+    public function testDoesNotOverrideUserSuppliedConnectTimeout(): void
+    {
+        $uri = $this->uriFactory->create([
+            'protocol' => 'custom_uri',
+            'uri' => 'mongodb://user@localhost:27017/db?connectTimeoutMS=30000',
+            'password' => 'pass',
+        ]);
+
+        $result = Extractor::appendMongoshTimeouts($uri);
+
+        self::assertStringContainsString('connectTimeoutMS=30000', $result);
+        self::assertStringNotContainsString('connectTimeoutMS=10000', $result);
+        self::assertStringContainsString('serverSelectionTimeoutMS=5000', $result);
+    }
+
+    public function testDoesNotDuplicateWhenBothAlreadyPresent(): void
+    {
+        $uri = $this->uriFactory->create([
+            'protocol' => 'custom_uri',
+            'uri' => 'mongodb://user@localhost:27017/db?connectTimeoutMS=15000&serverSelectionTimeoutMS=15000',
+            'password' => 'pass',
+        ]);
+
+        $result = Extractor::appendMongoshTimeouts($uri);
+
+        self::assertSame(1, substr_count($result, 'connectTimeoutMS='));
+        self::assertSame(1, substr_count($result, 'serverSelectionTimeoutMS='));
+        self::assertStringContainsString('connectTimeoutMS=15000', $result);
+        self::assertStringContainsString('serverSelectionTimeoutMS=15000', $result);
     }
 }
 
