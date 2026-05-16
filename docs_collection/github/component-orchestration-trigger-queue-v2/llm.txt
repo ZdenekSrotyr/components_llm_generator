@@ -39,12 +39,15 @@ Directory structure:
     │       └── update_properties.sh
     ├── src/
     │   ├── component.py
+    │   ├── flow_resolver.py
     │   └── client/
     │       ├── __init__.py
     │       └── queue_api.py
     ├── tests/
     │   ├── __init__.py
-    │   └── test_component.py
+    │   ├── test_component.py
+    │   ├── test_flow_resolver.py
+    │   └── test_queue_api.py
     └── .github/
         └── workflows/
             └── push.yml
@@ -89,6 +92,17 @@ Configuration
  - **Orchestration ID** (orchestrationId) – [REQ] The specific orchestration ID, obtained from the link.
  - **Wait for job finish and check jobs status** (waitUntilFinish) – [REQ] if set to `true`, the component will only finish executing once the triggered orchestration has stopped. If the orchestration ends in failure, the trigger job fails as well.
  - **Fail on warning** (failOnWarning) – [OPT] If set to `true`, the component will fail when the orchestration ends with a warning.
+
+
+### Conditional Flows (keboola.flow) support
+
+The component automatically detects whether the configured ID belongs to a
+`keboola.flow` (Conditional Flow) configuration. If a non-disabled
+`keboola.flow` configuration with that ID exists in the target project, the
+component triggers it as `keboola.flow`. Otherwise (404 or `isDisabled = true`)
+it falls back to triggering `keboola.orchestrator`, preserving the previous
+behaviour. The same auto-detection applies to the optional failure-action
+configuration.
 
 
 Sample Configuration
@@ -1393,9 +1407,16 @@ from keboola.component.exceptions import UserException
 from keboola.component.sync_actions import SelectElement, ValidationResult
 
 from client import QueueApiClient, QueueApiClientException
+from flow_resolver import (
+    FLOW_COMPONENT_ID,
+    list_triggerable_configurations,
+    resolve_component_id,
+)
 
 CURRENT_COMPONENT_ID = 'kds-team.app-orchestration-trigger-queue-v2'
-FLOW_COMPONENT_ID = "keboola.orchestrator"
+
+ORCHESTRATOR_UI_LABEL = "Flow"
+FLOW_UI_LABEL = "Conditional Flow"
 
 KEY_SAPI_TOKEN = '#kbcToken'
 KEY_STACK = 'kbcUrl'
@@ -1440,6 +1461,12 @@ def check_variables(variables) -> None:
                             "Please provide a valid name or remove the variable row.")
 
 
+def _ui_label_for_component(component_id: str) -> str:
+    if component_id == FLOW_COMPONENT_ID:
+        return FLOW_UI_LABEL
+    return ORCHESTRATOR_UI_LABEL
+
+
 class Component(ComponentBase):
 
     def __init__(self):
@@ -1465,9 +1492,19 @@ class Component(ComponentBase):
         fail_on_warning = params.get(KEY_FAIL_ON_WARNING, True)
 
         try:
-            orchestration_run = self._runner_client.run_orchestration(orch_id, variables)
+            main_component_id = resolve_component_id(self._configurations_client, str(orch_id))
+            logging.info(f"Triggering configuration {orch_id} as {main_component_id}")
+            orchestration_run = self._runner_client.run_orchestration(
+                orch_id,
+                variables,
+                component_id=main_component_id,
+            )
         except QueueApiClientException as api_exc:
             raise UserException(api_exc) from api_exc
+        except requests.HTTPError as http_exc:
+            raise UserException(
+                f"Failed to resolve component type for configuration {orch_id}: {http_exc}"
+            ) from http_exc
 
         logging.info(f"Flow run started with job ID {orchestration_run.get('id')} and "
                      f"configuration ID {orch_id}")
@@ -1497,9 +1534,17 @@ class Component(ComponentBase):
                         variables_on_failure.extend(variables)
 
                     try:
+                        failure_component_id = resolve_component_id(
+                            self._configurations_on_failure_client,
+                            str(job_to_trigger),
+                        )
+                        logging.info(
+                            f"Triggering failure configuration {job_to_trigger} as {failure_component_id}"
+                        )
                         action_on_failure_run = self._failure_action_runner_client.run_orchestration(
                             job_to_trigger,
-                            variables_on_failure
+                            variables_on_failure,
+                            component_id=failure_component_id,
                         )
                         project = params.get(KEY_ACTION_ON_FAILURE_SETTINGS, {}).get(KEY_TARGET_PROJECT)
                         if project == "current":
@@ -1534,6 +1579,11 @@ class Component(ComponentBase):
                     except QueueApiClientException as api_exc:
                         raise UserException("Flow triggered on failure failed on: "
                                             f"{api_exc}") from api_exc
+                    except requests.HTTPError as http_exc:
+                        raise UserException(
+                            "Failed to resolve component type for failure configuration "
+                            f"{job_to_trigger}: {http_exc}"
+                        ) from http_exc
                 else:
                     logging.info("Flow is finished")
                     self.process_status(status, fail_on_warning)
@@ -1691,23 +1741,21 @@ class Component(ComponentBase):
     @sync_action('list_orchestrations')
     def list_orchestration(self):
         self._init_clients()
-        configurations = self._configurations_client.list(FLOW_COMPONENT_ID)
-        return [
-            SelectElement(
-                label="[%s] %s" % (c["id"], c["name"]),
-                value=str(c["id"])
-            ) for c in configurations
-        ]
+        return self._triggerable_select_elements(self._configurations_client)
 
     @sync_action('list_failure_orchestrations')
     def list_failure_orchestrations(self):
         self._init_clients()
-        configurations = self._configurations_on_failure_client.list(FLOW_COMPONENT_ID)
+        return self._triggerable_select_elements(self._configurations_on_failure_client)
+
+    @staticmethod
+    def _triggerable_select_elements(configurations_client: Configurations) -> List[SelectElement]:
         return [
             SelectElement(
-                label="[%s] %s" % (c["id"], c["name"]),
-                value=str(c["id"])
-            ) for c in configurations
+                label='[%s "%s"] %s' % (_ui_label_for_component(entry["component_id"]), entry["id"], entry["name"]),
+                value=entry["id"],
+            )
+            for entry in list_triggerable_configurations(configurations_client)
         ]
 
     @sync_action('sync_trigger_metadata')
@@ -1717,23 +1765,31 @@ class Component(ComponentBase):
         self._init_clients()
         flow_id = params.get(KEY_ORCHESTRATION_ID)
 
-        flow_url = self._compose_flow_url(flow_id, self.stack_url, self._get_project_id())
-        flow_cfg = self._get_component_detail(self._configurations_client, FLOW_COMPONENT_ID, str(flow_id))
-
-        info_message = (f"This configuration triggers flow named [{flow_cfg['name']}]({flow_url}) "
-                        f"in project `{self._get_project_id()}`.")
+        info_message = self._format_trigger_info(
+            self._configurations_client,
+            flow_id,
+            self.stack_url,
+            self._get_project_id(),
+            prefix="This configuration triggers",
+        )
 
         if params.get(KEY_TRIGGER_ACTION_ON_FAILURE, False):
             flow_id_on_failure = params.get(KEY_ACTION_ON_FAILURE_SETTINGS, {}).get(KEY_CONFIGURATION_ID_ON_FAILURE)
-            flow_cfg_on_failure = self._get_component_detail(self._configurations_on_failure_client,
-                                                             FLOW_COMPONENT_ID,
-                                                             str(flow_id_on_failure))
-
-            flow_url_on_failure = self._compose_flow_url(flow_id_on_failure, self.stack_url_on_failure,
-                                                         self._target_project_on_failure)
-            info_message += (f" If the flow fails, it will trigger flow [{flow_cfg_on_failure['name']}]"
-                             f"({flow_url_on_failure}) in project `{self._target_project_on_failure}`.")
+            info_message += " " + self._format_trigger_info(
+                self._configurations_on_failure_client,
+                flow_id_on_failure,
+                self.stack_url_on_failure,
+                self._target_project_on_failure,
+                prefix="If it fails, it will trigger",
+            )
         return ValidationResult(info_message)
+
+    def _format_trigger_info(self, client: Configurations, configuration_id, stack_url, project_id, prefix: str) -> str:
+        component_id = resolve_component_id(client, str(configuration_id))
+        cfg = self._get_component_detail(client, component_id, str(configuration_id))
+        url = self._compose_flow_url(configuration_id, stack_url, project_id)
+        ui_label = _ui_label_for_component(component_id)
+        return f"{prefix} {ui_label} named [{cfg['name']}]({url}) in project `{project_id}`."
 
     @staticmethod
     def _get_component_detail(client: Configurations, component_id: str, configuration_id: str):
@@ -1764,6 +1820,110 @@ if __name__ == "__main__":
     except Exception as exc:
         logging.exception(exc)
         exit(2)
+
+
+
+================================================
+FILE: src/flow_resolver.py
+================================================
+"""Resolve whether a configuration ID refers to a keboola.flow or a keboola.orchestrator."""
+import logging
+from typing import Any, Dict, List
+
+import requests
+
+FLOW_COMPONENT_ID = "keboola.flow"
+ORCHESTRATOR_COMPONENT_ID = "keboola.orchestrator"
+
+
+def resolve_component_id(configurations_client: Any, configuration_id: str) -> str:
+    """
+    Return FLOW_COMPONENT_ID if a non-disabled keboola.flow configuration with the given ID
+    exists on the project the client points to; otherwise return ORCHESTRATOR_COMPONENT_ID.
+
+    Falls back to ORCHESTRATOR_COMPONENT_ID on HTTP 404 (no migrated flow exists) and when the
+    flow configuration is disabled. Re-raises any other HTTP error so unexpected failures are
+    not silently downgraded.
+    """
+    try:
+        config = configurations_client.detail(FLOW_COMPONENT_ID, configuration_id)
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            logging.debug(
+                "No keboola.flow config for id=%s (404); falling back to keboola.orchestrator",
+                configuration_id,
+            )
+            return ORCHESTRATOR_COMPONENT_ID
+        raise
+
+    if config.get("isDisabled"):
+        logging.debug(
+            "keboola.flow config id=%s is disabled; falling back to keboola.orchestrator",
+            configuration_id,
+        )
+        return ORCHESTRATOR_COMPONENT_ID
+
+    logging.debug("Resolved id=%s as keboola.flow", configuration_id)
+    return FLOW_COMPONENT_ID
+
+
+def list_triggerable_configurations(configurations_client: Any) -> List[Dict[str, str]]:
+    """
+    Return a merged list of configurations this component can trigger.
+
+    Combines keboola.flow and keboola.orchestrator configurations from the project and picks
+    one entry per configuration ID using the same rules as ``resolve_component_id``:
+
+    * keboola.flow exists and is not disabled -> keboola.flow
+    * keboola.flow is disabled and keboola.orchestrator exists -> keboola.orchestrator
+    * only keboola.flow exists and is enabled -> keboola.flow
+    * only keboola.orchestrator exists -> keboola.orchestrator
+
+    A disabled keboola.flow with no orchestrator counterpart is skipped — the trigger path
+    would resolve it as keboola.orchestrator and fail with "config not found", so listing it
+    in the picker would be misleading.
+
+    Each entry is a dict ``{"id": str, "name": str, "component_id": str}``. Results are
+    grouped by component type (Conditional Flow first, then Flow) and sorted by name within
+    each group for stable UI output.
+    """
+    flows_by_id = {str(c["id"]): c for c in _safe_list(configurations_client, FLOW_COMPONENT_ID)}
+    orchestrators_by_id = {str(c["id"]): c for c in _safe_list(configurations_client, ORCHESTRATOR_COMPONENT_ID)}
+
+    merged: List[Dict[str, str]] = []
+    for cfg_id in set(flows_by_id) | set(orchestrators_by_id):
+        entry = _pick_entry(cfg_id, flows_by_id.get(cfg_id), orchestrators_by_id.get(cfg_id))
+        if entry is not None:
+            merged.append(entry)
+
+    merged.sort(key=_sort_key)
+    return merged
+
+
+def _sort_key(entry: Dict[str, str]):
+    is_orchestrator = entry["component_id"] == ORCHESTRATOR_COMPONENT_ID
+    return (is_orchestrator, entry["name"].lower())
+
+
+def _pick_entry(cfg_id: str, flow: Any, orchestrator: Any):
+    if flow is not None and not flow.get("isDisabled"):
+        return {"id": cfg_id, "name": flow["name"], "component_id": FLOW_COMPONENT_ID}
+    if flow is not None and orchestrator is not None:
+        return {"id": cfg_id, "name": orchestrator["name"], "component_id": ORCHESTRATOR_COMPONENT_ID}
+    if flow is not None:
+        return None
+    return {"id": cfg_id, "name": orchestrator["name"], "component_id": ORCHESTRATOR_COMPONENT_ID}
+
+
+def _safe_list(configurations_client: Any, component_id: str) -> List[Dict]:
+    """List configurations of a component. Treats HTTP 404 as an empty list."""
+    try:
+        return configurations_client.list(component_id)
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            logging.debug("Listing %s returned 404; treating as empty", component_id)
+            return []
+        raise
 
 
 
@@ -1815,8 +1975,13 @@ class QueueApiClient(HttpClient):
         logging.debug(f"Using stack URL: {stack_url}")
         return stack_url
 
-    def run_orchestration(self, orch_id: str, variables: Optional[List[Dict]]) -> Dict:
-        data = {"component": "keboola.orchestrator",
+    def run_orchestration(
+        self,
+        orch_id: str,
+        variables: Optional[List[Dict]],
+        component_id: str = "keboola.orchestrator",
+    ) -> Dict:
+        data = {"component": component_id,
                 "mode": "run",
                 "config": orch_id}
         if variables:
@@ -1911,6 +2076,246 @@ class TestComponent(unittest.TestCase):
 
 if __name__ == "__main__":
     # import sys;sys.argv = ['', 'Test.testName']
+    unittest.main()
+
+
+
+================================================
+FILE: tests/test_flow_resolver.py
+================================================
+import unittest
+from unittest import mock
+
+import requests
+
+from flow_resolver import (
+    FLOW_COMPONENT_ID,
+    ORCHESTRATOR_COMPONENT_ID,
+    list_triggerable_configurations,
+    resolve_component_id,
+)
+
+
+def _http_error(status_code: int) -> requests.HTTPError:
+    response = mock.MagicMock()
+    response.status_code = status_code
+    return requests.HTTPError(response=response)
+
+
+def _client_with_lists(flows, orchestrators):
+    client = mock.MagicMock()
+
+    def _list(component_id):
+        if component_id == FLOW_COMPONENT_ID:
+            return flows
+        if component_id == ORCHESTRATOR_COMPONENT_ID:
+            return orchestrators
+        raise AssertionError(f"Unexpected component_id: {component_id}")
+
+    client.list.side_effect = _list
+    return client
+
+
+class TestResolveComponentId(unittest.TestCase):
+
+    def test_returns_flow_when_enabled_flow_config_exists(self):
+        client = mock.MagicMock()
+        client.detail.return_value = {"id": "123", "isDisabled": False, "name": "f"}
+
+        result = resolve_component_id(client, "123")
+
+        self.assertEqual(result, FLOW_COMPONENT_ID)
+        client.detail.assert_called_once_with("keboola.flow", "123")
+
+    def test_returns_orchestrator_when_flow_config_is_disabled(self):
+        client = mock.MagicMock()
+        client.detail.return_value = {"id": "123", "isDisabled": True, "name": "f"}
+
+        result = resolve_component_id(client, "123")
+
+        self.assertEqual(result, ORCHESTRATOR_COMPONENT_ID)
+
+    def test_returns_orchestrator_when_flow_config_does_not_exist(self):
+        client = mock.MagicMock()
+        response = mock.MagicMock()
+        response.status_code = 404
+        client.detail.side_effect = requests.HTTPError(response=response)
+
+        result = resolve_component_id(client, "123")
+
+        self.assertEqual(result, ORCHESTRATOR_COMPONENT_ID)
+
+    def test_reraises_non_404_http_errors(self):
+        client = mock.MagicMock()
+        response = mock.MagicMock()
+        response.status_code = 500
+        client.detail.side_effect = requests.HTTPError("boom", response=response)
+
+        with self.assertRaises(requests.HTTPError):
+            resolve_component_id(client, "123")
+
+
+class TestListTriggerableConfigurations(unittest.TestCase):
+
+    def test_lone_orchestrator_is_listed_as_orchestrator(self):
+        client = _client_with_lists(
+            flows=[],
+            orchestrators=[{"id": "111", "name": "Only Orch", "isDisabled": False}],
+        )
+
+        result = list_triggerable_configurations(client)
+
+        self.assertEqual(
+            result,
+            [{"id": "111", "name": "Only Orch", "component_id": ORCHESTRATOR_COMPONENT_ID}],
+        )
+
+    def test_lone_enabled_flow_is_listed_as_flow(self):
+        client = _client_with_lists(
+            flows=[{"id": "222", "name": "Only Flow", "isDisabled": False}],
+            orchestrators=[],
+        )
+
+        result = list_triggerable_configurations(client)
+
+        self.assertEqual(
+            result,
+            [{"id": "222", "name": "Only Flow", "component_id": FLOW_COMPONENT_ID}],
+        )
+
+    def test_lone_disabled_flow_is_hidden(self):
+        client = _client_with_lists(
+            flows=[{"id": "222", "name": "Only Disabled Flow", "isDisabled": True}],
+            orchestrators=[],
+        )
+
+        result = list_triggerable_configurations(client)
+
+        self.assertEqual(result, [])
+
+    def test_same_id_enabled_flow_wins_over_orchestrator(self):
+        client = _client_with_lists(
+            flows=[{"id": "333", "name": "Flow Name", "isDisabled": False}],
+            orchestrators=[{"id": "333", "name": "Orch Name", "isDisabled": False}],
+        )
+
+        result = list_triggerable_configurations(client)
+
+        self.assertEqual(
+            result,
+            [{"id": "333", "name": "Flow Name", "component_id": FLOW_COMPONENT_ID}],
+        )
+
+    def test_same_id_disabled_flow_falls_back_to_orchestrator(self):
+        client = _client_with_lists(
+            flows=[{"id": "444", "name": "Flow Name", "isDisabled": True}],
+            orchestrators=[{"id": "444", "name": "Orch Name", "isDisabled": False}],
+        )
+
+        result = list_triggerable_configurations(client)
+
+        self.assertEqual(
+            result,
+            [{"id": "444", "name": "Orch Name", "component_id": ORCHESTRATOR_COMPONENT_ID}],
+        )
+
+    def test_results_are_grouped_by_type_then_sorted_by_name(self):
+        client = _client_with_lists(
+            flows=[
+                {"id": "1", "name": "zeta", "isDisabled": False},
+                {"id": "4", "name": "Bravo", "isDisabled": False},
+            ],
+            orchestrators=[
+                {"id": "2", "name": "Alpha", "isDisabled": False},
+                {"id": "3", "name": "beta", "isDisabled": False},
+            ],
+        )
+
+        result = list_triggerable_configurations(client)
+
+        self.assertEqual(
+            [(item["component_id"], item["name"]) for item in result],
+            [
+                (FLOW_COMPONENT_ID, "Bravo"),
+                (FLOW_COMPONENT_ID, "zeta"),
+                (ORCHESTRATOR_COMPONENT_ID, "Alpha"),
+                (ORCHESTRATOR_COMPONENT_ID, "beta"),
+            ],
+        )
+
+    def test_flow_list_404_is_treated_as_empty(self):
+        client = mock.MagicMock()
+
+        def _list(component_id):
+            if component_id == FLOW_COMPONENT_ID:
+                raise _http_error(404)
+            return [{"id": "555", "name": "Orch", "isDisabled": False}]
+
+        client.list.side_effect = _list
+
+        result = list_triggerable_configurations(client)
+
+        self.assertEqual(
+            result,
+            [{"id": "555", "name": "Orch", "component_id": ORCHESTRATOR_COMPONENT_ID}],
+        )
+
+    def test_non_404_list_error_is_propagated(self):
+        client = mock.MagicMock()
+        client.list.side_effect = _http_error(500)
+
+        with self.assertRaises(requests.HTTPError):
+            list_triggerable_configurations(client)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+================================================
+FILE: tests/test_queue_api.py
+================================================
+import json
+import unittest
+from unittest import mock
+
+from client import QueueApiClient
+
+
+def _make_response(status_code=200, text='{"id":"job-1"}'):
+    response = mock.MagicMock()
+    response.status_code = status_code
+    response.text = text
+    response.raise_for_status.return_value = None
+    return response
+
+
+class TestRunOrchestration(unittest.TestCase):
+
+    def _build_client(self):
+        return QueueApiClient(sapi_token="t-123", keboola_stack="-", custom_stack="")
+
+    def test_default_component_id_is_orchestrator(self):
+        client = self._build_client()
+        with mock.patch.object(client, "post_raw", return_value=_make_response()) as post_raw:
+            client.run_orchestration("123", variables=None)
+
+        payload = json.loads(post_raw.call_args.kwargs["data"])
+        self.assertEqual(payload["component"], "keboola.orchestrator")
+        self.assertEqual(payload["config"], "123")
+        self.assertEqual(payload["mode"], "run")
+
+    def test_explicit_component_id_is_used(self):
+        client = self._build_client()
+        with mock.patch.object(client, "post_raw", return_value=_make_response()) as post_raw:
+            client.run_orchestration("123", variables=None, component_id="keboola.flow")
+
+        payload = json.loads(post_raw.call_args.kwargs["data"])
+        self.assertEqual(payload["component"], "keboola.flow")
+
+
+if __name__ == "__main__":
     unittest.main()
 
 
