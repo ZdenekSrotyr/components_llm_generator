@@ -172,6 +172,10 @@ Directory structure:
     │   │   │   ├── expected-code
     │   │   │   ├── expected-stdout
     │   │   │   └── setUp.php
+    │   │   ├── export-with-auth-mechanism/
+    │   │   │   ├── expected-code
+    │   │   │   ├── expected-stdout
+    │   │   │   └── setUp.php
     │   │   ├── include-parent-in-pk/
     │   │   │   ├── expected-code
     │   │   │   ├── expected-stdout
@@ -361,6 +365,9 @@ Directory structure:
     │   │   ├── test-connection-action-via-ssl/
     │   │   │   ├── expected-code
     │   │   │   └── expected-stdout
+    │   │   ├── test-connection-action-with-auth-mechanism/
+    │   │   │   ├── expected-code
+    │   │   │   └── expected-stdout
     │   │   ├── test-not-enabled-exports/
     │   │   │   ├── expected-code
     │   │   │   └── expected-stderr
@@ -411,6 +418,7 @@ The configuration `config.json` contains following properties in `parameters` ke
         - `port` - string (optional): Server port (default port is `27017`).
         - `database` - string (required):  Database to connect to.
         - `authenticationDatabase` - string (optional): [Authentication database](https://docs.mongodb.com/manual/reference/program/mongo/#authentication-options) for `user`.
+        - `authenticationMechanism` - enum (optional): SASL mechanism passed to `mongoexport --authenticationMechanism`. One of `SCRAM-SHA-1`, `SCRAM-SHA-256`, `MONGODB-X509`, `GSSAPI`, `PLAIN`, `MONGODB-AWS`. Required for Azure Cosmos DB (set to `SCRAM-SHA-256`); leave unset against vanilla MongoDB so the driver negotiates. Cannot be used with `custom_uri` — embed `authMechanism=` in the URI itself instead.
         - `user` - string (optional): User with correct access rights.
         - `#password` - string (optional): Password for given `user`. Both or none of couple `user` and `#password` must be specified.
         - `ssh` - object (optional): Settings for SSH tunnel.
@@ -671,7 +679,7 @@ config.json → Component → Extractor → Export (mongoexport CLI) → Parse �
 
 ### Key Supporting Classes
 
-- **ExportCommandFactory** — Builds `mongoexport` shell commands from config params (URI, collection, query, sort, etc.)
+- **ExportCommandFactory** — Builds `mongoexport` shell commands from config params. Two protocol branches in `connectionOptions()`: `mongodb+srv` and `custom_uri` pass a single `--uri`; the default `mongodb://` path emits individual `--host`/`--port`/`--username`/`--password`/`--authenticationDatabase`/`--authenticationMechanism` flags (URI mode hangs against some servers — see comment in source). Any new auth-related option must be plumbed in both branches.
 - **UriFactory / Uri** — Handles MongoDB URI construction including multi-host, `mongodb+srv://`, custom URI, and special character encoding via `league/uri`
 - **ExportOptions** — Value object encapsulating all export parameters (collection, query, mode, mapping, incremental settings)
 - **RelativeDateParser** — Converts relative date expressions (e.g., `"now - 7 days"`) in queries to absolute dates
@@ -6104,7 +6112,7 @@ RUN wget https://fastdl.mongodb.org/tools/db/mongodb-database-tools-debian12-x86
 RUN docker-php-ext-configure intl \
     && docker-php-ext-install intl
 
-RUN pecl install mongodb \
+RUN pecl install mongodb-2.2.0 \
   && docker-php-ext-enable mongodb
 
 ## Composer - deps always cached unless changed
@@ -7767,6 +7775,12 @@ class ExportCommandFactory
             ) {
                 $command[] = '--authenticationDatabase ' . escapeshellarg($params['authenticationDatabase']);
             }
+
+            if (isset($params['authenticationMechanism'])
+                && trim((string) $params['authenticationMechanism']) !== ''
+            ) {
+                $command[] = '--authenticationMechanism ' . escapeshellarg($params['authenticationMechanism']);
+            }
         }
 
         if (($params['ssl']['enabled'] ?? false)) {
@@ -8866,6 +8880,12 @@ class UriFactory
             $query[] = ['authSource', $params['authenticationDatabase']];
         }
 
+        if (isset($params['authenticationMechanism'])
+            && trim((string) $params['authenticationMechanism']) !== ''
+        ) {
+            $query[] = ['authMechanism', $params['authenticationMechanism']];
+        }
+
         if (($params['ssl']['enabled'] ?? false)) {
             $query[] = ['ssl', 'true'];
             if (isset($params['ssl']['caFile'])) {
@@ -9084,9 +9104,29 @@ class DbNode extends ArrayNodeDefinition
 
     public const NODE_NAME = 'db';
 
+    public const AUTH_MECHANISMS = [
+        'SCRAM-SHA-1',
+        'SCRAM-SHA-256',
+        'MONGODB-X509',
+        'GSSAPI',
+        'PLAIN',
+        'MONGODB-AWS',
+    ];
+
     public function __construct()
     {
         parent::__construct(self::NODE_NAME);
+        $this->beforeNormalization()->always(function (array $v): array {
+            // Treat an empty/whitespace-only authenticationMechanism as "not set"
+            // so the optional enum field does not reject "" sent by the UI for an
+            // unselected mechanism.
+            if (isset($v['authenticationMechanism'])
+                && trim((string) $v['authenticationMechanism']) === ''
+            ) {
+                unset($v['authenticationMechanism']);
+            }
+            return $v;
+        })->end();
         $this->validate()->always(function (array $v): array {
                 $protocol = $v['protocol'];
                 $sshTunnelEnabled = $v['ssh']['enabled'] ?? false;
@@ -9108,7 +9148,7 @@ class DbNode extends ArrayNodeDefinition
                 }
 
                 // Check incompatible keys
-                foreach (['host', 'port', 'database', 'authenticationDatabase'] as $key) {
+                foreach (['host', 'port', 'database', 'authenticationDatabase', 'authenticationMechanism'] as $key) {
                     if (isset($v[$key])) {
                         throw new InvalidConfigurationException(sprintf(
                             'Configuration node "db.%s" is not compatible with custom URI.',
@@ -9159,6 +9199,9 @@ class DbNode extends ArrayNodeDefinition
             ->scalarNode('port')->cannotBeEmpty()->end()
             ->scalarNode('database')->cannotBeEmpty()->end()
             ->scalarNode('authenticationDatabase')->end()
+            ->enumNode('authenticationMechanism')
+                ->values(self::AUTH_MECHANISMS)
+            ->end()
             ->scalarNode('user')->end()
             ->scalarNode('password')->end()
             ->scalarNode('#password')->end()
@@ -15957,6 +16000,38 @@ return static function (DatadirTest $test): void {
 
 
 ================================================
+FILE: tests/functional/export-with-auth-mechanism/expected-code
+================================================
+0
+
+
+================================================
+FILE: tests/functional/export-with-auth-mechanism/expected-stdout
+================================================
+Connected to mongodb://user@mongodb-auth:27017/test
+Exporting "export-all"
+Done "export-all", parsed 73 records in total
+
+
+================================================
+FILE: tests/functional/export-with-auth-mechanism/setUp.php
+================================================
+<?php
+
+declare(strict_types=1);
+
+use MongoExtractor\FunctionalTests\DatadirTest;
+use MongoExtractor\Tests\Traits\ImportDatasetTrait;
+
+return static function (DatadirTest $test): void {
+    (new class { use ImportDatasetTrait;
+
+    })::importDatatasetAuthDb('restaurants', 'dataset.json');
+};
+
+
+
+================================================
 FILE: tests/functional/include-parent-in-pk/expected-code
 ================================================
 0
@@ -17423,6 +17498,19 @@ FILE: tests/functional/test-connection-action-via-ssl/expected-stdout
 
 
 ================================================
+FILE: tests/functional/test-connection-action-with-auth-mechanism/expected-code
+================================================
+0
+
+
+================================================
+FILE: tests/functional/test-connection-action-with-auth-mechanism/expected-stdout
+================================================
+{"status":"ok"}
+
+
+
+================================================
 FILE: tests/functional/test-not-enabled-exports/expected-code
 ================================================
 1
@@ -17602,6 +17690,60 @@ class ConfigRowDefinitionTest extends TestCase
                                             [
                                                 '_id' => null,
                                             ],
+                                    ],
+                            ],
+                    ],
+            ],
+        ];
+
+        yield 'valid config with authenticationMechanism' => [
+            'configData' => [
+                'parameters' =>
+                    [
+                        'db' =>
+                            [
+                                'host' => '127.0.0.1',
+                                'port' => 27017,
+                                'database' => 'test',
+                                'user' => 'user',
+                                'password' => 'password',
+                                'authenticationMechanism' => 'SCRAM-SHA-256',
+                            ],
+                        'exports' =>
+                            [
+                                0 =>
+                                    [
+                                        'name' => 'bronx-bakeries',
+                                        'id' => 123,
+                                        'collection' => 'restaurants',
+                                        'mapping' => ['_id' => null],
+                                    ],
+                            ],
+                    ],
+            ],
+        ];
+
+        yield 'valid config with empty authenticationMechanism' => [
+            'configData' => [
+                'parameters' =>
+                    [
+                        'db' =>
+                            [
+                                'host' => '127.0.0.1',
+                                'port' => 27017,
+                                'database' => 'test',
+                                'user' => 'user',
+                                'password' => 'password',
+                                'authenticationMechanism' => '',
+                            ],
+                        'exports' =>
+                            [
+                                0 =>
+                                    [
+                                        'name' => 'bronx-bakeries',
+                                        'id' => 123,
+                                        'collection' => 'restaurants',
+                                        'mapping' => ['_id' => null],
                                     ],
                             ],
                     ],
@@ -17822,6 +17964,62 @@ class ConfigRowDefinitionTest extends TestCase
             ],
             'expectedError' => 'Both incremental fetching and sort cannot be set together.',
         ];
+
+        yield 'invalid authenticationMechanism value' => [
+            'configData' => [
+                'parameters' =>
+                    [
+                        'db' =>
+                            [
+                                'host' => '127.0.0.1',
+                                'port' => 27017,
+                                'database' => 'test',
+                                'user' => 'user',
+                                'password' => 'password',
+                                'authenticationMechanism' => 'INVALID-MECHANISM',
+                            ],
+                        'exports' =>
+                            [
+                                0 =>
+                                    [
+                                        'name' => 'bronx-bakeries',
+                                        'id' => 123,
+                                        'collection' => 'restaurants',
+                                        'mapping' => ['_id' => null],
+                                    ],
+                            ],
+                    ],
+            ],
+            'expectedError' => 'The value "INVALID-MECHANISM" is not allowed for path '
+                . '"root.parameters.db.authenticationMechanism".',
+        ];
+
+        yield 'authenticationMechanism not allowed with custom_uri' => [
+            'configData' => [
+                'parameters' =>
+                    [
+                        'db' =>
+                            [
+                                'protocol' => 'custom_uri',
+                                'uri' => 'mongodb://user@localhost/db',
+                                'password' => 'pass',
+                                'authenticationMechanism' => 'SCRAM-SHA-256',
+                            ],
+                        'exports' =>
+                            [
+                                0 =>
+                                    [
+                                        'name' => 'bronx-bakeries',
+                                        'id' => 123,
+                                        'collection' => 'restaurants',
+                                        'mapping' => ['_id' => null],
+                                    ],
+                            ],
+                    ],
+            ],
+            'expectedError' => 'Configuration node "db.authenticationMechanism" '
+                . 'is not compatible with custom URI.',
+        ];
     }
 
     /**
@@ -17892,6 +18090,44 @@ class ConfigRowDefinitionTest extends TestCase
                             'tableName' => 'bronx-bakeries',
                             'collection' => 'restaurants',
                             'incrementalFetchingColumn' => 'someColumn',
+                    ],
+            ],
+        ];
+
+        yield 'valid row config with authenticationMechanism' => [
+            'configData' => [
+                'parameters' =>
+                    [
+                        'db' =>
+                            [
+                                'host' => '127.0.0.1',
+                                'port' => 27017,
+                                'database' => 'test',
+                                'user' => 'user',
+                                'password' => 'password',
+                                'authenticationMechanism' => 'SCRAM-SHA-256',
+                            ],
+                            'tableName' => 'bronx-bakeries',
+                            'collection' => 'restaurants',
+                    ],
+            ],
+        ];
+
+        yield 'valid row config with empty authenticationMechanism' => [
+            'configData' => [
+                'parameters' =>
+                    [
+                        'db' =>
+                            [
+                                'host' => '127.0.0.1',
+                                'port' => 27017,
+                                'database' => 'test',
+                                'user' => 'user',
+                                'password' => 'password',
+                                'authenticationMechanism' => '',
+                            ],
+                            'tableName' => 'bronx-bakeries',
+                            'collection' => 'restaurants',
                     ],
             ],
         ];
@@ -18046,6 +18282,46 @@ class ConfigRowDefinitionTest extends TestCase
             ],
             'expectedError' => 'Both incremental fetching and sort cannot be set together.',
         ];
+
+        yield 'invalid authenticationMechanism value (row)' => [
+            'configData' => [
+                'parameters' =>
+                    [
+                        'db' =>
+                            [
+                                'host' => '127.0.0.1',
+                                'port' => 27017,
+                                'database' => 'test',
+                                'user' => 'user',
+                                'password' => 'password',
+                                'authenticationMechanism' => 'INVALID-MECHANISM',
+                            ],
+                            'tableName' => 'bronx-bakeries',
+                            'collection' => 'restaurants',
+                    ],
+            ],
+            'expectedError' => 'The value "INVALID-MECHANISM" is not allowed for path '
+                . '"root.parameters.db.authenticationMechanism".',
+        ];
+
+        yield 'authenticationMechanism not allowed with custom_uri (row)' => [
+            'configData' => [
+                'parameters' =>
+                    [
+                        'db' =>
+                            [
+                                'protocol' => 'custom_uri',
+                                'uri' => 'mongodb://user@localhost/db',
+                                'password' => 'pass',
+                                'authenticationMechanism' => 'SCRAM-SHA-256',
+                            ],
+                            'tableName' => 'bronx-bakeries',
+                            'collection' => 'restaurants',
+                    ],
+            ],
+            'expectedError' => 'Configuration node "db.authenticationMechanism" '
+                . 'is not compatible with custom URI.',
+        ];
     }
 
     /**
@@ -18056,6 +18332,12 @@ class ConfigRowDefinitionTest extends TestCase
     {
         if (!array_key_exists('protocol', $configData['parameters']['db'])) {
             $configData['parameters']['db']['protocol'] = DbNode::PROTOCOL_MONGO_DB;
+        }
+
+        if (array_key_exists('authenticationMechanism', $configData['parameters']['db'])
+            && trim((string) $configData['parameters']['db']['authenticationMechanism']) === ''
+        ) {
+            unset($configData['parameters']['db']['authenticationMechanism']);
         }
 
         if ($oldConfig) {
@@ -18246,6 +18528,54 @@ BASH;
 mongoexport --uri 'mongodb+srv://user:pass@localhost/myDatabase?authSource=myAuthDatabase' --collection 'myCollection' --sort '{_id: 1}' --type 'json'
 BASH;
         // phpcs:enable
+        $this->assertSame($expectedCommand, $command);
+    }
+
+    public function testWithAuthenticationMechanism(): void
+    {
+        $options = [
+            'host' => 'localhost',
+            'port' => 27017,
+            'database' => 'myDatabase',
+            'collection' => 'myCollection',
+            'out' => '/tmp/create-test.json',
+            'user' => 'user',
+            'password' => 'pass',
+            'authenticationDatabase' => 'myAuthDatabase',
+            'authenticationMechanism' => 'SCRAM-SHA-256',
+        ];
+
+        $command = $this->commandFactory->create($options);
+        // phpcs:disable Generic.Files.LineLength.MaxExceeded
+        $expectedCommand = <<<BASH
+mongoexport --host 'localhost' --port '27017' --db 'myDatabase' --username 'user' --password 'pass' --authenticationDatabase 'myAuthDatabase' --authenticationMechanism 'SCRAM-SHA-256' --collection 'myCollection' --sort '{_id: 1}' --type 'json'
+BASH;
+        // phpcs:enable
+
+        $this->assertSame($expectedCommand, $command);
+    }
+
+    public function testMongoDbSrvProtocolWithAuthenticationMechanism(): void
+    {
+        $options = [
+            'protocol' => 'mongodb+srv',
+            'host' => 'localhost',
+            'database' => 'myDatabase',
+            'collection' => 'myCollection',
+            'out' => '/tmp/create-test.json',
+            'user' => 'user',
+            'password' => 'pass',
+            'authenticationMechanism' => 'SCRAM-SHA-256',
+        ];
+
+        $command = $this->commandFactory->create($options);
+
+        // phpcs:disable Generic.Files.LineLength.MaxExceeded
+        $expectedCommand = <<<BASH
+mongoexport --uri 'mongodb+srv://user:pass@localhost/myDatabase?authMechanism=SCRAM-SHA-256' --collection 'myCollection' --sort '{_id: 1}' --type 'json'
+BASH;
+        // phpcs:enable
+
         $this->assertSame($expectedCommand, $command);
     }
 
@@ -19269,6 +19599,51 @@ class UriFactoryTest extends TestCase
                     'user' => 'u$er',
                     'password' => 'pa$$',
                     'authenticationDatabase' => 'authDb',
+                ],
+            ],
+            'authMechanism-mongodb' => [
+                'mongodb://user:pass@localhost:27017/myDatabase?authMechanism=SCRAM-SHA-256',
+                [
+                    'host' => 'localhost',
+                    'port' => 27017,
+                    'database' => 'myDatabase',
+                    'user' => 'user',
+                    'password' => 'pass',
+                    'authenticationMechanism' => 'SCRAM-SHA-256',
+                ],
+            ],
+            'authMechanism-with-authSource' => [
+                'mongodb://user:pass@localhost:27017/myDatabase?authSource=authDb&authMechanism=SCRAM-SHA-256',
+                [
+                    'host' => 'localhost',
+                    'port' => 27017,
+                    'database' => 'myDatabase',
+                    'user' => 'user',
+                    'password' => 'pass',
+                    'authenticationDatabase' => 'authDb',
+                    'authenticationMechanism' => 'SCRAM-SHA-256',
+                ],
+            ],
+            'authMechanism-srv' => [
+                'mongodb+srv://user:pass@mongodb.cluster.local/myDatabase?authMechanism=SCRAM-SHA-256',
+                [
+                    'protocol' => 'mongodb+srv',
+                    'host' => 'mongodb.cluster.local',
+                    'database' => 'myDatabase',
+                    'user' => 'user',
+                    'password' => 'pass',
+                    'authenticationMechanism' => 'SCRAM-SHA-256',
+                ],
+            ],
+            'authMechanism-empty-not-emitted' => [
+                'mongodb://user:pass@localhost:27017/myDatabase',
+                [
+                    'host' => 'localhost',
+                    'port' => 27017,
+                    'database' => 'myDatabase',
+                    'user' => 'user',
+                    'password' => 'pass',
+                    'authenticationMechanism' => '',
                 ],
             ],
             'custom-uri' => [
