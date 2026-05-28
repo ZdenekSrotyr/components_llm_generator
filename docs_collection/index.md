@@ -1012,6 +1012,11 @@
 - Repository: https://github.com/keboola/component-ex-heureka
 - Description: None
 
+### component-ex-flexibee
+- [Documentation](github/component-ex-flexibee/llm.txt)
+- Repository: https://github.com/keboola/component-ex-flexibee
+- Description: Keboola extractor for ABRA Flexi (FlexiBee) accounting/ERP data
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
