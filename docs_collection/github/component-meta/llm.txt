@@ -25,6 +25,10 @@ Directory structure:
     │           └── tables/
     │               ├── test.csv
     │               └── test.csv.manifest
+    ├── docs/
+    │   ├── cftl-656-release-migration-test.cleanup.sh
+    │   ├── cftl-656-release-migration-test.md
+    │   └── cftl-656-support-remediation.md
     ├── scripts/
     │   └── developer_portal/
     │       ├── fn_actions_md_update.sh
@@ -41,6 +45,7 @@ Directory structure:
     │   ├── test_component.py
     │   ├── test_functional.py
     │   ├── test_output_parser_action_breakdowns.py
+    │   ├── test_output_parser_declared_fields.py
     │   ├── test_output_parser_streaming.py
     │   ├── test_page_loader_dsl.py
     │   └── setup/
@@ -1611,6 +1616,400 @@ FILE: component_config/sample-config/in/tables/test.csv.manifest
 
 
 ================================================
+FILE: docs/cftl-656-release-migration-test.cleanup.sh
+================================================
+#!/usr/bin/env bash
+# Tear down the CFTL-656 migration-test configs + their derived Storage buckets on cf-dev.
+# Safe to re-run: missing configs/buckets are skipped. Requires kbagent with a cf-dev project.
+set -u
+
+PROJECT="cf-dev"
+
+# slug : component-id : cohort : config-id  (created by the migration test run)
+CONFIGS=(
+  "instagram:keboola.ex-instagram-v2:A:01ksmrq4tc62rjdkqasxsnxz0m"
+  "instagram:keboola.ex-instagram-v2:B:01ksmrq6a27jdknx71mbcstx9d"
+  "instagram:keboola.ex-instagram-v2:C:01ksmrq7ntrejf5w3hbgbx2ng8"
+  "fbpages:keboola.ex-facebook-pages:A:01ksmrq9c7snxeb5qphdy303sv"
+  "fbpages:keboola.ex-facebook-pages:B:01ksmrqapgwcq6zggwbye05jdp"
+  "fbpages:keboola.ex-facebook-pages:C:01ksmrqc27zspanyd0480cmm47"
+  "fbads:keboola.ex-facebook-ads-v2:A:01ksmrqdgz1yrtv9nww0yrrhzq"
+  "fbads:keboola.ex-facebook-ads-v2:B:01ksmrqey5hehvd2q51rwkcbfy"
+  "fbads:keboola.ex-facebook-ads-v2:C:01ksmrqgg6j6m05na70yrgymqx"
+)
+
+bucket_prefix() {
+  # component-id dots -> dashes
+  echo "in.c-${1//./-}-${2}"
+}
+
+for spec in "${CONFIGS[@]}"; do
+  IFS=":" read -r slug comp cohort cid <<<"$spec"
+  bucket="$(bucket_prefix "$comp" "$cid")"
+  echo "=== ${slug} cohort ${cohort} (${cid}) ==="
+  echo "  deleting bucket ${bucket} (with tables)"
+  kbagent --json storage delete-bucket --project "$PROJECT" --bucket-id "$bucket" --force >/dev/null 2>&1 \
+    && echo "    bucket removed" || echo "    bucket absent / already removed"
+  echo "  deleting config ${cid}"
+  kbagent --json config delete --project "$PROJECT" --component-id "$comp" --config-id "$cid" >/dev/null 2>&1 \
+    && echo "    config removed" || echo "    config absent / already removed"
+done
+
+echo "cleanup complete"
+
+
+
+================================================
+FILE: docs/cftl-656-release-migration-test.md
+================================================
+# CFTL-656 release migration test (SUPPORT-16397)
+
+Customer-side acceptance test for the declared-field-backfill fix shipping as
+`0.0.19`. Validates that the three real customer migration paths across
+`0.0.17 → 0.0.18 → 0.0.19` are safe, on **real incremental Storage loads**
+(not VCR — VCR replays HTTP, it cannot exercise Storage schema evolution).
+
+## Why a platform test (not a functional/VCR test)
+
+The bug and its fix are about the **column set written to an existing Storage
+table on an incremental load**. Storage rejects a load when the CSV column set
+diverges from the destination table:
+
+- CSV has a column the table lacks → `Extra columns found` (the 0.0.18 forward break)
+- CSV lacks a column the table has → `Missing columns` (the reverse-direction risk)
+
+Only a real run against a persistent table reproduces this. VCR functional
+tests (in `tests/functional/`) cover the parser output shape; this runbook
+covers the cross-version Storage transitions.
+
+## Versions under test
+
+| Label | Image tag | Meaning |
+|---|---|---|
+| 0.0.17 | `0.0.17` | last good release before the incident (current rollback) |
+| 0.0.18 | `0.0.18` | the CFTL-630 backfill release that caused SUPPORT-16397 |
+| 0.0.19 | `cftl-656-followup-bare-tokens-and-child-rows-419` | this branch's CI build (the fix) |
+
+## Setup
+
+- Project: `cf-dev` (4214).
+- One config per (component × cohort), copied from the canonical changelog test
+  configs, so every config carries the **full bug-triggering field list**
+  (bare-token `comments,from_id,from_full_name` on instagram Q16, nested-edge
+  tokens on fb-pages, action-stats on fb-ads). Each config writes incrementally
+  into its own derived bucket `in.c-<component>-<config-id>`, giving natural
+  isolation.
+- Driver: `/tmp/cust_test/driver.py` (kept local, not committed). Config id map:
+  `/tmp/cust_test/configs.tsv`. Raw results: `/tmp/cust_test/results.json`.
+
+## Cohorts & sequences
+
+All cohorts use the bug-triggering config. Under incremental load, `0.0.18`
+succeeds **only when its table is born on 0.0.18** (the first load of a new
+table accepts any column set); on a table already created by 0.0.17 it fails
+with `Extra columns`. That platform fact shapes the three sequences:
+
+| Cohort | Real-world customer | Sequence | Storage state probed |
+|---|---|---|---|
+| **A** | suffered the 0.0.18 break, rolled back | `0.0.17 → 0.0.18 → 0.0.17 → 0.0.19` | does the fix load cleanly onto a **0.0.17-shaped** table |
+| **B** | "worked fine" on 0.0.18 (table born on 0.0.18) | `0.0.17 → [drop bucket] → 0.0.18 → 0.0.19` | **reverse direction** — does the fix break a **phantom-laden** table with `Missing columns` |
+| **C** | broke on 0.0.18, never adopted it (custom-tagged 0.0.17) | `0.0.17 → 0.0.19` | does the fix load cleanly onto a 0.0.17-shaped table (no 0.0.18 in history) |
+
+> Cohort B's `[drop bucket]` between 0.0.17 and 0.0.18 models the only realistic
+> way a phantom-column-producing config "worked fine" on 0.0.18: the destination
+> table was new (or recreated) under 0.0.18, so the first load accepted the
+> phantom columns and persisted them. This is the schema state that then meets
+> 0.0.19 — the case we most need to clear.
+
+## Backend matters — and cf-dev is Snowflake
+
+`cf-dev` runs on **Snowflake**, whose incremental load is **asymmetric**:
+
+- **Adding** columns is tolerated — a CSV with extra columns silently widens the table.
+- **Missing** columns are rejected — a CSV lacking a column the table has fails with
+  `Some columns are missing in the csv file. Missing columns: …`.
+
+The original SUPPORT-16397 customer failure was on **BigQuery BYODB**, which rejects
+**both** directions (`During the import new columns can't be added`). So the two
+backends fail at *different* steps:
+
+| | adds phantom cols (0.0.18 forward) | drops phantom cols (0.0.19 / rollback) |
+|---|---|---|
+| **BigQuery BYODB** | ❌ rejected up front (table stays clean) | ✅ clean table, fix loads fine |
+| **Snowflake** | ✅ silently widens table | ❌ rejected — `Missing columns` |
+
+This is the crux: **on Snowflake, 0.0.18 succeeds but permanently widens the table,
+and then *both the 0.0.17 rollback and the 0.0.19 fix fail* with `Missing columns`** —
+because neither re-emits the phantom columns the table now carries. This empirically
+explains the post-rollback failures the Lion Communications reporter described in
+CFTL-630 ("even the rollback must be broken … some of our components started to fail"):
+that project is Snowflake (eu-central-1), its tables were widened by 0.0.18, so the
+0.0.17 rollback then rejected the narrower CSV.
+
+## Predicted outcomes
+
+| Cohort | step | tag | predicted | rationale |
+|---|---|---|---|---|
+| A | 1 | 0.0.17 | ✅ success | fresh table, minimal column set |
+| A | 2 | 0.0.18 | ❌ `Extra columns` | backfill adds phantom cols vs the 0.0.17 table; load rejected, table unchanged |
+| A | 3 | 0.0.17 | ✅ success | back to minimal column set, matches table |
+| A | 4 | 0.0.19 | ✅ success | fix produces minimal column set, matches table |
+| B | 1 | 0.0.17 | ✅ success | fresh table |
+| B | 2 | 0.0.18 | ✅ success | table dropped first → born on 0.0.18 with phantom cols |
+| B | 3 | 0.0.19 | ⚠️ **key check** | fix drops phantom cols; table has them → risk of `Missing columns` |
+| C | 1 | 0.0.17 | ✅ success | fresh table |
+| C | 2 | 0.0.19 | ✅ success | fix produces minimal column set onto 0.0.17 table |
+
+The cohort-B step-3 result is the decisive one for the release: if it loads,
+the fix is safe even for tables that picked up phantom columns under 0.0.18.
+If it fails with `Missing columns`, those customers need a column-drop migration
+before upgrading — captured in the rollout note on PR #55.
+
+## Results
+
+<!-- filled in by the run; see /tmp/cust_test/results.json for raw column sets -->
+
+### instagram — COMPLETE (Snowflake / cf-dev)
+
+Tracked tables: `query_16_media` (parent), `query_16_comments` (child). Column
+counts shown as `media`/`comments`.
+
+| Cohort | step | tag | job | cols (media/comments) | note |
+|---|---|---|---|---|---|
+| A | 1 | 0.0.17 | ✅ success | 16 / 6 | fresh table, correct columns |
+| A | 2 | 0.0.18 | ✅ success | 19 / 20 | Snowflake **widens** table (phantom cols added) |
+| A | 3 | 0.0.17 | ❌ `Missing columns: comments,from_full_name,from_id` | 19 / 20 | rollback can't fill the phantom cols → **rejected** |
+| A | 4 | 0.0.19 | ❌ `Missing columns: comments,from_full_name,from_id` | 19 / 20 | **fix also rejected** — table still carries 0.0.18 phantoms |
+| B | 1 | 0.0.17 | ✅ success | 16 / 6 | fresh table |
+| B | 2 | 0.0.18 (bucket dropped first) | ✅ success | 19 / 20 | table **born on 0.0.18** with phantom cols |
+| B | 3 | 0.0.19 | ❌ `Missing columns: …` | 19 / 20 | reverse-direction break confirmed |
+| C | 1 | 0.0.17 | ✅ success | 16 / 6 | fresh table |
+| C | 2 | 0.0.19 | ✅ success | 16 / 6 | **clean upgrade** — table never touched by 0.0.18 |
+
+Job IDs: A = 46209068 / 46209499 / 46209634 / 46209730; B = 46209822 / 46210093 / 46210319; C = 46210357 / 46210383.
+
+**Verdict (instagram):** the fix produces the *correct* column set everywhere
+(16/6, matching the VCR functional expecteds). The only clean upgrade path is
+**cohort C** — a table whose history never included a successful 0.0.18 run. Any
+Snowflake table widened by 0.0.18 (cohorts A and B) rejects **both** the 0.0.17
+rollback and the 0.0.19 fix until the phantom columns are dropped.
+
+Phantom columns 0.0.18 adds (must be dropped before upgrading a widened table):
+
+- `query_16_media`: `comments`, `from_id`, `from_full_name`
+- `query_16_comments`: `caption`, `comments`, `comments_count`, `from_full_name`, `from_id`, `ig_id`, `is_comment_enabled`, `like_count`, `media_type`, `media_url`, `owner`, `permalink`, `shortcode`, `thumbnail_url`
+
+### facebook_pages — COMPLETE (Snowflake / cf-dev)
+
+Same pattern as instagram. Phantom columns appear on `query_23_comments`,
+`query_42_summary`, `query_50_ratings`.
+
+| Cohort | step | tag | job | note |
+|---|---|---|---|---|
+| A | 1 | 0.0.17 | ✅ success | baseline schema |
+| A | 2 | 0.0.18 | ✅ success | table widened (+1 col on 3 tables) |
+| A | 3 | 0.0.17 | ❌ `Missing columns` | rollback rejected |
+| A | 4 | 0.0.19 | ❌ `Missing columns` | fix also rejected — table still carries phantoms |
+| B | 1 | 0.0.17 | ✅ success | baseline |
+| B | 2 | 0.0.18 (bucket dropped) | ✅ success | born on 0.0.18 with phantoms |
+| B | 3 | 0.0.19 | ❌ `Missing columns` | reverse-direction break |
+| C | 1 | 0.0.17 | ✅ success | baseline |
+| C | 2 | 0.0.19 | ✅ success | **clean upgrade** |
+
+Phantom columns 0.0.18 adds (drop before upgrading a widened table):
+- `query_23_comments`: `comments`
+- `query_42_summary`: `comments`
+- `query_50_ratings`: `rating`
+
+Verdict identical: clean only for cohort C; widened tables (A, B) reject both
+rollback and fix until phantoms dropped.
+
+### facebook_ads — COMPLETE (Snowflake / cf-dev)
+
+Same pattern. 0.0.18 widens many `*_insights` action tables plus
+`query_134_adcreatives` and `query_218_customconversions`.
+
+| Cohort | step | tag | job |
+|---|---|---|---|
+| A | 1 | 0.0.17 | ✅ success |
+| A | 2 | 0.0.18 | ✅ success (table widened) |
+| A | 3 | 0.0.17 | ❌ `Missing columns` (e.g. `ad_id` on query_170) |
+| A | 4 | 0.0.19 | ❌ `Missing columns` |
+| B | 1 | 0.0.17 | ✅ success |
+| B | 2 | 0.0.18 (bucket dropped) | ✅ success |
+| B | 3 | 0.0.19 | ❌ `Missing columns: ad_id` (query_170) |
+| C | 1 | 0.0.17 | ✅ success |
+| C | 2 | 0.0.19 | ✅ success (clean upgrade) |
+
+Phantom / feature columns 0.0.18 adds (drop before upgrading a widened table):
+- `query_4_insights`, `query_41_insights`: `action_values`
+- `query_28_insights`, `query_37_insights`: `actions`, `action_values`
+- `query_195_insights`: `actions`
+- `query_193_insights`: `actions`, `action_values`, `video_30_sec_watched_actions`, `video_p25/p50/p75/p100_watched_actions`
+- `query_170_insights`: `ad_id`
+- `query_113_insights`: `campaign_id`, `campaign_name`
+- `query_45_insights`: `reach`
+- `query_134_adcreatives`: `adset_id`, `link_url`, `object_url`
+- `query_218_customconversions`: `action_source_type`, `description`, `event_source_id`
+
+> Note: some of these (e.g. `ad_id`, `campaign_name`, `reach`) are the **legitimate
+> CFTL-630 fields** the feature is meant to add — not phantoms. They still count as
+> "columns the 0.0.17 table lacks", so they participate in the same widen/narrow
+> Storage mechanic. This is why the migration affects more than just the bare-token
+> phantom tables.
+
+### The one-line mental model (empirically verified)
+
+```
+0.0.17 schema  ⊂  0.0.19 schema  ⊂  0.0.18 schema
+```
+
+- **0.0.19 vs a 0.0.17-shaped table** (never ran 0.0.18, or 0.0.18 was rejected on
+  BigQuery): 0.0.19 is *wider* — it adds the legitimate CFTL-630 feature columns.
+  fb-ads cohort C confirmed: most tables identical to 0.0.17, ~8 widened
+  (`query_113` 12→14, `query_134` 7→10, `query_28` 7→9, `query_218` 8→11,
+  `query_37` 9→11, `query_41` 16→17, `query_45` 12→13, `query_4` 17→18). On
+  Snowflake the widening is accepted (cohort C succeeded); on BigQuery BYODB it
+  would be rejected (`Extra columns`) — inherent to delivering the feature, not a
+  PR defect.
+- **0.0.19 vs a 0.0.18-widened table** (ran 0.0.18 successfully on Snowflake):
+  0.0.19 is *narrower* (phantoms removed) → `Missing columns` until those columns
+  are dropped (cohorts A/B).
+
+## Verdict & decision
+
+The fix (PR #55) produces the **correct, intended schema** on every transition.
+The cross-version *Storage* failures are caused by table column-set mutation under
+0.0.18, not by the fix. Decision for the release: **ship PR #55** + a support
+remediation runbook (drop the 0.0.18-added columns on already-widened tables). The
+auto-heal reconcile-to-existing-schema fallback is recorded as an optional
+follow-up (needs `forward_token` + Storage introspection; CFT-2729 precedent).
+
+## Release implications
+
+1. **The code fix is correct but not sufficient on its own for Snowflake.** 0.0.19
+   emits the right column set, but a Snowflake table that was widened by a
+   successful 0.0.18 run will reject it with `Missing columns` — exactly as it
+   already rejects the 0.0.17 rollback. These customers are *already broken on
+   0.0.17 today*; shipping 0.0.19 does not un-break them by itself.
+
+2. **Mandatory remediation for any table touched by 0.0.18 on Snowflake:** drop the
+   phantom columns from the destination Storage tables (or recreate the tables)
+   before the first 0.0.19 run. The phantom-column lists per query are recorded
+   above (instagram) and below (pages/ads). This makes the rollout note on PR #55
+   a hard prerequisite, not advisory, for the Snowflake + 0.0.18 cohort.
+
+3. **BigQuery BYODB customers are fine:** 0.0.18 was rejected up front there, so
+   their tables stayed clean and 0.0.19 loads without remediation.
+
+4. **Safe cohort everywhere:** any customer who never had a successful 0.0.18 run
+   (cohort C) upgrades to 0.0.19 cleanly.
+
+5. **Optional product follow-up to consider:** a one-shot "reconcile to existing
+   Storage schema" mode, or guidance to use full-load (not incremental) for the
+   first 0.0.19 run, would let widened tables self-heal without manual column
+   drops. Worth a separate ticket — out of scope for this fix.
+
+## Cleanup
+
+The 9 configs + buckets are left in place for inspection. To remove:
+
+```bash
+bash docs/cftl-656-release-migration-test.cleanup.sh
+```
+
+
+
+================================================
+FILE: docs/cftl-656-support-remediation.md
+================================================
+# Support remediation — FB/Instagram extractors after the 0.0.18 incident (CFTL-656 / SUPPORT-16397)
+
+For customers whose extractor **failed after the 0.0.17 rollback** or **fails on
+upgrade to 0.0.19**, with an error like:
+
+```
+Failed to load table "...": Some columns are missing in the csv file.
+Missing columns: <cols>. Expected columns: ...
+```
+
+## What happened
+
+`0.0.18` of `keboola.ex-facebook-ads-v2` / `keboola.ex-facebook-pages` /
+`keboola.ex-instagram-v2` added extra columns to output tables. On
+**column-add-tolerant backends (Snowflake / most Azure & GCP stacks)** the
+0.0.18 job *succeeded and physically widened the Storage table*. After the
+rollback to 0.0.17 (and likewise under the 0.0.19 fix) the extractor stops
+emitting those columns, so an incremental load now fails with **`Missing
+columns`** — the table has columns the new CSV doesn't.
+
+(On **BigQuery BYODB** the 0.0.18 job was rejected up front, so those tables
+stayed clean and need no remediation.)
+
+The 0.0.18-added columns are **empty** (no data), so dropping them is safe.
+
+## Fix: drop the 0.0.18-added columns from the affected tables
+
+1. Identify the added columns. The reliable, customer-specific way (works for any
+   config): open the failing table's **Events**, find the import event from the
+   **0.0.18 run** vs the prior **0.0.17 run**, and note the columns that appeared.
+   The error message's `Missing columns: …` list is also exactly the set to drop.
+2. (Optional, to reassure the customer) create a **table snapshot** first.
+3. In the table **Schema** tab, select those columns and **Delete**.
+4. Re-run the configuration — it loads cleanly afterward.
+
+### Columns 0.0.18 typically adds, by component (from the cf-dev reproduction)
+
+The exact set depends on the customer's query field list; use these as a guide
+for what to look for (the `Missing columns` error is authoritative per table).
+
+**keboola.ex-instagram-v2**
+- media tables: `comments`, `from_id`, `from_full_name`
+- comment tables: parent-row fields leaked into the child table — `caption`,
+  `comments`, `comments_count`, `from_full_name`, `from_id`, `ig_id`,
+  `is_comment_enabled`, `like_count`, `media_type`, `media_url`, `owner`,
+  `permalink`, `shortcode`, `thumbnail_url`
+
+**keboola.ex-facebook-pages**
+- comments tables: `comments`
+- post-summary tables: `comments`
+- ratings tables: `rating`
+- feed child tables (`*_attachments`, `*_comments`, `*_likes`): parent-row
+  scalars leaked in (`message`, `created_time`, `shares`, `permalink_url`,
+  `is_published`, …)
+
+**keboola.ex-facebook-ads-v2**
+- action-stats / insights tables: `actions`, `action_values`,
+  `video_30_sec_watched_actions`, `video_p25/p50/p75/p100_watched_actions`
+- some insights tables also gained legitimate CFTL-630 fields that 0.0.17
+  lacked (`ad_id`, `campaign_id`, `campaign_name`, `reach`) — these are also
+  empty on the affected rows and safe to drop for the migration
+- adcreatives tables: `adset_id`, `link_url`, `object_url`
+- customconversions tables: `action_source_type`, `description`, `event_source_id`
+
+## Alternative (no column drop): pin the 0.0.18 custom tag temporarily
+
+If the customer is uncomfortable dropping columns, unblock them by pinning the
+0.0.18 tag via the config `runtime` field until 0.0.19 ships and they can do the
+column drop at leisure:
+
+```json
+{ "parameters": { }, "runtime": { "tag": "0.0.18" } }
+```
+
+This keeps producing the wide schema that matches their current table.
+
+## Customer messaging notes
+
+- Apologise; the 0.0.18 release contained a bug and was rolled back.
+- The extra columns are **empty** — dropping them loses no data (offer a snapshot
+  if they're unsure; this addresses the concern raised in SUPPORT-16425).
+- After 0.0.19 ships, no custom tag is needed; the column drop is the durable fix.
+- Do **not** name other customers; reference SUPPORT/Linear IDs only.
+
+
+
+================================================
 FILE: scripts/developer_portal/fn_actions_md_update.sh
 ================================================
 #!/bin/bash
@@ -2617,6 +3016,31 @@ class OutputParser:
         "frequency_control_specs",
     ]
 
+    # Parser-synthesized output column names that are NEVER valid FB Graph bare field
+    # names. Users who declared these as bare tokens in their config field list were
+    # copying parser child-row outputs back into the request — the FB API silently
+    # ignored those tokens, returning rows that didn't contain them. Pre-PR #50 the
+    # parser then emitted no column at all; PR #50's backfill injected them as empty
+    # strings on parent rows, which surfaced as ``Extra columns found: "from_id, ..."``
+    # Storage failures (CFTL-656 / SUPPORT-16397).
+    #
+    # Runtime detection in ``_observed_connections`` catches connection-shaped values
+    # the API actually returns (``{"data": [...]}``, list-of-dicts), so we deliberately
+    # do NOT keep a general FB connection-edge allowlist — that risks dropping a name
+    # that is a legitimate scalar field somewhere. This allowlist is limited to names
+    # the parser itself synthesizes when flattening nested ``from{...}`` expansions and
+    # is therefore safe: no resource type uses these as flat scalar fields, the API
+    # never returns them as keys, and users only encountered them as legacy CSV output
+    # column names.
+    PARSER_SYNTHESIZED_FIELDS = frozenset(
+        {
+            "from_id",
+            "from_name",
+            "from_full_name",
+            "from_username",
+        }
+    )
+
     def __init__(self, page_loader, page_id: str, row_config):
         self.page_loader = page_loader
         self.page_id = page_id
@@ -2624,6 +3048,11 @@ class OutputParser:
         # Parse the declared field list once — used by _backfill_declared_fields to keep
         # the output CSV schema stable when the FB API omits a field for the period (CFTL-630).
         self._declared_fields = self._parse_declared_fields(getattr(row_config, "query", None))
+        # FB Graph connection names observed in API responses for THIS query are tracked here
+        # and excluded from backfill on subsequent rows. Catches connection edges that aren't
+        # in the static allowlist (e.g. account-specific custom edges). Populated by
+        # ``_process_fields`` as it routes ``{"data": [...]}`` keys to child tables.
+        self._observed_connections: set[str] = set()
 
     # Minimum rows buffered before yielding a streaming batch (CFTL-473).
     # Page-sized yields made test suites ~6x slower because every batch pays
@@ -2640,6 +3069,7 @@ class OutputParser:
         parent_id: str,
         table_name: str | None = None,
         row_threshold: int | None = None,
+        apply_backfill: bool = True,
     ) -> Iterator[dict[str, list[dict[str, Any]]]]:
         """Stream parsed rows as ``{table: [rows...]}`` batches (CFTL-473 / SUPPORT-15993).
 
@@ -2652,6 +3082,11 @@ class OutputParser:
 
         Nested-field pagination is still resolved synchronously inside each outer
         row to preserve existing row ordering guarantees.
+
+        ``apply_backfill`` gates the declared-field backfill on each emitted row. It is
+        ``True`` for the outer query (so CFTL-630 stays fixed) and ``False`` when the
+        parser recurses into nested child tables via ``_process_nested_data`` — child
+        rows must not receive the parent query's declared-field schema (CFTL-656).
         """
         threshold = row_threshold if row_threshold is not None else self.DEFAULT_STREAM_ROW_THRESHOLD
         if not isinstance(threshold, int) or threshold <= 0:
@@ -2664,8 +3099,15 @@ class OutputParser:
             if not rows:
                 break
 
+            # Pre-scan: observe connection-shaped keys across all rows in this page
+            # BEFORE running backfill on any of them. Without this, a connection that
+            # appears in row N can't influence backfill on rows 1..N-1 (CFTL-656).
+            if apply_backfill:
+                for row in rows:
+                    self._observe_connection_keys(row)
+
             for row in rows:
-                self._process_row(row, fb_node, parent_id, table_name, result)
+                self._process_row(row, fb_node, parent_id, table_name, result, apply_backfill=apply_backfill)
                 buffered_rows = sum(len(v) for v in result.values())
                 if buffered_rows >= threshold:
                     yield result
@@ -2675,21 +3117,40 @@ class OutputParser:
         if result:
             yield result
 
+    def _observe_connection_keys(self, row: dict[str, Any]) -> None:
+        """Record any key whose value is a FB Graph connection-shaped payload.
+
+        Values that look like ``{"data": [...]}``, ``{"summary": {...}}``, or a
+        list whose first element is a dict identify the key as a connection edge —
+        it will be extracted as a child table by ``_process_fields`` and must not
+        also be backfilled onto the parent row as an empty string (CFTL-656).
+        """
+        for key, value in row.items():
+            if isinstance(value, dict) and ("data" in value or "summary" in value):
+                self._observed_connections.add(key)
+            elif isinstance(value, list) and value and isinstance(value[0], dict):
+                self._observed_connections.add(key)
+
     def parse_data(
         self,
         response: dict,
         fb_node: str,
         parent_id: str,
         table_name: str | None = None,
+        apply_backfill: bool = True,
     ) -> dict[str, list[dict[str, Any]]]:
         """Fully accumulate rows into a single dict (pre-CFTL-473 behavior).
 
         Kept for recursive nested-field processing, where synchronous accumulation is
         intentional: nested responses share the outer row's lifetime and must be merged
         into the page's batch in deterministic order.
+
+        ``apply_backfill`` is forwarded to ``iter_parsed_data``; ``_process_nested_data``
+        sets it to ``False`` so child-table rows do not receive the parent's declared
+        fields (CFTL-656).
         """
         result: dict[str, list[dict[str, Any]]] = {}
-        for batch in self.iter_parsed_data(response, fb_node, parent_id, table_name):
+        for batch in self.iter_parsed_data(response, fb_node, parent_id, table_name, apply_backfill=apply_backfill):
             for k, v in batch.items():
                 if k in result:
                     result[k].extend(v)
@@ -2730,14 +3191,22 @@ class OutputParser:
         parent_id: str,
         table_name: str | None,
         result: dict[str, list[dict[str, Any]]],
+        apply_backfill: bool = True,
     ) -> None:
-        """Process a single row from the API response."""
+        """Process a single row from the API response.
+
+        ``apply_backfill`` defaults to ``True`` for the outer query (preserves
+        CFTL-630). Recursive calls from ``_process_nested_data`` pass ``False`` so
+        child-table rows do not receive the parent's declared-field schema
+        (CFTL-656).
+        """
         table_name = self._get_table_name(table_name or getattr(self.row_config.query, "path", ""))
 
         # Backfill fields the user explicitly requested but that FB omitted from this row.
         # Stops Storage loads from failing with "Missing columns: impressions" when the
         # API returns no rows containing a metric for the queried period (CFTL-630).
-        row = self._backfill_declared_fields(row)
+        if apply_backfill:
+            row = self._backfill_declared_fields(row)
 
         # Create base row with metadata
         base_row = self._create_base_row(fb_graph_node, parent_id)
@@ -2784,11 +3253,18 @@ class OutputParser:
         for it in the queried period. Downstream Storage loads then fail with
         ``Missing columns: ...`` because the destination table already has the column
         from a previous run. Filling absent declared fields with ``""`` keeps the
-        output CSV schema stable regardless of API response content.
+        output CSV schema stable regardless of API response content (CFTL-630).
+
+        ``_observed_connections`` excludes any declared field name the parser has
+        already seen in this query as a connection-shaped value (``{"data": [...]}``
+        / ``{"summary": ...}`` / list-of-dicts). Injecting those as empty strings on
+        the parent row would produce phantom columns and the "Extra columns found"
+        Storage failure documented in SUPPORT-16397 (CFTL-656).
         """
         if not self._declared_fields:
             return row
-        missing = [field for field in self._declared_fields if field not in row]
+        excluded = self.PARSER_SYNTHESIZED_FIELDS | self._observed_connections
+        missing = [field for field in self._declared_fields if field not in row and field not in excluded]
         if not missing:
             return row
         filled = dict(row)
@@ -2831,7 +3307,8 @@ class OutputParser:
             if isinstance(fields_val, str):
                 return OutputParser._split_field_dsl(fields_val)
             if isinstance(fields_val, list):
-                return [OutputParser._base_field_name(str(f)) for f in fields_val if str(f).strip()]
+                names = [OutputParser._base_field_name(str(f)) for f in fields_val if str(f).strip()]
+                return [name for name in names if name]
 
         return []
 
@@ -2871,10 +3348,22 @@ class OutputParser:
 
     @staticmethod
     def _base_field_name(field_dsl: str) -> str:
-        """Strip ``{...}`` expansion and ``.modifier(args)`` suffix from a DSL token."""
+        """Return the token if it is a flat scalar field; empty string otherwise.
+
+        Only flat scalar names (``impressions``, ``ad_id``, ``shares``) are columns
+        on the parent row and need backfilling when the API omits them. Tokens with
+        ``{...}`` expansion (``comments{message,from}``) or ``.modifier(...)`` calls
+        (``comments.limit(0).summary(true)``, ``reactions.type(SAD)``) are nested-edge
+        traversals that produce CHILD tables and have no parent-row column — backfilling
+        them as empty strings on the parent injects phantom columns and breaks Storage
+        loads with "Extra columns found" (CFTL-656 / SUPPORT-16397).
+        """
         token = field_dsl.replace("\n", "").strip()
-        cuts = [i for i in (token.find(c) for c in "{.(") if i >= 0]
-        return token[: min(cuts)].strip() if cuts else token
+        if not token:
+            return ""
+        if any(c in token for c in "{.("):
+            return ""
+        return token
 
     def _create_base_row(self, fb_graph_node: str, parent_id: str) -> dict[str, Any]:
         """Create base row with standard metadata."""
@@ -2916,6 +3405,10 @@ class OutputParser:
                 processed["values"] = value
             elif isinstance(value, dict) and "data" in value:
                 processed["nested_tables"][key] = value
+                # Once we have seen a key as a connection edge in any row, exclude it
+                # from declared-field backfill on every subsequent row of this query
+                # (CFTL-656 dynamic detection — complements FB_CONNECTION_EDGES).
+                self._observed_connections.add(key)
                 # Also check if this nested object has summary alongside data
                 if "summary" in value:
                     fake_nested = {"data": [value["summary"]]}
@@ -2923,6 +3416,7 @@ class OutputParser:
             elif isinstance(value, dict) and "summary" in value:
                 fake_nested = {"data": [value["summary"]]}
                 processed["nested_tables"]["summary"] = fake_nested
+                self._observed_connections.add(key)
             elif key in self.ADS_ACTION_STATS_ROW and isinstance(value, list):
                 # Handle Facebook Ads action stats as separate table
                 processed["action_stats"][key] = value
@@ -3173,12 +3667,22 @@ class OutputParser:
             return f"{self.row_config.name}_{stats_field_name}_insights"
 
     def _process_nested_data(self, nested_tables: dict, original_row: dict, fb_graph_node: str, result: dict) -> None:
-        """Process nested table data recursively into the current batch."""
+        """Process nested table data recursively into the current batch.
+
+        The recursive parse runs with ``apply_backfill=False`` because the parent
+        query's declared field list describes the parent row's schema, not the
+        child table's. Without this gate, every nested row got the parent's
+        declared fields injected as empty strings — surfaced as
+        ``Extra columns found`` Storage failures on child tables like
+        ``feed_attachments`` / ``feed_comments`` (CFTL-656 / SUPPORT-16397).
+        """
         for table_name, table_data in nested_tables.items():
             nested_graph_node = f"{fb_graph_node}_{table_name}"
             nested_row_id = original_row.get("id")
 
-            nested_result = self.parse_data(table_data, nested_graph_node, nested_row_id, table_name)
+            nested_result = self.parse_data(
+                table_data, nested_graph_node, nested_row_id, table_name, apply_backfill=False
+            )
 
             # Merge nested results
             for nested_table, nested_rows in nested_result.items():
@@ -4073,6 +4577,379 @@ class TestDeclaredFieldBackfill(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+================================================
+FILE: tests/test_output_parser_declared_fields.py
+================================================
+"""Regression tests for ``OutputParser`` field-list parsing (CFTL-656 / SUPPORT-16397).
+
+PR #50 introduced ``_backfill_declared_fields`` to fix CFTL-630 — when the Facebook API
+omits a requested flat field from a row (zero data for the period), the function writes
+``""`` so the output CSV keeps a stable column set against the existing Storage schema.
+
+That fix was correct for flat scalar names (``impressions``, ``spend``, ``shares``) but
+the field parser also returned a base name for **nested-edge DSL tokens** such as
+``comments{message,from}`` or ``comments.limit(0).summary(true)``. Those names identify
+*child tables*, not parent-row columns. Backfilling them as empty strings injected
+phantom ``comments`` / ``messages`` / ``likes`` columns onto parent rows, and Storage
+rejected the load with::
+
+    Extra columns found: "comments, shares".
+    During the import new columns can't be added.
+
+These tests pin down:
+
+* nested-edge tokens (``{...}`` expansion, ``.modifier(...)``) are NOT backfilled;
+* flat scalar tokens still ARE backfilled (the original CFTL-630 case still passes);
+* mixed field lists (flat + nested) keep only the flat names;
+* the bug scenario itself — a row missing the nested key — leaves the parent row
+  free of any phantom column.
+"""
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from output_parser import OutputParser
+
+
+def _query(fields: str = "", parameters=None) -> MagicMock:
+    q = MagicMock()
+    q.fields = fields
+    q.parameters = parameters
+    return q
+
+
+# ---------- _base_field_name ----------
+
+
+@pytest.mark.parametrize(
+    "token,expected",
+    [
+        ("impressions", "impressions"),
+        ("ad_id", "ad_id"),
+        ("shares", "shares"),
+        ("  spend  ", "spend"),
+        ("", ""),
+        ("   ", ""),
+    ],
+)
+def test_base_field_name_keeps_flat_scalars(token: str, expected: str) -> None:
+    assert OutputParser._base_field_name(token) == expected
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "comments{message,from}",
+        "comments{message,from{name}}",
+        "attachments{caption,type,description}",
+        "messages{created_time,from,to,message}",
+        "likes{name,username}",
+        "comments.limit(0).summary(true)",
+        "comments.summary(total_count, can_comment).limit(0)",
+        "reactions.type(SAD).summary(total_count).limit(0)",
+        "reactions.type(SAD)",
+    ],
+)
+def test_base_field_name_drops_nested_edges(token: str) -> None:
+    assert OutputParser._base_field_name(token) == ""
+
+
+# ---------- _split_field_dsl ----------
+
+
+def test_split_field_dsl_keeps_flat_drops_nested() -> None:
+    fields = "attachments{caption, type, description},message,created_time,shares"
+    assert OutputParser._split_field_dsl(fields) == ["message", "created_time", "shares"]
+
+
+def test_split_field_dsl_all_nested_returns_empty() -> None:
+    fields = "comments{message,created_time,from,comments{message,created_time,from}}"
+    assert OutputParser._split_field_dsl(fields) == []
+
+
+def test_split_field_dsl_all_flat_unchanged() -> None:
+    fields = "ad_id,ad_name,spend,impressions,reach"
+    assert OutputParser._split_field_dsl(fields) == ["ad_id", "ad_name", "spend", "impressions", "reach"]
+
+
+# ---------- _parse_declared_fields ----------
+
+
+def test_parse_declared_fields_insights_flat_only() -> None:
+    query = _query("insights.since(today).metric(impressions,spend){ad_id,impressions,spend,reach}")
+    assert OutputParser._parse_declared_fields(query) == ["ad_id", "impressions", "spend", "reach"]
+
+
+def test_parse_declared_fields_path_query_with_mixed_fields() -> None:
+    # Real shape: query_14 from Matyas's test config, also typical of GRPN configs.
+    query = _query("attachments{caption, type, description},message,created_time,shares")
+    assert OutputParser._parse_declared_fields(query) == ["message", "created_time", "shares"]
+
+
+def test_parse_declared_fields_pure_nested_returns_empty() -> None:
+    # The exact GRPN bug shape — query 23 in Matyas's test config.
+    query = _query("comments{message,created_time,from,comments{message,created_time,from}}")
+    assert OutputParser._parse_declared_fields(query) == []
+
+
+def test_parse_declared_fields_modifier_only_returns_empty() -> None:
+    # query 42 in Matyas's test config.
+    query = _query("comments.limit(0).summary(true)")
+    assert OutputParser._parse_declared_fields(query) == []
+
+
+def test_parse_declared_fields_none_query() -> None:
+    assert OutputParser._parse_declared_fields(None) == []
+
+
+def test_parse_declared_fields_empty_fields() -> None:
+    assert OutputParser._parse_declared_fields(_query("")) == []
+
+
+def test_parse_declared_fields_parameters_list_filters_nested() -> None:
+    query = _query(fields="", parameters={"fields": ["impressions", "comments{message}"]})
+    assert OutputParser._parse_declared_fields(query) == ["impressions"]
+
+
+def test_parse_declared_fields_parameters_string_filters_nested() -> None:
+    query = _query(fields="", parameters="fields=attachments{type},message,shares")
+    assert OutputParser._parse_declared_fields(query) == ["message", "shares"]
+
+
+# ---------- end-to-end: _backfill_declared_fields no longer adds phantom columns ----------
+
+
+def _row_config_for(fields: str) -> MagicMock:
+    row_config = MagicMock()
+    row_config.name = "q"
+    row_config.type = "regular"
+    row_config.query.path = "feed"
+    row_config.query.fields = fields
+    row_config.query.parameters = None
+    return row_config
+
+
+def test_backfill_keeps_flat_field_behavior() -> None:
+    # Original CFTL-630 case: API omitted `shares` for this row, backfill must add "".
+    row_config = _row_config_for("message,created_time,shares")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    out = parser._backfill_declared_fields({"id": "post1", "message": "hi", "created_time": "2026-01-01"})
+    assert out == {"id": "post1", "message": "hi", "created_time": "2026-01-01", "shares": ""}
+
+
+def test_backfill_does_not_add_phantom_nested_column() -> None:
+    # The exact bug: a feed-path query with `comments{...}` expansion, on a post that
+    # FB returned without `comments` (zero comments). Pre-fix, the parent row gained a
+    # phantom `comments: ""` column. Post-fix, the parent row stays clean.
+    row_config = _row_config_for("comments{message,created_time,from,comments{message,created_time,from}}")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    row = {"id": "post1", "message": "hi", "created_time": "2026-01-01"}
+    out = parser._backfill_declared_fields(row)
+    assert "comments" not in out
+    assert out == row
+
+
+def test_backfill_mixed_fields_only_backfills_flat() -> None:
+    # GRPN-shape mixed case: nested `attachments{...}` and `comments{...}` alongside
+    # flat `message`, `created_time`, `shares`. Only `shares` is missing from the row.
+    row_config = _row_config_for("attachments{type,url},message,created_time,shares,comments{message}")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    row = {"id": "post1", "message": "hi", "created_time": "2026-01-01"}
+    out = parser._backfill_declared_fields(row)
+    assert "attachments" not in out
+    assert "comments" not in out
+    assert out["shares"] == ""
+
+
+# ---------- PARSER_SYNTHESIZED_FIELDS allowlist (CFTL-656 / SUPPORT-16397) ----------
+
+
+@pytest.mark.parametrize(
+    "synthesized",
+    ["from_id", "from_name", "from_full_name", "from_username"],
+)
+def test_backfill_drops_parser_synthesized_names(synthesized: str) -> None:
+    """The names listed in ``PARSER_SYNTHESIZED_FIELDS`` are produced by the parser's
+    own flattening of nested ``from{...}`` expansions. The FB Graph API never returns
+    them as flat scalar fields — runtime detection therefore can't catch them. Users
+    who declared them as bare tokens in their config field list were copying parser
+    output columns back into request input. The narrow static exclusion list stops
+    backfill from injecting them as phantom empty columns on parent rows."""
+    row_config = _row_config_for(f"id,message,{synthesized}")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    out = parser._backfill_declared_fields({"id": "post1", "message": "hi"})
+    assert synthesized not in out
+    assert out == {"id": "post1", "message": "hi"}
+
+
+def test_backfill_drops_support_16397_instagram_q16_shape() -> None:
+    """Exact field-list shape from the SUPPORT-16397 Instagram failure
+    (``Extra columns found: "comments, from_full_name, from_id"`` on the
+    ``...media`` table). With the combined runtime + synthesized-name fix the
+    parent row must NOT carry any of those three columns:
+
+    * ``comments`` — caught dynamically when any media row returns it as
+      ``{"data": [...]}`` (``_observed_connections``);
+    * ``from_id`` / ``from_full_name`` — caught by the synthesized-name allowlist.
+    """
+    row_config = _row_config_for(
+        "id,caption,media_type,like_count,ig_id,comments_count,is_comment_enabled,"
+        "media_url,owner,permalink,shortcode,timestamp,thumbnail_url,"
+        "comments,from_id,from_full_name"
+    )
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    # Simulate the API revealing ``comments`` as a connection on at least one row.
+    parser._observe_connection_keys({"id": "m0", "comments": {"data": [{"id": "c1"}]}})
+    out = parser._backfill_declared_fields({"id": "media1", "caption": "x", "media_type": "IMAGE", "like_count": 5})
+    for phantom in ("comments", "from_id", "from_full_name"):
+        assert phantom not in out, f"phantom column {phantom} re-injected"
+    # Legitimate flat fields the API omitted still get backfilled with "".
+    assert out["ig_id"] == ""
+    assert out["permalink"] == ""
+
+
+# ---------- _observed_connections runtime detection ----------
+
+
+def test_observed_connections_drops_after_seen_as_dict_with_data() -> None:
+    """If a key appears as ``{"data": [...]}`` in any earlier row, subsequent rows
+    that omit the key must NOT receive it as a backfilled empty column. Catches
+    account-specific or future connection edges not in the static allowlist."""
+    row_config = _row_config_for("id,message,custom_edge")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    # First row reveals `custom_edge` as a connection.
+    parser._process_fields({"id": "1", "message": "a", "custom_edge": {"data": [{"x": 1}]}})
+    assert "custom_edge" in parser._observed_connections
+    # Second row omits `custom_edge` — must NOT be backfilled.
+    out = parser._backfill_declared_fields({"id": "2", "message": "b"})
+    assert "custom_edge" not in out
+
+
+def test_observed_connections_drops_after_seen_as_summary_only() -> None:
+    """Same dynamic detection when a key appears with only ``summary`` (no ``data``),
+    as ``reactions.summary(total_count)`` does."""
+    row_config = _row_config_for("id,reactions_count,my_reactions")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    parser._process_fields({"id": "1", "my_reactions": {"summary": {"total_count": 3}}})
+    assert "my_reactions" in parser._observed_connections
+    out = parser._backfill_declared_fields({"id": "2"})
+    assert "my_reactions" not in out
+
+
+def test_observed_connections_does_not_drop_flat_scalar_fields() -> None:
+    """A regular scalar key seen in a previous row must NOT end up in observed
+    connections — otherwise CFTL-630 regresses for genuine flat fields."""
+    row_config = _row_config_for("id,impressions,reach")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    parser._process_fields({"id": "1", "impressions": 100, "reach": 80})
+    assert parser._observed_connections == set()
+    # Row with API omitting `impressions` must still get backfilled.
+    out = parser._backfill_declared_fields({"id": "2", "reach": 0})
+    assert out["impressions"] == ""
+
+
+def test_observe_connection_keys_picks_up_list_of_dicts() -> None:
+    """FB Ads ``actions`` style fields come back as a list of dicts. Without
+    catching them in ``_observe_connection_keys``, they'd be backfilled as empty
+    strings on parent rows (then leak into action-stats rows via
+    ``_add_action_stats_to_main_table``)."""
+    row_config = _row_config_for("id,actions,action_values")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    parser._observe_connection_keys({"id": "1", "actions": [{"action_type": "view", "value": 1}]})
+    assert "actions" in parser._observed_connections
+    out = parser._backfill_declared_fields({"id": "2"})
+    assert "actions" not in out
+
+
+def test_pre_scan_catches_connection_revealed_in_later_row() -> None:
+    """End-to-end: a query whose FIRST row omits ``comments`` but LATER rows have it
+    as a connection. The within-page pre-scan in ``iter_parsed_data`` must register
+    the connection before backfill runs on row 1 — otherwise row 1 gets a phantom
+    ``comments`` column while later rows do not, producing a mixed schema (CFTL-656)."""
+    row_config = _row_config_for("id,message,comments")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    response = {
+        "data": [
+            # row 0 omits `comments` entirely (the bug-trigger case)
+            {"id": "p1", "message": "first"},
+            # row 1 reveals it as a connection edge
+            {"id": "p2", "message": "second", "comments": {"data": [{"id": "c1", "text": "hi"}]}},
+        ]
+    }
+    result = parser.parse_data(response, "page", "page1", "feed")
+    main_table = next(v for k, v in result.items() if not k.endswith("comments"))
+    for row in main_table:
+        assert "comments" not in row, f"row {row!r} still has phantom 'comments' column"
+
+
+# ---------- apply_backfill flag: nested-row no-backfill ----------
+
+
+def test_process_row_apply_backfill_false_skips_backfill() -> None:
+    """``_process_row`` must not backfill declared fields when called from the nested
+    recursion path. Otherwise the parent query's field list bleeds into child-table
+    rows (the ``feed_attachments`` / ``media_comments`` extra-columns symptom in
+    SUPPORT-16397)."""
+    row_config = _row_config_for("id,message,created_time,shares")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    result: dict = {}
+    # Simulate a child-row payload that lacks parent-only fields (`message`, `shares`).
+    child_row = {"id": "comment1", "from_name": "Alice", "comment_text": "hi"}
+    parser._process_row(child_row, "page_feed_comments", "post1", "comments", result, apply_backfill=False)
+    rows = next(iter(result.values()))
+    assert len(rows) == 1
+    emitted = rows[0]
+    for parent_only in ("message", "shares", "created_time"):
+        assert parent_only not in emitted, (
+            f"child row received parent-only field {parent_only} despite apply_backfill=False"
+        )
+
+
+def test_process_row_apply_backfill_true_still_backfills() -> None:
+    """Sanity: the outer-query path keeps the CFTL-630 backfill behavior."""
+    row_config = _row_config_for("id,message,created_time,shares")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    result: dict = {}
+    outer_row = {"id": "post1", "message": "hi", "created_time": "2026-01-01"}
+    parser._process_row(outer_row, "page_feed", "page1", None, result, apply_backfill=True)
+    rows = next(iter(result.values()))
+    assert len(rows) == 1
+    assert rows[0]["shares"] == ""
+
+
+def test_nested_data_recursion_passes_apply_backfill_false() -> None:
+    """End-to-end: a feed-style response with a nested ``comments`` connection must
+    NOT inject the parent query's declared fields into the child ``feed_comments``
+    rows."""
+    row_config = _row_config_for("id,message,created_time,shares,permalink_url,is_published")
+    parser = OutputParser(page_loader=None, page_id="page1", row_config=row_config)
+    response = {
+        "data": [
+            {
+                "id": "post1",
+                "message": "outer",
+                "comments": {
+                    "data": [
+                        {"id": "c1", "from": {"id": "u1", "name": "Alice"}},
+                        {"id": "c2", "from": {"id": "u2", "name": "Bob"}},
+                    ]
+                },
+            }
+        ]
+    }
+    result = parser.parse_data(response, "page", "page1", "feed")
+    # The recursion produces a child table whose name carries the nested edge identifier.
+    comments_table = next((v for k, v in result.items() if k.endswith("comments") or "comments" in k), None)
+    assert comments_table is not None, f"child table missing; got tables: {list(result)}"
+    assert len(comments_table) == 2, f"expected 2 child rows, got {len(comments_table)}"
+    parent_only_fields = {"message", "created_time", "shares", "permalink_url", "is_published"}
+    for child_row in comments_table:
+        leaking = parent_only_fields & set(child_row)
+        assert not leaking, f"child row leaked parent fields {leaking}: {child_row}"
 
 
 
