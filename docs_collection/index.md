@@ -1017,6 +1017,16 @@
 - Repository: https://github.com/keboola/component-ex-flexibee
 - Description: Keboola extractor for ABRA Flexi (FlexiBee) accounting/ERP data
 
+### component-ex-premier
+- [Documentation](github/component-ex-premier/llm.txt)
+- Repository: https://github.com/keboola/component-ex-premier
+- Description: Keboola extractor for the PREMIER System ERP/accounting API
+
+### component-wr-abra-flexi
+- [Documentation](github/component-wr-abra-flexi/llm.txt)
+- Repository: https://github.com/keboola/component-wr-abra-flexi
+- Description: Keboola writer component for ABRA Flexi (FlexiBee) ERP via REST API
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
