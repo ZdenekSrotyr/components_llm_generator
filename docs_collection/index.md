@@ -1027,6 +1027,11 @@
 - Repository: https://github.com/keboola/component-wr-abra-flexi
 - Description: Keboola writer component for ABRA Flexi (FlexiBee) ERP via REST API
 
+### component-wr-premier
+- [Documentation](github/component-wr-premier/llm.txt)
+- Repository: https://github.com/keboola/component-wr-premier
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
