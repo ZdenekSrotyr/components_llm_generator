@@ -1032,6 +1032,16 @@
 - Repository: https://github.com/keboola/component-wr-premier
 - Description: None
 
+### component-wr-uol
+- [Documentation](github/component-wr-uol/llm.txt)
+- Repository: https://github.com/keboola/component-wr-uol
+- Description: None
+
+### component-ex-uol
+- [Documentation](github/component-ex-uol/llm.txt)
+- Repository: https://github.com/keboola/component-ex-uol
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
