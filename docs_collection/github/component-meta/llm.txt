@@ -38,6 +38,7 @@ Directory structure:
     ├── tests/
     │   ├── __init__.py
     │   ├── conftest.py
+    │   ├── test_client_resilience.py
     │   ├── test_component.py
     │   ├── test_functional.py
     │   ├── test_output_parser_streaming.py
@@ -1719,17 +1720,30 @@ FILE: src/client.py
 ================================================
 import logging
 import re
+import time
 from collections.abc import Iterator
 from typing import Any
 
 from keboola.component.dao import OauthCredentials
 from keboola.component.exceptions import UserException
 from keboola.http_client import HttpClient
-from requests import HTTPError
+from requests import HTTPError, RequestException
+from requests.exceptions import RetryError
 
 from configuration import Account, QueryRow
 from output_parser import OutputParser
-from page_loader import PageLoader
+from page_loader import (
+    _FB_TRANSIENT_ERROR_BACKOFF_BASE,
+    _FB_TRANSIENT_ERROR_MAX_RETRIES,
+    AsyncInsightsJobTransientError,
+    PageLoader,
+)
+
+# Errors that mean "this one object failed transiently / at the API" — contain them
+# (skip the object, count it, warn at end of run) instead of killing the whole extraction.
+# UserException (user-actionable misconfig) and programming errors (KeyError, ...) are
+# intentionally NOT here, so they still propagate.
+_CONTAINED_OBJECT_ERRORS = (HTTPError, RetryError, RequestException, AsyncInsightsJobTransientError)
 
 
 class AccessTokenFilter(logging.Filter):
@@ -1831,6 +1845,9 @@ class FacebookClient:
         self.oauth = oauth
         self.api_version = api_version
         self.page_tokens = None  # Cache for page tokens
+        # Count of objects skipped due to contained API errors; surfaced as an
+        # end-of-run warning so partial output is not silently read as complete.
+        self.skipped_objects = 0
 
         if self.oauth.data and self.oauth.data.get("token", None) and not self.oauth.data.get("access_token", None):
             logger.info("Direct insert token is used for authentication.")
@@ -1926,6 +1943,9 @@ class FacebookClient:
                         "output_parser": OutputParser(page_loader, page_id, row_config),
                         "fb_graph_node": self._get_fb_graph_node(is_page_token, row_config),
                         "access_token": token,
+                        # Needed to re-submit the report on a transient poll failure.
+                        "row_config": row_config,
+                        "start_params": self._with_token({}, token),
                     }
             except Exception as e:
                 logger.error(f"Failed to start async job for {page_id}: {e}")
@@ -1933,19 +1953,49 @@ class FacebookClient:
 
     def _poll_and_process_async_jobs(self, all_job_details: dict) -> Iterator[dict]:
         for report_id, details in all_job_details.items():
+            page_id = details["page_id"]
             try:
-                page_loader = details["page_loader"]
-                # Get the access token from the job details
-                access_token = details.get("access_token", self.oauth.data.get("access_token"))
-                page_data = page_loader.poll_async_job(report_id, access_token)
+                page_data = self._poll_async_with_resubmit(report_id, details)
                 if not page_data.get("data"):
                     continue
-                output_parser = details["output_parser"]
-                fb_graph_node = details["fb_graph_node"]
-                page_id = details["page_id"]
-                yield from output_parser.iter_parsed_data(page_data, fb_graph_node, page_id)
-            except Exception as e:
-                logger.error(f"Failed to process async job result for report_id: {report_id}: {e}")
+                yield from details["output_parser"].iter_parsed_data(page_data, details["fb_graph_node"], page_id)
+            except _CONTAINED_OBJECT_ERRORS as e:
+                # Transient/API failure for this one report — contain it so the rest of the
+                # run completes; UserException and programming errors still propagate.
+                logger.error(
+                    f"Skipping async report {report_id} (object {page_id}) after errors: {type(e).__name__}: {e}"
+                )
+                self.skipped_objects += 1
+
+    def _poll_async_with_resubmit(self, report_id: str, details: dict) -> dict[str, Any]:
+        """Poll an async report, re-submitting it with exponential backoff on transient failures.
+
+        Facebook fails report jobs transiently under load ("Job Failed"/"Job Skipped"/timeout);
+        ``poll_async_job`` raises ``AsyncInsightsJobTransientError`` for these. We re-submit the
+        report and re-poll. Once the retry budget is exhausted the last error propagates and the
+        caller contains it (skip + count). This is the *production* retry path — the previous
+        loop in ``PageLoader._load_async_insights`` was never reached by a real job.
+        """
+        page_loader = details["page_loader"]
+        access_token = details.get("access_token", self.oauth.data.get("access_token"))
+        for attempt in range(_FB_TRANSIENT_ERROR_MAX_RETRIES + 1):
+            try:
+                return page_loader.poll_async_job(report_id, access_token)
+            except AsyncInsightsJobTransientError as e:
+                if attempt >= _FB_TRANSIENT_ERROR_MAX_RETRIES:
+                    raise
+                wait = _FB_TRANSIENT_ERROR_BACKOFF_BASE * (2**attempt)
+                logger.warning(
+                    f"Async report {report_id} transiently failed ({e}); resubmitting, "
+                    f"attempt {attempt + 2}/{_FB_TRANSIENT_ERROR_MAX_RETRIES + 1}, retrying in {wait}s"
+                )
+                time.sleep(wait)
+                report_id = page_loader.start_async_insights_job(
+                    details["row_config"].query, details["page_id"], params=details["start_params"]
+                )
+                if not report_id:
+                    return {"data": []}
+        return {"data": []}  # unreachable — loop always returns or raises
 
     def _handle_batch_request(self, account_ids: list[str], row_config) -> Iterator[dict]:
         """
@@ -2075,7 +2125,21 @@ class FacebookClient:
             if not page_content:
                 continue
 
-            yield from output_parser.iter_parsed_data(page_data, fb_graph_node, page_id)
+            # Pagination/parsing happens lazily here. A failure on one object's nested
+            # pagination (e.g. Facebook code=2 on a deep insights paging.next that outlives
+            # the transient-retry budget) must not kill the whole extraction with an opaque
+            # "Internal Server Error" — log it with full context and move on to the next object.
+            query_name = getattr(row_config, "name", None) or getattr(getattr(row_config, "query", None), "path", "?")
+            try:
+                yield from output_parser.iter_parsed_data(page_data, fb_graph_node, page_id)
+            except _CONTAINED_OBJECT_ERRORS as e:
+                # Contain transient/API failures for this one object; UserException
+                # (user-actionable) and programming errors deliberately propagate.
+                logger.error(
+                    f"Skipping query '{query_name}' for object {page_id} after errors: {type(e).__name__}: {e}"
+                )
+                self.skipped_objects += 1
+                continue
 
     def get_accounts(self, url_path: str, fields: str | None) -> list[dict[str, Any]]:
         params = {}
@@ -2383,6 +2447,12 @@ class Component(ComponentBase):
                 primary_key = self._get_primary_key(rows_list)
                 self._write_rows(table_name, rows_list, primary_key, True)
                 logger.debug(f"Wrote batch of {len(rows_list)} rows to table {table_name}")
+
+        if self.client.skipped_objects:
+            logger.warning(
+                f"{self.client.skipped_objects} object(s) were skipped due to API errors; "
+                f"output may be incomplete for this run."
+            )
 
     def _finalize_tables(self) -> None:
         for cache_record in self._writer_cache.values():
@@ -3194,8 +3264,15 @@ _FB_TRANSIENT_ERROR_CODES = frozenset(
         613,  # Rate limit exceeded
     }
 )
-_FB_TRANSIENT_ERROR_MAX_RETRIES = 3
-_FB_TRANSIENT_ERROR_BACKOFF_BASE = 5  # seconds; delays are 5s, 10s, 20s
+_FB_TRANSIENT_ERROR_MAX_RETRIES = 5
+_FB_TRANSIENT_ERROR_BACKOFF_BASE = 5  # seconds; delays are 5s, 10s, 20s, 40s, 80s
+
+
+class AsyncInsightsJobTransientError(Exception):
+    """Raised when a Facebook async insights report fails transiently (``Job Failed`` /
+    ``Job Skipped`` / poll timeout). These are recoverable by re-submitting the report —
+    Facebook returns them under load — so they must not surface as a hard ``UserException``.
+    """
 
 
 def resolve_query_window(query_config) -> tuple[str | None, str | None]:
@@ -3406,20 +3483,16 @@ class PageLoader:
         return None  # unreachable — loop always returns or raises
 
     def load_page(self, query_config, page_id: str, params: dict[str, Any] = None) -> dict[str, Any]:
+        # Async-insights queries are NOT loaded here: FacebookClient runs them via
+        # start_async_insights_job + _poll_and_process_async_jobs (parallel start, then poll
+        # with re-submit/backoff). load_page is only ever called for sync queries, whose
+        # query_type is never "async-insights-query"; guard against future misrouting.
         if self.query_type == "async-insights-query":
-            return self._load_async_insights(query_config, page_id, params)
-        else:
-            return self._load_regular_page(query_config, page_id, params)
-
-    def _load_async_insights(self, query_config, page_id: str, params: dict[str, Any] = None) -> dict[str, Any]:
-        report_id = self.start_async_insights_job(query_config, page_id, params)
-        if not report_id:
-            return {"data": []}
-
-        logger.info(f"Started polling for insights job report: {report_id}")
-
-        # Poll for completion
-        return self.poll_async_job(report_id)
+            raise RuntimeError(
+                "async-insights-query must be processed via the async job path "
+                "(start_async_insights_job / poll_async_job), not load_page()"
+            )
+        return self._load_regular_page(query_config, page_id, params)
 
     def start_async_insights_job(self, query_config, page_id: str, params: dict = {}) -> str | None:
         page_id = page_id if page_id.startswith("act_") else f"act_{page_id}"
@@ -3472,18 +3545,22 @@ class PageLoader:
                 is_finished = async_percent == 100
 
                 if async_status in ["Job Failed", "Job Skipped"]:
-                    raise UserException(f"Async insights job failed: {async_status}")
+                    # Transient under load — caller re-submits the report.
+                    raise AsyncInsightsJobTransientError(f"async_status={async_status}")
 
                 if not is_finished or async_status != "Job Completed":
                     time.sleep(5)
                     attempt += 1
 
+            except AsyncInsightsJobTransientError:
+                raise
             except Exception as e:
                 logger.error(f"Error polling async job {report_id}: {str(e)}")
                 raise e
 
         if not is_finished or async_status != "Job Completed":
-            raise UserException(f"Async insights job {report_id} did not complete within timeout")
+            # Did not complete within the poll budget — also transient; let the caller re-submit.
+            raise AsyncInsightsJobTransientError(f"report {report_id} did not complete within timeout")
 
         # Get final results with access token
         try:
@@ -3701,6 +3778,167 @@ sys.path.insert(0, str(project_root / "tests"))
 
 # Suppress verbose VCR cassette replay logging (produces 30k+ lines per test)
 logging.getLogger("vcr").setLevel(logging.WARNING)
+
+
+
+================================================
+FILE: tests/test_client_resilience.py
+================================================
+"""Resilience tests for FacebookClient's *production* execution paths.
+
+These drive the code that real jobs actually run:
+
+* async insights → ``_poll_and_process_async_jobs`` (parallel-start, then poll),
+* sync queries   → ``_process_single_sync_query`` (per-object pagination).
+
+The earlier async-retry test exercised ``PageLoader._load_async_insights`` directly,
+which production never calls — so the resubmit/backoff it asserted was dead code.
+Every test here goes through a client method that a job invokes.
+"""
+
+import unittest
+from unittest.mock import MagicMock, patch
+
+from keboola.component.exceptions import UserException
+from requests import HTTPError
+
+from client import FacebookClient
+from page_loader import _FB_TRANSIENT_ERROR_MAX_RETRIES, AsyncInsightsJobTransientError
+
+
+def make_client() -> FacebookClient:
+    oauth = MagicMock()
+    oauth.data = {"access_token": "user-token"}
+    return FacebookClient(oauth, "v25.0")
+
+
+def make_async_job_details(loader: MagicMock, parser: MagicMock, page_id: str = "act_123") -> dict:
+    """Build the per-report job_details dict that _start_async_jobs_for_query produces."""
+    return {
+        "report-1": {
+            "page_id": page_id,
+            "page_loader": loader,
+            "output_parser": parser,
+            "fb_graph_node": "ad_account",
+            "access_token": "tok",
+            "row_config": MagicMock(),
+            "start_params": {"access_token": "tok"},
+        }
+    }
+
+
+@patch("client.time.sleep", return_value=None)
+class TestAsyncInsightsResubmit(unittest.TestCase):
+    def test_resubmits_after_transient_failure_then_succeeds(self, _sleep):
+        """A transient 'Job Failed' on poll triggers a real re-submit + re-poll in production."""
+        loader = MagicMock()
+        loader.poll_async_job.side_effect = [
+            AsyncInsightsJobTransientError("async_status=Job Failed"),
+            {"data": [{"impressions": "5"}]},
+        ]
+        loader.start_async_insights_job.return_value = "report-2"
+        parser = MagicMock()
+        parser.iter_parsed_data.return_value = iter([{"query_x": [{"impressions": "5"}]}])
+
+        client = make_client()
+        results = list(client._poll_and_process_async_jobs(make_async_job_details(loader, parser)))
+
+        self.assertEqual(results, [{"query_x": [{"impressions": "5"}]}])
+        self.assertEqual(loader.poll_async_job.call_count, 2)
+        self.assertEqual(loader.start_async_insights_job.call_count, 1)  # one resubmit
+        self.assertEqual(client.skipped_objects, 0)
+
+    def test_exhausted_retries_skip_and_count_without_crashing(self, _sleep):
+        """Persistent transient failures skip that one report and increment the counter (contain + warn)."""
+        loader = MagicMock()
+        loader.poll_async_job.side_effect = AsyncInsightsJobTransientError("async_status=Job Failed")
+        loader.start_async_insights_job.return_value = "report-n"
+        parser = MagicMock()
+
+        client = make_client()
+        results = list(client._poll_and_process_async_jobs(make_async_job_details(loader, parser)))
+
+        self.assertEqual(results, [])
+        self.assertEqual(client.skipped_objects, 1)
+        self.assertEqual(loader.poll_async_job.call_count, _FB_TRANSIENT_ERROR_MAX_RETRIES + 1)
+        parser.iter_parsed_data.assert_not_called()
+
+    def test_pagination_httperror_skips_and_counts(self, _sleep):
+        """An HTTPError while parsing/paginating the async result is contained, not fatal."""
+        loader = MagicMock()
+        loader.poll_async_job.return_value = {"data": [{"impressions": "5"}]}
+        parser = MagicMock()
+        parser.iter_parsed_data.side_effect = HTTPError("500 Server Error")
+
+        client = make_client()
+        results = list(client._poll_and_process_async_jobs(make_async_job_details(loader, parser)))
+
+        self.assertEqual(results, [])
+        self.assertEqual(client.skipped_objects, 1)
+
+    def test_programming_error_propagates_not_swallowed(self, _sleep):
+        """A KeyError (real bug) must crash the job, not be masked as a skipped object."""
+        loader = MagicMock()
+        loader.poll_async_job.return_value = {"data": [{"impressions": "5"}]}
+        parser = MagicMock()
+        parser.iter_parsed_data.side_effect = KeyError("regression")
+
+        client = make_client()
+        with self.assertRaises(KeyError):
+            list(client._poll_and_process_async_jobs(make_async_job_details(loader, parser)))
+
+
+def make_sync_row(path: str = "feed") -> MagicMock:
+    row = MagicMock()
+    row.name = "my_query"
+    row.type = "query"
+    row.query.path = path
+    row.query.ids = None
+    row.query.fields = "message,created_time"
+    return row
+
+
+@patch("client.OutputParser")
+@patch("client.PageLoader")
+class TestSyncPaginationResilience(unittest.TestCase):
+    def _prepare(self, MockPL, MockOP):
+        client = make_client()
+        client._request_require_page_token = MagicMock(return_value=False)
+        client._get_fb_graph_node = MagicMock(return_value="page")
+        loader = MockPL.return_value
+        loader.load_page.return_value = {"data": [{"id": "1"}]}
+        parser = MockOP.return_value
+        account = MagicMock()
+        account.id = "act_1"
+        return client, parser, [account]
+
+    def test_pagination_httperror_skips_and_counts(self, MockPL, MockOP):
+        client, parser, accounts = self._prepare(MockPL, MockOP)
+        parser.iter_parsed_data.side_effect = HTTPError("500 Server Error")
+
+        results = list(client._process_single_sync_query(accounts, make_sync_row()))
+
+        self.assertEqual(results, [])
+        self.assertEqual(client.skipped_objects, 1)
+
+    def test_programming_error_propagates(self, MockPL, MockOP):
+        client, parser, accounts = self._prepare(MockPL, MockOP)
+        parser.iter_parsed_data.side_effect = AttributeError("regression")
+
+        with self.assertRaises(AttributeError):
+            list(client._process_single_sync_query(accounts, make_sync_row()))
+
+    def test_user_actionable_error_propagates(self, MockPL, MockOP):
+        """UserException (e.g. misconfigured metric) must surface, not be silently skipped."""
+        client, parser, accounts = self._prepare(MockPL, MockOP)
+        parser.iter_parsed_data.side_effect = UserException("Add 'metric_type(total_value)' ...")
+
+        with self.assertRaises(UserException):
+            list(client._process_single_sync_query(accounts, make_sync_row()))
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 
