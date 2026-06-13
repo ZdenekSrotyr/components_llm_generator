@@ -1042,6 +1042,11 @@
 - Repository: https://github.com/keboola/component-ex-uol
 - Description: None
 
+### component-ex-revenuecat
+- [Documentation](github/component-ex-revenuecat/llm.txt)
+- Repository: https://github.com/keboola/component-ex-revenuecat
+- Description: None
+
 ## Bitbucket Repositories
 
 ### kds-team.app-gd-custom-colors
