@@ -27,16 +27,34 @@ Directory structure:
     │           └── tables/
     │               ├── test.csv
     │               └── test.csv.manifest
+    ├── docs/
+    │   └── superpowers/
+    │       ├── wr-premier-lifecycle.md
+    │       ├── plans/
+    │       │   └── 2026-06-04-wr-premier.md
+    │       └── specs/
+    │           └── 2026-06-04-wr-premier-design.md
     ├── scripts/
     │   └── developer_portal/
     │       ├── fn_actions_md_update.sh
     │       └── update_properties.sh
     ├── src/
     │   ├── component.py
-    │   └── configuration.py
+    │   ├── configuration.py
+    │   └── client/
+    │       ├── __init__.py
+    │       └── premier_client.py
     ├── tests/
     │   ├── __init__.py
-    │   └── test_component.py
+    │   ├── test_component_run.py
+    │   ├── test_configuration.py
+    │   ├── test_functional.py
+    │   ├── test_premier_client.py
+    │   ├── test_premier_response.py
+    │   ├── functional/
+    │   │   └── README.md
+    │   └── setup/
+    │       └── configs.json
     └── .github/
         └── workflows/
             └── push.yml
@@ -44,90 +62,86 @@ Directory structure:
 ================================================
 FILE: README.md
 ================================================
-wr-premier
-=============
+# wr-premier
 
-Description
+`wr-premier` is a Keboola **writer** that loads rows from Keboola Storage tables into the
+**PREMIER system** ([PREMIER](https://www.premier.cz), a Czech ERP/accounting software) via its
+ApiComPrem JSON-RPC API. Each Keboola table row becomes one PREMIER create/write command call.
 
-**Table of Contents:**
+## How it works
 
-[TOC]
+The component uses **config rows** — one row = one input table → one PREMIER write command. Each
+row reads exactly one mapped input table, and for every CSV row it issues one `POST /api/comm` call
+to PREMIER, with the row's columns mapped to PREMIER parameters.
 
-Functionality Notes
-===================
+## Configuration
 
-Prerequisites
-=============
+### Connection (config level)
 
-Ensure you have the necessary API token, register the application, etc.
+| Parameter     | Description                                                                  |
+|---------------|------------------------------------------------------------------------------|
+| `host`        | PREMIER server host/IP.                                                       |
+| `port`        | API port (e.g. `443`; the sandbox uses `12375`).                             |
+| `use_https`   | Use HTTPS. Default `true`.                                                    |
+| `username`    | PREMIER user.                                                                |
+| `#password`   | PREMIER user password (encrypted).                                           |
+| `id_uj`       | Accounting-unit GUID, sent as the `ID-UJ` header.                            |
+| `max_retries` | Optional. Number of API retries. Default `5`.                               |
+| `debug`       | Optional. Enable verbose DEBUG logging. Default `false`.                     |
 
-Features
-========
+### Write target (row level)
 
-| **Feature**             | **Description**                               |
-|-------------------------|-----------------------------------------------|
-| Generic UI Form         | Dynamic UI form for easy configuration.       |
-| Row-Based Configuration | Allows structuring the configuration in rows. |
-| OAuth                   | OAuth authentication enabled.                 |
-| Incremental Loading     | Fetch data in new increments.                 |
-| Backfill Mode           | Supports seamless backfill setup.             |
-| Date Range Filter       | Specify the date range for data retrieval.    |
+| Parameter           | Description                                                                                              |
+|---------------------|----------------------------------------------------------------------------------------------------------|
+| `command`           | The PREMIER write command (e.g. `FA_OUT_ADD`). Chosen from a dropdown populated live from the API `INFO` command. |
+| `column_mapping`    | List of `{source, target}` pairs mapping an input column → a PREMIER parameter name.                     |
+| `dedup_key_column`  | Optional. An input column used as a natural key for idempotent re-runs.                                  |
+| `continue_on_error` | Continue writing remaining rows after a failure. Default `true`.                                        |
 
-Supported Endpoints
-===================
+## Sync actions
 
-If you need additional endpoints, please submit your request to
-[ideas.keboola.com](https://ideas.keboola.com/).
+- **testConnection** — validates host + Basic auth + `ID-UJ`.
+- **listCommands** — lists the available PREMIER write commands.
 
-Configuration
-=============
+## Idempotency and deduplication
 
-Param 1
--------
-Details about parameter 1.
+PREMIER write commands are **create-only with no idempotency key**, so re-running could create
+duplicate documents. If `dedup_key_column` is set, the component records each successfully-written
+key (`written_keys`) and skips those rows on subsequent runs. **If `dedup_key_column` is left empty,
+every run re-sends every row — risking duplicates.**
 
-Param 2
--------
-Details about parameter 2.
+Dedup state durability:
 
-Output
-======
+- On **successful** completion the platform persists the state file. The normal
+  `continue_on_error=true` path completes successfully (recording per-row `OK`/`ERR`), so
+  `written_keys` is saved.
+- On a **hard abort** — the first failure with `continue_on_error=false`, or a connection/auth error
+  (exit 1) — the platform does **not** persist the state file. A subsequent re-run may therefore
+  re-send rows that were written just before the abort.
+- The `results` table is written with `write_always`, so it is still uploaded on failure for
+  inspection even when the state file is not persisted.
 
-Provides a list of tables, foreign keys, and schema.
+## Results table
 
-Development
------------
+The component outputs a `results` table with the columns `row_index`, `dedup_key`, `status`,
+`message`, where `status` is `OK` / `ERR` / `SKIPPED`, so write outcomes are inspectable in Keboola.
 
-To customize the local data folder path, replace the `CUSTOM_FOLDER` placeholder with your desired path in the `docker-compose.yml` file:
+- With `continue_on_error=true`, failed rows are recorded and the job still succeeds as long as at
+  least one row succeeds (the job fails only if all rows fail).
+- With `continue_on_error=false`, the job aborts on the first failed row (after persisting progress).
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    volumes:
-      - ./:/code
-      - ./CUSTOM_FOLDER:/data
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+## Preconditions and limitations
 
-Clone this repository, initialize the workspace, and run the component using the following
-commands:
+- PREMIER is typically deployed **on-premise per customer** — there is no central cloud endpoint, so
+  the PREMIER API server must be **network-reachable from Keboola** (public IP / VPN / reverse proxy),
+  and `host`/`port` are configured per customer.
+- The API requires the **PREMIER ENTERPRISE (SQL) edition** with the API module enabled by a PREMIER
+  admin (who also generates the `ID-UJ`).
+- PREMIER field/parameter names are Czech abbreviations (e.g. `DOKLAD`, `VARIABL`, `KOD_DPH`).
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-git clone  component-wr-premier
-cd component-wr-premier
-docker-compose build
-docker-compose run --rm dev
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+## Development
 
-Run the test suite and perform lint checks using this command:
-
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-docker-compose run --rm test
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Integration
-===========
-
-For details about deployment and integration with Keboola, refer to the
-[deployment section of the developer
-documentation](https://developers.keboola.com/extend/component/deployment/).
+Run the tests with `uv run pytest`. Lint with `uv run ruff check src tests`.
 
 
 
@@ -217,7 +231,6 @@ dynamic = ["version"]
 readme = "README.md"
 requires-python = "~=3.14.0"
 dependencies = [
-    "freezegun>=1.5.1",
     "keboola-component>=1.9.0",
     "keboola-http-client>=1.0.1",
     "keboola-utils>=1.1.0",
@@ -228,12 +241,12 @@ dependencies = [
 dev = [
     "keboola.datadirtest>=2.0.0",
     "pytest>=9.0.2",
+    "responses>=0.25.0",
     "ruff>=0.15.2",
 ]
 
 [tool.ruff]
 line-length = 120
-target-version = "py314"
 
 [tool.ruff.lint]
 extend-select = ["I", "UP", "G"]
@@ -707,6 +720,20 @@ wheels = [
 ]
 
 [[package]]
+name = "responses"
+version = "0.26.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyyaml" },
+    { name = "requests" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c2/58/1fb6de3503428196df78638f991ec8095274f1ee9723e272ee4d9ff0092b/responses-0.26.1.tar.gz", hash = "sha256:2eb3218553cc8f79b57d257bac23af5e1bf381f5b9390b1767816f0843e01dc2", size = 83088, upload-time = "2026-05-21T19:56:39.747Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3a/31/6a620b4427d546b9e7cca8b3b8c5f0559d9cef2bb9eedcda7f73c1473c19/responses-0.26.1-py3-none-any.whl", hash = "sha256:8aacc4586eb08fb2208ef64a9eb4258d9b0c6e6f4260845f2f018ab847495345", size = 35502, upload-time = "2026-05-21T19:56:38.046Z" },
+]
+
+[[package]]
 name = "ruff"
 version = "0.15.15"
 source = { registry = "https://pypi.org/simple" }
@@ -808,7 +835,6 @@ wheels = [
 name = "wr-premier"
 source = { virtual = "." }
 dependencies = [
-    { name = "freezegun" },
     { name = "keboola-component" },
     { name = "keboola-http-client" },
     { name = "keboola-utils" },
@@ -819,12 +845,12 @@ dependencies = [
 dev = [
     { name = "keboola-datadirtest" },
     { name = "pytest" },
+    { name = "responses" },
     { name = "ruff" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "freezegun", specifier = ">=1.5.1" },
     { name = "keboola-component", specifier = ">=1.9.0" },
     { name = "keboola-http-client", specifier = ">=1.0.1" },
     { name = "keboola-utils", specifier = ">=1.1.0" },
@@ -835,6 +861,7 @@ requires-dist = [
 dev = [
     { name = "keboola-datadirtest", specifier = ">=2.0.0" },
     { name = "pytest", specifier = ">=9.0.2" },
+    { name = "responses", specifier = ">=0.25.0" },
     { name = "ruff", specifier = ">=0.15.2" },
 ]
 
@@ -911,21 +938,87 @@ repos:
 ================================================
 FILE: component_config/component_long_description.md
 ================================================
-Enter long description of the component here.
+# PREMIER Writer
+
+Loads Keboola Storage tables into the **PREMIER system** (Czech ERP, [premier.cz](https://www.premier.cz)) via its ApiComPrem API. One config row = one input table → one PREMIER write command (e.g. `FA_OUT_ADD`, `PARTNERI_ADD`).
+
+- Per-row column → PREMIER parameter mapping.
+- Optional dedup key skips already-written rows on re-runs.
+- Results table with per-row `OK` / `ERR` / `SKIPPED`.
+
+**Requires** PREMIER ENTERPRISE (SQL) with the API module, reachable from Keboola.
 
 
 
 ================================================
 FILE: component_config/component_short_description.md
 ================================================
-Enter short description of the component here.
+Writes Keboola Storage tables into the PREMIER system (Czech ERP) via its API.
 
 
 
 ================================================
 FILE: component_config/configRowSchema.json
 ================================================
-{}
+{
+  "type": "object",
+  "title": "PREMIER Writer – Write Target",
+  "required": ["command", "column_mapping"],
+  "properties": {
+    "command": {
+      "type": "string",
+      "title": "PREMIER Command",
+      "description": "The write command to execute (e.g. FA_OUT_ADD).",
+      "format": "select",
+      "enum": [],
+      "options": {
+        "async": {
+          "label": "Load Commands",
+          "action": "listCommands",
+          "autoload": []
+        }
+      },
+      "propertyOrder": 1
+    },
+    "column_mapping": {
+      "type": "array",
+      "title": "Column Mapping",
+      "description": "Map input table columns to PREMIER parameter names.",
+      "format": "table",
+      "items": {
+        "type": "object",
+        "required": ["source", "target"],
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Input Column",
+            "propertyOrder": 1
+          },
+          "target": {
+            "type": "string",
+            "title": "PREMIER Parameter",
+            "propertyOrder": 2
+          }
+        }
+      },
+      "propertyOrder": 2
+    },
+    "dedup_key_column": {
+      "type": "string",
+      "title": "Deduplication Key Column",
+      "description": "Optional input column used as a natural key so re-runs skip already-written rows. Leave empty to re-send every row (may create duplicates).",
+      "propertyOrder": 3
+    },
+    "continue_on_error": {
+      "type": "boolean",
+      "title": "Continue On Error",
+      "description": "If enabled, failed rows are recorded and the job continues; otherwise it aborts on the first failure.",
+      "default": true,
+      "propertyOrder": 4
+    }
+  }
+}
+
 
 
 ================================================
@@ -933,20 +1026,65 @@ FILE: component_config/configSchema.json
 ================================================
 {
   "type": "object",
-  "title": "extractor configuration",
-  "required": [
-    "print_hello"
-  ],
+  "title": "PREMIER Writer – Connection & Authentication",
+  "required": ["host", "port", "username", "#password", "id_uj"],
   "properties": {
-    "print_hello": {
-      "type": "boolean",
-      "title": "Print Hello",
+    "host": {
+      "type": "string",
+      "title": "PREMIER Host",
+      "description": "PREMIER server host or IP (e.g. dev.premier.cz).",
       "propertyOrder": 1
     },
-    "debug": {
-      "type": "boolean",
-      "title": "Debug",
+    "port": {
+      "type": "integer",
+      "title": "Port",
+      "description": "API port (the public sandbox uses 12375).",
+      "default": 443,
       "propertyOrder": 2
+    },
+    "use_https": {
+      "type": "boolean",
+      "title": "Use HTTPS",
+      "description": "Connect over HTTPS. Disable only for a plain-HTTP PREMIER endpoint.",
+      "propertyOrder": 3,
+      "default": true
+    },
+    "username": {
+      "type": "string",
+      "title": "Username",
+      "description": "PREMIER user.",
+      "propertyOrder": 4
+    },
+    "#password": {
+      "type": "string",
+      "title": "Password",
+      "description": "PREMIER user password.",
+      "format": "password",
+      "propertyOrder": 5
+    },
+    "id_uj": {
+      "type": "string",
+      "title": "Accounting Unit (ID-UJ)",
+      "description": "Accounting-unit GUID sent as the ID-UJ header.",
+      "propertyOrder": 6
+    },
+    "test_connection": {
+      "type": "button",
+      "format": "test-connection",
+      "propertyOrder": 7,
+      "options": {
+        "async": {
+          "label": "Test Connection",
+          "action": "testConnection"
+        }
+      }
+    },
+    "max_retries": {
+      "type": "integer",
+      "title": "Max Retries",
+      "description": "Number of API retries on transient errors.",
+      "default": 5,
+      "propertyOrder": 8
     }
   }
 }
@@ -956,7 +1094,8 @@ FILE: component_config/configSchema.json
 ================================================
 FILE: component_config/configuration_description.md
 ================================================
-Configuration description.
+Enter the connection and click **Test Connection**. Then add one row per input table, pick the PREMIER command, and map your columns.
+
 
 
 ================================================
@@ -1200,6 +1339,477 @@ FILE: component_config/sample-config/in/tables/test.csv.manifest
 
 
 ================================================
+FILE: docs/superpowers/wr-premier-lifecycle.md
+================================================
+# keboola.wr-premier — New Component Build Lifecycle
+
+> **For agents (read this first):** This file is the **durable, cross-session source of truth** for
+> building this new component. `TodoWrite` resets every session; this file does not. Whenever you
+> start work on this component — in any skill, in any session — open this file, find the phase you
+> own, and act on it.
+>
+> **The loop for every phase:**
+> 1. Read this file; find your phase and the phase(s) before it. Earlier phases are dependencies —
+>    if one isn't ticked, resolve it (or surface the blocker) before starting yours.
+> 2. Do the phase's work.
+> 3. Dispatch the **phase verifier** (see *Verification contract* below) as a fresh subagent.
+> 4. **Only tick `- [x]` when the verifier returns ✅ with real evidence** — never on your own
+>    say-so. Paste the evidence line under the phase.
+> 5. Commit this file (`git add` + commit) so the next session sees the new state.
+>
+> Mirror the still-open phases into `TodoWrite` for the live in-session checklist, but treat *this
+> file* as authoritative.
+
+**Component:** `keboola.wr-premier`  ·  **Type:** `writer`
+**Created:** `2026-06-04`
+**Spec:** `docs/superpowers/specs/2026-06-04-wr-premier-design.md`
+**Plan:** `docs/superpowers/plans/2026-06-04-wr-premier.md` (created in Phase 3)
+
+---
+
+## Verification contract
+
+A phase is "done" only when it's confirmed against **real evidence** by a check that is independent of
+the work itself.
+
+**Preferred — dispatch a fresh subagent** (the `Task`/`Agent` tool) so the verifier has a clean context
+and no implementer bias. **If subagent dispatch isn't available to you**, run the verification yourself
+as a *separate, deliberate pass*: re-derive every piece of evidence from scratch (run the commands,
+read the files, query the platform) and do **not** lean on your own earlier claims about what you did.
+Either way, give the verifier the phase's **Definition of done** and this instruction:
+
+> Verify ONLY whether this phase is genuinely complete, by gathering **real evidence** — run the
+> commands, read the actual files, query the platform/portal/git as needed. Do **not** fix or change
+> anything; you are a checker, not an implementer. Return either:
+> - `✅ DONE` followed by the concrete evidence you observed (command output, file paths, job IDs,
+>   tag names — the specifics), or
+> - `❌ NOT DONE` followed by exactly what is missing or failing.
+>
+> If you cannot confirm a requirement with evidence, default to `❌ NOT DONE`. "Should be fine" is not
+> evidence.
+
+If the verifier returns ❌, the box stays unticked — fix the gap and re-verify. This mirrors the
+superpowers principle: *evidence before assertions, always.*
+
+---
+
+## Phases
+
+Later phases generally depend on earlier ones, so work top-down. Where two adjacent phases are
+genuinely independent (Phase 6 portal value-setup and Phase 7 cf-dev smoke-test don't depend on each
+other — both only need Phases 1–5), either order is fine.
+
+### Phase 1 — Scaffold + bootstrap release · owner: `component-get-started` (verified here by `component-plan-new`)
+- [x] complete
+
+**Definition of done:**
+- Repo pushed to `origin` under the correct org; initial commit on `main`.
+- Per-repo portal creds set for the **target vendor**: `KBC_DEVELOPERPORTAL_USERNAME` (variable) +
+  `KBC_DEVELOPERPORTAL_PASSWORD` (secret).
+- Dev Portal **app created** (via `kbagent dev-portal create`) — the release pipeline needs a target.
+- `0.0.1` tag exists and its `push.yml` run **built and pushed the image** (run is green).
+
+> Note: `get-started` runs *before* this tracker exists. `component-plan-new` creates this file and
+> runs the Phase 1 verifier retroactively to confirm the scaffold actually landed before planning.
+
+**Evidence:** Verified 2026-06-04 by fresh subagent.
+- Repo: `origin → https://github.com/keboola/component-wr-premier.git`, branch `main`, commit `eab4361 initial cookiecutter-template-based commit`.
+- Creds: `KBC_DEVELOPERPORTAL_USERNAME=keboola+ComponentFactory_CI` (variable), `KBC_DEVELOPERPORTAL_PASSWORD` (secret) both set.
+- Dev Portal app `keboola.wr-premier` exists (type writer, name "Premier").
+- Release `0.0.1`; push.yml run `26944000114` concluded **success** (Build Production Image / Push to ECR / Update Dev Portal Properties / Deploy to KBC all green).
+- Portal `repository.tag` = `0.0.1`, uri `…/developer-portal-v2/keboola.wr-premier`.
+
+### Phase 2 — Research the source/target system · owner: `component-plan-new`
+- [x] complete
+
+**Definition of done:** a research summary settles API style(s), auth method(s) and which the vendor
+recommends, pagination, rate limits, incremental/cursor support — plus a **feasibility & provisioning
+verdict** (sandbox availability, headless-auth vs admin-only setup). Blockers surfaced to the user.
+
+**Evidence:** Verified 2026-06-04 by fresh subagent against the spec. API style = custom JSON-RPC over
+HTTPS POST `/api/comm` (live-verified contract). Auth = HTTP Basic + `ID-UJ` header (only method
+exposed). No pagination/batch on writes; rate limits none documented; no incremental (create-only, no
+idempotency → state.json dedup strategy). Provisioning = NOT headless on customer side (admin installs
+ApiComPrem service, generates ID_UJ); sandbox `dev.premier.cz:12375` reachable for reads, writes
+unconfirmed, no customer creds yet. 6 ranked blockers in spec §9.
+
+### Phase 3 — Spec + implementation plan · owner: `component-plan-new`
+- [x] complete
+
+**Definition of done:** `docs/superpowers/specs/...-design.md` committed (full scope: source system,
+Keboola mapping, auth/provisioning, data model, config/schema, code architecture, datadir + VCR
+tests, cf-dev deployment, risks) with **no placeholders/TODOs**, AND a superpowers plan committed at
+`docs/superpowers/plans/...md`. User approved the spec.
+
+**Evidence:** Verified 2026-06-04 by fresh subagent. Spec `06fa5ad` (all 9 sections, zero placeholder
+grep matches) + plan `8ed7e85` (13 bite-sized TDD tasks with real failing-test + implementation code;
+imports/method names consistent across tasks; schema↔Pydantic parity cross-checked in Task 11). User
+approved the spec by invoking `/superpowers:writing-plans`.
+
+### Phase 4 — Implement on `initial-implementation` branch · owner: `component-develop`
+- [x] complete
+
+**Definition of done:** branch `initial-implementation` exists; component logic implemented per the
+plan; `run()` is a clean orchestrator with logic in private methods; `ruff check` clean. Fine-grained
+step tracking lives in the superpowers plan file — this box tracks the phase as a whole.
+
+**Evidence:** Verified 2026-06-04 by fresh subagent. Branch `initial-implementation` pushed (16 impl
+commits, main..branch). `src/component.py` run() is a clean orchestrator delegating to `_build_client`/
+`_validate_columns`/`_result` + sync actions `testConnection`/`listCommands`; `src/configuration.py`
+(PREMIER Configuration + ColumnMap); `src/client/premier_client.py` (PremierClient/PremierResponse/
+exceptions). No leftover cookiecutter logic (grep clean). `uv run ruff check src tests` → All checks
+passed. `uv run pytest -q` → 28 passed. configSchema.json + configRowSchema.json present (non-template).
+Implemented via subagent-driven TDD; two review gates per task; final whole-impl review found no
+functional blockers (one robustness fix applied: `from __future__ import annotations`).
+Remaining for later phases: VCR cassettes (Phase 5) must verify the API-contract assumptions
+(inParam.parameters nesting, INFO/typ_prikazu, VERZEAPI probe) against real responses.
+
+### Phase 5 — Local VCR tests + cassettes · owner: `component-test`
+- [x] complete
+
+**Definition of done:** datadir/unit/VCR tests present; the **full `pytest` suite runs green** (paste
+the `N passed` line, not "should pass"); cassettes recorded and **verifiably sanitized** — grep every
+cassette for secret patterns (the values from `secrets.json`, common keys like `token`/`password`/
+`authorization`/`api_key`, and the configured `VCR_SANITIZERS` targets) and paste a clean result.
+
+**Evidence:** Verified 2026-06-04 (commit `07703b2`). VCR read-path functional cases recorded against
+`dev.premier.cz:12375`: `01_testConnection` (VERZEAPI) + `02_listCommands` (INFO/FULL, 22 IN commands).
+`VCRDataDirTester` runner; `VCR_SANITIZERS` in component.py. `uv run pytest -q` → **29 passed**;
+`ruff check` clean. Cassette grep for `3ce17312` / `Authorization` / `ID-UJ` / password → **no matches**.
+**Recording caught a real contract bug:** the live API returns `Data[0]["CommList"]` of `{CMD:{...}}`
+envelopes (NOT a flat list); `list_write_commands()` was fixed to unwrap/flatten it and unit-test mocks
+updated to the real shape. Write-path cassettes intentionally deferred (no blind sandbox writes).
+
+### Phase 6 — Full Developer Portal value setup · owner: `component-dev-portal`
+- [x] complete
+
+**Evidence:** 2026-06-04. Patched the portal (user-run TTY `kbagent dev-portal patch --data …`) and
+confirmed live via `kbagent dev-portal get --app keboola.wr-premier`: `configurationSchema` (PREMIER
+Connection & Auth — host/port/use_https/username/#password/id_uj/test_connection/max_retries),
+`configurationRowSchema` (command via listCommands select, column_mapping table, dedup_key_column,
+continue_on_error), short/long/configuration descriptions, `actions: [testConnection, listCommands]`,
+and `uiOptions: [genericDockerUI, genericDockerUI-rows]`. The UI config form now renders correctly.
+(These `[script]` props will re-sync identically from `component_config/` on the next release.)
+
+**Definition of done — MUST happen *after* the `0.0.1` release:** configSchema (and row schema if
+config rows), sync actions, and the portal-owned properties (descriptions, UI options, etc.) are live
+in the portal, confirmed via a fresh `kbagent dev-portal` GET.
+
+> **Ordering, do not get this wrong:** the `0.0.1` release's CI-sync writes portal values from the
+> repo. If you set portal values *before* that release, the release **overwrites** them. The bootstrap
+> release already happened in Phase 1, so this manual value setup is safe here — but if any further
+> release is cut afterwards, re-confirm the synced-vs-portal-owned property boundary.
+
+**Evidence:** _
+
+### Phase 7 — Deploy + smoke-test in cf-dev (image-tag override) · owner: `component-test` (tier 4)
+- [ ] complete
+
+**Definition of done:** an image built from the `initial-implementation` branch exists in the
+platform; a config created in the **cf-dev** project (via kbagent) with the **image tag overridden**
+to that branch build; a real job run **succeeded** end-to-end. Evidence must include the job ID, its
+`success` status, **and the resolved image tag the job actually ran** — confirm it matches the
+`initial-implementation` build, not a stale stable release (a green job against the wrong image is a
+false pass).
+
+**Evidence — PARTIAL (deployment ✅, functional smoke ❌ blocked by environment, not code):** 2026-06-04.
+- ✅ Branch image `initial-implementation-9` (commit `3a6d60b`) built + pushed to ECR.
+- ✅ cf-dev config `01kt9aegh8ek5eq6xt957rzqzs` created (project 4214) with `runtime.tag=initial-implementation-9`, encrypted `#password`; portal actions registered; image tag resolves to the branch build.
+- ❌ `testConnection` / `listCommands` sync actions **time out (~48s)** — the Keboola **GCP runner cannot reach `dev.premier.cz:12375`** (egress to external host on a non-standard port is blocked). NOT a component bug: the component starts and is recognized; the same calls succeed locally (`curl`) and in the VCR tests. This is the same on-prem reachability constraint as spec §9 risk #1.
+- A genuine end-to-end smoke needs a PREMIER instance reachable from the Keboola stack (a customer/partner instance, or an allow-listed network path) — not available for this public sandbox.
+
+### Phase 8 — Final CF-standards review · owner: `component-review`
+- [x] complete
+
+**Definition of done:** `component-review` run over the full implementation; no open **blocking**
+(critical/important) findings; component aligns with Component Factory standards.
+
+**Evidence:** Verified 2026-06-04. Ran the full component-review (12 specialist agents + validator).
+Validator dropped 8 false positives (both logging findings matched the cookiecutter template; the
+suggested `extra="forbid"` would have broken sync actions; the test-connection `options.async` is the
+canonical pattern; client-in-`__init__` / run()-length aren't in any cited rule). Verdict
+REQUEST_CHANGES on real items, all fixed in commit `78679fa`: (1) credential fields default to `""`
+so sync actions don't crash on a partial form + `_require_connection()` enforces presence in run() and
+both sync actions; (2) results table `write_always=True` (survives exit-1 per output-mapping.md);
+(3) non-dict API response guarded → PremierClientError; (4) `finally` persistence wrapped so it can't
+mask a UserException; (5) typing hints; (6) README corrected re dedup durability (state persists on
+success/`continue_on_error=true`, NOT on a hard exit-1 abort). `uv run pytest -q` → **31 passed**;
+`ruff check` clean. No open blocking findings.
+
+> **Known limitation (tracked, not blocking — no users yet):** dedup `state.json` is not persisted by
+> the platform on an exit-1 abort, so the fail-fast / connection-error paths may re-send rows on rerun.
+> Documented in README. A durable-ledger redesign can be a follow-up.
+
+> **If you cut a release after Phase 6** (e.g. promoting the reviewed component to a stable version),
+> the CI property-sync runs again and overwrites the `[script]` portal properties from the repo —
+> **re-run the Phase 6 verifier afterward** to confirm the portal-owned values survived. Phase 6 is
+> only protected from the *bootstrap* `0.0.1` release automatically.
+
+**Evidence:** _
+
+
+
+================================================
+FILE: docs/superpowers/plans/2026-06-04-wr-premier.md
+================================================
+[Binary file]
+
+
+================================================
+FILE: docs/superpowers/specs/2026-06-04-wr-premier-design.md
+================================================
+# wr-premier — Design Spec
+
+> Type: writer
+> Component ID: keboola.wr-premier
+> Status: draft
+> Date: 2026-06-04
+
+## 1. Overview & source system
+
+`keboola.wr-premier` is a **writer** that pushes rows from Keboola Storage tables into the
+**PREMIER system** (Czech ERP / accounting / economic software, https://www.premier.cz) via its
+**ApiComPrem** API — creating partners, invoices, orders, stock cards, and other documents from
+tabular data managed in Keboola.
+
+- **Target system:** PREMIER system, ApiComPrem engine.
+- **API docs:** vendor page https://www.premier.cz/produkty/moduly/dalsi-reseni/api/ ; manual
+  https://premier-system.atlassian.net/wiki/spaces/PS/pages/8349813/PREMIER+API (Czech, gated) ;
+  live contract reverse-engineered from the public test client at
+  `https://dev.premier.cz/cmd_test/index.html`.
+- **Primary use case:** a Keboola user who keeps master/transactional data (partners, invoices,
+  orders, stock) in Keboola and wants to load it into their on-premise PREMIER ENTERPRISE instance
+  without manual re-keying.
+
+The API is a **custom JSON-RPC over HTTPS POST** (not REST, not SOAP): every call hits a single
+`/api/comm` endpoint with a body naming a command and its parameters. It is **create-oriented**
+(22 write commands), per-customer **on-premise**, and uses **HTTP Basic auth + an `ID-UJ` header**
+identifying the accounting unit.
+
+## 2. Keboola mapping
+
+How PREMIER maps onto how Keboola runs a writer:
+
+- **Input tables → API writes.** This is a writer: it *reads* one Keboola input-mapping table per
+  configuration row and, for each table row, issues one PREMIER **write command** (`*_ADD`/`*_UPD`).
+- **Config rows, one row per write target.** PREMIER exposes 22 distinct write commands
+  (`PARTNERI_ADD`, `FA_OUT_ADD`, `OB_IN_ADD`, `SKLAD_ADD`, …). Per Keboola convention, multiple
+  independent objects → **config rows**, one row per command/target. Each row = "take this input
+  table and write it into PREMIER via command X with this column→parameter mapping." Rows can be
+  enabled/run/retried independently and run in parallel. *(Override note: a single row is fine for a
+  user writing just one object.)*
+- **No incremental "load" in the extractor sense.** A writer doesn't produce output tables, so
+  output-mapping incremental loading does not apply. What *does* matter is **idempotency**: PREMIER
+  write commands are **create-only with no idempotency key**, so re-running a row risks duplicate
+  documents. Strategy: persist per-row **`state.json`** tracking which input rows were already
+  written successfully (keyed by a user-designated natural key column, e.g. `VARIABL`/document
+  number), and skip them on re-run. See §6.
+- **Secrets → `#`-prefixed.** The PREMIER user password is `#password` (encrypted). Username, host,
+  port, and `ID-UJ` are non-secret.
+- **Sync actions:**
+  - `testConnection` — validate host reachability + Basic auth + `ID-UJ` by issuing a harmless read
+    (e.g. `VERZEAPI` or `INFO`).
+  - `listCommands` — call `INFO` (prikaz=FULL), filter to `typ_prikazu == "IN"`, and populate the
+    row's "command" dropdown with the live write-command catalog (so the UI never offers a command
+    the customer's instance doesn't license).
+  - (Optional, later) `listCommandParameters` — given a chosen command, surface its documented
+    parameters to assist column mapping.
+- **No output bucket.** A writer has no output tables by default. **Exception:** we will write **one
+  results table** (`out.c-wr-premier.results` or default-bucket equivalent) recording per-input-row
+  write status — see §4/§6 — so the "continue-on-failure" outcome is inspectable in Keboola.
+
+## 3. Authentication & connection
+
+- **Auth: HTTP Basic** over HTTPS — the username + password of a PREMIER user, base64-encoded into
+  `Authorization: Basic …`. Chosen because it is the only method the API exposes (no OAuth/token
+  flow). Plus the mandatory **`ID-UJ`** header (accounting-unit GUID) selecting which company DB to
+  write to.
+- **Connection: custom JSON-RPC over HTTPS POST** to `https://<host>:<port>/api/comm`. There is no
+  alternative surface; this is the only API.
+- **Confirmed request contract** (from the live test client):
+  - Method/URL: `POST https://<host>:<port>/api/comm`
+  - Headers: `Content-Type: application/json; charset=UTF-8`, `ID-UJ: <guid>`,
+    `Authorization: Basic <base64(user:pass)>`
+  - Body: `{"command":{"inComm":"<CMD>","inParam":{"parameters":{<k>:<v>, …}}}}`
+  - Response: `{"Result":"OK"|"ERR","CommandIn":"<cmd>","Data":[…],"Error":[{number,desc}],"Warning":[…]}`
+- **Provisioning (NOT headless on the customer side):** before Keboola can connect, a PREMIER admin
+  must, on the customer's own server:
+  1. Run PREMIER **ENTERPRISE** (SQL edition; MS SQL 2016+, compat level ≥130) — the API works only
+     with this edition.
+  2. Install the **ApiComPrem** Windows service (`apicompremservice.exe`); the SQL service account
+     needs `sysadmin`.
+  3. Run `ApiComPremForm.exe` to bind accounting units and generate the **`ID_UJ`** GUID, and hand
+     that GUID to the integrator.
+  4. Make the service **network-reachable from Keboola** (public IP, VPN, or reverse proxy) and
+     supply host:port.
+  Once that's done, the writer authenticates headlessly per run (plain Basic + header).
+- **Blockers / access (see §9 for ranking):**
+  - **On-premise reachability** is the dominant architectural constraint — there is no central cloud
+    endpoint; each customer is a distinct reachable host or the writer cannot connect.
+  - **Sandbox:** the public `dev.premier.cz:12375` instance (test unit `ID-UJ
+    3ce17312-8dbd-49a0-94d3-2e01b65e4173`) is reachable and serves all read/`INFO` commands without
+    even requiring auth. **It is unknown whether it persists writes**, and we will not blind-fire
+    creates into it (see §7 + §9). The user has **no real customer credentials yet**.
+
+## 4. Data model & endpoints
+
+- **In scope for v1:** a **generic, command-driven writer** covering **all 22 PREMIER `IN` (write)
+  commands**, surfaced via the `listCommands` dropdown rather than hard-coded per object. The user's
+  requirement is "write everywhere the API allows," so the design treats the command as data, not as
+  bespoke code per object. The 22 write commands (from a live `INFO` FULL dump):
+
+  | Command | Purpose | Command | Purpose |
+  |---|---|---|---|
+  | `PARTNERI_ADD` | add/edit partner | `FA_ZIN_ADD` | received advance invoice |
+  | `PART_ADR_ADD` | partner address | `FA_IN_AUDIT` | mark received invoice audited |
+  | `PART_KON_ADD` | partner contact | `FA_ZOUT_ADD` | issued advance invoice |
+  | `OB_IN_ADD` | received order | `FA_ZIN_AUDIT` | audit received advance invoice |
+  | `OB_OUT_ADD` | issued order | `ZAKAZKA_ADD` | add job/contract |
+  | `OB_IN_UPD` | update order | `ZAKAZKA_UPD` | supplement job/contract |
+  | `PRIJEMKY_ADD` | goods receipt | `SKLAD_ADD` | warehouse stock card |
+  | `VYDEJKY_ADD` | goods issue | `NABIDKY_ADD` | quotation |
+  | `VYDEJKY_UPD` | supplement goods issue | `VAZBY_ADD` | document links |
+  | `FA_IN_ADD` | received invoice | `FA_IN_UPD` | supplement invoice |
+  | `FA_OUT_ADD` | issued invoice | `FA_ZIN_UPD` | supplement advance invoice |
+
+- **No pagination** on writes (each call writes one document/record). **Rate limits: none
+  documented** — the writer will issue calls sequentially per row with a small, configurable
+  inter-request pause and bounded retry/back-off on transient HTTP/5xx errors.
+- **No batch/multi-document call documented** — one input row → one command call (a command may
+  carry a line-items array within a single document, e.g. invoice lines, but that's intra-document).
+- **Response shape:** flat envelope `{Result, Data, Error, Warning}`. The writer interprets
+  `Result=="OK"` as success and `Result=="ERR"` (or HTTP error) as a row failure, capturing
+  `Error[].desc` into the results table.
+- **Field-level schemas:** `INFO` returns command-level *control* parameters (e.g. `typCmd
+  ADD/UPD`); the full column schema for a record lives in the underlying DB table and is fetched via
+  `INFO table_name=<real table>`. v1 does **not** hard-validate record fields against the schema —
+  the user maps input columns to PREMIER parameter names, and PREMIER's own server-side validation
+  is the authority (errors surface per-row).
+
+## 5. Configuration & schema
+
+> Handoff: the actual `configSchema.json` / `configRowSchema.json` is built by `component-build-ui`.
+> This section describes the fields only.
+
+**Config-level (shared, entered once):**
+- `host` (string, required) — PREMIER server host/IP.
+- `port` (integer, required, default e.g. 443) — API port (sandbox uses 12375).
+- `use_https` (boolean, default true).
+- `username` (string, required) — PREMIER user.
+- `#password` (string, secret, required) — PREMIER user password.
+- `id_uj` (string, required) — accounting-unit GUID (`ID-UJ` header).
+- `request_delay_ms` / `max_retries` (optional, advanced) — pacing/back-off knobs.
+- Sync action: **`testConnection`**.
+
+**Row-level (per write target):**
+- `command` (string, required) — the PREMIER write command; populated by the **`listCommands`**
+  sync-action dropdown (live `IN` commands).
+- `column_mapping` (object/array, required) — maps input-table column names → PREMIER parameter
+  names (`inParam.parameters` keys). Free-form because parameter sets vary per command; a future
+  iteration can drive this from `listCommandParameters`.
+- `dedup_key_column` (string, optional) — input column used as the natural key for idempotent
+  re-runs (state-tracked). If empty, every run re-sends every row (documented caveat).
+- `continue_on_error` (boolean, default true) — per the agreed failure mode; when true, failed rows
+  are recorded and the job still succeeds if any row succeeds.
+
+**Input mapping:** exactly one input table per row (the rows-to-write source).
+
+**Sync actions:** `testConnection` (config level), `listCommands` (row level), optional
+`listCommandParameters` (row level, later).
+
+## 6. Code architecture
+
+- **`client/premier_client.py` — `PremierClient`** (separate from `component.py`):
+  - `__init__(host, port, use_https, username, password, id_uj, delay_ms, max_retries)` — builds the
+    base URL and the static headers (incl. `Authorization`, `ID-UJ`).
+  - `call(command: str, parameters: dict) -> PremierResponse` — the single POST primitive; wraps the
+    `{"command":{"inComm":…,"inParam":{"parameters":…}}}` envelope, parses
+    `{Result,Data,Error,Warning}`, applies retry/back-off on transient errors.
+  - `test_connection()` — issues `VERZEAPI`/`INFO`; raises on failure.
+  - `list_write_commands()` — `INFO` FULL → filter `typ_prikazu=="IN"` → list of command names.
+  - `write(command, parameters)` — thin wrapper over `call` returning success/`Error[].desc`.
+- **`configuration.py`** — Pydantic models: one config-level model (connection/auth), one row-level
+  model (command, mapping, dedup, continue_on_error). Validated early; missing/invalid config →
+  `UserException`.
+- **`component.py` — `run()` is a thin orchestrator:**
+  1. Parse + validate config (Pydantic).
+  2. Build `PremierClient`.
+  3. Read the input table (csv) for the row.
+  4. Load `state.json` (set of already-written dedup keys).
+  5. For each input row: build `parameters` via `column_mapping`; skip if dedup key already in
+     state; else `client.write(...)`; record outcome.
+  6. Write the **results table** (input identifier, status OK/ERR, error message) and update
+     `state.json` with newly-succeeded keys.
+  7. If `continue_on_error` is false and any row failed → `UserException`.
+- **Sync actions** (`@sync_action`): `testConnection`, `listCommands`, (later) `listCommandParameters`.
+- **Error handling:**
+  - `UserException` (exit 1): bad/missing config, auth failure (401), host unreachable, `ID-UJ`
+    rejected, all rows failed, or any failure when `continue_on_error=false`.
+  - Unexpected (exit 2): programming errors, unhandled exceptions.
+- **Dependencies:** `keboola.component` (CommonInterface), `requests` (HTTP), `pydantic` (config
+  models), `tenacity` (retry/back-off) — all standard CF choices.
+
+## 7. Testing
+
+- **Datadir tests:**
+  - Happy path — one input row → one mocked `Result=OK` → results table shows OK, exit 0.
+  - Partial failure — two rows, one `Result=ERR`; `continue_on_error=true` → results table has
+    OK+ERR, exit 0; with `continue_on_error=false` → exit 1.
+  - Dedup — row whose key is already in `state.json` is skipped (no call issued).
+  - Config validation — missing `#password`/`id_uj` → `UserException` exit 1.
+  - Auth failure — mocked 401 → `UserException` exit 1.
+- **VCR strategy:**
+  - **Read-side cassettes are recordable now** against `dev.premier.cz:12375` (no auth needed):
+    `VERZEAPI`, `INFO` FULL — these seed `testConnection` and `listCommands` tests. (An `INFO` FULL
+    response — 63 commands — is already captured at `/tmp/info_noauth.json` during research and can
+    seed a cassette.)
+  - **Write-side cassettes:** we will **not** blind-fire creates at the sandbox. Two options,
+    decided at implementation time: (a) get explicit authorization to send **one** controlled
+    `*_ADD` to `dev.premier.cz` and record it, or (b) hand-author the write cassette from the
+    documented `{Result:OK}` envelope until a real instance is available. Default to (b) to avoid
+    polluting the shared sandbox; upgrade to a real recording once customer creds exist.
+  - **Sanitizers:** `VCR_SANITIZERS` must scrub the `Authorization` header and the `username`/
+    `#password`/`id_uj` values from request bodies/headers in all cassettes.
+- **Sync action tests:** `testConnection` (OK + failure), `listCommands` (returns the 22 IN
+  commands from the recorded `INFO`).
+
+## 8. Deployment & validation (CF test project)
+
+- Image for the `initial-implementation` branch is built by `push.yml` on push (Phase 1 already
+  proved the pipeline is green).
+- Via **kbagent**, create a config in the **cf-dev** project with the image tag **overridden** to
+  the branch build, pointed at `dev.premier.cz:12375` + the public test `ID-UJ`, using a
+  **read-only** validation path first (`testConnection` + `listCommands`) so the smoke test doesn't
+  depend on writes succeeding.
+- A successful end-to-end run = job `success`, `testConnection` passes, `listCommands` returns the
+  write catalog, and the results table is produced. Confirm the **resolved image tag** matches the
+  branch build (not a stale `0.0.1`). A write-path smoke test is gated on having a writable target.
+
+## 9. Open risks & blockers
+
+1. **On-premise reachability (architectural, high).** No cloud endpoint; every real customer needs a
+   network-reachable host. Keboola→customer connectivity (public IP/VPN/reverse proxy) is a
+   per-customer prerequisite outside the component's control. *Owner: customer/solution eng.*
+2. **No writable sandbox confirmed (testing, high).** `dev.premier.cz` serves reads freely but we
+   have not confirmed it persists writes, and we won't blind-write to it. Write-path cassettes and
+   the write smoke test are therefore blocked on either authorized single-write sandbox testing or
+   real customer creds. *Owner: user to provide creds / authorize a controlled sandbox write.*
+3. **Create-only + no idempotency (correctness, high).** Re-runs can duplicate documents. Mitigated
+   by `state.json` dedup keyed on a user-chosen natural-key column — but if the user leaves
+   `dedup_key_column` empty, duplicates are possible. Must be surfaced clearly in the UI/docs.
+4. **Per-command parameter schemas not statically known (scope, medium).** v1 relies on free-form
+   column→parameter mapping + PREMIER server-side validation rather than enforcing field schemas.
+   Acceptable for v1; a later iteration can drive validation from `INFO table_name=…`.
+5. **Enterprise-SQL-only + licensed API module (access, medium).** The API needs PREMIER ENTERPRISE
+   (SQL) and the API module may be a paid add-on; non-Enterprise customers cannot use the writer.
+   Documentation must state this precondition. *Owner: customer.*
+6. **Czech field names + evolving API (maintainability, low).** Parameters are Czech abbreviations
+   and the API evolves; the manual is "informational only," so `INFO` (live) is the source of truth —
+   which is exactly why `listCommands` is driven off `INFO` rather than a hard-coded list.
+
+
+
+================================================
 FILE: scripts/developer_portal/fn_actions_md_update.sh
 ================================================
 #!/bin/bash
@@ -1307,102 +1917,189 @@ update_property "$app_id" "actions" "component_config/actions.md"
 ================================================
 FILE: src/component.py
 ================================================
-"""
-Template Component main class.
-
-"""
+"""PREMIER system writer component."""
 
 import csv
 import logging
-from datetime import datetime
+from collections.abc import Iterator
 
-from keboola.component.base import ComponentBase
+from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
+from keboola.component.sync_actions import SelectElement, ValidationResult
+from keboola.vcr import DefaultSanitizer
 
+from client.premier_client import PremierAuthError, PremierClient, PremierClientError
 from configuration import Configuration
+
+# Scrub credentials from every cassette interaction:
+#   - DefaultSanitizer strips the Authorization header (not in the safe-header whitelist)
+#     and the ID-UJ header (ditto), and redacts #password / username body fields.
+#   - additional_sensitive_fields covers id_uj if it appears as a JSON key in bodies.
+VCR_SANITIZERS = [
+    DefaultSanitizer(
+        additional_sensitive_fields=["id_uj", "username"],
+    ),
+]
+
+RESULTS_TABLE = "results.csv"
+RESULTS_COLUMNS = ["row_index", "dedup_key", "status", "message"]
 
 
 class Component(ComponentBase):
-    """
-    Extends base class for general Python components. Initializes the CommonInterface
-    and performs configuration validation.
-
-    For easier debugging the data folder is picked up by default from `../data` path,
-    relative to working directory.
-
-    If `debug` parameter is present in the `config.json`, the default logger is set to verbose DEBUG mode.
-    """
-
     def __init__(self):
         super().__init__()
+        self.params = Configuration(**self.configuration.parameters)
+        self.client = self._build_client(self.params)
 
-    def run(self):
-        """
-        Main execution code
-        """
+    def run(self) -> None:
+        params = self.params
+        if not params.command:
+            raise UserException("No PREMIER command selected for this configuration row.")
+        params.require_connection()
+        client = self.client
 
-        # ####### EXAMPLE TO REMOVE
-        # check for missing configuration parameters
-        params = Configuration(**self.configuration.parameters)
-
-        # Access parameters in configuration
-        if params.print_hello:
-            logging.info("Hello World")
-
-        # get input table definitions
         input_tables = self.get_input_tables_definitions()
-        for table in input_tables:
-            logging.info("Received input table: %s with path: %s", table.name, table.full_path)
-
-        if len(input_tables) == 0:
-            raise UserException("No input tables found")
-
-        # get last state data/in/state.json from previous run
-        previous_state = self.get_state_file()
-        logging.info(previous_state.get("some_parameter"))
-
-        # Create output table (Table definition - just metadata)
-        table = self.create_out_table_definition("output.csv", incremental=True, primary_key=["timestamp"])
-
-        # get file path of the table (data/out/tables/Features.csv)
-        out_table_path = table.full_path
-        logging.info(out_table_path)
-
-        # Add timestamp column and save into out_table_path
+        if not input_tables:
+            raise UserException("No input table found. Map exactly one table to this configuration row.")
+        if len(input_tables) > 1:
+            raise UserException("Expected exactly one input table per configuration row.")
         input_table = input_tables[0]
-        with (
-            open(input_table.full_path) as inp_file,
-            open(table.full_path, mode="w", encoding="utf-8", newline="") as out_file,
-        ):
-            reader = csv.DictReader(inp_file)
 
-            columns = list(reader.fieldnames)
-            # append timestamp
-            columns.append("timestamp")
+        mapping = params.mapping_as_dict()
+        if not mapping:
+            raise UserException("column_mapping is empty — map at least one input column to a PREMIER parameter.")
 
-            # write result with column added
-            writer = csv.DictWriter(out_file, fieldnames=columns)
-            writer.writeheader()
-            for in_row in reader:
-                in_row["timestamp"] = datetime.now().isoformat()
-                writer.writerow(in_row)
+        state = self.get_state_file() or {}
+        written_keys: list[str] = list(state.get("written_keys", []))
+        already = set(written_keys)
 
-        # Save table manifest (output.csv.manifest) from the Table definition
-        self.write_manifest(table)
+        results_def = self.create_out_table_definition(RESULTS_TABLE, schema=RESULTS_COLUMNS, write_always=True)
+        successes = 0
+        failures = 0
+        skipped = 0
 
-        # Write new state - will be available next run
-        self.write_state_file({"some_state_parameter": "value"})
+        try:
+            try:
+                inp = open(input_table.full_path, encoding="utf-8")
+            except OSError as e:
+                raise UserException(f"Failed to open input table '{input_table.full_path}': {e}") from e
+            with (
+                inp,
+                open(results_def.full_path, "w", encoding="utf-8", newline="") as out,
+            ):
+                reader = csv.DictReader(inp)
+                self._validate_columns(reader.fieldnames, mapping, params.dedup_key_column)
+                writer = csv.DictWriter(out, fieldnames=RESULTS_COLUMNS)
+                writer.writeheader()
 
-        # ####### EXAMPLE TO REMOVE END
+                rows = self._iter_rows(reader, input_table.full_path)
+                for idx, row in rows:
+                    # A blank dedup cell means "no dedup for this row" (do not collapse blanks together).
+                    dedup_key = (row.get(params.dedup_key_column) or None) if params.dedup_key_column else None
+
+                    if dedup_key is not None and dedup_key in already:
+                        skipped += 1
+                        writer.writerow(self._result(idx, dedup_key, "SKIPPED", "already written (state)"))
+                        continue
+
+                    parameters = {target: row.get(source, "") for source, target in mapping.items()}
+                    try:
+                        resp = client.write(params.command, parameters)
+                    except (PremierAuthError, PremierClientError) as e:
+                        # Transport/auth failure mid-run: abort cleanly (exit 1). The finally block
+                        # below persists the rows already written so a rerun skips them (no duplicates).
+                        raise UserException(
+                            f"PREMIER write aborted on row {idx} due to a connection/auth error: {e} "
+                            f"({successes} row(s) already written have been saved to state)."
+                        ) from e
+
+                    if resp.is_ok:
+                        successes += 1
+                        if dedup_key is not None:
+                            written_keys.append(dedup_key)
+                            already.add(dedup_key)
+                        writer.writerow(self._result(idx, dedup_key, "OK", ""))
+                    else:
+                        failures += 1
+                        writer.writerow(self._result(idx, dedup_key, "ERR", resp.error_message))
+                        if not params.continue_on_error:
+                            raise UserException(
+                                f"Write failed on row {idx} (dedup key {dedup_key!r}): {resp.error_message}"
+                            )
+        finally:
+            # Always persist progress + manifest, no matter how the loop exited.
+            # Guard so a secondary error here does not mask a propagating UserException.
+            try:
+                self.write_manifest(results_def)
+                self.write_state_file({"written_keys": written_keys})
+            except Exception:
+                logging.exception("Failed to persist results manifest / state file.")
+
+        logging.info(
+            "PREMIER writer finished: %d succeeded, %d failed, %d skipped.",
+            successes,
+            failures,
+            skipped,
+        )
+
+        if successes == 0 and failures > 0:
+            raise UserException(f"All {failures} rows failed to write to PREMIER. See the results table.")
+
+    @staticmethod
+    def _iter_rows(reader: csv.DictReader, path: str) -> Iterator[tuple[int, dict]]:
+        """Yield (index, row) and map lazy CSV/decoding read errors to a clean exit-1 UserException."""
+        try:
+            yield from enumerate(reader)
+        except (UnicodeDecodeError, csv.Error) as e:
+            raise UserException(f"Failed to read input table '{path}': {e}") from e
+
+    @staticmethod
+    def _result(idx: int, dedup_key: str | None, status: str, message: str) -> dict[str, str | int]:
+        return {"row_index": idx, "dedup_key": dedup_key or "", "status": status, "message": message}
+
+    @staticmethod
+    def _validate_columns(fieldnames: list[str] | None, mapping: dict[str, str], dedup_key_column: str | None) -> None:
+        cols = set(fieldnames or [])
+        missing = [c for c in mapping if c not in cols]
+        if missing:
+            raise UserException(f"Input table is missing mapped column(s): {', '.join(sorted(missing))}.")
+        if dedup_key_column and dedup_key_column not in cols:
+            raise UserException(f"dedup_key_column '{dedup_key_column}' is not a column in the input table.")
+
+    @staticmethod
+    def _build_client(params: Configuration) -> PremierClient:
+        return PremierClient(
+            host=params.host,
+            port=params.port,
+            use_https=params.use_https,
+            username=params.username,
+            password=params.password,
+            id_uj=params.id_uj,
+            max_retries=params.max_retries,
+        )
+
+    @sync_action("testConnection")
+    def test_connection(self) -> ValidationResult:
+        self.params.require_connection()
+        try:
+            self.client.test_connection()
+        except (PremierAuthError, PremierClientError) as e:
+            raise UserException(str(e)) from e
+        return ValidationResult("Connection to PREMIER established.")
+
+    @sync_action("listCommands")
+    def list_commands(self) -> list[SelectElement]:
+        self.params.require_connection()
+        try:
+            commands = self.client.list_write_commands()
+        except (PremierAuthError, PremierClientError) as e:
+            raise UserException(str(e)) from e
+        return [SelectElement(value=c, label=c) for c in commands]
 
 
-"""
-        Main entrypoint
-"""
 if __name__ == "__main__":
     try:
         comp = Component()
-        # this triggers the run method by default and is controlled by the configuration.action parameter
         comp.execute_action()
     except UserException as exc:
         logging.exception(exc)
@@ -1419,29 +2116,205 @@ FILE: src/configuration.py
 import logging
 
 from keboola.component.exceptions import UserException
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError
+
+
+class ColumnMap(BaseModel):
+    source: str  # input table column name
+    target: str  # PREMIER inParam parameter name
 
 
 class Configuration(BaseModel):
-    print_hello: bool
-    api_token: str = Field(alias="#api_token")
+    # --- connection / auth (config level) ---
+    host: str = ""
+    port: int = 443
+    use_https: bool = True
+    username: str = ""
+    password: str = Field(default="", alias="#password")
+    id_uj: str = ""
+    max_retries: int = 5
+
+    # --- write target (row level) ---
+    command: str | None = None
+    column_mapping: list[ColumnMap] = Field(default_factory=list)
+    dedup_key_column: str | None = None
+    continue_on_error: bool = True
+
     debug: bool = False
 
     def __init__(self, **data):
         try:
             super().__init__(**data)
         except ValidationError as e:
-            error_messages = [f"{err['loc'][0]}: {err['msg']}" for err in e.errors()]
+            error_messages = [f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()]
             raise UserException(f"Validation Error: {', '.join(error_messages)}")
 
         if self.debug:
             logging.debug("Component will run in Debug mode")
 
-    @field_validator("api_token")
-    def token_must_be_uppercase(cls, v):
-        if not v.isupper():
-            raise UserException("API token must be uppercase")
-        return v
+    def mapping_as_dict(self) -> dict[str, str]:
+        """input-column -> PREMIER-parameter."""
+        return {m.source: m.target for m in self.column_mapping}
+
+    def require_connection(self) -> None:
+        """Validate that all connection/auth fields are present.
+
+        ``command`` intentionally stays optional — the sync actions
+        (testConnection, listCommands) run before a command is chosen.
+        """
+        missing = [
+            name
+            for name, value in (
+                ("host", self.host),
+                ("username", self.username),
+                ("#password", self.password),
+                ("accounting unit (ID-UJ)", self.id_uj),
+            )
+            if not value
+        ]
+        if missing:
+            raise UserException(f"Missing required connection setting(s): {', '.join(missing)}.")
+
+
+
+================================================
+FILE: src/client/__init__.py
+================================================
+from client.premier_client import (
+    PremierAuthError,
+    PremierClient,
+    PremierClientError,
+    PremierResponse,
+)
+
+__all__ = [
+    "PremierAuthError",
+    "PremierClient",
+    "PremierClientError",
+    "PremierResponse",
+]
+
+
+
+================================================
+FILE: src/client/premier_client.py
+================================================
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import requests
+from keboola.http_client import HttpClient
+
+
+@dataclass
+class PremierResponse:
+    """Parsed PREMIER ApiComPrem response envelope."""
+
+    result: str
+    data: list[dict] = field(default_factory=list)
+    errors: list[dict] = field(default_factory=list)
+    warnings: list[dict] = field(default_factory=list)
+
+    @property
+    def is_ok(self) -> bool:
+        return self.result == "OK"
+
+    @property
+    def error_message(self) -> str:
+        return "; ".join(str(e.get("desc", "")) for e in self.errors)
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> PremierResponse:
+        return cls(
+            result=raw.get("Result", ""),
+            data=raw.get("Data", []) or [],
+            errors=raw.get("Error", []) or [],
+            warnings=raw.get("Warning", []) or [],
+        )
+
+
+class PremierClientError(Exception):
+    """Non-auth transport/protocol error talking to the PREMIER API."""
+
+
+class PremierAuthError(PremierClientError):
+    """Authentication or accounting-unit (ID-UJ) rejection."""
+
+
+class PremierClient(HttpClient):
+    """Client for the PREMIER ApiComPrem JSON-RPC endpoint (`POST /api/comm`)."""
+
+    ENDPOINT = "comm"
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        use_https: bool,
+        username: str,
+        password: str,
+        id_uj: str,
+        max_retries: int = 5,
+    ):
+        scheme = "https" if use_https else "http"
+        base_url = f"{scheme}://{host}:{port}/api/"
+        super().__init__(
+            base_url,
+            max_retries=max_retries,
+            default_http_header={
+                "Content-Type": "application/json; charset=UTF-8",
+                "ID-UJ": id_uj,
+            },
+            auth=(username, password),
+        )
+
+    def call(self, command: str, parameters: dict | None = None) -> PremierResponse:
+        body = {"command": {"inComm": command, "inParam": {"parameters": parameters or {}}}}
+        try:
+            raw = self.post(endpoint_path=self.ENDPOINT, json=body)
+        except requests.RequestException as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in (401, 403):
+                raise PremierAuthError(f"PREMIER rejected the credentials or ID-UJ (HTTP {status}).") from e
+            raise PremierClientError(f"PREMIER API request failed (HTTP {status}).") from e
+        if not isinstance(raw, dict):
+            raise PremierClientError("Unexpected PREMIER API response (expected a JSON object).")
+        return PremierResponse.from_dict(raw)
+
+    def test_connection(self) -> None:
+        """Validate host reachability + Basic auth + ID-UJ via a harmless read command."""
+        resp = self.call("VERZEAPI")
+        if not resp.is_ok:
+            raise PremierClientError(f"PREMIER connection check failed: {resp.error_message or 'unexpected response'}")
+
+    def list_write_commands(self) -> list[str]:
+        """Return the live catalog of write (``typ_prikazu == "IN"``) command names via INFO.
+
+        The PREMIER API returns ``Data`` as a one-element list whose single item has the
+        shape ``{"CommList": [{"<CMD>": {"nazov": "<CMD>", "typ_prikazu": "IN|OUT", ...}}, ...]}``.
+        We unwrap that envelope and flatten each ``{"<CMD>": {...}}`` entry into the inner dict.
+        """
+        resp = self.call("INFO", {"prikaz": "FULL"})
+        if not resp.is_ok:
+            raise PremierClientError(f"Could not list PREMIER commands: {resp.error_message or 'unexpected response'}")
+
+        # Unwrap the CommList envelope: Data[0]["CommList"] is the actual command list.
+        comm_list: list[dict] = []
+        if resp.data and isinstance(resp.data[0], dict):
+            raw_list = resp.data[0].get("CommList", [])
+            for entry in raw_list:
+                if isinstance(entry, dict):
+                    # Each entry is {"CMD_NAME": {nazov, typ_prikazu, ...}}
+                    for cmd_info in entry.values():
+                        if isinstance(cmd_info, dict):
+                            comm_list.append(cmd_info)
+
+        return [str(item["nazov"]) for item in comm_list if item.get("typ_prikazu") == "IN" and item.get("nazov")]
+
+    def write(self, command: str, parameters: dict) -> PremierResponse:
+        """Issue a single write/create command. The caller inspects `is_ok` / `error_message`."""
+        return self.call(command, parameters)
 
 
 
@@ -1456,30 +2329,556 @@ sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 
 
 ================================================
-FILE: tests/test_component.py
+FILE: tests/test_component_run.py
 ================================================
-import os
-import unittest
+import csv
+import json
+import sys
+from pathlib import Path
 from unittest import mock
 
-from freezegun import freeze_time
+import pytest
 
-from component import Component
+sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
+
+from keboola.component.exceptions import UserException
+
+from client.premier_client import PremierResponse
 
 
-class TestComponent(unittest.TestCase):
-    # set global time to 2010-10-10 - affects functions like datetime.now()
-    @freeze_time("2010-10-10")
-    # set KBC_DATADIR env to non-existing dir
-    @mock.patch.dict(os.environ, {"KBC_DATADIR": "./non-existing-dir"})
-    def test_run_no_cfg_fails(self):
-        with self.assertRaises(ValueError):
-            comp = Component()
-            comp.run()
+def _write_datadir(tmp_path, rows, continue_on_error=True, state=None, command="FA_OUT_ADD"):
+    data_dir = tmp_path / "data"
+    (data_dir / "in" / "tables").mkdir(parents=True)
+    (data_dir / "out" / "tables").mkdir(parents=True)
+    in_table = data_dir / "in" / "tables" / "src.csv"
+    with open(in_table, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["doc", "vs"])
+        w.writeheader()
+        w.writerows(rows)
+    (data_dir / "in" / "tables" / "src.csv.manifest").write_text(
+        json.dumps({"destination": "in.c-main.src", "columns": ["doc", "vs"]})
+    )
+    params = {
+        "host": "premier.example.com",
+        "port": 12375,
+        "use_https": True,
+        "username": "user",
+        "#password": "secret",
+        "id_uj": "11111111-2222-3333-4444-555555555555",
+        "column_mapping": [{"source": "doc", "target": "DOKLAD"}, {"source": "vs", "target": "VARIABL"}],
+        "dedup_key_column": "vs",
+        "continue_on_error": continue_on_error,
+    }
+    if command is not None:
+        params["command"] = command
+    config = {
+        "parameters": params,
+        "storage": {"input": {"tables": [{"source": "in.c-main.src", "destination": "src.csv"}]}},
+    }
+    (data_dir / "config.json").write_text(json.dumps(config))
+    if state is not None:
+        (data_dir / "in" / "state.json").write_text(json.dumps(state))
+    return data_dir
+
+
+def _run(data_dir):
+    from component import Component
+
+    with mock.patch.dict("os.environ", {"KBC_DATADIR": str(data_dir)}):
+        comp = Component()
+        comp.run()
+
+
+def _read_results(data_dir):
+    with open(data_dir / "out" / "tables" / "results.csv") as f:
+        return list(csv.DictReader(f))
+
+
+def test_all_rows_written_ok(tmp_path):
+    data_dir = _write_datadir(tmp_path, [{"doc": "FV1", "vs": "2024001"}, {"doc": "FV2", "vs": "2024002"}])
+    with mock.patch("component.PremierClient") as MockClient:
+        MockClient.return_value.write.return_value = PremierResponse(result="OK")
+        _run(data_dir)
+    results = _read_results(data_dir)
+    assert [r["status"] for r in results] == ["OK", "OK"]
+    state = json.loads((data_dir / "out" / "state.json").read_text())
+    assert set(state["written_keys"]) == {"2024001", "2024002"}
+
+
+def test_partial_failure_continue(tmp_path):
+    data_dir = _write_datadir(tmp_path, [{"doc": "FV1", "vs": "2024001"}, {"doc": "FV2", "vs": "2024002"}])
+
+    def side_effect(command, params):
+        if params["VARIABL"] == "2024002":
+            return PremierResponse(result="ERR", errors=[{"desc": "bad DPH"}])
+        return PremierResponse(result="OK")
+
+    with mock.patch("component.PremierClient") as MockClient:
+        MockClient.return_value.write.side_effect = side_effect
+        _run(data_dir)
+    statuses = {r["dedup_key"]: r["status"] for r in _read_results(data_dir)}
+    assert statuses == {"2024001": "OK", "2024002": "ERR"}
+    state = json.loads((data_dir / "out" / "state.json").read_text())
+    assert state["written_keys"] == ["2024001"]
+
+
+def test_dedup_skips_already_written(tmp_path):
+    data_dir = _write_datadir(
+        tmp_path,
+        [{"doc": "FV1", "vs": "2024001"}, {"doc": "FV2", "vs": "2024002"}],
+        state={"written_keys": ["2024001"]},
+    )
+    with mock.patch("component.PremierClient") as MockClient:
+        MockClient.return_value.write.return_value = PremierResponse(result="OK")
+        _run(data_dir)
+        assert MockClient.return_value.write.call_count == 1
+    statuses = {r["dedup_key"]: r["status"] for r in _read_results(data_dir)}
+    assert statuses == {"2024001": "SKIPPED", "2024002": "OK"}
+
+
+def test_fail_fast_persists_progress_and_raises(tmp_path):
+    data_dir = _write_datadir(
+        tmp_path,
+        [{"doc": "FV1", "vs": "2024001"}, {"doc": "FV2", "vs": "2024002"}],
+        continue_on_error=False,
+    )
+
+    def side_effect(command, params):
+        if params["VARIABL"] == "2024002":
+            return PremierResponse(result="ERR", errors=[{"desc": "nope"}])
+        return PremierResponse(result="OK")
+
+    with mock.patch("component.PremierClient") as MockClient:
+        MockClient.return_value.write.side_effect = side_effect
+        with pytest.raises(UserException):
+            _run(data_dir)
+    # progress persisted despite the raise
+    state = json.loads((data_dir / "out" / "state.json").read_text())
+    assert state["written_keys"] == ["2024001"]
+    statuses = {r["dedup_key"]: r["status"] for r in _read_results(data_dir)}
+    assert statuses["2024001"] == "OK"
+    assert statuses["2024002"] == "ERR"
+
+
+def test_transport_error_persists_state_and_raises(tmp_path):
+    from client.premier_client import PremierClientError
+
+    data_dir = _write_datadir(tmp_path, [{"doc": "FV1", "vs": "2024001"}, {"doc": "FV2", "vs": "2024002"}])
+
+    def side_effect(command, params):
+        if params["VARIABL"] == "2024002":
+            raise PremierClientError("server unreachable")
+        return PremierResponse(result="OK")
+
+    with mock.patch("component.PremierClient") as MockClient:
+        MockClient.return_value.write.side_effect = side_effect
+        with pytest.raises(UserException):
+            _run(data_dir)
+    state = json.loads((data_dir / "out" / "state.json").read_text())
+    assert state["written_keys"] == ["2024001"]  # row 1 saved before the transport error
+
+
+def test_blank_dedup_keys_are_not_collapsed(tmp_path):
+    data_dir = _write_datadir(tmp_path, [{"doc": "FV1", "vs": ""}, {"doc": "FV2", "vs": ""}])
+    with mock.patch("component.PremierClient") as MockClient:
+        MockClient.return_value.write.return_value = PremierResponse(result="OK")
+        _run(data_dir)
+        assert MockClient.return_value.write.call_count == 2  # both written, neither skipped
+    statuses = [r["status"] for r in _read_results(data_dir)]
+    assert statuses == ["OK", "OK"]
+
+
+def test_all_failed_raises(tmp_path):
+    data_dir = _write_datadir(tmp_path, [{"doc": "FV1", "vs": "2024001"}])
+    with mock.patch("component.PremierClient") as MockClient:
+        MockClient.return_value.write.return_value = PremierResponse(result="ERR", errors=[{"desc": "bad"}])
+        with pytest.raises(UserException):
+            _run(data_dir)
+    statuses = [r["status"] for r in _read_results(data_dir)]
+    assert statuses == ["ERR"]
+
+
+def test_missing_mapped_column_raises(tmp_path):
+    data_dir = _write_datadir(tmp_path, [{"doc": "FV1", "vs": "2024001"}])
+    # rewrite config to map a non-existent column
+    cfg = json.loads((data_dir / "config.json").read_text())
+    cfg["parameters"]["column_mapping"] = [{"source": "nonexistent", "target": "DOKLAD"}]
+    (data_dir / "config.json").write_text(json.dumps(cfg))
+    with mock.patch("component.PremierClient"):
+        with pytest.raises(UserException):
+            _run(data_dir)
+
+
+def test_missing_connection_field_raises(tmp_path):
+    data_dir = _write_datadir(tmp_path, [{"doc": "FV1", "vs": "2024001"}])
+    cfg = json.loads((data_dir / "config.json").read_text())
+    cfg["parameters"]["host"] = ""
+    (data_dir / "config.json").write_text(json.dumps(cfg))
+    with mock.patch("component.PremierClient"):
+        with pytest.raises(UserException):
+            _run(data_dir)
+
+
+def test_missing_command_raises(tmp_path):
+    data_dir = _write_datadir(tmp_path, [{"doc": "FV1", "vs": "2024001"}], command=None)
+    with mock.patch("component.PremierClient"):
+        raised = False
+        try:
+            _run(data_dir)
+        except UserException:
+            raised = True
+    assert raised is True
+
+
+
+================================================
+FILE: tests/test_configuration.py
+================================================
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
+
+from configuration import Configuration
+
+VALID = {
+    "host": "premier.example.com",
+    "port": 12375,
+    "use_https": True,
+    "username": "user",
+    "#password": "secret",
+    "id_uj": "11111111-2222-3333-4444-555555555555",
+    "command": "FA_OUT_ADD",
+    "column_mapping": [{"source": "doc", "target": "DOKLAD"}],
+}
+
+
+def test_valid_config_parses_and_maps_secret():
+    cfg = Configuration(**VALID)
+    assert cfg.password == "secret"
+    assert cfg.command == "FA_OUT_ADD"
+    assert cfg.mapping_as_dict() == {"doc": "DOKLAD"}
+    assert cfg.continue_on_error is True  # default
+
+
+def test_missing_password_defaults_to_empty():
+    data = {k: v for k, v in VALID.items() if k != "#password"}
+    cfg = Configuration(**data)
+    assert cfg.password == ""  # presence enforced at run()/sync-action, not construction
+
+
+def test_missing_command_is_allowed_at_construction():
+    data = {k: v for k, v in VALID.items() if k != "command"}
+    cfg = Configuration(**data)
+    assert cfg.command is None  # presence is enforced at run(), not construction
+
+
+
+================================================
+FILE: tests/test_functional.py
+================================================
+import unittest
+from pathlib import Path
+
+from keboola.datadirtest.vcr import VCRDataDirTester
+
+FUNCTIONAL_DIR = Path(__file__).resolve().parent / "functional"
+COMPONENT_SCRIPT = Path(__file__).resolve().parent.parent / "src" / "component.py"
+
+
+class TestFunctional(unittest.TestCase):
+    def test_functional(self):
+        tester = VCRDataDirTester(
+            data_dir=str(FUNCTIONAL_DIR),
+            component_script=str(COMPONENT_SCRIPT),
+        )
+        tester.run()
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+================================================
+FILE: tests/test_premier_client.py
+================================================
+import sys
+from pathlib import Path
+
+import pytest
+import requests
+import responses
+
+sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
+
+from client.premier_client import PremierAuthError, PremierClient, PremierClientError
+
+BASE = "https://premier.example.com:12375/api/comm"
+
+
+def make_client():
+    return PremierClient(
+        host="premier.example.com",
+        port=12375,
+        use_https=True,
+        username="user",
+        password="pass",
+        id_uj="11111111-2222-3333-4444-555555555555",
+    )
+
+
+@responses.activate
+def test_call_sends_correct_envelope_and_parses_ok():
+    responses.add(responses.POST, BASE, json={"Result": "OK", "Data": [{"x": 1}]}, status=200)
+    client = make_client()
+    resp = client.call("VERZEAPI", {"foo": "bar"})
+    assert resp.is_ok is True
+    sent = responses.calls[0].request
+    body = sent.body if isinstance(sent.body, str) else sent.body.decode()
+    assert '"inComm": "VERZEAPI"' in body
+    assert '"foo": "bar"' in body
+    assert sent.headers["ID-UJ"] == "11111111-2222-3333-4444-555555555555"
+    assert sent.headers["Authorization"].startswith("Basic ")
+
+
+@responses.activate
+def test_call_raises_auth_error_on_401():
+    responses.add(responses.POST, BASE, status=401)
+    client = make_client()
+    with pytest.raises(PremierAuthError):
+        client.call("VERZEAPI")
+
+
+@responses.activate
+def test_call_raises_client_error_on_400():
+    responses.add(responses.POST, BASE, status=400)
+    client = make_client()
+    with pytest.raises(PremierClientError):
+        client.call("VERZEAPI")
+
+
+@responses.activate
+def test_call_raises_auth_error_on_403():
+    responses.add(responses.POST, BASE, status=403)
+    client = make_client()
+    with pytest.raises(PremierAuthError):
+        client.call("VERZEAPI")
+
+
+@responses.activate
+def test_call_wraps_connection_error_as_client_error():
+    responses.add(responses.POST, BASE, body=requests.exceptions.ConnectionError("server unreachable"))
+    client = make_client()
+    with pytest.raises(PremierClientError):
+        client.call("VERZEAPI")
+
+
+@responses.activate
+def test_test_connection_ok():
+    responses.add(responses.POST, BASE, json={"Result": "OK", "Data": [{"verze": "1.0.1.280"}]}, status=200)
+    client = make_client()
+    client.test_connection()  # must not raise
+
+
+@responses.activate
+def test_test_connection_err_result_raises():
+    responses.add(responses.POST, BASE, json={"Result": "ERR", "Error": [{"desc": "bad unit"}]}, status=200)
+    client = make_client()
+    with pytest.raises(PremierClientError):
+        client.test_connection()
+
+
+@responses.activate
+def test_list_write_commands_filters_to_in_type():
+    # Real PREMIER API wraps commands inside Data[0]["CommList"] where each entry is
+    # {"CMD_NAME": {"nazov": "CMD_NAME", "typ_prikazu": "IN|OUT", ...}}.
+    responses.add(
+        responses.POST,
+        BASE,
+        json={
+            "Result": "OK",
+            "Data": [
+                {
+                    "CommList": [
+                        {"FA_OUT_ADD": {"nazov": "FA_OUT_ADD", "typ_prikazu": "IN", "popis": "issued invoice"}},
+                        {"INFO": {"nazov": "INFO", "typ_prikazu": "OUT", "popis": "info"}},
+                        {"PARTNERI_ADD": {"nazov": "PARTNERI_ADD", "typ_prikazu": "IN", "popis": "add partner"}},
+                    ]
+                }
+            ],
+        },
+        status=200,
+    )
+    client = make_client()
+    commands = client.list_write_commands()
+    assert commands == ["FA_OUT_ADD", "PARTNERI_ADD"]
+
+
+@responses.activate
+def test_write_returns_response_unchanged():
+    responses.add(responses.POST, BASE, json={"Result": "OK", "Data": [{"doc": 42}]}, status=200)
+    client = make_client()
+    resp = client.write("FA_OUT_ADD", {"DOKLAD": "FV1", "VARIABL": "2024001"})
+    assert resp.is_ok is True
+    body = responses.calls[0].request.body
+    body = body if isinstance(body, str) else body.decode()
+    assert '"inComm": "FA_OUT_ADD"' in body
+    assert '"VARIABL": "2024001"' in body
+
+
+@responses.activate
+def test_list_write_commands_handles_empty_and_malformed_data():
+    # Data with missing / empty CommList → returns empty list without error.
+    responses.add(
+        responses.POST,
+        BASE,
+        json={
+            "Result": "OK",
+            "Data": [{}],  # CommList key absent
+        },
+        status=200,
+    )
+    client = make_client()
+    assert client.list_write_commands() == []
+
+
+@responses.activate
+def test_list_write_commands_skips_entries_without_nazov():
+    responses.add(
+        responses.POST,
+        BASE,
+        json={
+            "Result": "OK",
+            "Data": [
+                {
+                    "CommList": [
+                        {"SKLAD_ADD": {"nazov": "SKLAD_ADD", "typ_prikazu": "IN"}},
+                        {"NO_NAZOV": {"typ_prikazu": "IN"}},  # missing nazov → skipped
+                        {"EMPTY_NAZOV": {"nazov": "", "typ_prikazu": "IN"}},  # empty → skipped
+                    ]
+                }
+            ],
+        },
+        status=200,
+    )
+    client = make_client()
+    assert client.list_write_commands() == ["SKLAD_ADD"]
+
+
+@responses.activate
+def test_call_raises_on_non_dict_response():
+    responses.add(responses.POST, BASE, json=["not", "a", "dict"], status=200)
+    client = make_client()
+    with pytest.raises(PremierClientError):
+        client.call("VERZEAPI")
+
+
+@responses.activate
+def test_test_connection_propagates_auth_error():
+    responses.add(responses.POST, BASE, status=401)
+    client = make_client()
+    with pytest.raises(PremierAuthError):
+        client.test_connection()
+
+
+
+================================================
+FILE: tests/test_premier_response.py
+================================================
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
+
+from client.premier_client import PremierResponse
+
+
+def test_ok_response_parses():
+    raw = {"Result": "OK", "CommandIn": "FA_OUT_ADD", "Data": [{"id": 1}], "Error": [], "Warning": []}
+    resp = PremierResponse.from_dict(raw)
+    assert resp.is_ok is True
+    assert resp.data == [{"id": 1}]
+    assert resp.error_message == ""
+
+
+def test_err_response_collects_error_descriptions():
+    raw = {
+        "Result": "ERR",
+        "CommandIn": "FA_OUT_ADD",
+        "Data": [],
+        "Error": [{"number": 5, "desc": "Invalid DPH code"}, {"number": 6, "desc": "Missing partner"}],
+        "Warning": [],
+    }
+    resp = PremierResponse.from_dict(raw)
+    assert resp.is_ok is False
+    assert resp.error_message == "Invalid DPH code; Missing partner"
+
+
+def test_missing_keys_default_to_empty():
+    resp = PremierResponse.from_dict({"Result": "OK"})
+    assert resp.data == []
+    assert resp.errors == []
+    assert resp.warnings == []
+
+
+
+================================================
+FILE: tests/functional/README.md
+================================================
+# Functional (datadir) tests
+
+Each subdirectory here is one datadir test case with this layout:
+
+```
+<test_name>/
+  source/data/config.json        # the component config for this case
+  source/data/in/tables/*.csv     # input tables
+  expected/data/out/tables/*.csv  # expected output (e.g. results.csv)
+```
+
+`DataDirTester` runs `src/component.py` against each case's `source/data` and compares the produced `out/` against `expected/`.
+
+- Directories whose name starts with `_` are SKIPPED (use this for templates / not-yet-recorded cases).
+- Because this is a **writer**, live cases need VCR cassettes (recorded HTTP) so tests don't hit a real PREMIER server. Cassettes + `secrets.json` + `VCR_SANITIZERS` are added in the VCR test phase (see the build plan). Until then, only the skipped `_example_*` template exists.
+
+
+
+================================================
+FILE: tests/setup/configs.json
+================================================
+[
+  {
+    "name": "01_testConnection",
+    "description": "Validate connection to PREMIER sandbox via VERZEAPI (read-only)",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "host": "dev.premier.cz",
+        "port": 12375,
+        "use_https": true,
+        "username": "DUMMY_USER",
+        "#password": "DUMMY_PASS",
+        "id_uj": "DUMMY_ID_UJ"
+      }
+    }
+  },
+  {
+    "name": "02_listCommands",
+    "description": "Fetch full catalog of PREMIER write commands via INFO/prikaz=FULL (read-only)",
+    "config": {
+      "action": "listCommands",
+      "parameters": {
+        "host": "dev.premier.cz",
+        "port": 12375,
+        "use_https": true,
+        "username": "DUMMY_USER",
+        "#password": "DUMMY_PASS",
+        "id_uj": "DUMMY_ID_UJ"
+      }
+    }
+  }
+]
 
 
 
