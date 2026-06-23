@@ -935,7 +935,7 @@ class QuickbooksClient:
     QuickBooks Requests Handler
     """
 
-    def __init__(self, company_id, access_token, refresh_token, oauth, sandbox):
+    def __init__(self, company_id, access_token, refresh_token, oauth, sandbox, on_token_refresh=None):
         self.data_2 = None
         self.data = None
         self.app_key = oauth.appKey
@@ -952,6 +952,7 @@ class QuickbooksClient:
         self.access_token_refreshed = False
         self.new_refresh_token = False
         self.company_id = company_id
+        self.on_token_refresh = on_token_refresh
         self.reports_required_accounting_type = [
             "ProfitAndLoss",
             "ProfitAndLossDetail",
@@ -1007,9 +1008,6 @@ class QuickbooksClient:
             self.count = self.get_count()  # total count of records for pagination
             if self.count == 0:
                 logging.info("There are no returns for {0}".format(self.endpoint))
-                self.data = []
-            else:
-                self.data_request()
 
     @backoff.on_exception(backoff.expo, HTTPError, max_tries=3)
     def refresh_access_token(self):
@@ -1035,6 +1033,8 @@ class QuickbooksClient:
         self.access_token = results["access_token"]
         self.refresh_token = results["refresh_token"]
         self.access_token_refreshed = True
+        if self.on_token_refresh:
+            self.on_token_refresh(self.refresh_token, self.access_token)
 
     def get_count(self):
         """
@@ -1071,6 +1071,10 @@ class QuickbooksClient:
         request_success = False
         while not request_success:
             headers = {"Authorization": "Bearer " + self.access_token, "Accept": "application/json"}
+            if params is None:
+                params = {}
+            if "minorversion" not in params:
+                params["minorversion"] = "75"
             logging.info(f"Requesting: {url} with params: {params}")
             data = requesting.get(url, headers=headers, params=params)
 
@@ -1096,7 +1100,8 @@ class QuickbooksClient:
 
     def data_request(self):
         """
-        Handles Request Parameters and Pagination
+        Generator that yields one page of records at a time.
+        This keeps memory usage constant regardless of total record count.
         """
 
         num_of_run = 0
@@ -1118,7 +1123,7 @@ class QuickbooksClient:
             encoded_query = self.url_encode(query)
             url = "{0}/{1}/query?query={2}".format(self.base_url, self.company_id, encoded_query)
 
-            # Requests and concatenating results into class's data variable
+            # Requests
             results = self._request(url)
 
             # If API returns error, raise exception and terminate application
@@ -1127,10 +1132,9 @@ class QuickbooksClient:
 
             data = results["QueryResponse"][self.endpoint]
 
-            # Concatenate with exist extracted data
-            self.data = self.data + data
+            yield data
 
-            # Handling pagination paramters
+            # Handling pagination parameters
             self.startposition += self.maxresults
             num_of_run += 1
 
@@ -1304,25 +1308,18 @@ class Component(ComponentBase):
             params.get(KEY_SUMMARIZE_COLUMN_BY) if params.get(KEY_SUMMARIZE_COLUMN_BY) else self.summarize_column_by
         )
 
-        self.write_state_file(
-            {
-                "tokens": {
-                    "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                    "#refresh_token": self.refresh_token,
-                    "#access_token": self.access_token,
-                }
-            }
-        )
-
         quickbooks_param = QuickbooksClient(
             company_id=company_id,
             refresh_token=self.refresh_token,
             access_token=self.access_token,
             oauth=oauth,
             sandbox=sandbox,
+            on_token_refresh=self._on_token_refresh,
         )
 
         self.process_oauth_tokens(quickbooks_param)
+
+        self._save_tokens_to_state_file()
 
         # Fetching reports for each configured endpoint
         for endpoint in endpoints:
@@ -1339,21 +1336,16 @@ class Component(ComponentBase):
 
             # Phase 2: Mapping
             # Translate Input JSON file into CSV with configured mapping
-            # For different accounting_type,
-            # input_data will be outputting Accrual Type
-            # input_data_2 will be outputting Cash Type
             logging.info("Parsing API results...")
-            input_data = quickbooks_param.data
 
-            # if there are no data
-            # output blank
-            if len(input_data) == 0:
-                pass
-            else:
-                logging.info("Report API Template Enable: {0}".format(report_api_bool))
-                if report_api_bool:
+            if report_api_bool:
+                # Report endpoints: single response, no pagination
+                input_data = quickbooks_param.data
+                if len(input_data) == 0:
+                    pass
+                else:
+                    logging.info("Report API Template Enable: True")
                     if endpoint == "CustomQuery":
-                        # Not implemented
                         ReportMapping(endpoint=endpoint, data=input_data, query=self.start_date)
                     else:
                         if endpoint in quickbooks_param.reports_required_accounting_type:
@@ -1362,8 +1354,13 @@ class Component(ComponentBase):
                             ReportMapping(endpoint=endpoint, data=input_data_2, accounting_type="cash")
                         else:
                             ReportMapping(endpoint=endpoint, data=input_data)
+            else:
+                # Data endpoints: stream page-by-page to keep memory constant
+                if quickbooks_param.count == 0:
+                    pass
                 else:
-                    Mapping(endpoint=endpoint, data=input_data)
+                    for page in quickbooks_param.data_request():
+                        Mapping(endpoint=endpoint, data=page, append=True)
 
     def get_tokens(self, oauth):
         try:
@@ -1388,14 +1385,30 @@ class Component(ComponentBase):
 
         return refresh_token, access_token
 
+    def _on_token_refresh(self, new_refresh_token: str, new_access_token: str) -> None:
+        """Callback invoked by the client whenever tokens are refreshed during the initial token refresh."""
+        self.refresh_token = new_refresh_token
+        self.access_token = new_access_token
+        self._save_tokens_to_state_file()
+
+    def _save_tokens_to_state_file(self) -> None:
+        """Writes the current tokens to the output state file so they persist for the next run."""
+        self.write_state_file(
+            {
+                "tokens": {
+                    "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                    "#refresh_token": self.refresh_token,
+                    "#access_token": self.access_token,
+                }
+            }
+        )
+
     def process_oauth_tokens(self, client) -> None:
         """Uses Quickbooks client to get new tokens and saves them using API if they have changed since the last run."""
+        original_refresh_token = self.refresh_token
         new_refresh_token, new_access_token = client.get_new_refresh_token()
-        if self.refresh_token != new_refresh_token:
+        if original_refresh_token != new_refresh_token:
             self.save_new_oauth_tokens(new_refresh_token, new_access_token)
-
-            # We also save new tokens to class vars, so we can save them unencrypted if case statefile update fails
-            # in update_config_state() method.
             self.refresh_token = new_refresh_token
             self.access_token = new_access_token
 
@@ -1439,7 +1452,7 @@ class Component(ComponentBase):
 
     @backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=5)
     def encrypt(self, token: str) -> str:
-        url = f"https://encryption.{URL_SUFFIX}.com/encrypt"
+        url = f"https://encryption.{URL_SUFFIX}/encrypt"
         params = {
             "componentId": self.environment_variables.component_id,
             "projectId": self.environment_variables.project_id,
@@ -1543,8 +1556,9 @@ class Mapping:
     Handling Generic Ex Mapping
     """
 
-    def __init__(self, endpoint, data):
+    def __init__(self, endpoint, data, append=False):
         self.endpoint = endpoint
+        self.append = append
         self.mapping = self.mapping_check(self.endpoint)
         self.out_file = {self.endpoint: []}
         self.out_file_pk = {self.endpoint: []}  # destination name from mapping
@@ -1758,7 +1772,11 @@ class Mapping:
         for file in out_file:
             out_df = pd.DataFrame(out_file[file])
             file_dest = DEFAULT_FILE_DESTINATION + file + ".csv"
-            out_df.to_csv(file_dest, index=False)
+            if self.append:
+                file_exists = os.path.exists(file_dest)
+                out_df.to_csv(file_dest, mode="a", index=False, header=not file_exists)
+            else:
+                out_df.to_csv(file_dest, index=False)
             logging.info("Table output: {0}...".format(file_dest))
 
         # Outputting manifest file if incremental
@@ -3243,6 +3261,37 @@ FILE: src/mappings.json
                                 "destination": "NetAmountTaxable"
                             }
                         }
+                    }
+                }
+            }
+        },
+        "CustomField": {
+            "type": "table",
+            "destination": "Invoice-CustomField",
+            "tableMapping": {
+                "DefinitionId": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Definition_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Name": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Name"
+                    }
+                },
+                "Type": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Type"
+                    }
+                },
+                "StringValue": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "StringValue"
                     }
                 }
             }
@@ -5185,8 +5234,1260 @@ FILE: src/mappings.json
                     "destination": "time"
                 }
             }
+    },
+    "SalesReceipt": {
+        "Id": {
+            "type": "column",
+            "mapping": {
+                "destination": "ID",
+                "primaryKey": true
+            }
+        },
+        "CustomerRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "Customer_ID"
+            }
+        },
+        "CustomerRef.name": {
+            "type": "column",
+            "mapping": {
+                "destination": "Customer_name"
+            }
+        },
+        "DocNumber": {
+            "type": "column",
+            "mapping": {
+                "destination": "DocNumber"
+            }
+        },
+        "TxnDate": {
+            "type": "column",
+            "mapping": {
+                "destination": "TxnDate"
+            }
+        },
+        "CurrencyRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "Currency"
+            }
+        },
+        "ExchangeRate": {
+            "type": "column",
+            "mapping": {
+                "destination": "ExchangeRate"
+            }
+        },
+        "GlobalTaxCalculation": {
+            "type": "column",
+            "mapping": {
+                "destination": "GlobalTaxCalculation"
+            }
+        },
+        "TotalAmt": {
+            "type": "column",
+            "mapping": {
+                "destination": "TotalAmount"
+            }
+        },
+        "HomeTotalAmt": {
+            "type": "column",
+            "mapping": {
+                "destination": "HomeTotalAmount"
+            }
+        },
+        "PrintStatus": {
+            "type": "column",
+            "mapping": {
+                "destination": "PrintStatus"
+            }
+        },
+        "EmailStatus": {
+            "type": "column",
+            "mapping": {
+                "destination": "EmailStatus"
+            }
+        },
+        "BillEmail.Address": {
+            "type": "column",
+            "mapping": {
+                "destination": "BillEmail_Address"
+            }
+        },
+        "Balance": {
+            "type": "column",
+            "mapping": {
+                "destination": "Balance"
+            }
+        },
+        "PaymentMethodRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "PaymentMethod_ID"
+            }
+        },
+        "PaymentMethodRef.name": {
+            "type": "column",
+            "mapping": {
+                "destination": "PaymentMethod_name"
+            }
+        },
+        "DepositToAccountRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "DepositToAccount_ID"
+            }
+        },
+        "DepositToAccountRef.name": {
+            "type": "column",
+            "mapping": {
+                "destination": "DepositToAccount_name"
+            }
+        },
+        "BillAddr": {
+            "type": "table",
+            "destination": "SalesReceipt-BillAddr",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "BillAddr_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Line1": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Line_1"
+                    }
+                },
+                "City": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "City"
+                    }
+                },
+                "CountrySubDivisionCode": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "State"
+                    }
+                }
+            }
+        },
+        "ShipAddr": {
+            "type": "table",
+            "destination": "SalesReceipt-ShipAddr",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "ShipAddr_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Line1": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Line_1"
+                    }
+                },
+                "City": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "City"
+                    }
+                },
+                "CountrySubDivisionCode": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "State"
+                    }
+                }
+            }
+        },
+        "Line": {
+            "type": "table",
+            "destination": "SalesReceipt-Line",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "ID",
+                        "primaryKey": true
+                    }
+                },
+                "LineNum": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "LineNum"
+                    }
+                },
+                "Description": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Description"
+                    }
+                },
+                "Amount": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Amount"
+                    }
+                },
+                "DetailType": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "DetailType"
+                    }
+                },
+                "SalesItemLineDetail.ItemRef.value": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "SalesItem_ID"
+                    }
+                },
+                "SalesItemLineDetail.ItemRef.name": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "SalesItem_name"
+                    }
+                },
+                "SalesItemLineDetail.UnitPrice": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "UnitPrice"
+                    }
+                },
+                "SalesItemLineDetail.Qty": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Qty"
+                    }
+                },
+                "SalesItemLineDetail.TaxCodeRef.value": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "TaxCode"
+                    }
+                }
+            }
+        },
+        "TxnTaxDetail": {
+            "type": "table",
+            "destination": "SalesReceipt-TxnTaxDetail",
+            "tableMapping": {
+                "TotalTax": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "TotalTax"
+                    }
+                },
+                "TaxLine": {
+                    "type": "table",
+                    "destination": "SalesReceipt-TxnTaxDetail-TaxLine",
+                    "tableMapping": {
+                        "Amount": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "Amount"
+                            }
+                        },
+                        "DetailType": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "DetailType"
+                            }
+                        },
+                        "TaxLineDetail.TaxRateRef.value": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "TaxRate_ID",
+                                "primaryKey": true
+                            }
+                        },
+                        "TaxLineDetail.TaxPercent": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "TaxPercent"
+                            }
+                        },
+                        "TaxLineDetail.NetAmountTaxable": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "NetAmountTaxable"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "CustomField": {
+            "type": "table",
+            "destination": "SalesReceipt-CustomField",
+            "tableMapping": {
+                "DefinitionId": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Definition_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Name": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Name"
+                    }
+                },
+                "Type": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Type"
+                    }
+                },
+                "StringValue": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "StringValue"
+                    }
+                }
+            }
+        }
+    },
+    "Estimate": {
+        "Id": {
+            "type": "column",
+            "mapping": {
+                "destination": "ID",
+                "primaryKey": true
+            }
+        },
+        "CustomerRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "Customer_ID"
+            }
+        },
+        "CustomerRef.name": {
+            "type": "column",
+            "mapping": {
+                "destination": "Customer_name"
+            }
+        },
+        "DocNumber": {
+            "type": "column",
+            "mapping": {
+                "destination": "DocNumber"
+            }
+        },
+        "TxnDate": {
+            "type": "column",
+            "mapping": {
+                "destination": "TxnDate"
+            }
+        },
+        "ExpirationDate": {
+            "type": "column",
+            "mapping": {
+                "destination": "ExpirationDate"
+            }
+        },
+        "AcceptedDate": {
+            "type": "column",
+            "mapping": {
+                "destination": "AcceptedDate"
+            }
+        },
+        "TxnStatus": {
+            "type": "column",
+            "mapping": {
+                "destination": "TxnStatus"
+            }
+        },
+        "CurrencyRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "Currency"
+            }
+        },
+        "ExchangeRate": {
+            "type": "column",
+            "mapping": {
+                "destination": "ExchangeRate"
+            }
+        },
+        "GlobalTaxCalculation": {
+            "type": "column",
+            "mapping": {
+                "destination": "GlobalTaxCalculation"
+            }
+        },
+        "TotalAmt": {
+            "type": "column",
+            "mapping": {
+                "destination": "TotalAmount"
+            }
+        },
+        "HomeTotalAmt": {
+            "type": "column",
+            "mapping": {
+                "destination": "HomeTotalAmount"
+            }
+        },
+        "PrintStatus": {
+            "type": "column",
+            "mapping": {
+                "destination": "PrintStatus"
+            }
+        },
+        "EmailStatus": {
+            "type": "column",
+            "mapping": {
+                "destination": "EmailStatus"
+            }
+        },
+        "BillEmail.Address": {
+            "type": "column",
+            "mapping": {
+                "destination": "BillEmail_Address"
+            }
+        },
+        "BillAddr": {
+            "type": "table",
+            "destination": "Estimate-BillAddr",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "BillAddr_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Line1": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Line_1"
+                    }
+                },
+                "City": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "City"
+                    }
+                },
+                "CountrySubDivisionCode": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "State"
+                    }
+                }
+            }
+        },
+        "ShipAddr": {
+            "type": "table",
+            "destination": "Estimate-ShipAddr",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "ShipAddr_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Line1": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Line_1"
+                    }
+                },
+                "City": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "City"
+                    }
+                },
+                "CountrySubDivisionCode": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "State"
+                    }
+                }
+            }
+        },
+        "Line": {
+            "type": "table",
+            "destination": "Estimate-Line",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "ID",
+                        "primaryKey": true
+                    }
+                },
+                "LineNum": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "LineNum"
+                    }
+                },
+                "Description": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Description"
+                    }
+                },
+                "Amount": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Amount"
+                    }
+                },
+                "DetailType": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "DetailType"
+                    }
+                },
+                "SalesItemLineDetail.ItemRef.value": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "SalesItem_ID"
+                    }
+                },
+                "SalesItemLineDetail.ItemRef.name": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "SalesItem_name"
+                    }
+                },
+                "SalesItemLineDetail.UnitPrice": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "UnitPrice"
+                    }
+                },
+                "SalesItemLineDetail.Qty": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Qty"
+                    }
+                },
+                "SalesItemLineDetail.TaxCodeRef.value": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "TaxCode"
+                    }
+                }
+            }
+        },
+        "TxnTaxDetail": {
+            "type": "table",
+            "destination": "Estimate-TxnTaxDetail",
+            "tableMapping": {
+                "TotalTax": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "TotalTax"
+                    }
+                },
+                "TaxLine": {
+                    "type": "table",
+                    "destination": "Estimate-TxnTaxDetail-TaxLine",
+                    "tableMapping": {
+                        "Amount": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "Amount"
+                            }
+                        },
+                        "DetailType": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "DetailType"
+                            }
+                        },
+                        "TaxLineDetail.TaxRateRef.value": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "TaxRate_ID",
+                                "primaryKey": true
+                            }
+                        },
+                        "TaxLineDetail.TaxPercent": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "TaxPercent"
+                            }
+                        },
+                        "TaxLineDetail.NetAmountTaxable": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "NetAmountTaxable"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "LinkedTxn": {
+            "type": "table",
+            "destination": "Estimate-LinkedTxn",
+            "tableMapping": {
+                "TxnId": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "TxnID",
+                        "primaryKey": true
+                    }
+                },
+                "TxnType": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "TxnType"
+                    }
+                }
+            }
+        },
+        "CustomField": {
+            "type": "table",
+            "destination": "Estimate-CustomField",
+            "tableMapping": {
+                "DefinitionId": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Definition_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Name": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Name"
+                    }
+                },
+                "Type": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Type"
+                    }
+                },
+                "StringValue": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "StringValue"
+                    }
+                }
+            }
+        }
+    },
+    "CreditMemo": {
+        "Id": {
+            "type": "column",
+            "mapping": {
+                "destination": "ID",
+                "primaryKey": true
+            }
+        },
+        "CustomerRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "Customer_ID"
+            }
+        },
+        "CustomerRef.name": {
+            "type": "column",
+            "mapping": {
+                "destination": "Customer_name"
+            }
+        },
+        "DocNumber": {
+            "type": "column",
+            "mapping": {
+                "destination": "DocNumber"
+            }
+        },
+        "TxnDate": {
+            "type": "column",
+            "mapping": {
+                "destination": "TxnDate"
+            }
+        },
+        "CurrencyRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "Currency"
+            }
+        },
+        "ExchangeRate": {
+            "type": "column",
+            "mapping": {
+                "destination": "ExchangeRate"
+            }
+        },
+        "GlobalTaxCalculation": {
+            "type": "column",
+            "mapping": {
+                "destination": "GlobalTaxCalculation"
+            }
+        },
+        "TotalAmt": {
+            "type": "column",
+            "mapping": {
+                "destination": "TotalAmount"
+            }
+        },
+        "HomeTotalAmt": {
+            "type": "column",
+            "mapping": {
+                "destination": "HomeTotalAmount"
+            }
+        },
+        "PrintStatus": {
+            "type": "column",
+            "mapping": {
+                "destination": "PrintStatus"
+            }
+        },
+        "EmailStatus": {
+            "type": "column",
+            "mapping": {
+                "destination": "EmailStatus"
+            }
+        },
+        "BillEmail.Address": {
+            "type": "column",
+            "mapping": {
+                "destination": "BillEmail_Address"
+            }
+        },
+        "Balance": {
+            "type": "column",
+            "mapping": {
+                "destination": "Balance"
+            }
+        },
+        "RemainingCredit": {
+            "type": "column",
+            "mapping": {
+                "destination": "RemainingCredit"
+            }
+        },
+        "BillAddr": {
+            "type": "table",
+            "destination": "CreditMemo-BillAddr",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "BillAddr_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Line1": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Line_1"
+                    }
+                },
+                "City": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "City"
+                    }
+                },
+                "CountrySubDivisionCode": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "State"
+                    }
+                }
+            }
+        },
+        "ShipAddr": {
+            "type": "table",
+            "destination": "CreditMemo-ShipAddr",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "ShipAddr_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Line1": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Line_1"
+                    }
+                },
+                "City": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "City"
+                    }
+                },
+                "CountrySubDivisionCode": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "State"
+                    }
+                }
+            }
+        },
+        "Line": {
+            "type": "table",
+            "destination": "CreditMemo-Line",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "ID",
+                        "primaryKey": true
+                    }
+                },
+                "LineNum": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "LineNum"
+                    }
+                },
+                "Description": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Description"
+                    }
+                },
+                "Amount": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Amount"
+                    }
+                },
+                "DetailType": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "DetailType"
+                    }
+                },
+                "SalesItemLineDetail.ItemRef.value": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "SalesItem_ID"
+                    }
+                },
+                "SalesItemLineDetail.ItemRef.name": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "SalesItem_name"
+                    }
+                },
+                "SalesItemLineDetail.UnitPrice": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "UnitPrice"
+                    }
+                },
+                "SalesItemLineDetail.Qty": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Qty"
+                    }
+                },
+                "SalesItemLineDetail.TaxCodeRef.value": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "TaxCode"
+                    }
+                }
+            }
+        },
+        "TxnTaxDetail": {
+            "type": "table",
+            "destination": "CreditMemo-TxnTaxDetail",
+            "tableMapping": {
+                "TotalTax": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "TotalTax"
+                    }
+                },
+                "TaxLine": {
+                    "type": "table",
+                    "destination": "CreditMemo-TxnTaxDetail-TaxLine",
+                    "tableMapping": {
+                        "Amount": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "Amount"
+                            }
+                        },
+                        "DetailType": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "DetailType"
+                            }
+                        },
+                        "TaxLineDetail.TaxRateRef.value": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "TaxRate_ID",
+                                "primaryKey": true
+                            }
+                        },
+                        "TaxLineDetail.TaxPercent": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "TaxPercent"
+                            }
+                        },
+                        "TaxLineDetail.NetAmountTaxable": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "NetAmountTaxable"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "CustomField": {
+            "type": "table",
+            "destination": "CreditMemo-CustomField",
+            "tableMapping": {
+                "DefinitionId": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Definition_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Name": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Name"
+                    }
+                },
+                "Type": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Type"
+                    }
+                },
+                "StringValue": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "StringValue"
+                    }
+                }
+            }
+        }
+    },
+    "RefundReceipt": {
+        "Id": {
+            "type": "column",
+            "mapping": {
+                "destination": "ID",
+                "primaryKey": true
+            }
+        },
+        "CustomerRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "Customer_ID"
+            }
+        },
+        "CustomerRef.name": {
+            "type": "column",
+            "mapping": {
+                "destination": "Customer_name"
+            }
+        },
+        "DocNumber": {
+            "type": "column",
+            "mapping": {
+                "destination": "DocNumber"
+            }
+        },
+        "TxnDate": {
+            "type": "column",
+            "mapping": {
+                "destination": "TxnDate"
+            }
+        },
+        "CurrencyRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "Currency"
+            }
+        },
+        "ExchangeRate": {
+            "type": "column",
+            "mapping": {
+                "destination": "ExchangeRate"
+            }
+        },
+        "GlobalTaxCalculation": {
+            "type": "column",
+            "mapping": {
+                "destination": "GlobalTaxCalculation"
+            }
+        },
+        "TotalAmt": {
+            "type": "column",
+            "mapping": {
+                "destination": "TotalAmount"
+            }
+        },
+        "HomeTotalAmt": {
+            "type": "column",
+            "mapping": {
+                "destination": "HomeTotalAmount"
+            }
+        },
+        "PrintStatus": {
+            "type": "column",
+            "mapping": {
+                "destination": "PrintStatus"
+            }
+        },
+        "PaymentMethodRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "PaymentMethod_ID"
+            }
+        },
+        "PaymentMethodRef.name": {
+            "type": "column",
+            "mapping": {
+                "destination": "PaymentMethod_name"
+            }
+        },
+        "DepositToAccountRef.value": {
+            "type": "column",
+            "mapping": {
+                "destination": "DepositToAccount_ID"
+            }
+        },
+        "DepositToAccountRef.name": {
+            "type": "column",
+            "mapping": {
+                "destination": "DepositToAccount_name"
+            }
+        },
+        "BillAddr": {
+            "type": "table",
+            "destination": "RefundReceipt-BillAddr",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "BillAddr_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Line1": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Line_1"
+                    }
+                },
+                "City": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "City"
+                    }
+                },
+                "CountrySubDivisionCode": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "State"
+                    }
+                }
+            }
+        },
+        "ShipAddr": {
+            "type": "table",
+            "destination": "RefundReceipt-ShipAddr",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "ShipAddr_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Line1": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Line_1"
+                    }
+                },
+                "City": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "City"
+                    }
+                },
+                "CountrySubDivisionCode": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "State"
+                    }
+                }
+            }
+        },
+        "Line": {
+            "type": "table",
+            "destination": "RefundReceipt-Line",
+            "tableMapping": {
+                "Id": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "ID",
+                        "primaryKey": true
+                    }
+                },
+                "LineNum": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "LineNum"
+                    }
+                },
+                "Description": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Description"
+                    }
+                },
+                "Amount": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Amount"
+                    }
+                },
+                "DetailType": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "DetailType"
+                    }
+                },
+                "SalesItemLineDetail.ItemRef.value": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "SalesItem_ID"
+                    }
+                },
+                "SalesItemLineDetail.ItemRef.name": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "SalesItem_name"
+                    }
+                },
+                "SalesItemLineDetail.UnitPrice": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "UnitPrice"
+                    }
+                },
+                "SalesItemLineDetail.Qty": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Qty"
+                    }
+                },
+                "SalesItemLineDetail.TaxCodeRef.value": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "TaxCode"
+                    }
+                }
+            }
+        },
+        "TxnTaxDetail": {
+            "type": "table",
+            "destination": "RefundReceipt-TxnTaxDetail",
+            "tableMapping": {
+                "TotalTax": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "TotalTax"
+                    }
+                },
+                "TaxLine": {
+                    "type": "table",
+                    "destination": "RefundReceipt-TxnTaxDetail-TaxLine",
+                    "tableMapping": {
+                        "Amount": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "Amount"
+                            }
+                        },
+                        "DetailType": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "DetailType"
+                            }
+                        },
+                        "TaxLineDetail.TaxRateRef.value": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "TaxRate_ID",
+                                "primaryKey": true
+                            }
+                        },
+                        "TaxLineDetail.TaxPercent": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "TaxPercent"
+                            }
+                        },
+                        "TaxLineDetail.NetAmountTaxable": {
+                            "type": "column",
+                            "mapping": {
+                                "destination": "NetAmountTaxable"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "CustomField": {
+            "type": "table",
+            "destination": "RefundReceipt-CustomField",
+            "tableMapping": {
+                "DefinitionId": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Definition_ID",
+                        "primaryKey": true
+                    }
+                },
+                "Name": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Name"
+                    }
+                },
+                "Type": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "Type"
+                    }
+                },
+                "StringValue": {
+                    "type": "column",
+                    "mapping": {
+                        "destination": "StringValue"
+                    }
+                }
+            }
+        }
     }
 }
+
 
 
 ================================================
