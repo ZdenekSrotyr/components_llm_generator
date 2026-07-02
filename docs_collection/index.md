@@ -787,11 +787,6 @@
 - Repository: https://github.com/keboola/component-energis
 - Description: A KBC extractor for Energis 
 
-### component-esg
-- [Documentation](github/component-esg/llm.txt)
-- Repository: https://github.com/keboola/component-esg
-- Description: None
-
 ### component-google-play-console
 - [Documentation](github/component-google-play-console/llm.txt)
 - Repository: https://github.com/keboola/component-google-play-console
